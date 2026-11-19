@@ -37,8 +37,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 /// Agents whose last probes failed: when to try again, and how many failed in a row. Cleared by
 /// the first probe that succeeds.
-static FAILED: LazyLock<Mutex<HashMap<ProbeKey, (Instant, i32)>>> =
-    LazyLock::new(Default::default);
+static FAILED: LazyLock<Mutex<HashMap<ProbeKey, (Instant, i32)>>> = LazyLock::new(Default::default);
 
 /// Agents with a probe running, each with what turns true when it ends.
 type ProbeKey = (PathBuf, String);

@@ -110,7 +110,6 @@ impl AgentStatusOption {
     pub(crate) fn display_value(&self) -> String {
         self.value.display()
     }
-
 }
 
 /// The agent identity plus its advertised configuration, ordered for display.

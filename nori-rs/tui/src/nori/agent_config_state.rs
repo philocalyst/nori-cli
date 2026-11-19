@@ -164,7 +164,6 @@ impl AgentConfigState {
     pub(crate) fn mode_config(&self) -> Option<super::session_config_mode::AcpModeConfig> {
         super::session_config_mode::acp_mode_config_from_options(&self.raw_options())
     }
-
 }
 
 /// Resolve a select option's current value to the label the agent advertises
