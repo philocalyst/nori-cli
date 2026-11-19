@@ -39,14 +39,16 @@ impl Session {
         );
 
         // Create permission checker for hooks
-        // Load settings from ~/.claude/settings.json, .claude/settings.json, etc.
-        let settings_manager = SettingsManager::new(&cwd)
+        // Load settings from the login's settings.json (an account's CLAUDE_CONFIG_DIR, else
+        // ~/.claude), then .claude/settings.json and .claude/settings.local.json in the project.
+        let config_dir = crate::utils::claude_config_dir(&config.environment);
+        let settings_manager = SettingsManager::new(&cwd, config_dir.as_deref())
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to load settings manager from cwd: {}. Using default settings.", e);
                 // Fallback: try to load settings from home directory
                 if let Some(home) = dirs::home_dir() {
                     tracing::info!("Attempting to load settings from home directory");
-                    SettingsManager::new(&home).unwrap_or_else(|e2| {
+                    SettingsManager::new(&home, config_dir.as_deref()).unwrap_or_else(|e2| {
                         tracing::error!("Failed to load settings from home directory: {}. Using minimal default settings.", e2);
                         // Last resort: create a manager with minimal settings
                         SettingsManager::new_with_settings(crate::settings::Settings::default())
@@ -68,6 +70,7 @@ impl Session {
         // PermissionHandler uses AcceptEdits mode (compatible with root, allows all tools)
         let permission_handler = Arc::new(RwLock::new(PermissionHandler::with_checker(
             permission_checker.clone(),
+            config_dir.map(|dir| dir.join("plans")).unwrap_or_default(),
         )));
 
         // Create shared connection_cx_lock for hook permission requests

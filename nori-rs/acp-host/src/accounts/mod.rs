@@ -32,6 +32,7 @@ pub use identity::identity_of;
 pub use identity::record_identity;
 pub use launch::LoginProgram;
 pub use launch::login_program;
+pub use launch::default_environment;
 pub use launch::native_environment;
 pub use unwrap::Unwrapped;
 pub use unwrap::unwrap_executable;

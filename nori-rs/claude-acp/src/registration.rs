@@ -22,18 +22,23 @@ const OPTIONS: &[&str] = &["cli_path", "model"];
 fn config_for(spec: &InProcessSpec) -> std::io::Result<AgentConfig> {
     let options = SpecOptions::parse("Claude", &spec.config, OPTIONS)?;
     let project_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut config = AgentConfig::from_settings_or_env(&project_dir);
-    config.cli_path = options.get("cli_path").map(PathBuf::from);
-    if let Some(model) = options.get("model") {
-        config.model = Some(model.to_owned());
-    }
     // The agent's own environment (an account's home, its launcher's exports) reaches the CLI,
-    // never the process environment that every in-process agent shares.
-    config.environment = spec
+    // never the process environment that every in-process agent shares, and it decides whose
+    // settings are read.
+    let environment: std::collections::BTreeMap<String, String> = spec
         .environment
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
+    let mut config = AgentConfig::from_settings_or_env(
+        &project_dir,
+        crate::utils::claude_config_dir(&environment).as_deref(),
+    );
+    config.cli_path = options.get("cli_path").map(PathBuf::from);
+    if let Some(model) = options.get("model") {
+        config.model = Some(model.to_owned());
+    }
+    config.environment = environment;
     Ok(config)
 }
 

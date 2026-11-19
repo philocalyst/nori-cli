@@ -54,17 +54,10 @@ enum ExitPlanModeOutcome {
 /// Returns Ok(Some(content)) if plan file is found and readable,
 /// Ok(None) if no plan file exists or file is too large (>20MB),
 /// or Err if there's an error reading.
-fn read_plan_file() -> Result<Option<String>, std::io::Error> {
+fn read_plan_file(plans_dir: &std::path::Path) -> Result<Option<String>, std::io::Error> {
     // Maximum plan file size: 20MB
     // Plan files are typically small (a few KB), but we add a safety limit
     const MAX_PLAN_FILE_SIZE: u64 = 20 * 1024 * 1024; // 20MB
-
-    // Get the home directory
-    let Some(home) = dirs::home_dir() else {
-        return Ok(None);
-    };
-
-    let plans_dir = home.join(".claude").join("plans");
 
     // Check if plans directory exists
     if !plans_dir.exists() {
@@ -159,7 +152,8 @@ async fn send_exit_plan_mode_request(
             )
         } else {
             // Try to read the most recent plan file
-            match read_plan_file() {
+            let plans_dir = session.permission().await.plans_dir().to_path_buf();
+            match read_plan_file(&plans_dir) {
                 Ok(Some(plan_content)) => {
                     info!("Read plan file content for ExitPlanMode display");
                     (

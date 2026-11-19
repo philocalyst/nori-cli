@@ -293,7 +293,8 @@ impl AcpAgentInfo {
     /// Create agent info from an AgentKind enum
     pub fn from_agent(agent: AgentKind) -> Self {
         // A built-in agent that runs inside Nori has no CLI to find, so it counts as installed.
-        let native = native_name(agent).filter(|name| crate::in_process::in_process_available(name));
+        let native =
+            native_name(agent).filter(|name| crate::in_process::in_process_available(name));
         let unavailable = native.and_then(crate::in_process::in_process_unavailable);
         let (is_installed, managed_by) = if native.is_some() {
             (unavailable.is_none(), None)
@@ -685,7 +686,10 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                             anyhow::anyhow!("{} cannot start: {reason}", registered.name)
                         })?
                     }
-                    _ => HashMap::new(),
+                    // The provider's own login: where its launcher already keeps it.
+                    _ => registered.kind.map_or_else(HashMap::new, |kind| {
+                        crate::accounts::default_environment(crate::accounts::provider_of(kind))
+                    }),
                 };
                 (String::new(), Vec::new(), environment)
             }

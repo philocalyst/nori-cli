@@ -83,6 +83,21 @@ pub fn native_environment(
     Ok(environment)
 }
 
+/// The environment the provider's own, default login runs with in process. Nori picks nothing for
+/// it: only the home its launcher already forces (the user's `claude` wrapper exporting
+/// `CLAUDE_CONFIG_DIR`) is named, so the agent reads its settings and plans where its login
+/// actually lives instead of guessing `~/.claude`.
+pub fn default_environment(provider: &ProviderAccounts) -> HashMap<String, String> {
+    let Some(executable) = runs_executable(provider) else {
+        return HashMap::new();
+    };
+    super::wrapper::scan(provider.id, &executable, &HashMap::new())
+        .filter(|scan| scan.provider.id == provider.id)
+        .and_then(|scan| scan.home)
+        .map(|home| provider.environment(&home))
+        .unwrap_or_default()
+}
+
 /// The sign-in program of the native account `slug`: the provider's login CLI, run through its
 /// unwrapped executable with the account's home. Launcher arguments are not carried over, since
 /// they are written for running the agent, not for signing in. `None` for an account that is not

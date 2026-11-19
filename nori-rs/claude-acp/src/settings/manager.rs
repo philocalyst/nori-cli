@@ -12,7 +12,6 @@ use super::rule::PermissionSettings;
 use crate::types::Result;
 
 /// Settings file names
-const USER_SETTINGS_DIR: &str = ".claude";
 const PROJECT_SETTINGS_DIR: &str = ".claude";
 const SETTINGS_FILE: &str = "settings.json";
 const LOCAL_SETTINGS_FILE: &str = "settings.local.json";
@@ -195,8 +194,10 @@ impl SettingsManager {
     /// # Arguments
     ///
     /// * `project_dir` - The project working directory
-    pub fn new(project_dir: impl AsRef<Path>) -> Result<Self> {
-        let settings = Self::load_all_settings(project_dir.as_ref());
+    /// * `user_dir` - The login's config directory (`claude_config_dir`), whose `settings.json`
+    ///   is the user's; `None` reads no user settings
+    pub fn new(project_dir: impl AsRef<Path>, user_dir: Option<&Path>) -> Result<Self> {
+        let settings = Self::load_all_settings(project_dir.as_ref(), user_dir);
 
         Ok(Self { settings })
     }
@@ -213,11 +214,11 @@ impl SettingsManager {
     /// Load and merge all settings sources
     ///
     /// Priority: Local > Project > User
-    fn load_all_settings(project_dir: &Path) -> Settings {
+    fn load_all_settings(project_dir: &Path, user_dir: Option<&Path>) -> Settings {
         let mut settings = Settings::new();
 
-        // 1. Load user settings (~/.claude/settings.json)
-        if let Some(user_settings) = Self::load_user_settings() {
+        // 1. Load user settings (<config dir>/settings.json, ~/.claude by default)
+        if let Some(user_settings) = user_dir.and_then(Self::load_user_settings) {
             tracing::debug!("Loaded user settings");
             settings.merge(user_settings);
         }
@@ -237,11 +238,9 @@ impl SettingsManager {
         settings
     }
 
-    /// Load user settings from ~/.claude/settings.json
-    fn load_user_settings() -> Option<Settings> {
-        let home = dirs::home_dir()?;
-        let path = home.join(USER_SETTINGS_DIR).join(SETTINGS_FILE);
-        Self::load_settings_file(&path)
+    /// Load user settings from the login's `settings.json`
+    fn load_user_settings(user_dir: &Path) -> Option<Settings> {
+        Self::load_settings_file(&user_dir.join(SETTINGS_FILE))
     }
 
     /// Load project settings from .claude/settings.json

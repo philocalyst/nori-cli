@@ -24,7 +24,10 @@ fn make_test_hook_with_mode(
     let connection_cx_lock: Arc<OnceLock<Cx>> = Arc::new(OnceLock::new());
     let tool_use_id_cache: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
     // Create PermissionHandler with the specified mode
-    let mut permission = PermissionHandler::with_checker(checker.clone());
+    let mut permission = PermissionHandler::with_checker(
+        checker.clone(),
+        dirs::home_dir().unwrap().join(".claude/plans"),
+    );
     permission.set_mode(mode);
     create_pre_tool_use_hook(
         connection_cx_lock,
@@ -644,17 +647,20 @@ async fn test_is_plans_directory_path() {
     // Test absolute path
     let home = dirs::home_dir().unwrap();
     let plans_path = home.join(".claude").join("plans").join("plan.md");
-    assert!(is_plans_directory_path(plans_path.to_str().unwrap()));
+    assert!(is_plans_directory_path(
+        plans_path.to_str().unwrap(),
+        &dirs::home_dir().unwrap().join(".claude/plans"),
+    ));
 
     // Test ~ expansion
-    assert!(is_plans_directory_path("~/.claude/plans/plan.md"));
+    assert!(is_plans_directory_path("~/.claude/plans/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
 
     // Test non-plans path
-    assert!(!is_plans_directory_path("/tmp/plan.md"));
-    assert!(!is_plans_directory_path("~/other/path/plan.md"));
+    assert!(!is_plans_directory_path("/tmp/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
+    assert!(!is_plans_directory_path("~/other/path/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
 
     // Test edge case: similar but not plans directory
-    assert!(!is_plans_directory_path("~/../.claude/plans/plan.md"));
+    assert!(!is_plans_directory_path("~/../.claude/plans/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
 }
 
 #[tokio::test]

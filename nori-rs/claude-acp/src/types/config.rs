@@ -108,14 +108,17 @@ impl AgentConfig {
     /// ```
     /// This will set `MAX_THINKING_TOKENS` to 20000 by default.
     /// You can still override it with the `MAX_THINKING_TOKENS` environment variable.
-    pub fn from_settings_or_env(project_dir: &std::path::Path) -> Self {
+    pub fn from_settings_or_env(
+        project_dir: &std::path::Path,
+        user_dir: Option<&std::path::Path>,
+    ) -> Self {
         use crate::settings::SettingsManager;
 
         // Default max thinking tokens when always_thinking_enabled is true
         const DEFAULT_MAX_THINKING_TOKENS: u32 = 20000;
 
         // Load settings from files (may fail if files don't exist)
-        let settings = SettingsManager::new(project_dir)
+        let settings = SettingsManager::new(project_dir, user_dir)
             .map(|m| m.settings().clone())
             .unwrap_or_default();
 
@@ -506,7 +509,7 @@ mod tests {
             std::env::set_var("ANTHROPIC_MODEL", "env-model");
         }
 
-        let config = AgentConfig::from_settings_or_env(&temp_dir);
+        let config = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config.model, Some("env-model".to_string()));
         assert_eq!(
             config.small_fast_model,
@@ -527,7 +530,7 @@ mod tests {
             "ANTHROPIC_MODEL should be removed"
         );
 
-        let config2 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config2 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config2.model, Some("settings-model".to_string()));
         assert_eq!(
             config2.small_fast_model,
@@ -540,7 +543,7 @@ mod tests {
             std::env::set_var("ANTHROPIC_MODEL", "env-only-model");
         }
 
-        let config3 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config3 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config3.model, Some("env-only-model".to_string()));
         assert!(config3.small_fast_model.is_none());
 
@@ -595,7 +598,7 @@ mod tests {
         )
         .ok();
 
-        let config = AgentConfig::from_settings_or_env(&temp_dir);
+        let config = AgentConfig::from_settings_or_env(&temp_dir, None);
         // Local settings should override any user global settings
         assert_eq!(config.model, Some("local-model".to_string()));
         assert_eq!(
@@ -640,14 +643,14 @@ mod tests {
         .ok();
 
         // Test 1: Top-level should override env object
-        let config1 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config1 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config1.model, Some("top-level-model".to_string()));
 
         // Test 2: Env var should override both
         unsafe {
             std::env::set_var("ANTHROPIC_MODEL", "env-var-model");
         }
-        let config2 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config2 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config2.model, Some("env-var-model".to_string()));
 
         // Cleanup (EnvGuard handles env var restoration)
@@ -683,7 +686,7 @@ mod tests {
         )
         .ok();
 
-        let config1 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config1 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config1.max_thinking_tokens, Some(20000));
 
         // Test 2: alwaysThinkingEnabled = false should not set MAX_THINKING_TOKENS
@@ -695,7 +698,7 @@ mod tests {
         )
         .ok();
 
-        let config2 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config2 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config2.max_thinking_tokens, None);
 
         // Test 3: Env var should override alwaysThinkingEnabled
@@ -710,7 +713,7 @@ mod tests {
             std::env::set_var("MAX_THINKING_TOKENS", "8000");
         }
 
-        let config3 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config3 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config3.max_thinking_tokens, Some(8000));
 
         // Test 4: No alwaysThinkingEnabled should not set MAX_THINKING_TOKENS
@@ -724,7 +727,7 @@ mod tests {
         )
         .ok();
 
-        let config4 = AgentConfig::from_settings_or_env(&temp_dir);
+        let config4 = AgentConfig::from_settings_or_env(&temp_dir, None);
         assert_eq!(config4.max_thinking_tokens, None);
 
         // Cleanup (EnvGuard handles env var restoration)

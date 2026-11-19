@@ -85,7 +85,9 @@ mod tests {
 
     #[test]
     fn test_auto_approves_reads() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         assert!(strategy.should_auto_approve("Read", &json!({})));
         assert!(strategy.should_auto_approve("Glob", &json!({})));
         assert!(strategy.should_auto_approve("Grep", &json!({})));
@@ -95,7 +97,9 @@ mod tests {
 
     #[test]
     fn test_does_not_auto_approve_writes() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         assert!(!strategy.should_auto_approve("Write", &json!({})));
         assert!(!strategy.should_auto_approve("Edit", &json!({})));
         assert!(!strategy.should_auto_approve("Bash", &json!({})));
@@ -103,7 +107,9 @@ mod tests {
 
     #[test]
     fn test_blocks_non_plan_writes() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         let result = strategy.is_tool_blocked(
             "Write",
             &json!({"file_path": "/tmp/test.txt", "content": "test"}),
@@ -114,7 +120,9 @@ mod tests {
 
     #[test]
     fn test_blocks_bash() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         let result = strategy.is_tool_blocked("Bash", &json!({"command": "echo test"}));
         assert!(result.is_some());
         assert!(result.unwrap().contains("not allowed in Plan mode"));
@@ -122,7 +130,9 @@ mod tests {
 
     #[test]
     fn test_allows_plan_file_writes() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         let plan_path = home_plans_path();
         let result = strategy.is_tool_blocked(
             "Write",
@@ -133,7 +143,9 @@ mod tests {
 
     #[test]
     fn test_check_permission_allows_reads() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         match strategy.check_permission("Read", &json!({})) {
             ToolPermissionResult::Allowed => {}
             _ => panic!("Expected Allowed for Read"),
@@ -142,7 +154,9 @@ mod tests {
 
     #[test]
     fn test_check_permission_blocks_non_plan_writes() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         match strategy.check_permission("Write", &json!({"file_path": "/tmp/test.txt"})) {
             ToolPermissionResult::Blocked { .. } => {}
             _ => panic!("Expected Blocked for non-plan file writes"),
@@ -151,7 +165,9 @@ mod tests {
 
     #[test]
     fn test_check_permission_allows_plan_writes() {
-        let strategy = PlanModeStrategy;
+        let strategy = PlanModeStrategy {
+            plans_dir: dirs::home_dir().unwrap().join(".claude/plans"),
+        };
         let plan_path = home_plans_path();
         match strategy.check_permission("Write", &json!({"file_path": plan_path})) {
             ToolPermissionResult::Allowed => {}
