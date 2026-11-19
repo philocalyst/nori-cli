@@ -1,49 +1,24 @@
 [package]
-name = "claude-code-acp-rs"
-version = "0.1.22"
-authors = ["guochao.song <soddygo@qq.com>"]
-edition = "2024"
-rust-version = "1.90"
-description = "Use Claude Code from any ACP client - A Rust implementation of Claude Code ACP Agent"
-repository = "https://github.com/soddygo/claude-code-acp-rs"
-homepage = "https://github.com/soddygo/claude-code-acp-rs"
-documentation = "https://docs.rs/claude-code-acp-rs"
+name = "nori-claude-acp"
+version.workspace = true
+edition.workspace = true
 license = "MIT"
-keywords = ["claude", "acp", "agent", "ai", "anthropic"]
-categories = ["development-tools", "api-bindings", "asynchronous"]
+description = "Claude Code as an in-process ACP agent for Nori"
 
 [lib]
-name = "claude_code_acp"
+name = "nori_claude_acp"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
-# ACP Protocol SDK (sacp re-exports agent-client-protocol-schema types via sacp::schema)
-# Using official symposium-acp from crates.io
-# NOTE: During development, patch is applied below to use fork with flush mechanism
-sacp = "11.0.0"
-
-# Re-export agent-client-protocol-schema types for unstable features
-# Note: sacp 10.1.0 pulls in agent-client-protocol-schema without unstable features,
-# but our [patch.crates-io] overrides it with the local vendor version that has all features enabled.
-agent-client-protocol-schema = { version = "0.11.0", features = [
-    "unstable_session_model",
-    "unstable_session_fork",
-    "unstable_session_resume",
-    "unstable_session_close",
-    "unstable_session_usage",
-] }
-
+nori-acp-kit = { workspace = true }
 # The tools Nori hands an agent built into its own process.
-nori-host-tools = { path = "../host-tools" }
-
-# Claude Agent SDK
-# 开发阶段：使用本地 vendors 目录中的 SDK
-# claude-code-agent-sdk = { path = "vendors/claude-code-agent-sdk", version = "0.1.36" }
-# 发布阶段：恢复为 crates.io 版本
+nori-host-tools = { workspace = true }
 claude-code-agent-sdk = { version = "0.1.39", features = [] }
 
-# Async runtime
-tokio = { version = "1.48", features = [
+tokio = { workspace = true, features = [
     "macros",
     "rt-multi-thread",
     "process",
@@ -53,136 +28,26 @@ tokio = { version = "1.48", features = [
     "time",
     "fs",
 ] }
-tokio-util = { version = "0.7", features = ["compat"] }
-
-# Async utilities
-async-trait = "0.1"
-futures = "0.3"
-async-stream = "0.3"
-pin-project = "1.1"
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Error handling
-thiserror = "2.0"
-anyhow = "1.0"
-
-# Concurrent collections
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 dashmap = "6.1"
-
-# Process group management (avoids zombie processes)
 process-wrap = { version = "9.0", features = ["tokio1"] }
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# UUID generation
-uuid = { version = "1.20", features = ["v4"] }
-
-# Home directory detection
-dirs = "6.0"
-
-# File diff generation
-similar = "2.7"
-
-# Glob pattern matching
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+dirs = { workspace = true }
 globset = "0.4"
-
-# File system traversal
-walkdir = "2.5"
-
-# Regular expressions (for rule parsing)
 regex = "1.12"
-
-# Lazy static initialization
-once_cell = "1.20"
-
-# CLI argument parsing
-clap = { version = "4.5", features = ["derive", "env"] }
-
-# Time formatting for log filename
-chrono = "0.4"
-
-# File system watching (notify 7 is compatible with notify-debouncer-mini)
-notify = "8"
-notify-debouncer-mini = "0.7"
-
-# OpenTelemetry (optional, for distributed tracing)
-opentelemetry = { version = "0.31", optional = true }
-opentelemetry_sdk = { version = "0.31", features = [
-    "rt-tokio",
-], optional = true }
-opentelemetry-otlp = { version = "0.31", features = [
-    "grpc-tonic",
-    "http-proto",
-], optional = true }
-tracing-opentelemetry = { version = "0.32", optional = true }
-base64 = "0.22.1"
-
-# MCP support (optional, for future use)
-# rmcp = { version = "0.8", features = ["server", "transport-io"], optional = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Reaping the processes the Claude CLI leaves behind.
-libc = "0.2"
+libc = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
-pretty_assertions = "1"
-tempfile = "3.25"
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
 serial_test = "3"
-
-[features]
-# `bundled-cli` downloads the Claude CLI during the build and `otel` pulls in a
-# large exporter stack, so neither is on by default.
-default = []
-# mcp = ["rmcp"]
-otel = [
-    "opentelemetry",
-    "opentelemetry_sdk",
-    "opentelemetry-otlp",
-    "tracing-opentelemetry",
-]
-# Enable flush mechanism from patched sacp (enabled by default during development)
-# When using official sacp, disable this feature: --no-default-features
-sacp-flush = []
-# Enable bundled CLI: build.rs automatically downloads Claude Code CLI binary
-# Disable in restricted network environments: --no-default-features --features otel,sacp-flush
-bundled-cli = ["claude-code-agent-sdk/bundled-cli"]
-# Enable verbose debug logging for troubleshooting
-verbose-debug = []
-
-[lints.rust]
-future_incompatible = { level = "warn", priority = -1 }
-let-underscore = "warn"
-missing_debug_implementations = "warn"
-nonstandard_style = { level = "warn", priority = -1 }
-rust_2018_idioms = { level = "warn", priority = -1 }
-unused = { level = "warn", priority = -1 }
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-doc_markdown = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-must_use_candidate = "allow"
-needless_pass_by_value = "allow"
-similar_names = "allow"
-struct_field_names = "allow"
-too_many_lines = "allow"
-wildcard_imports = "allow"
-module_name_repetitions = "allow"
-return_self_not_must_use = "allow"
-unnecessary_literal_bound = "allow"
-trivially_copy_pass_by_ref = "allow"
-uninlined_format_args = "allow"
-format_push_string = "allow"
-map_unwrap_or = "allow"
-collapsible_if = "allow"
-manual_non_exhaustive = "allow"
-match_same_arms = "allow"
-redundant_closure_for_method_calls = "allow"
-unused_self = "allow"

@@ -23,6 +23,10 @@ pub struct AgentConfig {
     /// `CLAUDE_CODE_EXECUTABLE` and then the SDK's search decide.
     pub cli_path: Option<std::path::PathBuf>,
 
+    /// Environment for the CLI on top of Nori's own: the account's home (`CLAUDE_CONFIG_DIR`)
+    /// when the agent runs one account among several.
+    pub environment: std::collections::BTreeMap<String, String>,
+
     /// Anthropic API base URL
     /// Environment variable: `ANTHROPIC_BASE_URL`
     /// Settings field: `apiBaseUrl`
@@ -56,41 +60,6 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    /// Create a new empty configuration
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Load configuration from environment variables
-    ///
-    /// Reads the following environment variables:
-    /// - `ANTHROPIC_BASE_URL`: API base URL
-    /// - `ANTHROPIC_API_KEY`: API key (preferred)
-    /// - `ANTHROPIC_AUTH_TOKEN`: Auth token (legacy, fallback if API_KEY not set)
-    /// - `ANTHROPIC_MODEL`: Primary model name
-    /// - `ANTHROPIC_SMALL_FAST_MODEL`: Small/fast model name
-    /// - `MAX_THINKING_TOKENS`: Maximum tokens for thinking blocks
-    pub fn from_env() -> Self {
-        // Prefer ANTHROPIC_API_KEY, fallback to ANTHROPIC_AUTH_TOKEN for compatibility
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok());
-
-        // Parse MAX_THINKING_TOKENS if present
-        let max_thinking_tokens = std::env::var("MAX_THINKING_TOKENS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok());
-
-        Self {
-            cli_path: None,
-            base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
-            api_key,
-            model: std::env::var("ANTHROPIC_MODEL").ok(),
-            small_fast_model: std::env::var("ANTHROPIC_SMALL_FAST_MODEL").ok(),
-            max_thinking_tokens,
-        }
-    }
-
     /// Load configuration from settings files and environment variables
     ///
     /// Configuration priority (highest to lowest):
@@ -251,6 +220,7 @@ impl AgentConfig {
 
         let config = Self {
             cli_path: None,
+            environment: Default::default(),
             base_url,
             api_key,
             model,
@@ -282,15 +252,6 @@ impl AgentConfig {
         }
 
         config
-    }
-
-    /// Check if any configuration is set
-    pub fn is_configured(&self) -> bool {
-        self.base_url.is_some()
-            || self.api_key.is_some()
-            || self.model.is_some()
-            || self.small_fast_model.is_some()
-            || self.max_thinking_tokens.is_some()
     }
 
     /// Get environment variables to pass to Claude Code CLI
@@ -373,7 +334,8 @@ impl AgentConfig {
         }
 
         // Pass base_url and api_key as environment variables
-        let env_vars = self.to_env_vars();
+        let mut env_vars = self.to_env_vars();
+        env_vars.extend(self.environment.clone());
         if !env_vars.is_empty() {
             options.env = env_vars;
         }
@@ -435,20 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config() {
-        let config = AgentConfig::default();
-        assert!(config.base_url.is_none());
-        assert!(config.api_key.is_none());
-        assert!(config.model.is_none());
-        assert!(config.small_fast_model.is_none());
-        assert!(config.max_thinking_tokens.is_none());
-        assert!(!config.is_configured());
-    }
-
-    #[test]
     fn test_to_env_vars() {
         let config = AgentConfig {
             cli_path: None,
+            environment: Default::default(),
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("secret-key".to_string()),
             model: Some("claude-3".to_string()),
@@ -516,30 +468,6 @@ mod tests {
         assert!(masked.starts_with("sk-a"));
         assert!(masked.ends_with("xxxx"));
         assert!(masked.contains("***"));
-    }
-
-    #[test]
-    fn test_is_configured() {
-        let mut config = AgentConfig::default();
-        assert!(!config.is_configured());
-
-        config.model = Some("test".to_string());
-        assert!(config.is_configured());
-    }
-
-    #[test]
-    fn test_max_thinking_tokens_config() {
-        let config = AgentConfig {
-            cli_path: None,
-            base_url: None,
-            api_key: None,
-            model: None,
-            small_fast_model: None,
-            max_thinking_tokens: Some(4096),
-        };
-
-        assert!(config.is_configured());
-        assert_eq!(config.max_thinking_tokens, Some(4096));
     }
 
     #[test]

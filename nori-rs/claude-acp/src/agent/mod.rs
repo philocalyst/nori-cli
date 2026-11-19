@@ -1,20 +1,13 @@
-//! ACP Agent implementation
-//!
-//! This module provides the core Claude ACP Agent that handles:
-//! - ACP protocol requests (initialize, session/new, session/prompt, etc.)
-//! - Session lifecycle management
-//! - Message conversion between ACP and Claude SDK
+//! The Claude Code agent: its [`NativeAgent`](nori_acp_kit::NativeAgent) implementation and
+//! the work behind each ACP request.
 
+mod catalog;
 mod core;
-mod flush;
-mod handlers;
-mod runner;
+mod identity;
+mod lifecycle;
+mod listing;
+mod native;
+mod prompt;
 mod slash_commands;
 
 pub use core::ClaudeAcpAgent;
-pub use runner::InProcessOptions;
-pub use runner::prewarm;
-pub use runner::run_acp;
-pub use runner::run_acp_with_cli;
-pub use runner::serve_in_process;
-pub use runner::shutdown_otel;

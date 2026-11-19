@@ -1,13 +1,7 @@
-//! Hooks system for tool execution lifecycle
-//!
-//! Provides PreToolUse and PostToolUse hooks that integrate with
-//! permission checking and ACP client notifications.
+//! The PreToolUse hook: permission checking for the CLI's tool calls, asking the client when
+//! the rules say to.
 
-mod callback_registry;
-mod post_tool_use;
+mod output;
 mod pre_tool_use;
 
-pub use callback_registry::HookCallbackRegistry;
-pub use callback_registry::PostToolUseCallback;
-pub use post_tool_use::create_post_tool_use_hook;
 pub use pre_tool_use::create_pre_tool_use_hook;

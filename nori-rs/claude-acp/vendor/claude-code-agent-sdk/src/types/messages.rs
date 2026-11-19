@@ -55,6 +55,24 @@ pub enum Message {
     /// Control cancel request (ignore this - it's internal control protocol)
     #[serde(rename = "control_cancel_request")]
     ControlCancelRequest(serde_json::Value),
+    /// A message type this SDK does not know (the CLI adds them between releases, like
+    /// `tool_progress`), kept whole. The parser files every unknown `type` here, so a newer CLI is
+    /// never an error; deserializing `Message` directly never produces it.
+    #[serde(skip)]
+    Unrecognized(serde_json::Value),
+}
+
+impl Message {
+    /// The `type` tags `Message` knows how to read.
+    pub const KNOWN_TYPES: [&'static str; 7] = [
+        "assistant",
+        "system",
+        "result",
+        "rate_limit_event",
+        "stream_event",
+        "user",
+        "control_cancel_request",
+    ];
 }
 
 /// User message
@@ -205,6 +223,13 @@ pub struct ResultMessage {
     /// Usage statistics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
+    /// Usage per model, with each model's `contextWindow`
+    #[serde(
+        default,
+        rename = "modelUsage",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_usage: Option<serde_json::Value>,
     /// Result text (if any)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,

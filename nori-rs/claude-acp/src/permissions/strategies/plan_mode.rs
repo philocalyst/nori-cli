@@ -6,7 +6,6 @@
 //! to the codebase.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use crate::utils::is_plans_directory_path;
 use serde_json::Value;
@@ -16,10 +15,6 @@ use serde_json::Value;
 pub struct PlanModeStrategy;
 
 impl PermissionModeStrategy for PlanModeStrategy {
-    fn mode(&self) -> PermissionMode {
-        PermissionMode::Plan
-    }
-
     fn should_auto_approve(&self, tool_name: &str, _tool_input: &Value) -> bool {
         // Auto-approve read operations
         matches!(tool_name, "Read" | "Glob" | "Grep" | "LS" | "NotebookRead")
@@ -40,17 +35,16 @@ impl PermissionModeStrategy for PlanModeStrategy {
                 .or_else(|| tool_input.get("notebook_path"))
                 .and_then(|v| v.as_str());
 
-            if let Some(path) = file_path {
-                if is_plans_directory_path(path) {
-                    return None; // Allow plan file writes
-                }
+            if let Some(path) = file_path
+                && is_plans_directory_path(path)
+            {
+                return None; // Allow plan file writes
             }
         }
 
         // Block all other write operations
         Some(format!(
-            "Tool {} is not allowed in Plan mode (only read operations and writing to ~/.claude/plans/ are allowed)",
-            tool_name
+            "Tool {tool_name} is not allowed in Plan mode (only read operations and writing to ~/.claude/plans/ are allowed)"
         ))
     }
 
@@ -84,12 +78,6 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
-    }
-
-    #[test]
-    fn test_mode() {
-        let strategy = PlanModeStrategy;
-        assert_eq!(strategy.mode(), PermissionMode::Plan);
     }
 
     #[test]

@@ -11,21 +11,5 @@
 //! - `terminal/release`: Release terminal resources
 
 mod client;
-mod handle;
 
 pub use client::TerminalClient;
-pub use handle::TerminalHandle;
-
-// Re-export relevant types from sacp::schema for convenience
-pub use sacp::schema::CreateTerminalRequest;
-pub use sacp::schema::CreateTerminalResponse;
-pub use sacp::schema::KillTerminalRequest;
-pub use sacp::schema::KillTerminalResponse;
-pub use sacp::schema::ReleaseTerminalRequest;
-pub use sacp::schema::ReleaseTerminalResponse;
-pub use sacp::schema::TerminalExitStatus;
-pub use sacp::schema::TerminalId;
-pub use sacp::schema::TerminalOutputRequest;
-pub use sacp::schema::TerminalOutputResponse;
-pub use sacp::schema::WaitForTerminalExitRequest;
-pub use sacp::schema::WaitForTerminalExitResponse;

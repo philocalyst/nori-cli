@@ -19,7 +19,7 @@ use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
-use sacp::schema::McpServer;
+use nori_acp_kit::schema::McpServer;
 
 use super::Session;
 use crate::mcp::HostToolsBinding;

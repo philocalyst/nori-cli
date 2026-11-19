@@ -38,11 +38,6 @@ impl SystemPromptMeta {
         meta.get("systemPrompt")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
-
-    /// Check if any system prompt modification is configured
-    pub fn is_configured(&self) -> bool {
-        self.append.is_some() || self.replace.is_some()
-    }
 }
 
 /// Claude Code specific options from meta field
@@ -174,7 +169,7 @@ impl NewSessionMeta {
             claude_code: ClaudeCodeMeta::from_meta(meta),
             disable_built_in_tools: meta
                 .get("disableBuiltInTools")
-                .and_then(|v| v.as_bool())
+                .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
             fork_session: false,
         }
@@ -207,36 +202,12 @@ impl NewSessionMeta {
     pub fn get_max_thinking_tokens(&self) -> Option<u32> {
         self.claude_code.as_ref()?.get_max_thinking_tokens()
     }
-
-    /// Check if this session should resume from a previous session
-    pub fn should_resume(&self) -> bool {
-        self.get_resume_session_id().is_some()
-    }
-
-    /// Check if this session is a fork of another session
-    pub fn is_fork(&self) -> bool {
-        self.fork_session
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_system_prompt_meta_parse() {
-        let meta = json!({
-            "systemPrompt": {
-                "append": "Please respond in Chinese"
-            }
-        });
-
-        let parsed = SystemPromptMeta::from_meta(&meta).unwrap();
-        assert_eq!(parsed.append, Some("Please respond in Chinese".to_string()));
-        assert!(parsed.replace.is_none());
-        assert!(parsed.is_configured());
-    }
 
     #[test]
     fn test_claude_code_meta_parse() {
@@ -269,38 +240,6 @@ mod tests {
     }
 
     #[test]
-    fn test_new_session_meta_full() {
-        let meta = json!({
-            "systemPrompt": {
-                "append": "Be concise"
-            },
-            "claudeCode": {
-                "options": {
-                    "resume": "abc-123",
-                    "maxThinkingTokens": 8000
-                }
-            },
-            "disableBuiltInTools": true
-        });
-
-        let parsed = NewSessionMeta::from_request_meta(Some(&meta));
-        assert_eq!(parsed.get_system_prompt_append(), Some("Be concise"));
-        assert_eq!(parsed.get_resume_session_id(), Some("abc-123"));
-        assert_eq!(parsed.get_max_thinking_tokens(), Some(8000));
-        assert!(parsed.disable_built_in_tools);
-        assert!(parsed.should_resume());
-    }
-
-    #[test]
-    fn test_new_session_meta_empty() {
-        let parsed = NewSessionMeta::from_request_meta(None);
-        assert!(parsed.system_prompt.is_none());
-        assert!(parsed.claude_code.is_none());
-        assert!(!parsed.disable_built_in_tools);
-        assert!(!parsed.should_resume());
-    }
-
-    #[test]
     fn test_new_session_meta_partial() {
         let meta = json!({
             "systemPrompt": {
@@ -315,14 +254,5 @@ mod tests {
         );
         assert!(parsed.get_system_prompt_append().is_none());
         assert!(parsed.get_resume_session_id().is_none());
-    }
-
-    #[test]
-    fn test_new_session_meta_with_resume() {
-        let meta = NewSessionMeta::with_resume("session-abc-123");
-        assert_eq!(meta.get_resume_session_id(), Some("session-abc-123"));
-        assert!(meta.should_resume());
-        assert!(meta.system_prompt.is_none());
-        assert!(!meta.disable_built_in_tools);
     }
 }

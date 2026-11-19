@@ -3,12 +3,13 @@
 //! This module provides predefined slash commands that are sent to clients
 //! via the ACP protocol's `available_commands_update` notification.
 
-use sacp::schema::AvailableCommand;
-use sacp::schema::AvailableCommandInput;
-use sacp::schema::UnstructuredCommandInput;
+use nori_acp_kit::schema::AvailableCommand;
+use nori_acp_kit::schema::AvailableCommandInput;
+use nori_acp_kit::schema::UnstructuredCommandInput;
 
 /// Cached regex for matching MCP command format
 /// Pattern: /mcp:server:name [args]
+#[allow(clippy::unwrap_used)] // The pattern is a constant that compiles.
 static MCP_COMMAND_REGEX: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^/mcp:([^:\s]+):(\S+)(\s+.*)?$").unwrap());
 
@@ -70,7 +71,7 @@ pub fn transform_mcp_command_input(text: &str) -> String {
         let server = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let command = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let args = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-        format!("/{}:{} (MCP){}", server, command, args)
+        format!("/{server}:{command} (MCP){args}")
     } else {
         text.to_string()
     }

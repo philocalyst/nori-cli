@@ -1,19 +1,18 @@
 //! Tool registry for managing MCP tools
 
+use nori_acp_kit::Cx;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sacp::Client;
-use sacp::ConnectionTo;
-use sacp::schema::SessionId;
-use sacp::schema::SessionNotification;
-use sacp::schema::SessionUpdate;
-use sacp::schema::Terminal;
-use sacp::schema::ToolCallContent;
-use sacp::schema::ToolCallId;
-use sacp::schema::ToolCallStatus;
-use sacp::schema::ToolCallUpdate;
-use sacp::schema::ToolCallUpdateFields;
+use nori_acp_kit::schema::SessionId;
+use nori_acp_kit::schema::SessionNotification;
+use nori_acp_kit::schema::SessionUpdate;
+use nori_acp_kit::schema::Terminal;
+use nori_acp_kit::schema::ToolCallContent;
+use nori_acp_kit::schema::ToolCallId;
+use nori_acp_kit::schema::ToolCallStatus;
+use nori_acp_kit::schema::ToolCallUpdate;
+use nori_acp_kit::schema::ToolCallUpdateFields;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -21,6 +20,19 @@ use super::tools::Tool;
 use crate::session::BackgroundProcessManager;
 use crate::settings::PermissionChecker;
 use crate::terminal::TerminalClient;
+
+/// Files larger than this are not read to report what an overwrite replaced.
+pub const MAX_JOURNALED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A file change a tool made, as the client's edit journal needs it: the file's whole content
+/// before and after. Not part of what the CLI receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: std::path::PathBuf,
+    /// What the file held before (`None`: it did not exist).
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
 
 /// Tool execution result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +46,9 @@ pub struct ToolResult {
     /// Additional metadata
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// The file change this call made, reported to the client as a diff.
+    #[serde(skip)]
+    pub diff: Option<FileDiff>,
 }
 
 impl ToolResult {
@@ -44,6 +59,7 @@ impl ToolResult {
             content: content.into(),
             is_error: false,
             metadata: None,
+            diff: None,
         }
     }
 
@@ -54,7 +70,14 @@ impl ToolResult {
             content: message.into(),
             is_error: true,
             metadata: None,
+            diff: None,
         }
+    }
+
+    /// Report the file change this call made.
+    pub fn with_diff(mut self, diff: FileDiff) -> Self {
+        self.diff = Some(diff);
+        self
     }
 
     /// Create a result with metadata
@@ -85,8 +108,6 @@ pub struct ToolContext {
     pub session_id: String,
     /// Working directory
     pub cwd: std::path::PathBuf,
-    /// Whether to allow dangerous operations
-    pub allow_dangerous: bool,
     /// Background process manager
     background_processes: Option<Arc<BackgroundProcessManager>>,
     /// Terminal client for executing commands via Client PTY
@@ -94,7 +115,7 @@ pub struct ToolContext {
     /// Current tool use ID (for sending mid-execution updates)
     tool_use_id: Option<String>,
     /// Connection context for sending notifications
-    connection_cx: Option<ConnectionTo<Client>>,
+    connection_cx: Option<Cx>,
     /// Permission checker for tool-level permission checks
     pub permission_checker: Option<Arc<tokio::sync::RwLock<PermissionChecker>>>,
 }
@@ -105,19 +126,12 @@ impl ToolContext {
         Self {
             session_id: session_id.into(),
             cwd: cwd.into(),
-            allow_dangerous: false,
             background_processes: None,
             terminal_client: None,
             tool_use_id: None,
             connection_cx: None,
             permission_checker: None,
         }
-    }
-
-    /// Set whether dangerous operations are allowed
-    pub fn with_dangerous(mut self, allow: bool) -> Self {
-        self.allow_dangerous = allow;
-        self
     }
 
     /// Set the background process manager
@@ -139,7 +153,7 @@ impl ToolContext {
     }
 
     /// Set the connection context for sending notifications
-    pub fn with_connection_cx(mut self, cx: ConnectionTo<Client>) -> Self {
+    pub fn with_connection_cx(mut self, cx: Cx) -> Self {
         self.connection_cx = Some(cx);
         self
     }
@@ -164,11 +178,6 @@ impl ToolContext {
     /// instead of directly spawning processes.
     pub fn terminal_client(&self) -> Option<&Arc<TerminalClient>> {
         self.terminal_client.as_ref()
-    }
-
-    /// Get the current tool use ID
-    pub fn tool_use_id(&self) -> Option<&str> {
-        self.tool_use_id.as_deref()
     }
 
     /// Send a ToolCallUpdate notification with Terminal content
@@ -220,7 +229,7 @@ impl ToolContext {
 
         connection_cx
             .send_notification(notification)
-            .map_err(|e| format!("Failed to send notification: {}", e))
+            .map_err(|e| format!("Failed to send notification: {e}"))
     }
 }
 
@@ -248,12 +257,6 @@ impl ToolRegistry {
         self.tools.insert(name, Arc::new(tool));
     }
 
-    /// Register a tool as Arc
-    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name, tool);
-    }
-
     /// Get a tool by name, supporting ACP prefix
     ///
     /// If the tool name starts with `mcp__acp__`, it will try to find
@@ -265,47 +268,13 @@ impl ToolRegistry {
         }
 
         // Try stripping ACP prefix
-        if let Some(stripped) = name.strip_prefix(ACP_TOOL_PREFIX) {
-            if let Some(tool) = self.tools.get(stripped) {
-                return Some(tool.clone());
-            }
+        if let Some(stripped) = name.strip_prefix(ACP_TOOL_PREFIX)
+            && let Some(tool) = self.tools.get(stripped)
+        {
+            return Some(tool.clone());
         }
 
         None
-    }
-
-    /// Check if a tool exists, supporting ACP prefix
-    pub fn contains(&self, name: &str) -> bool {
-        if self.tools.contains_key(name) {
-            return true;
-        }
-
-        // Try stripping ACP prefix
-        if let Some(stripped) = name.strip_prefix(ACP_TOOL_PREFIX) {
-            return self.tools.contains_key(stripped);
-        }
-
-        false
-    }
-
-    /// Normalize a tool name by stripping ACP prefix if present
-    pub fn normalize_name(name: &str) -> &str {
-        name.strip_prefix(ACP_TOOL_PREFIX).unwrap_or(name)
-    }
-
-    /// Get all tool names
-    pub fn names(&self) -> Vec<&str> {
-        self.tools.keys().map(String::as_str).collect()
-    }
-
-    /// Get the number of registered tools
-    pub fn len(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Check if the registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
     }
 
     /// Execute a tool by name
@@ -317,7 +286,7 @@ impl ToolRegistry {
     ) -> ToolResult {
         match self.get(name) {
             Some(tool) => tool.execute(input, context).await,
-            None => ToolResult::error(format!("Tool not found: {}", name)),
+            None => ToolResult::error(format!("Tool not found: {name}")),
         }
     }
 
@@ -370,36 +339,6 @@ mod tests {
     fn test_tool_result_with_metadata() {
         let result = ToolResult::success("data").with_metadata(json!({"lines": 10}));
         assert!(result.metadata.is_some());
-    }
-
-    #[test]
-    fn test_tool_context() {
-        let ctx = ToolContext::new("session-1", "/tmp").with_dangerous(true);
-        assert_eq!(ctx.session_id, "session-1");
-        assert_eq!(ctx.cwd, std::path::PathBuf::from("/tmp"));
-        assert!(ctx.allow_dangerous);
-    }
-
-    #[test]
-    fn test_registry_new() {
-        let registry = ToolRegistry::new();
-        assert!(registry.is_empty());
-        assert_eq!(registry.len(), 0);
-    }
-
-    #[test]
-    fn test_acp_prefix_normalize() {
-        // Without prefix
-        assert_eq!(ToolRegistry::normalize_name("Read"), "Read");
-        assert_eq!(ToolRegistry::normalize_name("Bash"), "Bash");
-
-        // With prefix
-        assert_eq!(ToolRegistry::normalize_name("mcp__acp__Read"), "Read");
-        assert_eq!(ToolRegistry::normalize_name("mcp__acp__Bash"), "Bash");
-        assert_eq!(
-            ToolRegistry::normalize_name("mcp__acp__TodoWrite"),
-            "TodoWrite"
-        );
     }
 
     #[test]

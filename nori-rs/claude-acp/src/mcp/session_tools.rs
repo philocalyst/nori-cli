@@ -20,11 +20,11 @@ use claude_code_agent_sdk::types::mcp::McpHttpServerConfig;
 use claude_code_agent_sdk::types::mcp::McpSdkServerConfig;
 use claude_code_agent_sdk::types::mcp::McpSseServerConfig;
 use claude_code_agent_sdk::types::mcp::McpStdioServerConfig;
+use nori_acp_kit::schema::McpServer;
+use nori_acp_kit::schema::Meta;
 use nori_host_tools::HostToolOutput;
 use nori_host_tools::HostToolSpec;
 use nori_host_tools::HostTools;
-use sacp::schema::McpServer;
-use sacp::schema::Meta;
 use serde_json::Value;
 use serde_json::json;
 
@@ -127,11 +127,6 @@ impl SessionTools {
         }
         servers
     }
-}
-
-/// The tool-name prefix Claude Code gives Nori's host tools.
-pub fn host_tool_prefix() -> String {
-    format!("mcp__{}__", nori_host_tools::SERVER_NAME)
 }
 
 /// The host tool a Claude Code tool name calls, if it is one.
@@ -380,12 +375,12 @@ impl SdkMcpServer for HostToolsServer {
 
 #[cfg(test)]
 mod tests {
+    use nori_acp_kit::schema::EnvVariable;
+    use nori_acp_kit::schema::HttpHeader;
+    use nori_acp_kit::schema::McpServerHttp;
+    use nori_acp_kit::schema::McpServerStdio;
     use nori_host_tools::HostToolFuture;
     use pretty_assertions::assert_eq;
-    use sacp::schema::EnvVariable;
-    use sacp::schema::HttpHeader;
-    use sacp::schema::McpServerHttp;
-    use sacp::schema::McpServerStdio;
 
     use super::*;
 
@@ -665,13 +660,5 @@ mod tests {
         assert_eq!(binding.specs()[0].name, "git_status");
         let output = binding.call("git_status", json!({})).await;
         assert_eq!(output.text, "git_status:{}");
-    }
-
-    #[test]
-    fn host_tool_names_are_recognised_by_their_server() {
-        assert_eq!(host_tool_name("mcp__nori__git_commit"), Some("git_commit"));
-        assert_eq!(host_tool_name("mcp__nori-client__git_commit"), None);
-        assert_eq!(host_tool_name("mcp__acp__Read"), None);
-        assert_eq!(host_tool_prefix(), "mcp__nori__");
     }
 }

@@ -12,20 +12,19 @@ use claude_code_agent_sdk::types::permissions::PermissionUpdate;
 use claude_code_agent_sdk::types::permissions::PermissionUpdateDestination;
 use claude_code_agent_sdk::types::permissions::PermissionUpdateType;
 use claude_code_agent_sdk::types::permissions::ToolPermissionContext;
-use sacp::Client;
-use sacp::ConnectionTo;
-use sacp::schema::Content;
-use sacp::schema::ContentBlock;
-use sacp::schema::PermissionOption;
-use sacp::schema::PermissionOptionId;
-use sacp::schema::PermissionOptionKind;
-use sacp::schema::RequestPermissionOutcome;
-use sacp::schema::RequestPermissionRequest;
-use sacp::schema::SessionId;
-use sacp::schema::TextContent;
-use sacp::schema::ToolCallContent;
-use sacp::schema::ToolCallUpdate;
-use sacp::schema::ToolCallUpdateFields;
+use nori_acp_kit::Cx;
+use nori_acp_kit::schema::Content;
+use nori_acp_kit::schema::ContentBlock;
+use nori_acp_kit::schema::PermissionOption;
+use nori_acp_kit::schema::PermissionOptionId;
+use nori_acp_kit::schema::PermissionOptionKind;
+use nori_acp_kit::schema::RequestPermissionOutcome;
+use nori_acp_kit::schema::RequestPermissionRequest;
+use nori_acp_kit::schema::SessionId;
+use nori_acp_kit::schema::TextContent;
+use nori_acp_kit::schema::ToolCallContent;
+use nori_acp_kit::schema::ToolCallUpdate;
+use nori_acp_kit::schema::ToolCallUpdateFields;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -79,15 +78,13 @@ fn read_plan_file() -> Result<Option<String>, std::io::Error> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("md") {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(mtime) = metadata.modified() {
-                    if mtime > most_recent_mtime {
-                        most_recent_mtime = mtime;
-                        most_recent_file = Some(path);
-                    }
-                }
-            }
+        if path.extension().and_then(|s| s.to_str()) == Some("md")
+            && let Ok(metadata) = entry.metadata()
+            && let Ok(mtime) = metadata.modified()
+            && mtime > most_recent_mtime
+        {
+            most_recent_mtime = mtime;
+            most_recent_file = Some(path);
         }
     }
 
@@ -128,7 +125,7 @@ async fn send_exit_plan_mode_request(
     session_id: &str,
     tool_use_id: &str,
     tool_input: &serde_json::Value,
-    connection_cx: &ConnectionTo<Client>,
+    connection_cx: &Cx,
 ) -> Result<ExitPlanModeOutcome, AgentError> {
     // ExitPlanMode specific options matching TypeScript implementation
     let options = vec![
@@ -225,7 +222,7 @@ async fn send_exit_plan_mode_request(
                 error = %e,
                 "ExitPlanMode permission request failed"
             );
-            AgentError::Internal(format!("Permission request failed: {}", e))
+            AgentError::Internal(format!("Permission request failed: {e}"))
         })?;
 
     // Parse the response
@@ -336,7 +333,7 @@ async fn handle_exit_plan_mode(
                 "ExitPlanMode request failed"
             );
             PermissionResult::Deny(PermissionResultDeny {
-                message: format!("ExitPlanMode failed: {}", e),
+                message: format!("ExitPlanMode failed: {e}"),
                 interrupt: false,
             })
         }
@@ -522,7 +519,7 @@ pub fn create_can_use_tool_callback(
                                     "Permission request failed"
                                 );
                                 PermissionResult::Deny(PermissionResultDeny {
-                                    message: format!("Permission request failed: {}", e),
+                                    message: format!("Permission request failed: {e}"),
                                     interrupt: false,
                                 })
                             }

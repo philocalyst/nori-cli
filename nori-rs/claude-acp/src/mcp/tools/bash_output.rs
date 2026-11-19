@@ -15,7 +15,7 @@ use serde_json::json;
 use super::base::Tool;
 use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
-use crate::terminal::TerminalId;
+use nori_acp_kit::schema::TerminalId;
 
 /// Prefix for Terminal API shell IDs
 const TERMINAL_API_PREFIX: &str = "term-";
@@ -59,7 +59,7 @@ impl Tool for BashOutputTool {
         // Parse input
         let params: BashOutputInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Check if this is a Terminal API shell
@@ -90,7 +90,7 @@ impl BashOutputTool {
                             if code == 0 {
                                 "completed (exit code 0)".to_string()
                             } else {
-                                format!("completed (exit code {})", code)
+                                format!("completed (exit code {code})")
                             }
                         } else if exit_status.signal.is_some() {
                             format!("killed (signal: {:?})", exit_status.signal)
@@ -103,9 +103,9 @@ impl BashOutputTool {
 
                 let output = &response.output;
                 let response_text = if output.is_empty() {
-                    format!("Status: {}\n\n(No output yet)", status)
+                    format!("Status: {status}\n\n(No output yet)")
                 } else {
-                    format!("Status: {}\n\n{}", status, output)
+                    format!("Status: {status}\n\n{output}")
                 };
 
                 ToolResult::success(response_text).with_metadata(json!({
@@ -114,7 +114,7 @@ impl BashOutputTool {
                     "terminal_api": true
                 }))
             }
-            Err(e) => ToolResult::error(format!("Failed to get terminal output: {}", e)),
+            Err(e) => ToolResult::error(format!("Failed to get terminal output: {e}")),
         }
     }
 
@@ -127,7 +127,7 @@ impl BashOutputTool {
 
         // Get the terminal
         let Some(terminal) = manager.get(bash_id) else {
-            return ToolResult::error(format!("Unknown shell ID: {}", bash_id));
+            return ToolResult::error(format!("Unknown shell ID: {bash_id}"));
         };
 
         // Get incremental output
@@ -136,9 +136,9 @@ impl BashOutputTool {
 
         // Format response
         let response = if output.is_empty() {
-            format!("Status: {}\n\n(No new output)", status)
+            format!("Status: {status}\n\n(No new output)")
         } else {
-            format!("Status: {}\n\n{}", status, output)
+            format!("Status: {status}\n\n{output}")
         };
 
         ToolResult::success(response)

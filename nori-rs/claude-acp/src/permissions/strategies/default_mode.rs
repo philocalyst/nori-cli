@@ -7,7 +7,6 @@
 
 use crate::command_safety::is_known_safe_command;
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
@@ -16,10 +15,6 @@ use serde_json::Value;
 pub struct DefaultModeStrategy;
 
 impl PermissionModeStrategy for DefaultModeStrategy {
-    fn mode(&self) -> PermissionMode {
-        PermissionMode::Default
-    }
-
     fn should_auto_approve(&self, tool_name: &str, tool_input: &Value) -> bool {
         // Auto-approve read operations
         if matches!(tool_name, "Read" | "Glob" | "Grep" | "LS" | "NotebookRead") {
@@ -27,10 +22,10 @@ impl PermissionModeStrategy for DefaultModeStrategy {
         }
 
         // Auto-approve known safe Bash commands
-        if tool_name == "Bash" {
-            if let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str()) {
-                return is_known_safe_command(cmd);
-            }
+        if tool_name == "Bash"
+            && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
+        {
+            return is_known_safe_command(cmd);
         }
 
         false
@@ -57,12 +52,6 @@ impl PermissionModeStrategy for DefaultModeStrategy {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_mode() {
-        let strategy = DefaultModeStrategy;
-        assert_eq!(strategy.mode(), PermissionMode::Default);
-    }
 
     #[test]
     fn test_auto_approves_reads() {

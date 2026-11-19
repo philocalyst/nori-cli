@@ -2,25 +2,23 @@
 //!
 //! Provides a client interface for sending Terminal API requests to the ACP Client.
 
+use nori_acp_kit::Cx;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
-use sacp::Client;
-use sacp::ConnectionTo;
-use sacp::schema::CreateTerminalRequest;
-use sacp::schema::CreateTerminalResponse;
-use sacp::schema::EnvVariable;
-use sacp::schema::KillTerminalRequest;
-use sacp::schema::KillTerminalResponse;
-use sacp::schema::ReleaseTerminalRequest;
-use sacp::schema::ReleaseTerminalResponse;
-use sacp::schema::SessionId;
-use sacp::schema::TerminalId;
-use sacp::schema::TerminalOutputRequest;
-use sacp::schema::TerminalOutputResponse;
-use sacp::schema::WaitForTerminalExitRequest;
-use sacp::schema::WaitForTerminalExitResponse;
+use nori_acp_kit::schema::CreateTerminalRequest;
+use nori_acp_kit::schema::CreateTerminalResponse;
+use nori_acp_kit::schema::EnvVariable;
+use nori_acp_kit::schema::KillTerminalRequest;
+use nori_acp_kit::schema::KillTerminalResponse;
+use nori_acp_kit::schema::ReleaseTerminalRequest;
+use nori_acp_kit::schema::ReleaseTerminalResponse;
+use nori_acp_kit::schema::SessionId;
+use nori_acp_kit::schema::TerminalId;
+use nori_acp_kit::schema::TerminalOutputRequest;
+use nori_acp_kit::schema::TerminalOutputResponse;
+use nori_acp_kit::schema::WaitForTerminalExitRequest;
+use nori_acp_kit::schema::WaitForTerminalExitResponse;
 use tracing::instrument;
 
 use crate::types::AgentError;
@@ -33,14 +31,14 @@ use crate::types::AgentError;
 #[derive(Debug, Clone)]
 pub struct TerminalClient {
     /// Connection context for sending requests
-    connection_cx: ConnectionTo<Client>,
+    connection_cx: Cx,
     /// Session ID for this client
     session_id: SessionId,
 }
 
 impl TerminalClient {
     /// Create a new Terminal API client
-    pub fn new(connection_cx: ConnectionTo<Client>, session_id: impl Into<SessionId>) -> Self {
+    pub fn new(connection_cx: Cx, session_id: impl Into<SessionId>) -> Self {
         Self {
             connection_cx,
             session_id: session_id.into(),
@@ -112,11 +110,11 @@ impl TerminalClient {
                     session_id = %self.session_id.0,
                     command = %cmd,
                     error = %e,
-                    error_type = %std::any::type_name::<sacp::Error>(),
+                    error_type = %std::any::type_name::<nori_acp_kit::acp::Error>(),
                     elapsed_ms = elapsed.as_millis(),
                     "Terminal create request failed"
                 );
-                AgentError::Internal(format!("Terminal create failed: {}", e))
+                AgentError::Internal(format!("Terminal create failed: {e}"))
             })?;
 
         let elapsed = start_time.elapsed();
@@ -165,7 +163,7 @@ impl TerminalClient {
                     elapsed_ms = elapsed.as_millis(),
                     "Terminal output request failed"
                 );
-                AgentError::Internal(format!("Terminal output failed: {}", e))
+                AgentError::Internal(format!("Terminal output failed: {e}"))
             })?;
 
         let elapsed = start_time.elapsed();
@@ -215,7 +213,7 @@ impl TerminalClient {
                     elapsed_ms = elapsed.as_millis(),
                     "Terminal wait_for_exit failed"
                 );
-                AgentError::Internal(format!("Terminal wait_for_exit failed: {}", e))
+                AgentError::Internal(format!("Terminal wait_for_exit failed: {e}"))
             })?;
 
         let elapsed = start_time.elapsed();
@@ -265,7 +263,7 @@ impl TerminalClient {
                     elapsed_ms = elapsed.as_millis(),
                     "Terminal kill failed"
                 );
-                AgentError::Internal(format!("Terminal kill failed: {}", e))
+                AgentError::Internal(format!("Terminal kill failed: {e}"))
             })?;
 
         let elapsed = start_time.elapsed();
@@ -314,7 +312,7 @@ impl TerminalClient {
                     elapsed_ms = elapsed.as_millis(),
                     "Terminal release failed"
                 );
-                AgentError::Internal(format!("Terminal release failed: {}", e))
+                AgentError::Internal(format!("Terminal release failed: {e}"))
             })?;
 
         let elapsed = start_time.elapsed();
@@ -325,16 +323,6 @@ impl TerminalClient {
         );
 
         Ok(response)
-    }
-
-    /// Get the session ID
-    pub fn session_id(&self) -> &SessionId {
-        &self.session_id
-    }
-
-    /// Create an Arc-wrapped client for sharing
-    pub fn into_arc(self) -> Arc<Self> {
-        Arc::new(self)
     }
 }
 

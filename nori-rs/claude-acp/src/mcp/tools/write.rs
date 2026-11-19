@@ -8,7 +8,8 @@ use serde_json::json;
 use std::time::Instant;
 
 use super::base::Tool;
-use super::base::ToolKind;
+use crate::mcp::registry::FileDiff;
+use crate::mcp::registry::MAX_JOURNALED_BYTES;
 use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
 
@@ -72,15 +73,6 @@ impl Tool for WriteTool {
             }
         })
     }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
-    fn requires_permission(&self) -> bool {
-        true // Writing requires permission
-    }
-
     async fn execute(&self, input: serde_json::Value, context: &ToolContext) -> ToolResult {
         // Check permission before executing
         if let Some(result) = self.check_permission(&input, context) {
@@ -90,7 +82,7 @@ impl Tool for WriteTool {
         // Parse input
         let params: WriteInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Resolve path relative to working directory if not absolute
@@ -103,22 +95,34 @@ impl Tool for WriteTool {
         let total_start = Instant::now();
 
         // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                let dir_start = Instant::now();
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    return ToolResult::error(format!("Failed to create directory: {}", e));
-                }
-                tracing::debug!(
-                    parent_dir = %parent.display(),
-                    dir_creation_duration_ms = dir_start.elapsed().as_millis(),
-                    "Parent directories created"
-                );
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            let dir_start = Instant::now();
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                return ToolResult::error(format!("Failed to create directory: {e}"));
             }
+            tracing::debug!(
+                parent_dir = %parent.display(),
+                dir_creation_duration_ms = dir_start.elapsed().as_millis(),
+                "Parent directories created"
+            );
         }
 
-        // Check if file exists (for reporting)
+        // Check if file exists (for reporting), and keep what it holds for the edit journal. A
+        // file too large or not text is overwritten without a reported diff: the journal could
+        // not restore it either.
         let file_existed = path.exists();
+        let old_text = if file_existed {
+            match tokio::fs::metadata(&path).await {
+                Ok(metadata) if metadata.len() <= MAX_JOURNALED_BYTES => {
+                    tokio::fs::read_to_string(&path).await.ok()
+                }
+                Ok(_) | Err(_) => None,
+            }
+        } else {
+            None
+        };
 
         // Write content to file
         let write_start = Instant::now();
@@ -141,14 +145,21 @@ impl Tool for WriteTool {
                     "File write successful"
                 );
 
-                ToolResult::success(format!(
+                let mut result = ToolResult::success(format!(
                     "{} {} ({} lines, {} bytes)",
                     action,
                     path.display(),
                     lines,
                     bytes
-                ))
-                .with_metadata(json!({
+                ));
+                if !file_existed || old_text.is_some() {
+                    result = result.with_diff(FileDiff {
+                        path: path.clone(),
+                        old_text,
+                        new_text: params.content.clone(),
+                    });
+                }
+                result.with_metadata(json!({
                     "path": path.display().to_string(),
                     "created": !file_existed,
                     "lines": lines,
@@ -165,7 +176,7 @@ impl Tool for WriteTool {
                     elapsed_ms = elapsed.as_millis(),
                     "File write failed"
                 );
-                ToolResult::error(format!("Failed to write file: {}", e))
+                ToolResult::error(format!("Failed to write file: {e}"))
             }
         }
     }
@@ -251,13 +262,5 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(file_path.exists());
-    }
-
-    #[test]
-    fn test_write_tool_properties() {
-        let tool = WriteTool::new();
-        assert_eq!(tool.name(), "Write");
-        assert_eq!(tool.kind(), ToolKind::Edit);
-        assert!(tool.requires_permission());
     }
 }

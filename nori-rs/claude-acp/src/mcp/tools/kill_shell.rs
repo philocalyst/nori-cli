@@ -17,7 +17,7 @@ use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
 use crate::session::BackgroundTerminal;
 use crate::session::TerminalExitStatus;
-use crate::terminal::TerminalId;
+use nori_acp_kit::schema::TerminalId;
 
 /// Prefix for Terminal API shell IDs
 const TERMINAL_API_PREFIX: &str = "term-";
@@ -61,7 +61,7 @@ impl Tool for KillShellTool {
         // Parse input
         let params: KillShellInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Check if this is a Terminal API shell
@@ -108,7 +108,7 @@ impl KillShellTool {
                     "terminal_api": true
                 }))
             }
-            Err(e) => ToolResult::error(format!("Failed to kill terminal: {}", e)),
+            Err(e) => ToolResult::error(format!("Failed to kill terminal: {e}")),
         }
     }
 
@@ -123,7 +123,7 @@ impl KillShellTool {
         // Use get() because BackgroundTerminal contains ChildHandle
         // We only need a shared reference to clone the ChildHandle
         let Some(terminal) = manager.get(shell_id) else {
-            return ToolResult::error(format!("Unknown shell ID: {}", shell_id));
+            return ToolResult::error(format!("Unknown shell ID: {shell_id}"));
         };
 
         // Check the terminal state and kill if running
@@ -161,7 +161,7 @@ impl KillShellTool {
                             }
                         ))
                     }
-                    Err(e) => ToolResult::error(format!("Failed to kill process: {}", e)),
+                    Err(e) => ToolResult::error(format!("Failed to kill process: {e}")),
                 }
             }
             BackgroundTerminal::Finished {
@@ -170,10 +170,9 @@ impl KillShellTool {
             } => {
                 let message = match status {
                     TerminalExitStatus::Exited(code) => {
-                        format!("Command had already exited with code {}.", code)
+                        format!("Command had already exited with code {code}.")
                     }
                     TerminalExitStatus::Killed => "Command was already killed.".to_string(),
-                    TerminalExitStatus::TimedOut => "Command was killed by timeout.".to_string(),
                     TerminalExitStatus::Aborted => "Command was aborted by user.".to_string(),
                 };
 

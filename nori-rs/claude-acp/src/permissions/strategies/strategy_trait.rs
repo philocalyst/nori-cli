@@ -1,6 +1,5 @@
 //! Core strategy trait for permission modes
 
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
@@ -9,9 +8,6 @@ use serde_json::Value;
 /// Each strategy encapsulates the permission logic for a specific mode,
 /// providing a single source of truth for how tools should be checked.
 pub trait PermissionModeStrategy: Send + Sync {
-    /// Get the permission mode this strategy handles
-    fn mode(&self) -> PermissionMode;
-
     /// Check if a tool should be auto-approved without user interaction
     ///
     /// Returns true if the tool can proceed immediately, false if it needs

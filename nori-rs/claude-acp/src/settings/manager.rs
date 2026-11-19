@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -184,12 +183,10 @@ impl Settings {
 }
 
 /// Settings manager for loading and accessing settings
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SettingsManager {
     /// The merged settings
     settings: Settings,
-    /// Project working directory
-    project_dir: PathBuf,
 }
 
 impl SettingsManager {
@@ -199,13 +196,9 @@ impl SettingsManager {
     ///
     /// * `project_dir` - The project working directory
     pub fn new(project_dir: impl AsRef<Path>) -> Result<Self> {
-        let project_dir = project_dir.as_ref().to_path_buf();
-        let settings = Self::load_all_settings(&project_dir);
+        let settings = Self::load_all_settings(project_dir.as_ref());
 
-        Ok(Self {
-            settings,
-            project_dir,
-        })
+        Ok(Self { settings })
     }
 
     /// Create a new settings manager with provided settings (fallback)
@@ -213,14 +206,8 @@ impl SettingsManager {
     /// # Arguments
     ///
     /// * `settings` - The settings to use
-    /// * `project_dir` - The project working directory
-    pub fn new_with_settings(settings: Settings, project_dir: impl AsRef<Path>) -> Self {
-        let project_dir = project_dir.as_ref().to_path_buf();
-
-        Self {
-            settings,
-            project_dir,
-        }
+    pub fn new_with_settings(settings: Settings) -> Self {
+        Self { settings }
     }
 
     /// Load and merge all settings sources
@@ -296,90 +283,11 @@ impl SettingsManager {
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
-
-    /// Get the project directory
-    pub fn project_dir(&self) -> &Path {
-        &self.project_dir
-    }
-
-    /// Reload settings from all sources
-    pub fn reload(&mut self) {
-        self.settings = Self::load_all_settings(&self.project_dir);
-    }
-
-    /// Get the system prompt if configured
-    pub fn system_prompt(&self) -> Option<&str> {
-        self.settings.system_prompt.as_deref()
-    }
-
-    /// Get the permission mode if configured
-    pub fn permission_mode(&self) -> Option<&str> {
-        self.settings.permission_mode.as_deref()
-    }
-
-    /// Get the model if configured
-    pub fn model(&self) -> Option<&str> {
-        self.settings.model.as_deref()
-    }
-
-    /// Get the small/fast model if configured
-    pub fn small_fast_model(&self) -> Option<&str> {
-        self.settings.small_fast_model.as_deref()
-    }
-
-    /// Get the API base URL if configured
-    pub fn api_base_url(&self) -> Option<&str> {
-        self.settings.api_base_url.as_deref()
-    }
-
-    /// Get whether extended thinking mode is always enabled
-    pub fn always_thinking_enabled(&self) -> bool {
-        self.settings.always_thinking_enabled.unwrap_or(false)
-    }
-
-    /// Get MCP servers configuration
-    pub fn mcp_servers(&self) -> Option<&HashMap<String, McpServerConfig>> {
-        self.settings.mcp_servers.as_ref()
-    }
-
-    /// Get environment variables
-    pub fn env(&self) -> Option<&HashMap<String, String>> {
-        self.settings.env.as_ref()
-    }
-
-    /// Check if a tool is allowed
-    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
-        // If denied_tools is set and contains the tool, deny it
-        if let Some(ref denied) = self.settings.denied_tools {
-            if denied.iter().any(|t| t == tool_name) {
-                return false;
-            }
-        }
-
-        // If allowed_tools is set, check if tool is in the list
-        if let Some(ref allowed) = self.settings.allowed_tools {
-            return allowed.iter().any(|t| t == tool_name);
-        }
-
-        // Default: allow all tools
-        true
-    }
-}
-
-impl Default for SettingsManager {
-    fn default() -> Self {
-        Self {
-            settings: Settings::default(),
-            project_dir: PathBuf::from("."),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::TempDir;
 
     #[test]
     fn test_settings_default() {
@@ -443,130 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_manager_new() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-
-        // Should load settings (may include user settings from ~/.claude)
-        // Just verify the manager was created successfully
-        assert_eq!(manager.project_dir(), temp_dir.path());
-    }
-
-    #[test]
-    fn test_settings_manager_load_project_settings() {
-        let temp_dir = TempDir::new().unwrap();
-        let settings_dir = temp_dir.path().join(".claude");
-        std::fs::create_dir_all(&settings_dir).unwrap();
-
-        let settings_file = settings_dir.join("settings.json");
-        let mut file = std::fs::File::create(&settings_file).unwrap();
-        writeln!(
-            file,
-            r#"{{
-            "model": "claude-opus",
-            "systemPrompt": "You are helpful"
-        }}"#
-        )
-        .unwrap();
-
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-
-        assert_eq!(manager.model(), Some("claude-opus"));
-        assert_eq!(manager.system_prompt(), Some("You are helpful"));
-    }
-
-    #[test]
-    fn test_settings_manager_local_overrides_project() {
-        let temp_dir = TempDir::new().unwrap();
-        let settings_dir = temp_dir.path().join(".claude");
-        std::fs::create_dir_all(&settings_dir).unwrap();
-
-        // Create project settings
-        let project_settings = settings_dir.join("settings.json");
-        let mut file = std::fs::File::create(&project_settings).unwrap();
-        writeln!(
-            file,
-            r#"{{
-            "model": "claude-opus",
-            "systemPrompt": "Project prompt"
-        }}"#
-        )
-        .unwrap();
-
-        // Create local settings (higher priority)
-        let local_settings = settings_dir.join("settings.local.json");
-        let mut file = std::fs::File::create(&local_settings).unwrap();
-        writeln!(
-            file,
-            r#"{{
-            "model": "claude-sonnet"
-        }}"#
-        )
-        .unwrap();
-
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-
-        // Local model should override project
-        assert_eq!(manager.model(), Some("claude-sonnet"));
-        // System prompt from project should remain
-        assert_eq!(manager.system_prompt(), Some("Project prompt"));
-    }
-
-    #[test]
-    fn test_is_tool_allowed() {
-        let mut settings = Settings::new();
-        let manager = SettingsManager {
-            settings: settings.clone(),
-            project_dir: PathBuf::from("."),
-        };
-
-        // Default: all tools allowed
-        assert!(manager.is_tool_allowed("Read"));
-        assert!(manager.is_tool_allowed("Write"));
-
-        // With allowed list
-        settings.allowed_tools = Some(vec!["Read".to_string(), "Edit".to_string()]);
-        let manager = SettingsManager {
-            settings: settings.clone(),
-            project_dir: PathBuf::from("."),
-        };
-        assert!(manager.is_tool_allowed("Read"));
-        assert!(!manager.is_tool_allowed("Write"));
-
-        // With denied list
-        settings.allowed_tools = None;
-        settings.denied_tools = Some(vec!["Bash".to_string()]);
-        let manager = SettingsManager {
-            settings,
-            project_dir: PathBuf::from("."),
-        };
-        assert!(manager.is_tool_allowed("Read"));
-        assert!(!manager.is_tool_allowed("Bash"));
-    }
-
-    #[test]
-    fn test_settings_manager_reload() {
-        let temp_dir = TempDir::new().unwrap();
-        let settings_dir = temp_dir.path().join(".claude");
-        std::fs::create_dir_all(&settings_dir).unwrap();
-
-        let settings_file = settings_dir.join("settings.json");
-        let mut file = std::fs::File::create(&settings_file).unwrap();
-        writeln!(file, r#"{{"model": "claude-opus"}}"#).unwrap();
-
-        let mut manager = SettingsManager::new(temp_dir.path()).unwrap();
-        assert_eq!(manager.model(), Some("claude-opus"));
-
-        // Update the file
-        let mut file = std::fs::File::create(&settings_file).unwrap();
-        writeln!(file, r#"{{"model": "claude-sonnet"}}"#).unwrap();
-
-        // Reload
-        manager.reload();
-        assert_eq!(manager.model(), Some("claude-sonnet"));
-    }
-
-    #[test]
     #[serial_test::serial]
     fn test_settings_deserialize_always_thinking_enabled() {
         // Direct test of Settings deserialization
@@ -591,62 +375,6 @@ mod tests {
         assert_eq!(
             settings_none.always_thinking_enabled, None,
             "Should default to None when not specified"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_always_thinking_enabled_parsing() {
-        let temp_dir = TempDir::new().unwrap();
-        let settings_dir = temp_dir.path().join(".claude");
-        std::fs::create_dir_all(&settings_dir).unwrap();
-
-        // Use settings.local.json (higher priority than user settings)
-        let local_settings_file = settings_dir.join("settings.local.json");
-
-        // Test 1: alwaysThinkingEnabled = true
-        drop(std::fs::remove_file(&local_settings_file));
-        let mut file = std::fs::File::create(&local_settings_file).unwrap();
-        writeln!(file, r#"{{"alwaysThinkingEnabled": true}}"#).unwrap();
-        drop(file);
-
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-        assert!(
-            manager.always_thinking_enabled(),
-            "alwaysThinkingEnabled should be true, got {}",
-            manager.always_thinking_enabled()
-        );
-
-        // Test 2: alwaysThinkingEnabled = false
-        drop(std::fs::remove_file(&local_settings_file));
-        let mut file = std::fs::File::create(&local_settings_file).unwrap();
-        writeln!(file, r#"{{"alwaysThinkingEnabled": false}}"#).unwrap();
-        drop(file);
-
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-        assert!(
-            !manager.always_thinking_enabled(),
-            "alwaysThinkingEnabled should be false, got {}",
-            manager.always_thinking_enabled()
-        );
-
-        // Test 3: Without alwaysThinkingEnabled (should default to false)
-        // Note: User settings may have alwaysThinkingEnabled: true, so we need to
-        // explicitly set it to false in the project settings to override
-        drop(std::fs::remove_file(&local_settings_file));
-        let mut file = std::fs::File::create(&local_settings_file).unwrap();
-        writeln!(
-            file,
-            r#"{{"model": "claude-opus", "alwaysThinkingEnabled": false}}"#
-        )
-        .unwrap();
-        drop(file);
-
-        let manager = SettingsManager::new(temp_dir.path()).unwrap();
-        assert!(
-            !manager.always_thinking_enabled(),
-            "alwaysThinkingEnabled should be false when explicitly set, got {}",
-            manager.always_thinking_enabled()
         );
     }
 }

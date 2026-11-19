@@ -8,16 +8,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Every live descendant of this process, children before their parents' siblings.
-#[cfg(unix)]
-pub fn descendants() -> Vec<i32> {
-    let table = process_table();
-    tree(
-        &table,
-        i32::try_from(std::process::id()).unwrap_or(i32::MAX),
-    )
-}
-
 /// The Claude CLI this process started for `session_id`, and everything under it, descendants
 /// first. The CLI is found by the session id on its command line (`--session-id` or
 /// `--resume`); empty when there is none.
@@ -133,22 +123,6 @@ pub async fn terminate(_pids: &[i32], _grace: Duration) {}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn finds_and_stops_a_process_the_adapter_started() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = i32::try_from(child.id()).expect("pid fits");
-
-        let found = descendants();
-        assert!(found.contains(&pid), "{pid} not among {found:?}");
-
-        terminate(&[pid], Duration::from_millis(50)).await;
-        let status = child.wait().expect("wait");
-        assert!(!status.success(), "sleep should have been signalled");
-    }
 
     #[tokio::test]
     async fn a_session_tree_is_its_cli_and_what_the_cli_started() {

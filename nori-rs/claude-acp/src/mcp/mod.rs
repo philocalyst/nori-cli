@@ -25,25 +25,13 @@
 //! protocol, allowing tools to send notifications during execution.
 
 mod acp_server;
-mod external;
 mod registry;
-mod server;
 mod session_tools;
 pub mod tools;
 
 pub use acp_server::AcpMcpServer;
-pub use acp_server::get_disallowed_tools;
-pub use external::ExternalMcpError;
-pub use external::ExternalMcpManager;
-pub use external::ExternalMcpServer;
 pub use registry::ACP_TOOL_PREFIX;
-pub use registry::ToolContext;
-pub use registry::ToolRegistry;
-pub use registry::ToolResult;
-pub use registry::ToolStatus;
-pub use server::McpServer;
+pub use registry::MAX_JOURNALED_BYTES;
 pub use session_tools::HostToolsBinding;
 pub use session_tools::SessionTools;
 pub use session_tools::host_tool_name;
-pub use session_tools::host_tool_prefix;
-pub use tools::Tool;

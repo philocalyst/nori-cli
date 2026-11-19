@@ -4,10 +4,10 @@
 //! - ACP `PromptRequest` → Claude SDK `UserContentBlock`
 //! - Claude SDK `Message` → ACP `SessionNotification`
 
+mod edit_snapshots;
 mod notification;
-mod prompt;
 mod tool;
 
+pub use edit_snapshots::EditSnapshots;
 pub use notification::NotificationConverter;
-pub use prompt::PromptConverter;
 pub use tool::extract_tool_info;

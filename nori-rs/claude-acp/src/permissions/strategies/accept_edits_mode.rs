@@ -4,7 +4,6 @@
 //! It's compatible with root user environments where BypassPermissions cannot be used.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
@@ -16,10 +15,6 @@ use serde_json::Value;
 pub struct AcceptEditsModeStrategy;
 
 impl PermissionModeStrategy for AcceptEditsModeStrategy {
-    fn mode(&self) -> PermissionMode {
-        PermissionMode::AcceptEdits
-    }
-
     fn should_auto_approve(&self, _tool_name: &str, _tool_input: &Value) -> bool {
         // Auto-approve ALL tools (same as BypassPermissions)
         true
@@ -40,12 +35,6 @@ impl PermissionModeStrategy for AcceptEditsModeStrategy {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_mode() {
-        let strategy = AcceptEditsModeStrategy;
-        assert_eq!(strategy.mode(), PermissionMode::AcceptEdits);
-    }
 
     #[test]
     fn test_always_auto_approves() {

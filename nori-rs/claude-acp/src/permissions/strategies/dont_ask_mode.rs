@@ -4,7 +4,6 @@
 //! No user prompts are shown.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
@@ -13,10 +12,6 @@ use serde_json::Value;
 pub struct DontAskModeStrategy;
 
 impl PermissionModeStrategy for DontAskModeStrategy {
-    fn mode(&self) -> PermissionMode {
-        PermissionMode::DontAsk
-    }
-
     fn should_auto_approve(&self, _tool_name: &str, _tool_input: &Value) -> bool {
         // DontAsk mode: no auto-approval
         // Tools must be explicitly allowed by settings rules
@@ -41,12 +36,6 @@ impl PermissionModeStrategy for DontAskModeStrategy {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_mode() {
-        let strategy = DontAskModeStrategy;
-        assert_eq!(strategy.mode(), PermissionMode::DontAsk);
-    }
 
     #[test]
     fn test_never_auto_approves() {

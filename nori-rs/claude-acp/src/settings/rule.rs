@@ -10,12 +10,12 @@ use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::mcp::ExternalMcpManager;
 use crate::mcp::tools::bash::contains_shell_operator;
 
 /// Cached regex for parsing permission rules
 /// Pattern: ToolName or ToolName(argument)
 /// Compiled once and reused for better performance
+#[allow(clippy::expect_used)] // The pattern is a constant that compiles.
 static RULE_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     // This regex is statically known and will always compile correctly
     Regex::new(r"^(\w+)(?:\((.+)\))?$").expect("Invalid hardcoded regex pattern")
@@ -42,8 +42,6 @@ pub struct PermissionCheckResult {
     pub decision: PermissionDecision,
     /// The rule that matched (if any)
     pub rule: Option<String>,
-    /// The source of the rule (allow, deny, ask)
-    pub source: Option<String>,
 }
 
 impl PermissionCheckResult {
@@ -52,7 +50,6 @@ impl PermissionCheckResult {
         Self {
             decision: PermissionDecision::Allow,
             rule: Some(rule.into()),
-            source: Some("allow".to_string()),
         }
     }
 
@@ -61,7 +58,6 @@ impl PermissionCheckResult {
         Self {
             decision: PermissionDecision::Deny,
             rule: Some(rule.into()),
-            source: Some("deny".to_string()),
         }
     }
 
@@ -70,7 +66,6 @@ impl PermissionCheckResult {
         Self {
             decision: PermissionDecision::Ask,
             rule: Some(rule.into()),
-            source: Some("ask".to_string()),
         }
     }
 
@@ -79,7 +74,6 @@ impl PermissionCheckResult {
         Self {
             decision: PermissionDecision::Ask,
             rule: None,
-            source: None,
         }
     }
 }
@@ -165,12 +159,13 @@ impl ParsedRule {
         let mut parsed = Self::parse(rule);
 
         // Compile glob for file-related tools
-        if let Some(ref arg) = parsed.argument {
-            if is_file_tool(&parsed.tool_name) && !parsed.is_wildcard {
-                let normalized = normalize_path(arg, cwd);
-                if let Ok(glob) = Glob::new(&normalized) {
-                    parsed.glob_matcher = Some(glob.compile_matcher());
-                }
+        if let Some(ref arg) = parsed.argument
+            && is_file_tool(&parsed.tool_name)
+            && !parsed.is_wildcard
+        {
+            let normalized = normalize_path(arg, cwd);
+            if let Ok(glob) = Glob::new(&normalized) {
+                parsed.glob_matcher = Some(glob.compile_matcher());
             }
         }
 
@@ -218,10 +213,9 @@ impl ParsedRule {
 
         // Check if this is an external MCP tool and get its friendly name
         // This allows rules like "deny: [WebFetch]" to match "mcp__web-fetch__webReader"
-        if let Some(friendly_name) = ExternalMcpManager::get_friendly_tool_name(tool_name) {
-            if self.tool_name == friendly_name {
-                return true;
-            }
+        if friendly_external_tool_name(tool_name).is_some_and(|friendly| self.tool_name == friendly)
+        {
+            return true;
         }
 
         // Tool group matching
@@ -365,6 +359,20 @@ fn extract_tool_argument(tool_name: &str, input: &serde_json::Value) -> Option<S
     }
 }
 
+/// The Claude Code tool an external MCP web tool stands in for, so a rule on `WebFetch` also
+/// covers `mcp__web-fetch__webReader`.
+fn friendly_external_tool_name(name: &str) -> Option<&'static str> {
+    let mut parts = name.splitn(3, "__");
+    if parts.next()? != "mcp" {
+        return None;
+    }
+    match (parts.next()?, parts.next()?) {
+        ("web-fetch" | "web-reader", "webReader") => Some("WebFetch"),
+        ("web-search-prime", "webSearchPrime") => Some("WebSearch"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +499,6 @@ mod tests {
         let allow = PermissionCheckResult::allow("Read");
         assert_eq!(allow.decision, PermissionDecision::Allow);
         assert_eq!(allow.rule, Some("Read".to_string()));
-        assert_eq!(allow.source, Some("allow".to_string()));
 
         let deny = PermissionCheckResult::deny("Bash");
         assert_eq!(deny.decision, PermissionDecision::Deny);

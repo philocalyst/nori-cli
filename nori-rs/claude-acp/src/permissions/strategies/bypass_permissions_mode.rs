@@ -3,7 +3,6 @@
 //! This strategy allows all tools without any permission checks.
 
 use crate::permissions::strategies::PermissionModeStrategy;
-use crate::session::PermissionMode;
 use crate::session::ToolPermissionResult;
 use serde_json::Value;
 
@@ -12,10 +11,6 @@ use serde_json::Value;
 pub struct BypassPermissionsModeStrategy;
 
 impl PermissionModeStrategy for BypassPermissionsModeStrategy {
-    fn mode(&self) -> PermissionMode {
-        PermissionMode::BypassPermissions
-    }
-
     fn should_auto_approve(&self, _tool_name: &str, _tool_input: &Value) -> bool {
         true
     }
@@ -33,12 +28,6 @@ impl PermissionModeStrategy for BypassPermissionsModeStrategy {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_mode() {
-        let strategy = BypassPermissionsModeStrategy;
-        assert_eq!(strategy.mode(), PermissionMode::BypassPermissions);
-    }
 
     #[test]
     fn test_always_auto_approves() {

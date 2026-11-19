@@ -50,15 +50,6 @@ impl ToolCallLocation {
             column: None,
         }
     }
-
-    /// Create a location with path and line number
-    pub fn with_line(path: impl Into<String>, line: u32) -> Self {
-        Self {
-            path: path.into(),
-            line: Some(line),
-            column: None,
-        }
-    }
 }
 
 /// Tool information for display in UI
@@ -109,25 +100,6 @@ impl ToolInfo {
             .push(ToolCallLocation::new(path));
         self
     }
-
-    /// Add text content
-    pub fn with_text(mut self, text: impl Into<String>) -> Self {
-        self.content
-            .push(ToolInfoContent::Text { text: text.into() });
-        self
-    }
-}
-
-/// Type of tool use (for caching purposes)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ToolUseType {
-    /// Standard tool use
-    #[default]
-    ToolUse,
-    /// Server-side tool use
-    ServerToolUse,
-    /// MCP tool use
-    McpToolUse,
 }
 
 /// Cached tool use entry
@@ -135,12 +107,6 @@ pub enum ToolUseType {
 /// Used to correlate tool_use blocks with their tool_result blocks.
 #[derive(Debug, Clone)]
 pub struct ToolUseEntry {
-    /// Type of tool use
-    pub tool_type: ToolUseType,
-
-    /// Tool use ID
-    pub id: String,
-
     /// Tool name
     pub name: String,
 
@@ -150,26 +116,14 @@ pub struct ToolUseEntry {
 
 impl ToolUseEntry {
     /// Create a new tool use entry
-    pub fn new(id: String, name: String, input: serde_json::Value) -> Self {
-        Self {
-            tool_type: ToolUseType::ToolUse,
-            id,
-            name,
-            input,
-        }
-    }
-
-    /// Create with a specific tool type
-    pub fn with_type(mut self, tool_type: ToolUseType) -> Self {
-        self.tool_type = tool_type;
-        self
+    pub fn new(name: String, input: serde_json::Value) -> Self {
+        Self { name, input }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_tool_kind_serialization() {
@@ -178,38 +132,5 @@ mod tests {
             serde_json::to_string(&ToolKind::Execute).unwrap(),
             "\"execute\""
         );
-    }
-
-    #[test]
-    fn test_tool_info_builder() {
-        let info = ToolInfo::new("Read file.txt", ToolKind::Read)
-            .with_location("/path/to/file.txt")
-            .with_text("File content preview...");
-
-        assert_eq!(info.title, "Read file.txt");
-        assert_eq!(info.kind, ToolKind::Read);
-        assert_eq!(info.locations.as_ref().unwrap().len(), 1);
-        assert_eq!(info.content.len(), 1);
-    }
-
-    #[test]
-    fn test_tool_use_entry() {
-        let entry = ToolUseEntry::new(
-            "tool_123".to_string(),
-            "Read".to_string(),
-            json!({"file_path": "/test.txt"}),
-        );
-
-        assert_eq!(entry.id, "tool_123");
-        assert_eq!(entry.name, "Read");
-        assert_eq!(entry.tool_type, ToolUseType::ToolUse);
-    }
-
-    #[test]
-    fn test_tool_call_location() {
-        let loc = ToolCallLocation::with_line("/path/to/file.rs", 42);
-        assert_eq!(loc.path, "/path/to/file.rs");
-        assert_eq!(loc.line, Some(42));
-        assert!(loc.column.is_none());
     }
 }

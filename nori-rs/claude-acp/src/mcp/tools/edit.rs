@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::base::Tool;
-use super::base::ToolKind;
+use crate::mcp::registry::FileDiff;
 use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
 // TODO: Uncomment when implementing permission checks
@@ -86,15 +86,6 @@ impl Tool for EditTool {
             }
         })
     }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Edit
-    }
-
-    fn requires_permission(&self) -> bool {
-        true // Editing requires permission
-    }
-
     async fn execute(&self, input: serde_json::Value, context: &ToolContext) -> ToolResult {
         // Check permission before executing
         if let Some(result) = self.check_permission(&input, context) {
@@ -104,7 +95,7 @@ impl Tool for EditTool {
         // Parse input
         let params: EditInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Resolve path relative to working directory if not absolute
@@ -122,7 +113,7 @@ impl Tool for EditTool {
         // Read current content
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
+            Err(e) => return ToolResult::error(format!("Failed to read file: {e}")),
         };
 
         // Check if old_string exists
@@ -136,8 +127,7 @@ impl Tool for EditTool {
 
         if match_count > 1 && !params.replace_all {
             return ToolResult::error(format!(
-                "Found {} occurrences of the search string. Use replace_all: true to replace all, or provide a more unique string.",
-                match_count
+                "Found {match_count} occurrences of the search string. Use replace_all: true to replace all, or provide a more unique string."
             ));
         }
 
@@ -163,6 +153,11 @@ impl Tool for EditTool {
                     if replacements > 1 { "s" } else { "" },
                     diff_preview
                 ))
+                .with_diff(FileDiff {
+                    path: path.clone(),
+                    old_text: Some(content),
+                    new_text: new_content,
+                })
                 .with_metadata(json!({
                     "path": path.display().to_string(),
                     "replacements": replacements,
@@ -170,7 +165,7 @@ impl Tool for EditTool {
                     "new_length": params.new_string.len()
                 }))
             }
-            Err(e) => ToolResult::error(format!("Failed to write file: {}", e)),
+            Err(e) => ToolResult::error(format!("Failed to write file: {e}")),
         }
     }
 }
@@ -185,7 +180,7 @@ fn generate_diff_preview(old: &str, new: &str) -> String {
     // Show removed lines (truncated if too many)
     let max_lines = 5;
     for (i, line) in old_lines.iter().take(max_lines).enumerate() {
-        preview.push_str(&format!("- {}\n", line));
+        preview.push_str(&format!("- {line}\n"));
         if i == max_lines - 1 && old_lines.len() > max_lines {
             preview.push_str(&format!(
                 "  ... ({} more lines)\n",
@@ -196,7 +191,7 @@ fn generate_diff_preview(old: &str, new: &str) -> String {
 
     // Show added lines (truncated if too many)
     for (i, line) in new_lines.iter().take(max_lines).enumerate() {
-        preview.push_str(&format!("+ {}\n", line));
+        preview.push_str(&format!("+ {line}\n"));
         if i == max_lines - 1 && new_lines.len() > max_lines {
             preview.push_str(&format!(
                 "  ... ({} more lines)\n",
@@ -323,14 +318,6 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("not found"));
-    }
-
-    #[test]
-    fn test_edit_tool_properties() {
-        let tool = EditTool::new();
-        assert_eq!(tool.name(), "Edit");
-        assert_eq!(tool.kind(), ToolKind::Edit);
-        assert!(tool.requires_permission());
     }
 
     #[test]

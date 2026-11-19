@@ -641,7 +641,7 @@ impl ClaudeClient {
                         match MessageParser::parse(json) {
                             Ok(msg) => yield Ok(msg),
                             Err(e) => {
-                                eprintln!("Failed to parse message: {}", e);
+                                tracing::warn!("failed to parse a Claude Code message: {e}");
                                 yield Err(e);
                             }
                         }
@@ -773,7 +773,7 @@ impl ClaudeClient {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Failed to parse message: {}", e);
+                                tracing::warn!("failed to parse a Claude Code message: {e}");
                                 yield Err(e);
                             }
                         }
@@ -1102,8 +1102,8 @@ impl Drop for ClaudeClient {
         // Note: We can't run async code in Drop, so we can't guarantee clean shutdown
         // Users should call disconnect() explicitly
         if self.connected {
-            eprintln!(
-                "Warning: ClaudeClient dropped without calling disconnect(). Resources may not be cleaned up properly."
+            tracing::warn!(
+                "ClaudeClient dropped without calling disconnect(); resources may not be cleaned up"
             );
         }
     }

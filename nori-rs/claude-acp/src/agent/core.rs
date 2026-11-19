@@ -1,143 +1,25 @@
-//! Core ACP Agent structure
-//!
-//! The ClaudeAcpAgent holds shared state and configuration for handling
-//! ACP protocol requests.
+//! The agent's shared state.
 
 use std::sync::Arc;
 
-use crate::session::PromptManager;
 use crate::session::SessionManager;
 use crate::types::AgentConfig;
 
-/// Claude ACP Agent
-///
-/// The main agent struct that holds configuration and session state.
-/// This is shared across all request handlers.
-///
-/// Configuration is loaded from (in priority order):
-/// 1. Environment variables (e.g., ANTHROPIC_MODEL, ANTHROPIC_BASE_URL)
-/// 2. Settings files (~/.claude/settings.json, .claude/settings.json, etc.)
-/// 3. Defaults
+/// The Claude Code agent: its configuration and the sessions it holds. One per connection.
 #[derive(Debug)]
 pub struct ClaudeAcpAgent {
-    /// Agent configuration from environment
-    config: AgentConfig,
-    /// Session manager for tracking active sessions
-    sessions: Arc<SessionManager>,
-    /// Prompt manager for tracking and cancelling active prompts
-    prompt_manager: Arc<PromptManager>,
-    /// Whether this agent runs inside its host's process and so can take the host's tools.
-    host_tools: bool,
+    pub(super) config: AgentConfig,
+    pub(super) sessions: Arc<SessionManager>,
+    /// Whether this connection has been told who the account is.
+    pub(super) identity_announced: std::sync::atomic::AtomicBool,
 }
 
 impl ClaudeAcpAgent {
-    /// Create a new agent with configuration from environment and settings files
-    ///
-    /// Configuration is loaded from:
-    /// 1. Environment variables (highest priority)
-    /// 2. Settings files (~/.claude/settings.json, .claude/settings.json, etc.)
-    /// 3. Defaults
-    pub fn new() -> Self {
-        let project_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-
-        let config = AgentConfig::from_settings_or_env(&project_dir);
-
-        tracing::info!(
-            model = ?config.model,
-            base_url = ?config.base_url,
-            api_key = ?config.masked_api_key(),
-            "Agent initialized with configuration"
-        );
-
+    pub fn new(config: AgentConfig) -> Self {
         Self {
             config,
             sessions: Arc::new(SessionManager::new()),
-            prompt_manager: Arc::new(PromptManager::new()),
-            host_tools: false,
+            identity_announced: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Create with custom configuration
-    pub fn with_config(config: AgentConfig) -> Self {
-        Self {
-            config,
-            sessions: Arc::new(SessionManager::new()),
-            prompt_manager: Arc::new(PromptManager::new()),
-            host_tools: false,
-        }
-    }
-
-    /// Take the host's tools: only for an agent running inside the host's own process, where a
-    /// session's host-tools token can be resolved.
-    pub fn with_host_tools(mut self) -> Self {
-        self.host_tools = true;
-        self
-    }
-
-    /// Whether this agent takes the host's tools.
-    pub fn takes_host_tools(&self) -> bool {
-        self.host_tools
-    }
-
-    /// Get the agent configuration
-    pub fn config(&self) -> &AgentConfig {
-        &self.config
-    }
-
-    /// Get the session manager
-    pub fn sessions(&self) -> &Arc<SessionManager> {
-        &self.sessions
-    }
-
-    /// Get the prompt manager
-    pub fn prompt_manager(&self) -> &Arc<PromptManager> {
-        &self.prompt_manager
-    }
-
-    /// Get agent name for logging
-    pub fn name(&self) -> &'static str {
-        "claude-code-acp-rs"
-    }
-
-    /// Get agent version
-    pub fn version(&self) -> &'static str {
-        env!("CARGO_PKG_VERSION")
-    }
-}
-
-impl Default for ClaudeAcpAgent {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_agent_new() {
-        let agent = ClaudeAcpAgent::new();
-        assert_eq!(agent.name(), "claude-code-acp-rs");
-        assert_eq!(agent.sessions().session_count(), 0);
-    }
-
-    #[test]
-    fn test_agent_with_config() {
-        let config = AgentConfig {
-            cli_path: None,
-            base_url: Some("https://api.example.com".to_string()),
-            api_key: Some("test-key".to_string()),
-            model: Some("claude-3-opus".to_string()),
-            small_fast_model: None,
-            max_thinking_tokens: Some(4096),
-        };
-
-        let agent = ClaudeAcpAgent::with_config(config);
-        assert_eq!(
-            agent.config().base_url,
-            Some("https://api.example.com".to_string())
-        );
-        assert_eq!(agent.config().max_thinking_tokens, Some(4096));
     }
 }

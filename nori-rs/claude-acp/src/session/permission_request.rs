@@ -3,16 +3,15 @@
 //! Implements the ACP permission request/response protocol for asking users
 //! whether to allow tool execution.
 
-use sacp::Client;
-use sacp::ConnectionTo;
-use sacp::schema::PermissionOption;
-use sacp::schema::PermissionOptionId;
-use sacp::schema::PermissionOptionKind;
-use sacp::schema::RequestPermissionOutcome;
-use sacp::schema::RequestPermissionRequest;
-use sacp::schema::SessionId;
-use sacp::schema::ToolCallUpdate;
-use sacp::schema::ToolCallUpdateFields;
+use nori_acp_kit::Cx;
+use nori_acp_kit::schema::PermissionOption;
+use nori_acp_kit::schema::PermissionOptionId;
+use nori_acp_kit::schema::PermissionOptionKind;
+use nori_acp_kit::schema::RequestPermissionOutcome;
+use nori_acp_kit::schema::RequestPermissionRequest;
+use nori_acp_kit::schema::SessionId;
+use nori_acp_kit::schema::ToolCallUpdate;
+use nori_acp_kit::schema::ToolCallUpdateFields;
 
 use crate::types::AgentError;
 
@@ -58,19 +57,10 @@ impl PermissionRequestBuilder {
         }
     }
 
-    /// Set a custom title for the permission dialog
-    pub fn title(mut self, title: impl Into<String>) -> Self {
-        self.title = title.into();
-        self
-    }
-
     /// Build the request and send it to the client
     ///
     /// Returns the user's decision as a `PermissionOutcome`.
-    pub async fn request(
-        self,
-        connection_cx: &ConnectionTo<Client>,
-    ) -> Result<PermissionOutcome, AgentError> {
+    pub async fn request(self, connection_cx: &Cx) -> Result<PermissionOutcome, AgentError> {
         // Build the options
         let options = vec![
             PermissionOption::new(
@@ -139,7 +129,7 @@ impl PermissionRequestBuilder {
                     error = %e,
                     "Permission request failed"
                 );
-                AgentError::Internal(format!("Permission request failed: {}", e))
+                AgentError::Internal(format!("Permission request failed: {e}"))
             })?;
 
         tracing::info!(
@@ -149,11 +139,6 @@ impl PermissionRequestBuilder {
 
         // Parse the response
         Ok(parse_permission_response(response.outcome))
-    }
-
-    /// Get the tool name
-    pub fn tool_name(&self) -> &str {
-        &self.tool_name
     }
 }
 
@@ -185,21 +170,21 @@ fn format_tool_title(tool_name: &str, input: &serde_json::Value) -> String {
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
-            format!("Read {}", path)
+            format!("Read {path}")
         }
         "Write" => {
             let path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
-            format!("Write to {}", path)
+            format!("Write to {path}")
         }
         "Edit" => {
             let path = input
                 .get("file_path")
                 .and_then(|v| v.as_str())
                 .unwrap_or("file");
-            format!("Edit {}", path)
+            format!("Edit {path}")
         }
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -209,11 +194,11 @@ fn format_tool_title(tool_name: &str, input: &serde_json::Value) -> String {
         }
         "Grep" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Search: {}", pattern)
+            format!("Search: {pattern}")
         }
         "Glob" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            format!("Find files: {}", pattern)
+            format!("Find files: {pattern}")
         }
         _ => stripped_name.to_string(),
     }
@@ -231,7 +216,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sacp::schema::SelectedPermissionOutcome;
+    use nori_acp_kit::schema::SelectedPermissionOutcome;
     use serde_json::json;
 
     #[test]

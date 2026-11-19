@@ -4,7 +4,7 @@
 //! Supports both direct process execution and Client-side PTY via Terminal API.
 
 use async_trait::async_trait;
-use sacp::schema::ToolCallStatus;
+use nori_acp_kit::schema::ToolCallStatus;
 use serde::Deserialize;
 use serde_json::json;
 use std::process::Stdio;
@@ -18,7 +18,6 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::base::Tool;
-use super::base::ToolKind;
 use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
 use crate::session::BackgroundTerminal;
@@ -156,15 +155,6 @@ impl Tool for BashTool {
             }
         })
     }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Execute
-    }
-
-    fn requires_permission(&self) -> bool {
-        true // Command execution requires permission
-    }
-
     async fn execute(&self, input: serde_json::Value, context: &ToolContext) -> ToolResult {
         // Check permission before executing
         if let Some(result) = self.check_permission(&input, context) {
@@ -174,7 +164,7 @@ impl Tool for BashTool {
         // Parse input
         let params: BashInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Prefer Terminal API when available (Client-side PTY)
@@ -238,7 +228,7 @@ impl BashTool {
                         error = %e,
                         "Bash command execution failed"
                     );
-                    return ToolResult::error(format!("Failed to execute command: {}", e));
+                    return ToolResult::error(format!("Failed to execute command: {e}"));
                 }
                 Err(_) => {
                     let exec_duration = exec_start.elapsed();
@@ -248,7 +238,7 @@ impl BashTool {
                         timeout_ms = ms,
                         "Bash command timed out"
                     );
-                    return ToolResult::error(format!("Command timed out after {}ms", ms));
+                    return ToolResult::error(format!("Command timed out after {ms}ms"));
                 }
             }
         } else {
@@ -263,7 +253,7 @@ impl BashTool {
                         error = %e,
                         "Bash command execution failed"
                     );
-                    return ToolResult::error(format!("Failed to execute command: {}", e));
+                    return ToolResult::error(format!("Failed to execute command: {e}"));
                 }
             }
         };
@@ -328,8 +318,7 @@ impl BashTool {
             }))
         } else {
             ToolResult::error(format!(
-                "Command failed with exit code {}\n{}",
-                exit_code, result_text
+                "Command failed with exit code {exit_code}\n{result_text}"
             ))
             .with_metadata(json!({
                 "exit_code": exit_code,
@@ -369,7 +358,7 @@ impl BashTool {
         // Spawn the process
         let mut wrapped_child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
+            Err(e) => return ToolResult::error(format!("Failed to spawn command: {e}")),
         };
 
         // Extract stdout and stderr BEFORE wrapping (ChildWrapper doesn't expose them)
@@ -398,7 +387,7 @@ impl BashTool {
         manager.register(shell_id.clone(), terminal);
 
         // Spawn task to read output
-        let manager_clone = manager.clone();
+        let manager_clone = manager;
         let description = params.description.clone();
         tokio::spawn(async move {
             let mut combined_output = String::new();
@@ -435,31 +424,30 @@ impl BashTool {
             // Wait for process to finish and update terminal state
             // Use get() instead of get_mut() because BackgroundTerminal contains ChildHandle
             // We only need a shared reference to clone the ChildHandle
-            if let Some(terminal_ref) = manager_clone.get(&shell_id_clone) {
-                if let BackgroundTerminal::Running { child, .. } = &*terminal_ref {
-                    // Clone the ChildHandle to hold it across await points
-                    let mut child_handle = child.clone();
-                    drop(terminal_ref); // Release DashMap read lock before await
+            if let Some(terminal_ref) = manager_clone.get(&shell_id_clone)
+                && let BackgroundTerminal::Running { child, .. } = &*terminal_ref
+            {
+                // Clone the ChildHandle to hold it across await points
+                let mut child_handle = child.clone();
+                drop(terminal_ref); // Release DashMap read lock before await
 
-                    // ChildHandle::wait() handles locking internally
-                    if let Ok(status) = child_handle.wait().await {
-                        let exit_code = status.code().unwrap_or(-1);
-                        manager_clone
-                            .finish_terminal(&shell_id_clone, TerminalExitStatus::Exited(exit_code))
-                            .await;
-                    } else {
-                        manager_clone
-                            .finish_terminal(&shell_id_clone, TerminalExitStatus::Aborted)
-                            .await;
-                    }
+                // ChildHandle::wait() handles locking internally
+                if let Ok(status) = child_handle.wait().await {
+                    let exit_code = status.code().unwrap_or(-1);
+                    manager_clone
+                        .finish_terminal(&shell_id_clone, TerminalExitStatus::Exited(exit_code))
+                        .await;
+                } else {
+                    manager_clone
+                        .finish_terminal(&shell_id_clone, TerminalExitStatus::Aborted)
+                        .await;
                 }
             }
         });
 
         // Return immediately with shell ID
         ToolResult::success(format!(
-            "Command started in background.\n\nShell ID: {}\n\nUse BashOutput to check status and retrieve output.",
-            shell_id
+            "Command started in background.\n\nShell ID: {shell_id}\n\nUse BashOutput to check status and retrieve output."
         )).with_metadata(json!({
             "shell_id": shell_id,
             "status": "running",
@@ -491,7 +479,7 @@ impl BashTool {
             .await
         {
             Ok(id) => id,
-            Err(e) => return ToolResult::error(format!("Failed to create terminal: {}", e)),
+            Err(e) => return ToolResult::error(format!("Failed to create terminal: {e}")),
         };
 
         // Send ToolCallUpdate with terminal_id immediately
@@ -522,7 +510,7 @@ impl BashTool {
         // Get output regardless of exit status
         let output = match terminal_client.output(terminal_id.clone()).await {
             Ok(resp) => resp.output,
-            Err(e) => format!("(failed to get output: {})", e),
+            Err(e) => format!("(failed to get output: {e})"),
         };
 
         // Release terminal (ignore result - best effort)
@@ -555,8 +543,7 @@ impl BashTool {
                     }))
                 } else {
                     ToolResult::error(format!(
-                        "Command failed with exit code {}\n{}",
-                        exit_code, result_text
+                        "Command failed with exit code {exit_code}\n{result_text}"
                     ))
                     .with_metadata(json!({
                         "exit_code": exit_code,
@@ -565,11 +552,11 @@ impl BashTool {
                     }))
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Terminal execution failed: {}", e)),
+            Ok(Err(e)) => ToolResult::error(format!("Terminal execution failed: {e}")),
             Err(_) => {
                 // Timeout occurred - timeout_ms must be Some in this branch
                 let ms = timeout_ms.unwrap_or(0);
-                ToolResult::error(format!("Command timed out after {}ms\n{}", ms, output))
+                ToolResult::error(format!("Command timed out after {ms}ms\n{output}"))
             }
         }
     }
@@ -595,7 +582,7 @@ impl BashTool {
             .await
         {
             Ok(id) => id,
-            Err(e) => return ToolResult::error(format!("Failed to create terminal: {}", e)),
+            Err(e) => return ToolResult::error(format!("Failed to create terminal: {e}")),
         };
 
         // Use terminal_id as shell_id (prefixed for clarity)
@@ -614,8 +601,7 @@ impl BashTool {
 
         // Return immediately with shell ID
         ToolResult::success(format!(
-            "Command started in background via Terminal API.\n\nShell ID: {}\n\nUse BashOutput to check status and retrieve output.",
-            shell_id
+            "Command started in background via Terminal API.\n\nShell ID: {shell_id}\n\nUse BashOutput to check status and retrieve output."
         )).with_metadata(json!({
             "shell_id": shell_id,
             "terminal_id": terminal_id.0.as_ref(),
@@ -725,14 +711,6 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("timed out"));
-    }
-
-    #[test]
-    fn test_bash_tool_properties() {
-        let tool = BashTool::new();
-        assert_eq!(tool.name(), "Bash");
-        assert_eq!(tool.kind(), ToolKind::Execute);
-        assert!(tool.requires_permission());
     }
 
     #[test]

@@ -11,9 +11,7 @@
 mod background_processes;
 mod manager;
 mod permission;
-mod permission_manager;
 mod permission_request;
-mod prompt_manager;
 #[allow(clippy::module_inception)]
 mod session;
 mod usage;
@@ -28,16 +26,9 @@ pub use manager::SessionManager;
 pub use permission::PermissionHandler;
 pub use permission::PermissionMode;
 pub use permission::ToolPermissionResult;
-pub use permission_manager::PendingPermissionRequest;
-pub use permission_manager::PermissionManager;
-pub use permission_manager::PermissionManagerDecision;
 pub use permission_request::PermissionOutcome;
 pub use permission_request::PermissionRequestBuilder;
-pub use prompt_manager::PromptId;
-pub use prompt_manager::PromptManager;
-pub use prompt_manager::PromptTask;
 pub use session::Session;
 pub(crate) use session::get_acp_replacement_tools as acp_replacement_tools;
 pub use session::stable_cache_key;
-pub use usage::UsageTracker;
 pub use wrapped_child::WrappedChild;

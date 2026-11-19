@@ -7,7 +7,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::base::Tool;
-use super::base::ToolKind;
 use crate::mcp::registry::ToolContext;
 use crate::mcp::registry::ToolResult;
 
@@ -90,20 +89,11 @@ impl Tool for ReadTool {
             }
         })
     }
-
-    fn kind(&self) -> ToolKind {
-        ToolKind::Read
-    }
-
-    fn requires_permission(&self) -> bool {
-        false // Reading doesn't require explicit permission
-    }
-
     async fn execute(&self, input: serde_json::Value, context: &ToolContext) -> ToolResult {
         // Parse input
         let params: ReadInput = match serde_json::from_value(input) {
             Ok(p) => p,
-            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+            Err(e) => return ToolResult::error(format!("Invalid input: {e}")),
         };
 
         // Resolve path relative to working directory if not absolute
@@ -127,7 +117,7 @@ impl Tool for ReadTool {
         let metadata = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
             Err(e) => {
-                return ToolResult::error(format!("Failed to get file metadata: {}", e));
+                return ToolResult::error(format!("Failed to get file metadata: {e}"));
             }
         };
 
@@ -138,8 +128,7 @@ impl Tool for ReadTool {
             #[allow(clippy::cast_precision_loss)]
             let max_file_size_mb = MAX_FILE_SIZE as f64 / 1024.0 / 1024.0;
             return ToolResult::error(format!(
-                "File too large ({:.1}MB). Maximum supported size is {:.1}MB. Use offset/limit parameters to read portions of the file.",
-                file_size_mb, max_file_size_mb
+                "File too large ({file_size_mb:.1}MB). Maximum supported size is {max_file_size_mb:.1}MB. Use offset/limit parameters to read portions of the file."
             ));
         }
 
@@ -202,7 +191,7 @@ impl Tool for ReadTool {
                 rel_str.to_string()
             } else {
                 // File directly in cwd: add ./ prefix
-                format!("./{}", rel_str)
+                format!("./{rel_str}")
             }
         } else {
             // File outside cwd: show absolute path
@@ -280,7 +269,7 @@ mod tests {
 
         let mut file = std::fs::File::create(&file_path).unwrap();
         for i in 1..=10 {
-            writeln!(file, "Line {}", i).unwrap();
+            writeln!(file, "Line {i}").unwrap();
         }
 
         let tool = ReadTool::new();
@@ -315,13 +304,5 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("not found"));
-    }
-
-    #[test]
-    fn test_read_tool_properties() {
-        let tool = ReadTool::new();
-        assert_eq!(tool.name(), "Read");
-        assert_eq!(tool.kind(), ToolKind::Read);
-        assert!(!tool.requires_permission());
     }
 }

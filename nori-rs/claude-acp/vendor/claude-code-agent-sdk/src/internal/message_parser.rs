@@ -9,8 +9,16 @@ use serde::Deserialize;
 pub struct MessageParser;
 
 impl MessageParser {
-    /// Parse a JSON value into a Message
+    /// Parse a JSON value into a Message. A message of a type this SDK does not know is kept as
+    /// [`Message::Unrecognized`]; only a known type that does not read is an error.
     pub fn parse(data: serde_json::Value) -> Result<Message> {
+        let known = data
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| Message::KNOWN_TYPES.contains(&kind));
+        if !known {
+            return Ok(Message::Unrecognized(data));
+        }
         Message::deserialize(&data).map_err(|e| {
             MessageParseError::new(
                 format!("Failed to parse message: {e}"),
@@ -85,14 +93,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_raw_payload_when_an_unknown_message_type_cannot_be_parsed() {
-        let payload = serde_json::json!({"type": "future_event", "usage": 17});
+    fn keeps_an_unknown_message_type_whole() {
+        let payload = serde_json::json!({"type": "tool_progress", "elapsed_time_seconds": 3});
 
-        let error = MessageParser::parse(payload.clone()).unwrap_err();
-        let ClaudeError::MessageParse(error) = error else {
-            panic!("expected a message parse error");
+        let Message::Unrecognized(kept) = MessageParser::parse(payload.clone()).unwrap() else {
+            panic!("expected an unrecognized message");
         };
 
-        assert_eq!(error.data, Some(payload));
+        assert_eq!(kept, payload);
     }
 }

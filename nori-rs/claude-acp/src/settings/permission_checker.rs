@@ -13,8 +13,6 @@ use crate::command_safety::extract_command_basename;
 /// Permission checker that evaluates tool permissions against settings rules
 #[derive(Debug)]
 pub struct PermissionChecker {
-    /// Merged settings with permission rules
-    settings: Settings,
     /// Working directory for path resolution
     cwd: PathBuf,
     /// Parsed and cached allow rules
@@ -45,7 +43,6 @@ impl PermissionChecker {
         );
 
         Self {
-            settings,
             cwd,
             allow_rules,
             deny_rules,
@@ -108,27 +105,6 @@ impl PermissionChecker {
         PermissionCheckResult::ask()
     }
 
-    /// Get the settings
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
-    /// Get the working directory
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
-    /// Check if there are any permission rules configured
-    pub fn has_rules(&self) -> bool {
-        !self.allow_rules.is_empty() || !self.deny_rules.is_empty() || !self.ask_rules.is_empty()
-    }
-
-    /// Add a runtime allow rule (e.g., from user's "Always Allow" choice)
-    pub fn add_allow_rule(&mut self, rule: &str) {
-        let parsed = ParsedRule::parse_with_glob(rule, &self.cwd);
-        self.allow_rules.push((rule.to_string(), parsed));
-    }
-
     /// Add a runtime allow rule for "Always Allow" permission decision
     ///
     /// For Bash tool: extracts the command name (first word) and generates
@@ -157,7 +133,7 @@ impl PermissionChecker {
                     if cmd_name.is_empty() {
                         stripped.to_string()
                     } else {
-                        format!("Bash({}:*)", cmd_name) // e.g., "Bash(find:*)"
+                        format!("Bash({cmd_name}:*)") // e.g., "Bash(find:*)"
                     }
                 } else {
                     stripped.to_string()
@@ -210,9 +186,9 @@ impl PermissionChecker {
 
                 // Generate glob rule for the directory
                 if dir_str.is_empty() || dir_str == "." {
-                    format!("{}(./*)", tool_name)
+                    format!("{tool_name}(./*)")
                 } else {
-                    format!("{}({}/**)", tool_name, dir_str)
+                    format!("{tool_name}({dir_str}/**)")
                 }
             } else {
                 tool_name.to_string()
@@ -220,28 +196,6 @@ impl PermissionChecker {
         } else {
             tool_name.to_string()
         }
-    }
-
-    /// Add a runtime deny rule
-    pub fn add_deny_rule(&mut self, rule: &str) {
-        let parsed = ParsedRule::parse_with_glob(rule, &self.cwd);
-        self.deny_rules.push((rule.to_string(), parsed));
-    }
-
-    /// Get the default permission mode from settings
-    pub fn default_mode(&self) -> Option<&str> {
-        self.settings
-            .permissions
-            .as_ref()
-            .and_then(|p| p.default_mode.as_deref())
-    }
-
-    /// Get additional directories from settings
-    pub fn additional_directories(&self) -> Option<&Vec<String>> {
-        self.settings
-            .permissions
-            .as_ref()
-            .and_then(|p| p.additional_directories.as_ref())
     }
 }
 
@@ -392,26 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_runtime_rule() {
-        let mut checker = PermissionChecker::default();
-
-        // Initially should ask
-        assert_eq!(
-            checker.check_permission("Read", &json!({})).decision,
-            PermissionDecision::Ask
-        );
-
-        // Add allow rule at runtime
-        checker.add_allow_rule("Read");
-
-        // Now should allow
-        assert_eq!(
-            checker.check_permission("Read", &json!({})).decision,
-            PermissionDecision::Allow
-        );
-    }
-
-    #[test]
     fn test_acp_prefix_stripped() {
         let permissions = PermissionSettings {
             allow: Some(vec!["Read".to_string()]),
@@ -430,19 +364,6 @@ mod tests {
                 .decision,
             PermissionDecision::Allow
         );
-    }
-
-    #[test]
-    fn test_has_rules() {
-        let checker = PermissionChecker::default();
-        assert!(!checker.has_rules());
-
-        let permissions = PermissionSettings {
-            allow: Some(vec!["Read".to_string()]),
-            ..Default::default()
-        };
-        let checker = PermissionChecker::new(settings_with_permissions(permissions), "/tmp");
-        assert!(checker.has_rules());
     }
 
     #[test]
