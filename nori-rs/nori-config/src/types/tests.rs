@@ -325,6 +325,8 @@ fn test_hotkey_config_default_uses_standard_bindings() {
     let config = HotkeyConfig::default();
     assert_eq!(config.open_transcript, HotkeyBinding::from_str("ctrl+t"));
     assert_eq!(config.open_editor, HotkeyBinding::from_str("ctrl+g"));
+    assert_eq!(HotkeyAction::Redraw.default_binding(), "ctrl+l");
+    assert_eq!(config.redraw, HotkeyBinding::from_str("ctrl+l"));
 }
 
 #[test]
@@ -333,6 +335,8 @@ fn test_hotkey_config_from_toml_uses_defaults_when_empty() {
     let config = HotkeyConfig::from_toml(&toml);
     assert_eq!(config.open_transcript, HotkeyBinding::from_str("ctrl+t"));
     assert_eq!(config.open_editor, HotkeyBinding::from_str("ctrl+g"));
+    assert_eq!(HotkeyAction::Redraw.default_binding(), "ctrl+l");
+    assert_eq!(config.redraw, HotkeyBinding::from_str("ctrl+l"));
 }
 
 #[test]
@@ -1065,41 +1069,29 @@ fn test_footer_segment_config_from_toml_some_disabled() {
 }
 
 #[test]
-fn test_footer_layout_default_places_mode_above_prompt_and_state_on_the_right() {
+fn test_footer_layout_default_places_metadata_on_quiet_statusline() {
     use pretty_assertions::assert_eq;
     let layout = FooterLayoutConfig::default();
 
-    // The model and the agent mode own the textarea's top-right corner, above the prompt.
     assert_eq!(
-        layout.textarea_top_right,
+        layout.footer_right,
         vec![
             FooterSegment::Model.into(),
-            FooterSegment::ModeIndicator.into()
-        ]
-    );
-    // Location and headroom sit inside the prompt bar.
-    assert_eq!(
-        layout.textarea_top_left,
-        vec![
-            FooterSegment::VimMode.into(),
-            FooterSegment::GitBranch.into(),
-            FooterSegment::WorktreeName.into(),
+            FooterSegment::ModeIndicator.into(),
             FooterSegment::Context.into(),
         ]
     );
-    // The footer and remaining corners leave room for subagent navigation.
-    assert_eq!(layout.footer_right, Vec::new());
+    assert_eq!(layout.textarea_top_left, Vec::new());
+    assert_eq!(layout.textarea_top_right, Vec::new());
     assert_eq!(layout.textarea_bottom_left, Vec::new());
     assert_eq!(layout.textarea_bottom_right, Vec::new());
 }
 
 #[test]
-fn test_footer_layout_default_left_group_is_self_hiding_state_plus_opt_ins() {
+fn test_footer_layout_default_left_group_is_location_plus_opt_ins() {
     let layout = FooterLayoutConfig::default();
     let segments = FooterSegmentConfig::default();
 
-    // Only self-hiding state renders on the left out of the box, so an
-    // ordinary local shell leaves the group empty.
     let enabled_on_the_left: Vec<FooterSegment> = layout
         .footer_left
         .iter()
@@ -1109,7 +1101,15 @@ fn test_footer_layout_default_left_group_is_self_hiding_state_plus_opt_ins() {
         })
         .filter(|segment| segments.is_enabled(*segment))
         .collect();
-    assert_eq!(enabled_on_the_left, vec![FooterSegment::CloudSession]);
+    assert_eq!(
+        enabled_on_the_left,
+        vec![
+            FooterSegment::VimMode,
+            FooterSegment::GitBranch,
+            FooterSegment::WorktreeName,
+            FooterSegment::CloudSession,
+        ]
+    );
 
     // The default-off segments still list a placement, so enabling one through
     // `[tui.footer_segments]` alone is enough to make it render.
@@ -1144,15 +1144,18 @@ textarea_top_right = ["git_branch"]
         layout.textarea_top_right,
         vec![FooterSegment::GitBranch.into()]
     );
-    // The segment moves rather than duplicating: it leaves the default
-    // `footer_right` group, and the rest of that group is untouched.
-    assert_eq!(
-        layout.textarea_top_left,
-        vec![
-            FooterSegment::VimMode.into(),
-            FooterSegment::WorktreeName.into(),
-            FooterSegment::Context.into(),
-        ]
+    // The segment moves rather than duplicating: it leaves `footer_left`,
+    // and the rest of that group stays intact.
+    assert!(
+        !layout
+            .footer_left
+            .contains(&FooterSegment::GitBranch.into())
+    );
+    assert!(layout.footer_left.contains(&FooterSegment::VimMode.into()));
+    assert!(
+        layout
+            .footer_left
+            .contains(&FooterSegment::WorktreeName.into())
     );
 }
 

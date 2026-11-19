@@ -351,6 +351,10 @@ pub struct NoriConfigToml {
     #[serde(default)]
     pub agents: Vec<AgentConfigToml>,
 
+    /// Accounts of built-in providers, each run in Nori's own process (see `accounts`).
+    #[serde(default)]
+    pub accounts: Vec<crate::AccountToml>,
+
     /// Cloud session settings
     #[serde(default)]
     pub cloud: CloudConfigToml,
@@ -983,7 +987,7 @@ impl HotkeyAction {
             Self::Yank => "ctrl+y",
             Self::HistorySearch => "ctrl+r",
             Self::TogglePlanDrawer => "ctrl+o",
-            Self::Redraw => "ctrl+shift+l",
+            Self::Redraw => "ctrl+l",
             Self::NextModel => "ctrl+n",
             Self::PreviousModel => "ctrl+p",
             Self::NextEffort => "ctrl+j",
@@ -1958,14 +1962,12 @@ pub struct FooterLayoutConfig {
 impl Default for FooterLayoutConfig {
     fn default() -> Self {
         Self {
-            // Only self-hiding state lands on the left by default:
-            // `CloudSession` renders when attached to a cloud session and
-            // the mode indicator is displayed in the prompt bar instead.
-            // This group remains empty in an ordinary local shell. The remaining entries are all disabled in
-            // `FooterSegmentConfig::default`; they stay listed so that turning
-            // one on through `[tui.footer_segments]` alone still has somewhere
-            // to render, without the user also writing a `[tui.footer_layout]`.
+            // Consolidate session metadata onto one clean Helix-style bottom
+            // statusline; textarea corners remain available for user opt-in.
             footer_left: vec![
+                FooterSegment::VimMode.into(),
+                FooterSegment::GitBranch.into(),
+                FooterSegment::WorktreeName.into(),
                 FooterSegment::CloudSession.into(),
                 FooterSegment::PromptSummary.into(),
                 FooterSegment::SessionTitle.into(),
@@ -1980,22 +1982,13 @@ impl Default for FooterLayoutConfig {
                 FooterSegment::NoriVersion.into(),
                 FooterSegment::TokenUsage.into(),
             ],
-            footer_right: Vec::new(),
-            // Location and headroom belong to the prompt bar, leaving the rows
-            // below it available for subagent navigation.
-            textarea_top_left: vec![
-                FooterSegment::VimMode.into(),
-                FooterSegment::GitBranch.into(),
-                FooterSegment::WorktreeName.into(),
-                FooterSegment::Context.into(),
-            ],
-            // The model and the agent mode sit on the textarea's top-right
-            // corner, above the prompt, so they read as properties of what you
-            // are about to send rather than other metadata chips.
-            textarea_top_right: vec![
+            footer_right: vec![
                 FooterSegment::Model.into(),
                 FooterSegment::ModeIndicator.into(),
+                FooterSegment::Context.into(),
             ],
+            textarea_top_left: Vec::new(),
+            textarea_top_right: Vec::new(),
             textarea_bottom_left: Vec::new(),
             textarea_bottom_right: Vec::new(),
         }
@@ -2057,7 +2050,8 @@ pub struct TuiConfigToml {
     /// Enable animations (shimmer effects, spinners)
     pub animations: Option<bool>,
 
-    /// Rebuild inline transcript scrollback when the terminal width changes.
+    /// Legacy and ignored: the stage always lays the conversation out again at a new width.
+    /// Kept so config files that still have it load.
     pub resize_reflow: Option<bool>,
 
     /// Terminal notification preference (OSC 9 escape sequences)
@@ -2086,6 +2080,10 @@ pub struct TuiConfigToml {
     /// Configurable hotkey bindings.
     #[serde(default)]
     pub hotkeys: HotkeyConfigToml,
+
+    /// Rebinds of the keys the TUI answers itself, by id (see the `keymap` module).
+    #[serde(default)]
+    pub keymap: std::collections::BTreeMap<String, crate::keymap::KeyOverride>,
 
     /// Footer segment visibility settings.
     #[serde(default)]
@@ -2129,9 +2127,6 @@ pub struct TuiConfig {
     /// Enable animations (shimmer effects, spinners)
     pub animations: bool,
 
-    /// Rebuild inline transcript scrollback when the terminal width changes.
-    pub resize_reflow: bool,
-
     /// Terminal notification preference (OSC 9 escape sequences)
     pub terminal_notifications: TerminalNotifications,
 
@@ -2149,7 +2144,6 @@ impl Default for TuiConfig {
     fn default() -> Self {
         Self {
             animations: true,
-            resize_reflow: true,
             terminal_notifications: TerminalNotifications::Enabled,
             os_notifications: OsNotifications::Enabled,
             vertical_footer: false,
@@ -2301,9 +2295,6 @@ pub struct NoriConfig {
     /// Enable TUI animations
     pub animations: bool,
 
-    /// Rebuild inline transcript scrollback when the terminal width changes.
-    pub resize_reflow: bool,
-
     /// Terminal notification preference (OSC 9 escape sequences)
     pub terminal_notifications: TerminalNotifications,
 
@@ -2327,6 +2318,9 @@ pub struct NoriConfig {
 
     /// Configurable hotkey bindings.
     pub hotkeys: HotkeyConfig,
+
+    /// Every key the TUI answers itself, with the user's rebinds applied.
+    pub keymap: crate::keymap::Keymap,
 
     /// Timeout for custom prompt script execution.
     pub script_timeout: ScriptTimeout,
@@ -2457,7 +2451,6 @@ impl Default for NoriConfig {
                 log_dir: PathBuf::from(".nori/cli/acp-wire"),
             },
             animations: true,
-            resize_reflow: true,
             terminal_notifications: TerminalNotifications::Enabled,
             os_notifications: OsNotifications::Enabled,
             vertical_footer: false,
@@ -2466,6 +2459,7 @@ impl Default for NoriConfig {
             vim_mode: VimEnterBehavior::Off,
             kakoune_mode: true,
             hotkeys: HotkeyConfig::default(),
+            keymap: crate::keymap::Keymap::default(),
             script_timeout: ScriptTimeout::default(),
             loop_count: None,
             auto_worktree: AutoWorktree::Off,

@@ -3,6 +3,7 @@
 //! Provides a minimal, standalone configuration system for ACP-only mode.
 //! Configuration is loaded from `~/.nori/cli/config.toml`.
 
+mod accounts;
 mod config_types;
 mod edits;
 mod git_log;
@@ -10,10 +11,20 @@ mod git_remote;
 mod git_repo;
 mod git_root;
 mod git_write;
+mod keymap;
 mod loader;
 mod policy;
 mod types;
 
+pub use accounts::AccountToml;
+pub use accounts::HomeVariable;
+pub use accounts::PROVIDERS;
+pub use accounts::ProviderAccounts;
+pub use accounts::account_slug;
+pub use accounts::check_account_name;
+pub use accounts::default_account_home;
+pub use accounts::expand_accounts;
+pub use accounts::parse_account_slug;
 pub use config_types::EnvironmentVariablePattern;
 pub use config_types::McpServerConfig;
 pub use config_types::McpServerTransportConfig;
@@ -31,6 +42,12 @@ pub use git_root::resolve_root_git_project_for_trust;
 pub use git_write::ChangeState;
 pub use git_write::ChangedFile;
 pub use git_write::CommitError;
+pub use keymap::HelpRow;
+pub use keymap::KeyAction;
+pub use keymap::KeyEntry;
+pub use keymap::KeyMode;
+pub use keymap::KeyOverride;
+pub use keymap::Keymap;
 pub use loader::CONFIG_FILE;
 pub use loader::NORI_HOME_DIR;
 pub use loader::NORI_HOME_ENV;

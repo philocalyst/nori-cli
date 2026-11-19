@@ -185,6 +185,11 @@ impl NoriConfig {
         let async_post_agent_response_hooks =
             super::types::resolve_hook_paths(toml.hooks.async_post_agent_response);
 
+        // Each `[[accounts]]` entry is one more in-process agent beside the `[[agents]]`.
+        let mut agents = toml.agents;
+        let account_agents = crate::expand_accounts(&toml.accounts, &nori_home, &agents)?;
+        agents.extend(account_agents);
+
         // Agent is the user's persisted preference, defaults to DEFAULT_AGENT
         let agent = toml.agent.unwrap_or_else(|| DEFAULT_AGENT.to_string());
 
@@ -222,7 +227,6 @@ impl NoriConfig {
             subagent_sessions: toml.subagent_sessions.unwrap_or(true),
             acp_proxy,
             animations: toml.tui.animations.unwrap_or(true),
-            resize_reflow: toml.tui.resize_reflow.unwrap_or(true),
             terminal_notifications: toml
                 .tui
                 .terminal_notifications
@@ -240,6 +244,7 @@ impl NoriConfig {
             vim_mode,
             kakoune_mode,
             hotkeys: super::types::HotkeyConfig::from_toml(&toml.tui.hotkeys),
+            keymap: crate::keymap::Keymap::with_overrides(&toml.tui.keymap).0,
             script_timeout: toml.tui.script_timeout.unwrap_or_default(),
             loop_count: toml.tui.loop_count,
             skillset_per_session,
@@ -279,7 +284,7 @@ impl NoriConfig {
             async_pre_agent_response_hooks,
             async_post_agent_response_hooks,
             default_models: toml.default_models,
-            agents: toml.agents,
+            agents,
             cloud_broker_url: toml.cloud.broker_url,
         })
     }
@@ -469,26 +474,12 @@ args = ["@example/not-allowed"]
     }
 
     #[test]
-    fn resize_reflow_defaults_to_enabled() {
-        let config = NoriConfig::from_toml(
-            NoriConfigToml::default(),
-            PathBuf::from("/tmp/nori"),
-            NoriConfigOverrides::default(),
-        )
-        .unwrap();
-
-        assert!(config.resize_reflow);
-    }
-
-    #[test]
-    fn resize_reflow_can_be_disabled_in_tui_config() {
+    fn a_legacy_resize_reflow_setting_still_loads() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join(CONFIG_FILE);
         std::fs::write(&config_path, "[tui]\nresize_reflow = false\n").unwrap();
 
-        let config = NoriConfig::load_from_path(&config_path).unwrap();
-
-        assert!(!config.resize_reflow);
+        assert!(NoriConfig::load_from_path(&config_path).is_ok());
     }
 
     #[test]

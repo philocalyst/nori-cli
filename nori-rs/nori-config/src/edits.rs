@@ -24,11 +24,27 @@ static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 enum ConfigEdit {
     Agent(String),
-    DefaultModel { agent: String, model: String },
-    ProjectTrustLevel { path: PathBuf, level: TrustLevel },
-    SetPath { path: Vec<String>, value: Value },
-    ClearPath { path: Vec<String> },
+    DefaultModel {
+        agent: String,
+        model: String,
+    },
+    ProjectTrustLevel {
+        path: PathBuf,
+        level: TrustLevel,
+    },
+    SetPath {
+        path: Vec<String>,
+        value: Value,
+    },
+    ClearPath {
+        path: Vec<String>,
+    },
     ReplaceMcpServers(BTreeMap<String, McpServerConfig>),
+    AddAccount {
+        provider: String,
+        name: String,
+        home: Option<String>,
+    },
 }
 
 /// A small builder for the config edits used by Nori's ACP frontend.
@@ -93,6 +109,17 @@ impl NoriConfigEdits {
         self
     }
 
+    /// Append an `[[accounts]]` entry. Existing entries and everything else in the file stay as
+    /// they are; an entry with the same provider and name is an error, never a second copy.
+    pub fn add_account(mut self, provider: &str, name: &str, home: Option<&Path>) -> Self {
+        self.edits.push(ConfigEdit::AddAccount {
+            provider: provider.to_owned(),
+            name: name.to_owned(),
+            home: home.map(|home| home.to_string_lossy().into_owned()),
+        });
+        self
+    }
+
     /// Apply the queued edits.
     pub async fn apply(self) -> Result<()> {
         self.apply_blocking()
@@ -141,11 +168,44 @@ impl NoriConfigEdits {
                 ConfigEdit::ReplaceMcpServers(servers) => {
                     replace_mcp_servers(&mut document, &servers)?;
                 }
+                ConfigEdit::AddAccount {
+                    provider,
+                    name,
+                    home,
+                } => add_account(&mut document, &provider, &name, home.as_deref())?,
             }
         }
 
         write_config(&config_path, document.to_string().as_bytes())
     }
+}
+
+fn add_account(
+    document: &mut DocumentMut,
+    provider: &str,
+    name: &str,
+    home: Option<&str>,
+) -> Result<()> {
+    let accounts = document
+        .as_table_mut()
+        .entry("accounts")
+        .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("`accounts` in config.toml is not a list of [[accounts]] tables")?;
+    if accounts.iter().any(|entry| {
+        entry.get("provider").and_then(Item::as_str) == Some(provider)
+            && entry.get("name").and_then(Item::as_str) == Some(name)
+    }) {
+        anyhow::bail!("config.toml already has an account {name:?} of {provider}");
+    }
+    let mut entry = Table::new();
+    entry["provider"] = value(provider);
+    entry["name"] = value(name);
+    if let Some(home) = home {
+        entry["home"] = value(home);
+    }
+    accounts.push(entry);
+    Ok(())
 }
 
 fn replace_mcp_servers(
