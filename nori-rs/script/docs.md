@@ -5,7 +5,7 @@ Path: @/nori-rs/script
 ### Overview
 
 The ACP harness uses `nori-pkl` for active workflow policy and conversation
-programs. See `@/docs/workflows.md` and `@/docs/conversation-programs.md`.
+programs. See `@/docs/workflows.md` and `@/docs/programs.md`.
 `nori-script` supplies shared `Workflow`, `Hook`, `CommitRules`, and `PrRules`
 data types and their rendering. Its legacy Steel evaluator remains available
 to library callers and compatibility tests; Nori does not invoke it for ACP
