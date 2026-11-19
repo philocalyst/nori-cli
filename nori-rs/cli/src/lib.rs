@@ -1,6 +1,8 @@
+pub mod agent_serve;
 pub mod cloud;
 pub mod debug_sandbox;
 mod exit_status;
+pub mod fake_world;
 pub mod native_agents;
 use clap::Parser;
 use codex_common::CliConfigOverrides;

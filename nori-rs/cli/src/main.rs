@@ -20,7 +20,6 @@ use nori_tui::RESUME_HINT_LEAD;
 use nori_tui::resume_command_for_conversation;
 use nori_tui::update_action::UpdateAction;
 use owo_colors::OwoColorize;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use supports_color::Stream;
@@ -53,6 +52,10 @@ struct MultitoolCli {
     /// Equivalent to `nori exec`.
     #[arg(short = 'p', long = "print", default_value_t = false)]
     print: bool,
+
+    /// Run against a world of fake agents (Pkl or JSON), with no network. For demos and captures.
+    #[arg(long = "world", value_name = "FILE", hide = true)]
+    world: Option<PathBuf>,
 
     #[clap(flatten)]
     interactive: TuiCli,
@@ -89,6 +92,9 @@ enum Subcommand {
 
     /// Run a prompt non-interactively or serve the ACP stdio facade.
     Exec(ExecCommand),
+
+    /// Serve a built-in agent (`claude`, `codex`, ...) over stdio ACP for any ACP client.
+    Agent(nori_cli::agent_serve::AgentCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -151,6 +157,15 @@ struct ExecCommand {
     /// Disable approval prompts and sandboxing for ACP-visible operations.
     #[arg(long)]
     dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Print every session event to stdout as one JSON object per line, instead of the answer.
+    #[arg(long, conflicts_with = "acp")]
+    json: bool,
+
+    /// Stop waiting for delegated work after this long (for example 90s, 5m, 2h). Without it
+    /// exec waits until nothing is running, owed or queued.
+    #[arg(long, value_name = "DURATION", value_parser = nori_exec::parse_wait, conflicts_with = "acp")]
+    max_wait: Option<std::time::Duration>,
 
     #[clap(flatten)]
     config_overrides: CliConfigOverrides,
@@ -342,6 +357,30 @@ fn pre_main_hardening() {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "native-codex")]
+    {
+        let mut args = std::env::args();
+        let _ = args.next();
+        match args.next().as_deref() {
+            Some("--codex-ui-plugin-process") => {
+                return codex_code_mode_runtime::run_ui_sandbox().map_err(Into::into);
+            }
+            Some("--nori-code-mode-host") => {
+                let args: Vec<_> = args.collect();
+                let listen = match args.as_slice() {
+                    [] => codex_code_mode_host::DEFAULT_LISTEN_URL,
+                    [flag, url] if flag == "--listen" => url.as_str(),
+                    _ => anyhow::bail!("invalid code-mode host arguments"),
+                };
+                return tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(codex_code_mode_host::run_main(listen));
+            }
+            _ => {}
+        }
+        codex_install_context::set_code_mode_host_program(std::env::current_exe()?);
+    }
     nori_tui::startup_trace::mark("main");
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         cli_main(codex_linux_sandbox_exe).await?;
@@ -352,12 +391,17 @@ fn main() -> anyhow::Result<()> {
 async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     nori_tui::startup_trace::mark("cli_main");
     nori_cli::native_agents::register();
+    nori_cli::fake_world::register();
     let MultitoolCli {
         config_overrides: root_config_overrides,
         print,
+        world,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+    if let Some(world) = &world {
+        nori_cli::fake_world::apply(world, &mut interactive)?;
+    }
     nori_tui::startup_trace::mark("args_parsed");
     // Agents without HTTP MCP reach Nori's own MCP server through this binary.
     if let Ok(exe) = std::env::current_exe() {
@@ -399,6 +443,8 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 agent: None,
                 cwd: None,
                 dangerously_bypass_approvals_and_sandbox: false,
+                json: false,
+                max_wait: None,
                 config_overrides: CliConfigOverrides::default(),
             };
             run_exec(
@@ -546,6 +592,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             )
             .await?;
         }
+        Some(Subcommand::Agent(cmd)) => {
+            nori_cli::agent_serve::run(cmd).await?;
+        }
         Some(Subcommand::Completions(cmd)) => {
             clap_complete::generate(
                 cmd.shell,
@@ -572,6 +621,8 @@ async fn run_exec(
         agent,
         cwd,
         dangerously_bypass_approvals_and_sandbox,
+        json,
+        max_wait,
         config_overrides,
     } = cmd;
 
@@ -618,19 +669,25 @@ async fn run_exec(
     let Some(prompt) = prompt else {
         anyhow::bail!("a prompt argument or piped stdin is required");
     };
-    let outcome = nori_exec::run_plaintext(config, cli_version, prompt, Some(analytics)).await?;
-    {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(outcome.output.as_bytes())?;
-        if !outcome.output.ends_with('\n') {
-            stdout.write_all(b"\n")?;
-        }
-        stdout.flush()?;
+    let outcome = nori_exec::run_headless(
+        config,
+        cli_version,
+        prompt,
+        Some(analytics),
+        nori_exec::HeadlessOptions { max_wait, json },
+        nori_exec::Sinks {
+            stdout: Box::new(std::io::stdout()),
+            stderr: Box::new(std::io::stderr()),
+        },
+    )
+    .await?;
+    // The run has printed what happened. The status says whether the final turn completed.
+    match outcome {
+        nori_exec::HeadlessOutcome::Completed => Ok(()),
+        nori_exec::HeadlessOutcome::Failed(_) => std::process::exit(1),
+        // The same status `timeout(1)` uses when the time ran out.
+        nori_exec::HeadlessOutcome::GaveUp(_) => std::process::exit(124),
     }
-    if outcome.permission_denied {
-        anyhow::bail!("permission request offered no allow option during unattended execution");
-    }
-    Ok(())
 }
 
 fn analytics_reporter(mode: SessionMode) -> Option<AnalyticsReporter> {
@@ -711,6 +768,7 @@ mod tests {
             interactive,
             config_overrides: root_overrides,
             print: _,
+            world: _,
             subcommand,
         } = cli;
 
@@ -1072,6 +1130,7 @@ mod tests {
             mut interactive,
             config_overrides: root_overrides,
             print: _,
+            world: _,
             subcommand,
         } = cli;
 

@@ -25,7 +25,7 @@ fn mock_agent_bin() -> io::Result<String> {
 }
 
 fn nori_command(nori_home: &TempDir) -> Result<Command, Box<dyn std::error::Error>> {
-    let mut command = Command::cargo_bin("nori")?;
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("nori");
     command
         .env("NORI_HOME", nori_home.path())
         .env("MOCK_ACP_AGENT_BIN", mock_agent_bin()?)
@@ -237,7 +237,7 @@ struct AcpProcess {
 impl AcpProcess {
     fn spawn() -> Result<(Self, TempDir), Box<dyn std::error::Error>> {
         let nori_home = TempDir::new()?;
-        let nori_bin = assert_cmd::cargo::cargo_bin("nori");
+        let nori_bin = assert_cmd::cargo::cargo_bin!("nori");
         let mut child = StdCommand::new(nori_bin)
             .env("NORI_HOME", nori_home.path())
             .env("MOCK_ACP_AGENT_BIN", mock_agent_bin()?)

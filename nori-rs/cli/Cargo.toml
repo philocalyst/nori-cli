@@ -19,14 +19,17 @@ workspace = true
 default = ["native-codex", "native-claude", "native-opencode"]
 # Run Codex inside Nori's own process instead of through an adapter. It links all of codex-core,
 # including V8, so a build without it is much smaller and faster to compile.
-native-codex = ["dep:codex-acp"]
+native-codex = ["dep:nori-codex-acp", "dep:codex-code-mode-host", "dep:codex-code-mode-runtime", "dep:codex-install-context"]
 # Run Claude Code through the in-process Rust driver instead of the TypeScript adapter. It still
 # starts Claude Code's own CLI; there is no adapter process.
-native-claude = ["dep:claude-code-acp-rs"]
+native-claude = ["dep:nori-claude-acp"]
 # The ACP adapter is in-process; OpenCode's v2 engine runs as a local server.
 native-opencode = ["dep:nori-opencode-acp"]
 # Opt-in Gemini Core frontend; the official CLI remains the default.
 native-gemini = ["dep:nori-gemini-acp"]
+# Opt-in `antigravity-sdk` agent: Antigravity's local harness over its Rust SDK, for API-key and
+# Vertex accounts. The default `antigravity` agent is the official `agy acp` process.
+native-antigravity-sdk = ["dep:nori-antigravity-acp"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -36,6 +39,7 @@ nori-acp-host = { workspace = true }
 nori-harness = { workspace = true }
 nori-installed = { workspace = true }
 nori-exec = { workspace = true }
+nori-fake-agent = { workspace = true }
 nori-config = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-common = { workspace = true, features = ["cli"] }
@@ -45,10 +49,14 @@ codex-process-hardening = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 nori-tui = { workspace = true }
 ctor = { workspace = true }
-codex-acp = { path = "../codex-acp", optional = true }
-claude-code-acp-rs = { path = "../claude-acp", optional = true }
+nori-codex-acp = { path = "../codex-acp", optional = true }
+codex-code-mode-host = { path = "../../vendor/codex/code-mode-host", optional = true }
+codex-code-mode-runtime = { path = "../../vendor/codex/code-mode-runtime", optional = true }
+codex-install-context = { path = "../../vendor/codex/install-context", optional = true }
+nori-claude-acp = { path = "../claude-acp", optional = true }
 nori-opencode-acp = { path = "../opencode-acp", optional = true }
 nori-gemini-acp = { path = "../gemini-acp", optional = true }
+nori-antigravity-acp = { path = "../antigravity-acp", optional = true }
 libc = { workspace = true }
 owo-colors = { workspace = true }
 regex-lite = { workspace = true}
@@ -69,6 +77,10 @@ which = { workspace = true }
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 
 [dev-dependencies]
+codex-code-mode = { path = "../../vendor/codex/code-mode" }
+codex-core = { path = "../../vendor/codex/core" }
+codex-protocol = { path = "../../vendor/codex/protocol" }
+tokio-util = { workspace = true, features = ["rt"] }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
 predicates = { workspace = true }

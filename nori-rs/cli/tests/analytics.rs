@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::io::BufRead;
 use std::io::BufReader;
@@ -108,6 +108,22 @@ fn analytics_server() -> (String, mpsc::Receiver<CapturedRequest>) {
 }
 
 fn home_with_auth(username: Option<&str>) -> TempDir {
+    // macOS validates a newly linked executable before main. With embedded V8 the
+    // debug binary can take several seconds on its first launch; that cost is
+    // unrelated to analytics and must precede the test server and measured exec.
+    static BINARY_READY: std::sync::Once = std::sync::Once::new();
+    BINARY_READY.call_once(|| {
+        let output = StdCommand::new(assert_cmd::cargo::cargo_bin!("nori"))
+            .arg("--version")
+            .env("NORI_NO_ANALYTICS", "1")
+            .output()
+            .expect("launch the CLI before starting analytics fixtures");
+        assert!(
+            output.status.success(),
+            "CLI preflight failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
     let home = TempDir::new().expect("temporary home");
     let expires_at = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -132,7 +148,7 @@ fn home_with_auth(username: Option<&str>) -> TempDir {
 }
 
 fn nori_command(home: &TempDir, analytics_url: &str) -> Command {
-    let mut command = Command::cargo_bin("nori").expect("built nori binary");
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("nori");
     command
         .env("HOME", home.path())
         .env("NORI_HOME", home.path().join(".nori/cli"))
@@ -146,8 +162,20 @@ fn nori_command(home: &TempDir, analytics_url: &str) -> Command {
     command
 }
 
+fn execution_diagnostics(started: Instant, stderr: &[u8]) -> String {
+    format!(
+        "elapsed={:?}, binary={}, cwd={}, inherited_opt_out={}, stderr={}",
+        started.elapsed(),
+        assert_cmd::cargo::cargo_bin!("nori").display(),
+        std::env::current_dir().unwrap().display(),
+        std::env::var_os("NORI_NO_ANALYTICS").is_some(),
+        String::from_utf8_lossy(stderr).replace("firebase-id-token", "<redacted>"),
+    )
+}
+
 #[test]
 fn exec_reports_one_authenticated_agent_session_without_changing_output() {
+    let started = Instant::now();
     let home = home_with_auth(Some("human@example.com"));
     let (analytics_url, requests) = analytics_server();
     let output = nori_command(&home, &analytics_url)
@@ -167,7 +195,12 @@ fn exec_reports_one_authenticated_agent_session_without_changing_output() {
 
     let request = requests
         .recv_timeout(Duration::from_secs(3))
-        .expect("authenticated analytics request");
+        .unwrap_or_else(|error| {
+            panic!(
+                "authenticated analytics request: {error:?}; {}",
+                execution_diagnostics(started, &output.stderr)
+            )
+        });
     assert_eq!(
         request.request_line,
         "POST /api/analytics/v1/events HTTP/1.1"
@@ -269,7 +302,11 @@ fn unavailable_analytics_never_changes_exec_output_or_exit() {
         String::from_utf8(output.stdout).expect("UTF-8 output"),
         "meaningful work\n"
     );
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{}",
+        execution_diagnostics(started, &output.stderr)
+    );
 }
 
 struct AcpProcess {
@@ -280,7 +317,7 @@ struct AcpProcess {
 
 impl AcpProcess {
     fn spawn(home: &TempDir, analytics_url: &str) -> Self {
-        let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("nori"))
+        let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin!("nori"))
             .env("HOME", home.path())
             .env("NORI_HOME", home.path().join(".nori/cli"))
             .env("NORI_ANALYTICS_URL", analytics_url)
@@ -382,7 +419,14 @@ fn acp_facade_reports_activity_only_after_its_prompt_reaches_the_agent() {
     assert_eq!(acp.response(3)["result"]["stopReason"], "end_turn");
     let request = requests
         .recv_timeout(Duration::from_secs(3))
-        .expect("ACP analytics request");
+        .unwrap_or_else(|error| {
+            panic!(
+                "ACP analytics request: {error:?}; binary={}, cwd={}, inherited_opt_out={}",
+                assert_cmd::cargo::cargo_bin!("nori").display(),
+                std::env::current_dir().unwrap().display(),
+                std::env::var_os("NORI_NO_ANALYTICS").is_some()
+            )
+        });
     assert_eq!(
         request.body["properties"],
         serde_json::json!({"session_mode": "acp"})

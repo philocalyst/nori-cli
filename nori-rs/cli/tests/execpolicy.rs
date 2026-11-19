@@ -1,6 +1,5 @@
 use std::fs;
 
-use assert_cmd::Command;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -19,7 +18,7 @@ prefix_rule(
 "#,
     )?;
 
-    let output = Command::cargo_bin("nori")?
+    let output = assert_cmd::cargo::cargo_bin_cmd!("nori")
         .env("CODEX_HOME", codex_home.path())
         .args([
             "execpolicy",
