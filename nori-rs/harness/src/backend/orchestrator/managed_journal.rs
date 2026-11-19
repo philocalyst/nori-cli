@@ -28,13 +28,46 @@ impl Inner {
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "The child conversation journal is unavailable".to_owned())?;
-        let snapshot = child
-            .harness
-            .get_session_config()
-            .await
-            .ok_or_else(|| "The child has not advertised its configuration".to_owned())?;
-        let (model, options) = super::super::child_control::child_model_and_options(snapshot)
-            .map_err(|error| error.to_string())?;
+        let snapshot = child.harness.get_session_config().await;
+        let (model, options) = match snapshot {
+            Some(snapshot) => {
+                match super::super::child_control::child_model_and_options(snapshot.clone()) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        // Non-Claude adapters (e.g. Gemini or OpenCode without a model selector)
+                        // may omit a model config option; preserve select options and fall back
+                        // to the configured default model so checkpoint-seeded fork succeeds.
+                        let options = snapshot
+                            .into_iter()
+                            .filter_map(|option| match option.kind {
+                                acp::SessionConfigKind::Select(select) => {
+                                    Some((option.id.to_string(), select.current_value.to_string()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let fallback_model = self
+                            .seed
+                            .config
+                            .default_models
+                            .get(&agent)
+                            .cloned()
+                            .unwrap_or_else(|| "default".to_owned());
+                        (fallback_model, options)
+                    }
+                }
+            }
+            None => {
+                let fallback_model = self
+                    .seed
+                    .config
+                    .default_models
+                    .get(&agent)
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_owned());
+                (fallback_model, Vec::new())
+            }
+        };
         let parent = match parent {
             Some(parent) => parent,
             None => backend.session_id().await,

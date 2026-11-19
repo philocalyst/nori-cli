@@ -6,6 +6,7 @@
 //! costs nothing. Asking while a probe runs waits for that probe instead of starting another.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -20,11 +21,14 @@ use super::Seed;
 
 /// How long an agent may take to start and open a session for its probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a user-visible re-check of one agent may take.
+const REPROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Agents probed at once.
 const PARALLEL_PROBES: usize = 3;
 
 /// Agents with a probe running, each with what turns true when it ends.
-static PROBING: LazyLock<Mutex<HashMap<String, watch::Receiver<bool>>>> =
+type ProbeKey = (PathBuf, String);
+static PROBING: LazyLock<Mutex<HashMap<ProbeKey, watch::Receiver<bool>>>> =
     LazyLock::new(Default::default);
 
 /// Probe every installed agent whose catalog entry is older than `fresh_for`. Returns when they
@@ -47,10 +51,13 @@ pub(crate) async fn refresh_excluding(
     excluded_agent: Option<String>,
 ) {
     let now = super::catalog::now_seconds();
+    let home = config
+        .nori_home
+        .canonicalize()
+        .unwrap_or_else(|_| config.nori_home.clone());
     let permits = Arc::new(tokio::sync::Semaphore::new(PARALLEL_PROBES));
-    let probes = crate::registry::list_available_agents()
+    let probes = crate::recovery::installed_agents(Some(&config.active_agent))
         .into_iter()
-        .filter(|agent| agent.is_installed)
         .map(|agent| agent.agent_name)
         .filter(|agent| excluded_agent.as_deref() != Some(agent.as_str()))
         .filter(|agent| {
@@ -58,12 +65,13 @@ pub(crate) async fn refresh_excluding(
             now - refreshed_at >= fresh_for.as_secs() as i64
         })
         .map(|agent| {
+            let key = (home.clone(), agent.clone());
             let mut probing = PROBING.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(running) = probing.get(&agent) {
+            if let Some(running) = probing.get(&key) {
                 return running.clone();
             }
             let (ended_tx, ended) = watch::channel(false);
-            probing.insert(agent.clone(), ended.clone());
+            probing.insert(key.clone(), ended.clone());
             drop(probing);
             let config = Arc::clone(&config);
             let cli_version = cli_version.clone();
@@ -80,7 +88,7 @@ pub(crate) async fn refresh_excluding(
                 PROBING
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&agent);
+                    .remove(&key);
                 let _ = ended_tx.send(true);
             });
             ended
@@ -90,6 +98,18 @@ pub(crate) async fn refresh_excluding(
             let _ = ended.wait_for(|ended| *ended).await;
         });
     futures::future::join_all(probes).await;
+}
+
+/// Ask `agent` again what it offers, now: the cheap check that a model which failed as
+/// unavailable is still advertised. Waits for a probe already running instead of starting another.
+pub(crate) async fn reprobe(
+    config: Arc<crate::config::NoriConfig>,
+    cli_version: String,
+    agent: &str,
+) -> Result<(), String> {
+    tokio::time::timeout(REPROBE_TIMEOUT, probe(&config, cli_version, agent))
+        .await
+        .unwrap_or_else(|_| Err("timed out".to_owned()))
 }
 
 /// Start `agent` in a bare session, remember what it advertises, and stop it.

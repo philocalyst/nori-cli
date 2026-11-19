@@ -62,15 +62,22 @@ impl Inner {
         };
         let parent_request_id = acp::RequestId::Str(format!("{view_id}/{request_id}"));
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        if is_permission {
-            self.set_awaiting_approval(task.as_ref(), true).await;
-        }
         if let Some(id) = &task {
-            let mut state = self.state.lock().await;
-            if let Some(record) = state.tasks.iter_mut().find(|record| &record.id == id) {
-                record.relayed_approvals.push(parent_request_id.clone());
+            self.directory().with(|registry| {
+                if let Some((actor, index)) = registry.task_mut(id) {
+                    let record = &mut actor.tasks[index];
+                    record.relayed_approvals.push(parent_request_id.clone());
+                    if is_permission && !record.status.is_ended() {
+                        record.pending_approvals.insert(parent_request_id.clone());
+                        record.awaiting_approval = !record.pending_approvals.is_empty();
+                    }
+                }
+            });
+            if is_permission {
+                self.directory().touch();
             }
         }
+        let tracked_id = parent_request_id.clone();
         self.signal(Signal::Approval(Box::new(DelegatedRequest {
             request_id: parent_request_id,
             request,
@@ -93,19 +100,23 @@ impl Inner {
             let _ = harness.respond_to_agent(request_id, response).await;
             if is_permission {
                 orchestrator
-                    .set_awaiting_approval(task.as_ref(), false)
+                    .clear_pending_approval(task.as_ref(), &tracked_id)
                     .await;
             }
         });
     }
 
-    async fn set_awaiting_approval(&self, id: Option<&TaskId>, awaiting: bool) {
+    async fn clear_pending_approval(&self, id: Option<&TaskId>, request_id: &acp::RequestId) {
         let Some(id) = id else { return };
-        let mut state = self.state.lock().await;
-        if let Some(task) = state.tasks.iter_mut().find(|task| &task.id == id) {
-            task.awaiting_approval = awaiting && !task.status.is_ended();
-        }
-        drop(state);
-        self.touch();
+        self.directory().with(|registry| {
+            if let Some((actor, index)) = registry.task_mut(id) {
+                let task = &mut actor.tasks[index];
+                task.pending_approvals.remove(request_id);
+                task.relayed_approvals.retain(|id| id != request_id);
+                task.awaiting_approval =
+                    !task.pending_approvals.is_empty() && !task.status.is_ended();
+            }
+        });
+        self.directory().touch();
     }
 }

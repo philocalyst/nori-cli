@@ -47,13 +47,59 @@ pub(super) struct NativeChildren {
     parents: Mutex<HashMap<acp::SessionId, acp::SessionId>>,
     snapshots: Mutex<HashMap<acp::SessionId, Vec<acp::SessionConfigOption>>>,
     closed: Mutex<HashSet<acp::SessionId>>,
+    archived: Mutex<HashMap<acp::SessionId, String>>,
     event_gate: Mutex<()>,
     control_gates: Mutex<HashMap<acp::SessionId, Arc<Mutex<()>>>>,
     history: Arc<RwLock<Option<Arc<NativeHistory>>>>,
     own_prompts: Arc<Mutex<HashSet<acp::SessionId>>>,
+    /// The tree's directory, where every provider child is registered as an actor.
+    directory: std::sync::OnceLock<(
+        Arc<super::orchestrator::Tree>,
+        std::sync::Weak<super::AcpBackend>,
+    )>,
 }
 
 impl NativeChildren {
+    /// Register provider children in `tree`'s directory as they are announced; `backend` is the
+    /// connection that owns them.
+    pub(super) fn attach_directory(
+        &self,
+        tree: Arc<super::orchestrator::Tree>,
+        backend: std::sync::Weak<super::AcpBackend>,
+    ) {
+        let _ = self.directory.set((tree, backend));
+    }
+
+    /// Mirror an announcement into the directory: the child is an addressable actor, and its
+    /// lifecycle follows the provider's reports.
+    fn register_actor(&self, update: &nori_protocol::SubagentUpdate) {
+        let Some((tree, backend)) = self.directory.get() else {
+            return;
+        };
+        fn text(patch: &Patch<String>) -> Option<&str> {
+            match patch {
+                Patch::Set(text) => Some(text.as_str()),
+                Patch::Keep | Patch::Clear => None,
+            }
+        }
+        let (running, ended) = match &update.state {
+            Patch::Set(SubagentState::Running) => (Some(true), None),
+            Patch::Set(SubagentState::Idle) => (Some(false), None),
+            Patch::Set(SubagentState::Ended(outcome)) => (None, Some(outcome.clone())),
+            Patch::Keep | Patch::Clear => (None, None),
+        };
+        tree.directory.observe_native(
+            &update.session_id,
+            &update.parent_session_id,
+            text(&update.agent),
+            text(&update.title),
+            text(&update.model),
+            running,
+            ended,
+            backend,
+        );
+    }
+
     pub(super) async fn observe(
         &self,
         connection: &Arc<AcpConnection>,
@@ -76,6 +122,7 @@ impl NativeChildren {
             }
             return true;
         };
+        self.register_actor(update);
         let mut actors = self.actors.lock().await;
         if matches!(
             &update.state,
@@ -92,15 +139,37 @@ impl NativeChildren {
             }
             return true;
         }
-        if &update.parent_session_id != root && !actors.contains_key(&update.parent_session_id) {
+        if &update.parent_session_id != root
+            && !actors.contains_key(&update.parent_session_id)
+            && !self
+                .archived
+                .lock()
+                .await
+                .contains_key(&update.parent_session_id)
+        {
             return true;
         }
         self.closed.lock().await.remove(&update.session_id);
+        self.archived.lock().await.remove(&update.session_id);
         self.parents
             .lock()
             .await
             .entry(update.session_id.clone())
             .or_insert_with(|| update.parent_session_id.clone());
+        if update.session_id != update.parent_session_id
+            && let Some(history) = self.history.read().await.clone()
+        {
+            let reference = if &update.parent_session_id == root {
+                history.recorder(&update.session_id).await.map(drop)
+            } else {
+                history
+                    .record_descendant_reference(&update.parent_session_id, &update.session_id)
+                    .await
+            };
+            if let Err(error) = reference {
+                tracing::warn!(%error, "failed to record initial native child reference");
+            }
+        }
         if &update.parent_session_id != root
             && let Some(history) = self.history.read().await.clone()
             && let Err(error) = history
@@ -123,14 +192,16 @@ impl NativeChildren {
         let tx = actors.entry(update.session_id.clone()).or_insert_with(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(run(
-                connection.clone(),
-                events.clone(),
-                update.parent_session_id.clone(),
-                update.session_id.clone(),
+                NativeActor {
+                    connection: connection.clone(),
+                    events: events.clone(),
+                    parent: update.parent_session_id.clone(),
+                    id: update.session_id.clone(),
+                    tx: tx.downgrade(),
+                    history: self.history.clone(),
+                    own_prompts: self.own_prompts.clone(),
+                },
                 rx,
-                tx.downgrade(),
-                self.history.clone(),
-                self.own_prompts.clone(),
             ));
             tx
         });
@@ -229,6 +300,9 @@ impl NativeChildren {
         &self,
         id: &acp::SessionId,
     ) -> Result<Vec<acp::SessionConfigOption>> {
+        if let Some(reason) = self.unavailable_reason(id).await {
+            return Err(anyhow!(reason));
+        }
         if let Ok(actor) = self.actor(id).await {
             let (tx, rx) = oneshot::channel();
             actor
@@ -304,6 +378,25 @@ impl NativeChildren {
             .bind_native(id, recorder)
             .await
     }
+    pub(super) async fn unavailable_reason(&self, id: &acp::SessionId) -> Option<String> {
+        self.archived.lock().await.get(id).cloned()
+    }
+
+    pub(super) async fn register_archived(
+        &self,
+        id: acp::SessionId,
+        parent: acp::SessionId,
+        reason: String,
+    ) {
+        let _gate = self.event_gate.lock().await;
+        self.parents.lock().await.insert(id.clone(), parent);
+        self.closed.lock().await.insert(id.clone());
+        self.archived.lock().await.insert(id.clone(), reason);
+        if let Some(actor) = self.actors.lock().await.remove(&id) {
+            let _ = actor.send(Command::Closed);
+        }
+    }
+
     pub(super) async fn known_ids(&self) -> Vec<acp::SessionId> {
         self.parents.lock().await.keys().cloned().collect()
     }
@@ -336,6 +429,9 @@ impl NativeChildren {
     }
 
     async fn actor(&self, id: &acp::SessionId) -> Result<mpsc::UnboundedSender<Command>> {
+        if let Some(reason) = self.unavailable_reason(id).await {
+            return Err(anyhow!(reason));
+        }
         self.actors
             .lock()
             .await
@@ -481,7 +577,7 @@ impl NativeChildren {
         }
     }
 
-    pub(super) async fn has_pending_work(&self) -> bool {
+    pub(crate) async fn has_pending_work(&self) -> bool {
         let actors = self
             .actors
             .lock()
@@ -502,6 +598,7 @@ impl NativeChildren {
         self.parents.lock().await.clear();
         self.snapshots.lock().await.clear();
         self.closed.lock().await.clear();
+        self.archived.lock().await.clear();
         let mut acknowledgements = Vec::new();
         for actor in std::mem::take(&mut *self.actors.lock().await).into_values() {
             let (tx, rx) = oneshot::channel();
@@ -518,16 +615,29 @@ impl NativeChildren {
     }
 }
 
-async fn run(
+/// What a provider child's actor works with, besides the commands it is sent.
+struct NativeActor {
     connection: Arc<AcpConnection>,
     events: mpsc::Sender<super::BackendEvent>,
     parent: acp::SessionId,
     id: acp::SessionId,
-    mut rx: mpsc::UnboundedReceiver<Command>,
+    /// The actor's own command channel, to tell itself a prompt finished.
     tx: mpsc::WeakUnboundedSender<Command>,
     history: Arc<RwLock<Option<Arc<NativeHistory>>>>,
     own_prompts: Arc<Mutex<HashSet<acp::SessionId>>>,
-) {
+}
+
+async fn run(actor: NativeActor, mut rx: mpsc::UnboundedReceiver<Command>) {
+    let NativeActor {
+        connection,
+        events,
+        parent,
+        id,
+        tx,
+        history,
+        own_prompts,
+    } = actor;
+
     let mut pending = VecDeque::new();
     let mut provider_running = true;
     let mut reserved = false;
@@ -682,6 +792,7 @@ async fn run(
                         parent_session_id: parent,
                         session_id: id.clone(),
                         agent: Patch::Keep,
+                        model: Patch::Keep,
                         title: Patch::Keep,
                         description: Patch::Keep,
                         state: Patch::Set(SubagentState::Ended(

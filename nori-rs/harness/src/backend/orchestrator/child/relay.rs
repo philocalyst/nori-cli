@@ -1,5 +1,6 @@
 //! Passing what a child does on to its parent's stream, and keeping the task's progress.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nori_protocol::AcpEvent;
@@ -8,9 +9,9 @@ use nori_protocol::SessionEvent;
 use nori_protocol::SubagentWire;
 use nori_protocol::acp::v1 as acp;
 
+use super::super::Inner;
+use super::super::task::TaskEnd;
 use super::Active;
-use super::Inner;
-use super::TaskEnd;
 use crate::runtime::HarnessHandle;
 
 /// Pass one child event on to the parent. Returns how the active turn ended, when this event
@@ -35,14 +36,22 @@ pub(super) async fn relay(
                         ..
                     }) => {
                         active.text.push(&text.text);
-                        if let (Some(line), Ok(mut progress)) =
-                            (active.text.last_line(), active.progress.lock())
+                        if let Ok(mut progress) = active.progress.lock()
+                            && let Some(line) = active.text.last_line()
                         {
                             progress.activity = line;
                         }
                     }
                     acp::SessionUpdate::ToolCall(call) => {
                         active.text.tool();
+                        if !matches!(
+                            call.status,
+                            acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed
+                        ) {
+                            active
+                                .in_flight_tools
+                                .insert(call.tool_call_id.clone(), call.title.clone());
+                        }
                         if let Ok(mut progress) = active.progress.lock() {
                             progress.tool_calls += 1;
                             progress.activity = call.title.chars().take(160).collect();
@@ -51,6 +60,12 @@ pub(super) async fn relay(
                     }
                     acp::SessionUpdate::ToolCallUpdate(update) => {
                         active.text.tool();
+                        if matches!(
+                            update.fields.status,
+                            Some(acp::ToolCallStatus::Completed | acp::ToolCallStatus::Failed)
+                        ) {
+                            active.in_flight_tools.remove(&update.tool_call_id);
+                        }
                         if let Ok(mut progress) = active.progress.lock() {
                             note_changes(
                                 &mut progress,
@@ -64,6 +79,32 @@ pub(super) async fn relay(
                 }
             }
             let view = view?;
+            if let acp::SessionUpdate::ConfigOptionUpdate(update) = &notification.update
+                && let Some(model) = super::super::models::current_model(&update.config_options)
+            {
+                let announce_parent = orchestrator.directory().with(|registry| {
+                    let id = registry.by_session(view)?.clone();
+                    let actor = registry.actor_mut(&id)?;
+                    actor.model = Some(model.clone());
+                    Some(actor.announce_parent.clone())
+                });
+                if let Some(announce_parent) = announce_parent
+                    && let Some(parent_session_id) =
+                        announce_parent.or_else(|| orchestrator.parent_session())
+                {
+                    orchestrator.emit(SessionEvent::Nori(NoriEvent::Subagent(
+                        SubagentWire::Update(nori_protocol::SubagentUpdate {
+                            parent_session_id,
+                            session_id: view.clone(),
+                            agent: nori_protocol::Patch::Keep,
+                            model: nori_protocol::Patch::Set(model),
+                            title: nori_protocol::Patch::Keep,
+                            description: nori_protocol::Patch::Keep,
+                            state: nori_protocol::Patch::Keep,
+                        }),
+                    ))).await;
+                }
+            }
             notification.session_id = view.clone();
             orchestrator
                 .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
@@ -74,10 +115,10 @@ pub(super) async fn relay(
         SessionEvent::Acp(AcpEvent::ChildNotification(mut notification)) => {
             let original = notification.session_id.clone();
             notification.session_id = scoped_id(scope, &original);
-            orchestrator.state.lock().await.descendants.insert(
+            orchestrator.directory().with(|registry| registry.routes.insert(
                 notification.session_id.clone(),
                 super::super::DescendantRoute { handle: harness.clone(), session_id: original },
-            );
+            ));
             orchestrator
                 .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
                 .await;
@@ -86,14 +127,9 @@ pub(super) async fn relay(
         SessionEvent::Nori(NoriEvent::Subagent(mut wire)) => {
             if let SubagentWire::Update(update) = &wire {
                 let public_id = scoped_id(scope, &update.session_id);
-                orchestrator
-                    .state
-                    .lock()
-                    .await
-                    .descendants
-                    .insert(public_id, super::super::DescendantRoute {
-                        handle: harness.clone(), session_id: update.session_id.clone(),
-                    });
+                orchestrator.directory().with(|registry| registry.routes.insert(public_id, super::super::DescendantRoute {
+                    handle: harness.clone(), session_id: update.session_id.clone(),
+                }));
             }
             if let Some(view) = view {
                 retarget(&mut wire, child_session, scope, view);
@@ -109,10 +145,10 @@ pub(super) async fn relay(
             } else {
                 let original = session_id;
                 session_id = scoped_id(scope, &original);
-                orchestrator.state.lock().await.descendants.insert(
+                orchestrator.directory().with(|registry| registry.routes.insert(
                     session_id.clone(),
                     super::super::DescendantRoute { handle: harness.clone(), session_id: original },
-                );
+                ));
             }
             orchestrator.emit(SessionEvent::Nori(NoriEvent::SubagentQueueChanged { session_id, prompts })).await;
             None
@@ -131,8 +167,8 @@ pub(super) async fn relay(
                     view.cloned()
                 } else {
                     let public = scoped_id(scope, &original);
-                    orchestrator.state.lock().await.descendants.insert(public.clone(),
-                        super::super::DescendantRoute { handle: harness.clone(), session_id: original });
+                    orchestrator.directory().with(|registry| registry.routes.insert(public.clone(),
+                        super::super::DescendantRoute { handle: harness.clone(), session_id: original }));
                     Some(public)
                 };
                 if let Some(public) = public {
@@ -175,6 +211,15 @@ pub(super) async fn relay(
                 },
             })
         }
+        SessionEvent::Nori(NoriEvent::SessionPhaseChanged(phase)) => {
+            let active = active?;
+            super::phase::interrupted_turn_ended(
+                &mut active.observed_prompt_phase,
+                &active.request_id,
+                active.interrupted,
+                &phase,
+            ).then_some(TaskEnd::Cancelled)
+        }
         SessionEvent::Nori(NoriEvent::RequestWithdrawn(request_id)) => {
             if let Some(view) = view {
                 orchestrator.signal(super::super::Signal::Withdraw(vec![acp::RequestId::Str(format!("{view}/{request_id}"))]));
@@ -194,15 +239,57 @@ pub(super) async fn relay(
                     .unwrap_or_else(|| "the child's session ended".to_owned()),
             })
         }
+        // A child that kept working after a cancel, or whose requests were declined, is announced
+        // to the user under the child's label, with the ID its permission request was relayed as.
+        SessionEvent::Nori(NoriEvent::AgentContinued(mut continued)) => {
+            if let Some(view) = view {
+                continued.request_id = acp::RequestId::Str(format!("{view}/{}", continued.request_id));
+                continued.agent = orchestrator.child_label(view, &continued.agent);
+                orchestrator
+                    .emit(SessionEvent::Nori(NoriEvent::AgentContinued(continued)))
+                    .await;
+            }
+            None
+        }
+        SessionEvent::Nori(NoriEvent::RequestDeclined(mut declined)) => {
+            if let Some(view) = view {
+                let agent = declined.agent.take().unwrap_or_default();
+                declined.agent = Some(orchestrator.child_label(view, &agent));
+                orchestrator
+                    .emit(SessionEvent::Nori(NoriEvent::RequestDeclined(declined)))
+                    .await;
+            }
+            None
+        }
+        SessionEvent::Nori(NoriEvent::ContextCompacted(compacted)) => {
+            if let Some(view) = view {
+                let journaled = orchestrator.directory().with(|registry| {
+                    let id = registry.by_session(view)?.clone();
+                    let actor = registry.actor_mut(&id)?;
+                    // Compacting changes what the child remembers, not what the parent sees of
+                    // it: identity, alias and state stay; the summary becomes its pinned facts.
+                    let digest = super::super::compaction::digest_of(
+                        actor,
+                        None,
+                        compacted.summary.as_deref(),
+                        None,
+                    );
+                    actor.digest = Some(digest);
+                    Some(actor.id.clone())
+                });
+                if let Some(id) = journaled {
+                    orchestrator.journal_digest(&id).await;
+                }
+            }
+            None
+        }
         SessionEvent::Acp(AcpEvent::Notification(_))
         | SessionEvent::Nori(
             NoriEvent::SessionStarted(_)
             | NoriEvent::SessionReady(_)
-            | NoriEvent::SessionPhaseChanged(_)
             | NoriEvent::QueueChanged(_)
             | NoriEvent::ReplayStarted(_)
             | NoriEvent::ReplayFinished
-            | NoriEvent::ContextCompacted(_)
             | NoriEvent::SessionForked(_)
             | NoriEvent::GoalChanged(_)
             | NoriEvent::CapabilitiesChanged(_)
@@ -211,11 +298,81 @@ pub(super) async fn relay(
             | NoriEvent::HookOutput(_)
             | NoriEvent::PromptSummaryUpdated(_)
             | NoriEvent::Notice(_)
+            | NoriEvent::PromptUnanswered(_)
+            | NoriEvent::QueueRestored(_)
+            | NoriEvent::AgentSilent(_)
+            | NoriEvent::AgentHeard
             | NoriEvent::SubscriptionExhausted(_)
+            | NoriEvent::RouteChanged(_)
+            | NoriEvent::RetryScheduled(_)
+            | NoriEvent::AttemptSuperseded(_)
             // Results the child's own tasks handed to it are the child's business.
             | NoriEvent::TaskResultsDelivered(_)
+            // A child's monitors are its own: they wake it, not its parent.
+            | NoriEvent::Monitor(_)
             | NoriEvent::ConversationResponseBoundary(_),
         ) => None,
+    }
+}
+
+/// The harness moved this child to another route, possibly on another agent: the actor keeps its
+/// identity and alias, and its directory entry and the parent's view name the new agent and
+/// model. `scope` is the actor's stable identity; `view` is where its activity is shown now.
+pub(super) async fn route_changed(
+    orchestrator: &Arc<Inner>,
+    scope: &acp::SessionId,
+    view: Option<&acp::SessionId>,
+    changed: &nori_protocol::RouteChanged,
+) {
+    let display_name = crate::registry::get_agent_display_name(&changed.to.agent);
+    let actor = super::super::directory::ActorId::new(scope.clone());
+    let announce_parent = orchestrator.directory().with(|registry| {
+        let actor = registry.actor_mut(&actor)?;
+        actor.agent = changed.to.agent.clone();
+        actor.agent_name = display_name;
+        actor.model = changed.to.model.clone();
+        Some(actor.announce_parent.clone())
+    });
+    let (Some(view), Some(announce_parent)) = (view, announce_parent) else {
+        return;
+    };
+    if let Some(parent_session_id) = announce_parent.or_else(|| orchestrator.parent_session()) {
+        orchestrator
+            .emit(SessionEvent::Nori(NoriEvent::Subagent(
+                SubagentWire::Update(nori_protocol::SubagentUpdate {
+                    parent_session_id,
+                    session_id: view.clone(),
+                    agent: nori_protocol::Patch::Set(changed.to.agent.clone()),
+                    model: changed
+                        .to
+                        .model
+                        .clone()
+                        .map_or(nori_protocol::Patch::Keep, nori_protocol::Patch::Set),
+                    title: nori_protocol::Patch::Keep,
+                    description: nori_protocol::Patch::Keep,
+                    state: nori_protocol::Patch::Keep,
+                }),
+            )))
+            .await;
+    }
+}
+
+/// Deterministically close any dangling in-flight tool calls when a child exits, fails, or is cancelled.
+pub(super) async fn finish_in_flight_tools(
+    orchestrator: &Arc<Inner>,
+    view: &acp::SessionId,
+    tools: HashMap<acp::ToolCallId, String>,
+) {
+    for (tool_call_id, _title) in tools {
+        let update = acp::ToolCallUpdate::new(
+            tool_call_id,
+            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
+        );
+        let notification =
+            acp::SessionNotification::new(view.clone(), acp::SessionUpdate::ToolCallUpdate(update));
+        orchestrator
+            .emit(SessionEvent::Acp(AcpEvent::ChildNotification(notification)))
+            .await;
     }
 }
 
@@ -278,7 +435,10 @@ fn retarget(
 }
 
 /// Stable, unambiguous public identity for an ID on this child connection.
-fn scoped_id(scope: &acp::SessionId, id: &acp::SessionId) -> acp::SessionId {
+pub(in crate::backend::orchestrator) fn scoped_id(
+    scope: &acp::SessionId,
+    id: &acp::SessionId,
+) -> acp::SessionId {
     let scope = scope.to_string();
     acp::SessionId::new(format!("nori-relay:{}:{scope}{id}", scope.len()))
 }
@@ -305,6 +465,7 @@ mod tests {
             parent_session_id: acp::SessionId::new("provider-root"),
             session_id: raw.clone(),
             agent: Patch::Keep,
+            model: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Keep,

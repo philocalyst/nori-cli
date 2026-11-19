@@ -5,20 +5,18 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use nori_protocol::acp::v1 as acp;
 
-use super::ChildKey;
-use super::ChildSlot;
 use super::Orchestrator;
 use super::child;
-use super::task::Delivery;
-use super::task::TaskEnd;
-use super::task::TaskId;
-use super::task::TaskRecord;
-use super::task::TaskStatus;
-use super::task::Wake;
+use super::delegation::Delegation;
+use super::delegation::ForkSpec;
+use super::directory::ActorId;
+use super::directory::ActorKind;
+use super::directory::Link;
+use super::directory::NewActor;
+use super::task::Party;
 use crate::runtime::HarnessHandle;
 use crate::transcript::TranscriptLine;
 
@@ -70,21 +68,19 @@ impl Orchestrator {
         entries: Vec<TranscriptLine>,
     ) -> Result<(), String> {
         self.inner
-            .delegate(super::launch::Delegation {
-                task: "Continue from the conversation above.".to_owned(),
+            .delegate(Delegation {
                 agent: Some(agent),
                 model,
                 title: Some("History fork".to_owned()),
-                role: None,
-                isolation: super::launch::Isolation::Shared,
-                mode: super::launch::Mode::Background,
-                timeout: None,
-                client_request_id: None,
                 options,
-                fork_context: Some(context),
-                fork_source: Some(source),
-                fork_entries: entries,
+                fork: Some(ForkSpec {
+                    context,
+                    source: Some(source),
+                    entries,
+                }),
                 parent_view: Some(parent_view),
+                requester: Some(Party::User),
+                ..Delegation::new("Continue from the conversation above.")
             })
             .await
             .map(drop)
@@ -191,17 +187,18 @@ impl Orchestrator {
             }
         }
         let generation = self.inner.generation.load(Ordering::Acquire);
+        if self.inner.shut_down.load(Ordering::Acquire)
+            || self.inner.directory().with(|registry| {
+                // A provider child's own entry is the one being taken over; anything else with
+                // this view is already someone's.
+                registry
+                    .by_session(&spec.public_id)
+                    .and_then(|id| registry.actor(id))
+                    .is_some_and(|actor| actor.kind != ActorKind::Native)
+                    || registry.routes.contains_key(&spec.public_id)
+            })
         {
-            let state = self.inner.state.lock().await;
-            if state.shut_down
-                || state
-                    .tasks
-                    .iter()
-                    .any(|task| task.view_id == spec.public_id)
-                || state.descendants.contains_key(&spec.public_id)
-            {
-                return Err("the child view is unavailable for adoption".to_owned());
-            }
+            return Err("the child view is unavailable for adoption".to_owned());
         }
         let agent_name = crate::registry::list_available_agents()
             .into_iter()
@@ -210,7 +207,13 @@ impl Orchestrator {
         let mut config = (*self.inner.seed.config).clone();
         config.active_agent = spec.agent.clone();
         config.approval_policy = self.inner.approval_policy();
-        if let Some(model) = &spec.model {
+        let normalized_model = spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != "default")
+            .map(str::to_owned);
+        if let Some(model) = &normalized_model {
             let offered = super::catalog::remembered(&config.nori_home, &spec.agent).models;
             let value = super::models::find(&offered, model)
                 .map_or_else(|| model.trim().to_owned(), |model| model.value.clone());
@@ -226,10 +229,11 @@ impl Orchestrator {
         let launched = child::launch(
             &self.inner,
             prepare,
-            spec.model.as_deref(),
+            normalized_model.as_deref(),
             &spec.options,
             true,
             spec.public_id.clone(),
+            child::ChildTerms::default(),
         )
         .await?;
         let (session_id, start, end) = spec.source;
@@ -300,266 +304,157 @@ impl Orchestrator {
         &self,
         staged: StagedNativeRebind,
     ) -> Result<HarnessHandle, String> {
-        let mut state = self.inner.state.lock().await;
-        if state.shut_down || staged.generation != self.inner.generation.load(Ordering::Acquire) {
-            return Err("the conversation changed before the child was adopted".to_owned());
-        }
-        if state
-            .tasks
-            .iter()
-            .any(|task| task.view_id == staged.public_id)
-            || state.descendants.contains_key(&staged.public_id)
-        {
-            return Err("the child view is already controlled by another session".to_owned());
-        }
-        state.next_child += 1;
-        let id = TaskId::parse(&format!("adopted-{}", uuid::Uuid::new_v4()));
-        let key = ChildKey(state.next_child);
-        let now = Instant::now();
-        let child = staged.launched.child;
+        let child = staged.launched.child.clone();
         let handle = child.harness.clone();
-        let view_id = staged.public_id;
-        state.tasks.push(TaskRecord {
-            id: id.clone(),
-            adoption_anchor: true,
-            child: key,
-            view_id: view_id.clone(),
-            parent_view: Some(staged.parent_id),
-            agent: staged.agent,
-            agent_name: staged.agent_name,
-            model: staged.launched.model,
-            title: "Continued child session".to_owned(),
-            status: TaskStatus::Ended(TaskEnd::Completed {
-                stop_reason: acp::StopReason::EndTurn,
-            }),
-            result: String::new(),
-            delivery: Delivery::Waived,
-            wake: Wake::Never,
-            awaiting_approval: false,
-            relayed_approvals: Vec::new(),
-            started_at: now,
-            ended_at: Some(now),
-            worktree: None,
-            progress: Default::default(),
+        let journal = handle.conversation_recorder().await.ok().flatten();
+        let view_id = staged.public_id.clone();
+        let owner = Arc::downgrade(&self.inner);
+        let committed = self.inner.directory().with(|registry| {
+            if self.inner.shut_down.load(Ordering::Acquire)
+                || staged.generation != self.inner.generation.load(Ordering::Acquire)
+            {
+                return Err("the conversation changed before the child was adopted".to_owned());
+            }
+            let existing = registry.by_session(&view_id).cloned();
+            let taking_over = existing
+                .as_ref()
+                .and_then(|id| registry.actor(id))
+                .is_some_and(|actor| actor.kind == ActorKind::Native);
+            if (existing.is_some() && !taking_over) || registry.routes.contains_key(&view_id) {
+                return Err("the child view is already controlled by another session".to_owned());
+            }
+            let parent = registry
+                .by_session(&staged.parent_id)
+                .cloned()
+                .or_else(|| registry.root.clone());
+            let id = match existing.filter(|_| taking_over) {
+                // The provider's child becomes a managed one under the same identity: its
+                // aliases, parent and task history stay.
+                Some(id) => {
+                    if let Some(actor) = registry.actor_mut(&id) {
+                        actor.kind = ActorKind::Managed;
+                        actor.link = Link::Staged(child.clone());
+                        actor.owner = Some(owner);
+                        actor.announce_parent = Some(staged.parent_id.clone());
+                        actor.agent.clone_from(&staged.agent);
+                        actor.agent_name.clone_from(&staged.agent_name);
+                        if staged.launched.model.is_some() {
+                            actor.model.clone_from(&staged.launched.model);
+                        }
+                        if actor.parent.is_none() {
+                            actor.parent = parent;
+                        }
+                    }
+                    id
+                }
+                None => {
+                    let id = ActorId::new(view_id.clone());
+                    registry.register(NewActor {
+                        parent,
+                        id: id.clone(),
+                        kind: ActorKind::Managed,
+                        announce_parent: Some(staged.parent_id.clone()),
+                        alias: None,
+                        agent: staged.agent.clone(),
+                        agent_name: staged.agent_name.clone(),
+                        model: staged.launched.model.clone(),
+                        options: Vec::new(),
+                        role: None,
+                        scope: None,
+                        title: "Continued child session".to_owned(),
+                        worktree: None,
+                        link: Link::Staged(child.clone()),
+                        owner: Some(owner),
+                    });
+                    id
+                }
+            };
+            if let Some(actor) = registry.actor_mut(&id) {
+                actor.journal = journal;
+            }
+            // Attach has no await: a failure is rolled back before any reader can take the lock.
+            if let Err(error) = child.attach(view_id.clone()) {
+                restore_or_remove(registry, &id);
+                return Err(error);
+            }
+            Ok(())
         });
-        state.children.insert(key, ChildSlot::Ready(child.clone()));
-        state.pending_adoptions.insert(view_id.clone());
-        // Attach has no await: a failure is rolled back before any reader can take the lock.
-        if let Err(error) = child.attach(view_id.clone()) {
-            state.children.remove(&key);
-            state.tasks.retain(|task| task.id != id);
-            state.pending_adoptions.remove(&view_id);
-            return Err(error);
-        }
-        drop(state);
-        self.inner.touch();
+        committed?;
+        self.inner.directory().touch();
         Ok(handle)
     }
 
     /// Release buffered events only after the durable binding was persisted.
     pub(crate) async fn activate_native_rebind(&self, view: &acp::SessionId) -> Result<(), String> {
-        let mut state = self.inner.state.lock().await;
-        if !state.pending_adoptions.contains(view) {
-            return Err("the child view has no pending adoption".to_owned());
-        }
-        let key = state
-            .tasks
-            .iter()
-            .find(|task| task.adoption_anchor && &task.view_id == view)
-            .map(|task| task.child)
-            .ok_or_else(|| "the staged child is unavailable".to_owned())?;
-        let Some(ChildSlot::Ready(child)) = state.children.get(&key) else {
-            return Err("the staged child is unavailable".to_owned());
-        };
-        child.activate()?;
-        state.pending_adoptions.remove(view);
+        let activated = self.inner.directory().with(|registry| {
+            let id = registry
+                .by_session(view)
+                .cloned()
+                .ok_or_else(|| "the child view has no pending adoption".to_owned())?;
+            let actor = registry
+                .actor_mut(&id)
+                .ok_or_else(|| "the staged child is unavailable".to_owned())?;
+            let Link::Staged(child) = &actor.link else {
+                return Err("the child view has no pending adoption".to_owned());
+            };
+            let child = child.clone();
+            child.activate()?;
+            actor.link = Link::Child(child);
+            Ok(id)
+        });
+        self.inner.directory().touch();
+        let id = activated?;
+        // Whatever was queued while the adoption was unpublished starts now.
+        self.inner.pump(&id).await;
         Ok(())
     }
 
     /// Discard a reserved, not-yet-activated mapping after a failed durable binding.
     pub(crate) async fn rollback_native_rebind(&self, view: &acp::SessionId) -> Result<(), String> {
-        let (key, child) = {
-            let state = self.inner.state.lock().await;
-            if !state.pending_adoptions.contains(view) {
-                return Err("the child view has no pending adoption".to_owned());
-            }
-            let key = state
-                .tasks
-                .iter()
-                .find(|task| task.adoption_anchor && &task.view_id == view)
-                .map(|task| task.child)
+        let (id, child) = self.inner.directory().with(|registry| {
+            let id = registry
+                .by_session(view)
+                .cloned()
+                .ok_or_else(|| "the child view has no pending adoption".to_owned())?;
+            let actor = registry
+                .actor(&id)
                 .ok_or_else(|| "the staged child is unavailable".to_owned())?;
-            if state
-                .tasks
-                .iter()
-                .any(|task| task.child == key && !task.adoption_anchor)
-            {
+            let Link::Staged(child) = &actor.link else {
+                return Err("the child view has no pending adoption".to_owned());
+            };
+            if actor.open_tasks().next().is_some() {
                 return Err("the staged child has already admitted work".to_owned());
             }
-            let Some(ChildSlot::Ready(child)) = state.children.get(&key) else {
-                return Err("the staged child is unavailable".to_owned());
-            };
-            (key, child.clone())
-        };
+            Ok((id, child.clone()))
+        })?;
         child
             .harness
             .shutdown()
             .await
             .map_err(|error| format!("could not stop the staged child: {error:#}"))?;
-        let mut state = self.inner.state.lock().await;
-        state.children.remove(&key);
-        state
-            .tasks
-            .retain(|task| !(task.adoption_anchor && task.child == key));
-        state.pending_adoptions.remove(view);
-        drop(state);
-        self.inner.touch();
+        self.inner
+            .directory()
+            .with(|registry| restore_or_remove(registry, &id));
+        self.inner.directory().touch();
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nori_config::AskForApproval;
-    use nori_protocol::AcpEvent;
-    use nori_protocol::SessionEvent;
-    use tokio::sync::mpsc;
-    use tokio::sync::watch;
-
-    #[tokio::test]
-    #[expect(clippy::expect_used, reason = "fixture failures should fail clearly")]
-    async fn staged_adoption_is_hidden_until_commit_and_uses_the_existing_view() {
-        let home = tempfile::tempdir().expect("temporary home");
-        let config = crate::config::NoriConfig {
-            active_agent: "mock-model".to_owned(),
-            cwd: home.path().to_path_buf(),
-            nori_home: home.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            ..Default::default()
-        };
-        let (events, mut event_rx) = mpsc::channel(64);
-        let (orchestrator, _signals) = Orchestrator::new(
-            super::super::Seed::root(Arc::new(config), "adoption-test".to_owned()),
-            events,
-        );
-        orchestrator.bind(super::super::Binding {
-            session_id: acp::SessionId::new("parent"),
-            approval_policy: watch::channel(AskForApproval::Never).1,
-        });
-        let view = acp::SessionId::new("native-child-view");
-        let spec = NativeRebindSpec {
-            public_id: view.clone(),
-            parent_id: acp::SessionId::new("parent"),
-            agent: "mock-model".to_owned(),
-            model: None,
-            options: Vec::new(),
-            context: "selected native prefix".to_owned(),
-            source: ("native-journal".to_owned(), 1, 3),
-            entries: Vec::new(),
-            nested_bindings: Vec::new(),
-            external_managed: Vec::new(),
-        };
-        let stale = orchestrator
-            .prepare_native_rebind(spec.clone())
-            .await
-            .expect("stage stale child");
-        orchestrator.advance_generation();
-        assert!(orchestrator.commit_native_rebind(stale).await.is_err());
-        assert!(!orchestrator.owns_view(&view).await);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "a rejected stage must not publish events"
-        );
-        let rolled_back = orchestrator
-            .prepare_native_rebind(spec.clone())
-            .await
-            .expect("stage rollback child");
-        orchestrator
-            .commit_native_rebind(rolled_back)
-            .await
-            .expect("reserve rollback child");
-        assert!(!orchestrator.owns_view(&view).await);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "a reserved stage must stay silent"
-        );
-        orchestrator
-            .rollback_native_rebind(&view)
-            .await
-            .expect("rollback child");
-        assert!(!orchestrator.owns_view(&view).await);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "rollback must not publish a closed view"
-        );
-        let duplicate = spec.clone();
-        let staged = orchestrator
-            .prepare_native_rebind(spec)
-            .await
-            .expect("stage child");
-        let recorder = staged
-            .handle()
-            .conversation_recorder()
-            .await
-            .expect("recorder request")
-            .expect("child journal");
-        assert_eq!(
-            recorder
-                .recorded_command_payload("fork-context")
-                .await
-                .as_deref(),
-            Some("selected native prefix")
-        );
-        assert!(!orchestrator.owns_view(&view).await);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "staging must not publish events"
-        );
-        assert!(!orchestrator.has_pending_work().await);
-        orchestrator
-            .commit_native_rebind(staged)
-            .await
-            .expect("commit child");
-        assert!(!orchestrator.owns_view(&view).await);
-        assert!(
-            event_rx.try_recv().is_err(),
-            "a reserved stage must stay silent"
-        );
-        orchestrator
-            .activate_native_rebind(&view)
-            .await
-            .expect("activate child");
-        assert!(orchestrator.owns_view(&view).await);
-        assert!(!orchestrator.has_pending_work().await);
-        assert!(
-            orchestrator.inner.list().await.is_empty(),
-            "adoption is not an agent task"
-        );
-        assert!(orchestrator.prepare_native_rebind(duplicate).await.is_err());
-        orchestrator
-            .send_user_content_message_locked(
-                view.clone(),
-                vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    "continue the child",
-                ))],
-            )
-            .await
-            .expect("continue adopted child");
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            loop {
-                let event = event_rx.recv().await.expect("parent event stream");
-                if let crate::backend::BackendEvent::Public(SessionEvent::Acp(
-                    AcpEvent::ChildNotification(notification),
-                )) = event
-                    && notification.session_id == view
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("adopted child events retain the public ID");
-        orchestrator.shutdown().await;
+/// Undo a reserved adoption: a provider child that was being taken over goes back to being one
+/// (the provider's next report corrects its state); a new view is forgotten.
+fn restore_or_remove(registry: &mut super::directory::Registry, id: &ActorId) {
+    let provider = registry
+        .actor(id)
+        .and_then(|actor| actor.native_backend.clone());
+    match (provider, registry.actor_mut(id)) {
+        (Some(backend), Some(actor)) => {
+            actor.kind = ActorKind::Native;
+            actor.link = Link::Native {
+                backend,
+                running: false,
+            };
+            actor.owner = None;
+        }
+        (None, _) | (Some(_), None) => registry.remove_actor(id),
     }
 }

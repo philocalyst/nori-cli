@@ -1,6 +1,6 @@
 //! What a child is told, and what the user sees a task called.
 
-use super::launch::Role;
+use super::delegation::Role;
 
 /// The title shown for a task: the one given, else the task's first line, shortened.
 pub(super) fn task_title(title: Option<&str>, task: &str) -> String {

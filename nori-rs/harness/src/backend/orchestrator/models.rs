@@ -27,7 +27,10 @@ impl Models {
     pub(super) fn of(options: &[acp::SessionConfigOption]) -> Option<Self> {
         options
             .iter()
-            .find(|option| option.category == Some(acp::SessionConfigOptionCategory::Model))
+            .find(|option| {
+                option.category == Some(acp::SessionConfigOptionCategory::Model)
+                    || option.id.to_string() == "model"
+            })
             .and_then(Self::from_option)
     }
 
@@ -46,7 +49,10 @@ impl Models {
     pub(super) fn settings(options: &[acp::SessionConfigOption]) -> Vec<Self> {
         options
             .iter()
-            .filter(|option| option.category != Some(acp::SessionConfigOptionCategory::Model))
+            .filter(|option| {
+                option.category != Some(acp::SessionConfigOptionCategory::Model)
+                    && option.id.to_string() != "model"
+            })
             .filter_map(Self::from_option)
             .collect()
     }
@@ -149,7 +155,7 @@ pub(super) async fn select_model(
     injected: bool,
 ) -> Result<String, String> {
     let Some(models) = Models::of(options) else {
-        if injected {
+        if injected || requested.trim() == "default" {
             return Ok(requested.trim().to_owned());
         }
         return Err(format!(
@@ -168,10 +174,11 @@ pub(super) async fn select_model(
         ));
     };
     if choice.value != models.current {
-        harness
+        let updated = harness
             .set_session_config_option(models.config_id.clone(), choice.value.clone())
             .await
             .map_err(|error| format!("the agent refused model `{}`: {error:#}", choice.value))?;
+        return Ok(current_model(&updated).unwrap_or_else(|| choice.name.clone()));
     }
     Ok(choice.name.clone())
 }
@@ -242,6 +249,14 @@ mod tests {
             )
             .category(acp::SessionConfigOptionCategory::Model),
         ]
+    }
+
+    #[test]
+    fn a_model_option_without_a_category_still_reports_its_current_choice() {
+        let mut options = options();
+        options[0].category = None;
+        assert_eq!(current_model(&options), Some("GPT-5.1".to_owned()));
+        assert!(Models::settings(&options).is_empty());
     }
 
     #[test]

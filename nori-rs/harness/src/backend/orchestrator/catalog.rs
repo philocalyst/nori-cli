@@ -16,6 +16,7 @@ use nori_protocol::acp::v1 as acp;
 
 use super::models::Model;
 use super::models::Models;
+use crate::recovery::Availability;
 
 const FILE: &str = "agent-models.json";
 
@@ -29,6 +30,98 @@ pub(super) struct Offer {
     /// When it was last read, in seconds since the Unix epoch.
     #[serde(default)]
     pub(super) refreshed_at: i64,
+    /// Models a session found it cannot run, though the agent still lists them.
+    #[serde(default)]
+    pub(super) unavailable: Vec<Unavailable>,
+}
+
+/// A model that failed as unavailable (HTTP 404, a stale id), and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Unavailable {
+    pub(super) model: String,
+    pub(super) reason: String,
+    /// When it failed, in seconds since the Unix epoch.
+    pub(super) at: i64,
+}
+
+/// How long a failed model stays marked before it is offered again.
+const UNAVAILABLE_FOR_SECONDS: i64 = 6 * 60 * 60;
+
+/// A model an agent last advertised, with whether it can be run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OfferedModel {
+    pub(crate) value: String,
+    pub(crate) name: String,
+    pub(crate) availability: Availability,
+}
+
+/// The models `agent` last advertised. A placeholder id is never runnable, and a model that
+/// failed as unavailable recently is reported with that failure instead of as runnable.
+pub(crate) fn offered_models(home: &Path, agent: &str) -> Vec<OfferedModel> {
+    let offer = remembered(home, agent);
+    let now = now_seconds();
+    offer
+        .models
+        .into_iter()
+        .map(|model| {
+            let failed = offer
+                .unavailable
+                .iter()
+                .find(|mark| mark.model == model.value && now - mark.at < UNAVAILABLE_FOR_SECONDS);
+            let availability = if model
+                .value
+                .to_ascii_uppercase()
+                .contains("MODEL_PLACEHOLDER")
+            {
+                Availability::Unavailable {
+                    reason: "the agent advertised an unfilled model placeholder".to_owned(),
+                }
+            } else if let Some(failed) = failed {
+                Availability::Unavailable {
+                    reason: failed.reason.clone(),
+                }
+            } else {
+                Availability::Runnable
+            };
+            OfferedModel {
+                value: model.value,
+                name: model.name,
+                availability,
+            }
+        })
+        .collect()
+}
+
+/// Whether `agent` advertises `model` as of when it last ran (a placeholder id never counts).
+pub(crate) fn advertises(home: &Path, agent: &str, model: &str) -> bool {
+    !model.to_ascii_uppercase().contains("MODEL_PLACEHOLDER")
+        && remembered(home, agent)
+            .models
+            .iter()
+            .any(|offered| offered.value == model)
+}
+
+/// `model` is confirmed to work on `agent` again: it is offered as runnable once more.
+pub(crate) fn clear_unavailable(home: &Path, agent: &str, model: &str) {
+    let mut offer = remembered(home, agent);
+    let before = offer.unavailable.len();
+    offer.unavailable.retain(|mark| mark.model != model);
+    if offer.unavailable.len() != before {
+        store(home, agent, offer);
+    }
+}
+
+/// Remember that `model` failed on `agent` with `reason`, so nothing offers it as runnable
+/// until the mark expires.
+pub(crate) fn mark_unavailable(home: &Path, agent: &str, model: &str, reason: &str) {
+    let mut offer = remembered(home, agent);
+    offer.unavailable.retain(|mark| mark.model != model);
+    offer.unavailable.push(Unavailable {
+        model: model.to_owned(),
+        reason: reason.to_owned(),
+        at: now_seconds(),
+    });
+    store(home, agent, offer);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -40,23 +133,34 @@ pub(super) struct Setting {
 
 #[derive(Default)]
 struct Catalog {
-    /// The Nori home `agents` was read from.
-    home: Option<PathBuf>,
+    homes: BTreeMap<PathBuf, HomeCatalog>,
+}
+
+struct HomeCatalog {
     agents: BTreeMap<String, Offer>,
+    dirty: BTreeMap<String, Offer>,
+    generation: i64,
+    writer: std::sync::Arc<Mutex<()>>,
 }
 
 static CATALOG: LazyLock<Mutex<Catalog>> = LazyLock::new(Default::default);
 
-fn with_catalog<T>(home: &Path, read: impl FnOnce(&mut BTreeMap<String, Offer>) -> T) -> T {
+fn with_catalog<T>(home: &Path, read: impl FnOnce(&mut HomeCatalog) -> T) -> T {
     let mut catalog = CATALOG.lock().unwrap_or_else(PoisonError::into_inner);
-    if catalog.home.as_deref() != Some(home) {
-        catalog.agents = std::fs::read(home.join(FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        catalog.home = Some(home.to_owned());
-    }
-    read(&mut catalog.agents)
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_owned());
+    let entry = catalog
+        .homes
+        .entry(home.clone())
+        .or_insert_with(|| HomeCatalog {
+            agents: std::fs::read(home.join(FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default(),
+            dirty: BTreeMap::new(),
+            generation: 0,
+            writer: std::sync::Arc::new(Mutex::new(())),
+        });
+    read(entry)
 }
 
 /// Remember what `agent` offers, from a session's advertised options.
@@ -74,22 +178,82 @@ pub(crate) fn remember(home: &Path, agent: &str, options: &[acp::SessionConfigOp
             })
             .collect(),
         refreshed_at: now_seconds(),
+        // A fresh advertisement does not prove a failed model works; keep its marks while
+        // the agent still lists it.
+        unavailable: remembered(home, agent)
+            .unavailable
+            .into_iter()
+            .filter(|mark| options_list_model(options, &mark.model))
+            .collect(),
     };
     if offer.models.is_empty() && offer.settings.is_empty() {
         return;
     }
-    let agents = with_catalog(home, |agents| {
-        agents.insert(agent.to_owned(), offer);
-        agents.clone()
+    store(home, agent, offer);
+}
+
+fn options_list_model(options: &[acp::SessionConfigOption], model: &str) -> bool {
+    Models::of(options).is_some_and(|models| models.offered.iter().any(|m| m.value == model))
+}
+
+/// Keep `offer` as what `agent` offers: in memory now, on disk in the background.
+fn store(home: &Path, agent: &str, offer: Offer) {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_owned());
+    let (generation, writer) = with_catalog(&home, |catalog| {
+        catalog.agents.insert(agent.to_owned(), offer.clone());
+        catalog.dirty.insert(agent.to_owned(), offer);
+        catalog.generation = catalog.generation.saturating_add(1);
+        (catalog.generation, std::sync::Arc::clone(&catalog.writer))
     });
-    let path = home.join(FILE);
     let write = move || {
+        let _guard = writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let dirty = {
+            let catalog = CATALOG.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(current) = catalog.homes.get(&home) else {
+                return;
+            };
+            if current.generation != generation {
+                return;
+            }
+            current.dirty.clone()
+        };
+        // Other Nori processes share this file. Merge only offers changed by
+        // this process, under an OS lock, so their providers cannot disappear
+        // when a stale in-memory snapshot finishes writing later.
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(home.join("agent-models.lock"))
+        else {
+            return;
+        };
+        if lock.lock().is_err() {
+            return;
+        }
+        let path = home.join(FILE);
+        let mut agents: BTreeMap<String, Offer> = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        agents.extend(dirty.clone());
         let Ok(json) = serde_json::to_vec_pretty(&agents) else {
             return;
         };
-        let temporary = path.with_extension("json.tmp");
-        if std::fs::write(&temporary, json).is_ok() {
-            let _ = std::fs::rename(&temporary, &path);
+        let process = std::process::id();
+        let temporary = home.join(format!("{FILE}.{process}.{generation}.tmp"));
+        if std::fs::write(&temporary, json).is_ok() && std::fs::rename(&temporary, &path).is_ok() {
+            let mut catalog = CATALOG.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(current) = catalog.homes.get_mut(&home) {
+                for (agent, offer) in dirty {
+                    if current.dirty.get(&agent) == Some(&offer) {
+                        current.dirty.remove(&agent);
+                    }
+                }
+                agents.extend(current.dirty.clone());
+                current.agents = agents;
+            }
         }
     };
     match tokio::runtime::Handle::try_current() {
@@ -108,8 +272,8 @@ pub(super) fn now_seconds() -> i64 {
 
 /// What `agent` offered when it last ran.
 pub(super) fn remembered(home: &Path, agent: &str) -> Offer {
-    with_catalog(home, |agents| {
-        agents.get(agent).cloned().unwrap_or_default()
+    with_catalog(home, |catalog| {
+        catalog.agents.get(agent).cloned().unwrap_or_default()
     })
 }
 
@@ -136,7 +300,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         // A new process reads the file.
-        CATALOG.lock().unwrap_or_else(PoisonError::into_inner).home = None;
+        CATALOG
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .homes
+            .remove(&home.path().canonicalize().expect("canonical home"));
         assert_eq!(
             remembered(home.path(), "codex").models,
             vec![Model {
@@ -146,5 +314,105 @@ mod tests {
         );
         assert!(remembered(home.path(), "codex").refreshed_at > 0);
         assert_eq!(remembered(home.path(), "claude"), Offer::default());
+    }
+
+    #[tokio::test]
+    async fn independent_homes_keep_their_catalogs_when_writes_overlap() {
+        let first = tempfile::tempdir().expect("first home");
+        let second = tempfile::tempdir().expect("second home");
+        let options = |value: &str| {
+            vec![
+                acp::SessionConfigOption::select(
+                    "model",
+                    "Model",
+                    value.to_owned(),
+                    vec![acp::SessionConfigSelectOption::new(
+                        value.to_owned(),
+                        value.to_owned(),
+                    )],
+                )
+                .category(acp::SessionConfigOptionCategory::Model),
+            ]
+        };
+        let writer = with_catalog(first.path(), |catalog| {
+            std::sync::Arc::clone(&catalog.writer)
+        });
+        {
+            let _guard = writer.lock().unwrap_or_else(PoisonError::into_inner);
+            remember(first.path(), "codex", &options("first"));
+            remember(second.path(), "opencode", &options("second"));
+            assert!(!first.path().join(FILE).exists());
+            // The first write is blocked: switching homes cannot recover its
+            // offers from disk, and must retain them in memory.
+            assert_eq!(remembered(first.path(), "codex").models[0].value, "first");
+            remember(first.path(), "codex", &options("latest"));
+            remember(first.path(), "claude", &options("another agent"));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (!first.path().join(FILE).exists() || !second.path().join(FILE).exists())
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let persisted: BTreeMap<String, Offer> = serde_json::from_slice(
+            &std::fs::read(first.path().join(FILE)).expect("persisted first home"),
+        )
+        .expect("catalog JSON");
+        assert_eq!(
+            persisted.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["claude", "codex"]
+        );
+        assert_eq!(persisted["codex"].models[0].value, "latest");
+        assert_eq!(remembered(first.path(), "codex").models[0].value, "latest");
+        assert_eq!(
+            remembered(second.path(), "opencode").models[0].value,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_merges_external_offers_instead_of_overwriting_with_a_stale_snapshot() {
+        let home = tempfile::tempdir().expect("home");
+        assert_eq!(remembered(home.path(), "external"), Offer::default());
+        let external = Offer {
+            models: vec![Model {
+                value: "external-model".to_owned(),
+                name: "external-model".to_owned(),
+            }],
+            ..Offer::default()
+        };
+        let path = home.path().join(FILE);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&BTreeMap::from([("external".to_owned(), external.clone())]))
+                .expect("external catalog JSON"),
+        )
+        .expect("another process's catalog write");
+        let options = vec![
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "local-model",
+                vec![acp::SessionConfigSelectOption::new("local-model", "Local")],
+            )
+            .category(acp::SessionConfigOptionCategory::Model),
+        ];
+        remember(home.path(), "local", &options);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let persisted: BTreeMap<String, Offer> =
+                serde_json::from_slice(&std::fs::read(&path).expect("catalog file"))
+                    .expect("catalog JSON");
+            if persisted.contains_key("local") {
+                assert_eq!(persisted.get("external"), Some(&external));
+                assert_eq!(persisted.len(), 2);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "catalog did not persist"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }

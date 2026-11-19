@@ -10,6 +10,8 @@ pub(super) struct RestoredChild {
     pub(super) parent: acp::SessionId,
     pub(super) events: Vec<nori_protocol::SessionEvent>,
     pub(super) retired: Vec<acp::SessionId>,
+    /// What the user's view shows the child as once restored.
+    pub(super) state: nori_protocol::SubagentState,
 }
 
 impl AcpBackend {
@@ -147,7 +149,12 @@ impl AcpBackend {
                 parent,
                 events,
                 retired: vec![id],
+                state: nori_protocol::SubagentState::Idle,
             });
+        }
+        // The rest of the tree: children, mail and task history of the previous run, dormant.
+        if previous_root.is_some() {
+            restored.extend(self.restore_actor_directory(&parent_recorder).await);
         }
         Ok(restored)
     }
@@ -190,10 +197,19 @@ impl AcpBackend {
                 continue;
             }
             let id = acp::SessionId::new(name.trim_start_matches("native-child-journal:"));
-            let value: serde_json::Value = serde_json::from_str(&payload)?;
+            let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+            if value.get("rebound").is_none() {
+                let Some(recovered) = self
+                    .recover_or_archive_uninitialized_native_child(id.clone(), value, &all_ids)
+                    .await?
+                else {
+                    continue;
+                };
+                value = serde_json::to_value(recovered)?;
+            }
             anyhow::ensure!(
                 value.get("rebound").and_then(serde_json::Value::as_bool) == Some(true),
-                "Selected descendant has no independent durable binding"
+                "Selected descendant has an invalid independent durable binding"
             );
             let parent = value
                 .get("parent")
@@ -202,8 +218,6 @@ impl AcpBackend {
                 .to_owned();
             children.push((id, parent));
         }
-        let ids: std::collections::HashSet<_> =
-            children.iter().map(|(id, _)| id.to_string()).collect();
         let mut pending = children;
         while !pending.is_empty() {
             let index = pending
@@ -211,7 +225,7 @@ impl AcpBackend {
                 .position(|(_, parent)| !pending.iter().any(|(id, _)| id.to_string() == *parent))
                 .context("Selected descendant hierarchy contains a cycle")?;
             let (id, parent) = pending.remove(index);
-            let parent_id = if ids.contains(&parent) {
+            let parent_id = if all_ids.contains(&parent) {
                 acp::SessionId::new(parent.clone())
             } else {
                 root.clone()
@@ -220,6 +234,7 @@ impl AcpBackend {
                 parent_session_id: parent_id,
                 session_id: id.clone(),
                 agent: Patch::Keep,
+                model: Patch::Keep,
                 title: Patch::Keep,
                 description: Patch::Keep,
                 state: Patch::Keep,
@@ -233,7 +248,7 @@ impl AcpBackend {
                 )
                 .await;
             // Rebase only the selected binding's original owning session to this new engine.
-            if !ids.contains(&parent) {
+            if !all_ids.contains(&parent) {
                 let mut binding = self
                     .native_children
                     .rebound_binding(&id)
@@ -256,6 +271,7 @@ impl AcpBackend {
                 parent_session_id: child.parent,
                 session_id: id.clone(),
                 agent: Patch::Keep,
+                model: Patch::Keep,
                 title: Patch::Keep,
                 description: Patch::Keep,
                 state: Patch::Set(SubagentState::Idle),
@@ -385,6 +401,7 @@ impl AcpBackend {
                 parent,
                 events,
                 retired,
+                state: nori_protocol::SubagentState::Idle,
             });
         }
         Ok(restored)

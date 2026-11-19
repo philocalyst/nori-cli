@@ -89,7 +89,7 @@ impl NativeHistory {
             )
         } else {
             let recorder = Arc::new(
-                TranscriptRecorder::new(
+                TranscriptRecorder::new_delegated(
                     &self.home,
                     &self.cwd,
                     Some(self.agent.clone()),
@@ -284,6 +284,34 @@ impl NativeHistory {
             .await?
             .record_session_event(&SessionEventEntry::new(event))
             .await?;
+        Ok(())
+    }
+
+    /// A native child may stop before publishing configuration. Keep its initial
+    /// journal reference with the immediate owner before recording its announcement.
+    pub(super) async fn record_descendant_reference(
+        &self,
+        parent: &acp::SessionId,
+        child: &acp::SessionId,
+    ) -> Result<()> {
+        let child_recorder = self.recorder(child).await?;
+        let parent_recorder = self.recorder(parent).await?;
+        let key = format!("native-child-journal:{child}");
+        if parent_recorder
+            .recorded_command_payload(&key)
+            .await
+            .is_none()
+        {
+            persist_binding(
+                &parent_recorder,
+                &key,
+                serde_json::json!({
+                    "project": child_recorder.project_id(), "session": child_recorder.session_id(),
+                })
+                .to_string(),
+            )
+            .await?;
+        }
         Ok(())
     }
 

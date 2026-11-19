@@ -13,15 +13,11 @@ use rmcp::tool_router;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::launch::Delegation;
-use super::launch::Isolation;
-use super::launch::Mode;
-use super::launch::Role;
-use super::task::TaskId;
+use super::delegation::Delegation;
+use super::delegation::Isolation;
+use super::delegation::Mode;
+use super::delegation::Role;
 use crate::backend::nori_client_mcp::NoriClientService;
-
-/// What the server tells agents about delegation, after its other instructions.
-pub(crate) const INSTRUCTIONS: &str = nori_host_tools::DELEGATION_INSTRUCTIONS;
 
 /// `agent_capabilities` re-reads agents whose entry is older than this...
 const CAPABILITIES_FRESH_FOR: Duration = Duration::from_secs(120);
@@ -76,22 +72,58 @@ pub(crate) struct DelegateTaskRequest {
     /// `agent_capabilities` lists: for example `{"thought_level": "high"}`.
     #[serde(default)]
     options: Option<std::collections::BTreeMap<String, String>>,
+    /// A one-word name for the child, such as `reviewer`, so you and other actors can message it
+    /// again (`task_send`, `actor://reviewer`). An alias that already names a live actor sends it
+    /// this task instead of starting a second child; an ended one is revived.
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskIdRequest {
-    /// Required. The `task_id` that `delegate_task` or `task_send` returned.
-    task_id: String,
+pub(crate) struct TaskTargetRequest {
+    /// Required. A `task-N` you started, or an actor: its alias, `actor://alias` or session id.
+    #[serde(
+        alias = "task_id",
+        alias = "actor",
+        alias = "id",
+        alias = "to",
+        alias = "recipient"
+    )]
+    target: String,
+}
+
+/// A list of addresses, or the one address a model wrote instead of a list.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(untagged)]
+pub(crate) enum OneOrMany {
+    Many(Vec<String>),
+    One(String),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Many(many) => many,
+            Self::One(one) => vec![one],
+        }
+    }
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskWaitRequest {
-    /// Required. The tasks to wait for.
-    task_ids: Vec<String>,
+    /// Required. The tasks (`task-N`) or actors (alias) to wait for; one is enough.
+    #[serde(
+        alias = "task_ids",
+        alias = "actors",
+        alias = "target",
+        alias = "task_id"
+    )]
+    targets: OneOrMany,
     /// Seconds to block: default 45, at most 50. A timeout cancels nothing.
     #[serde(default)]
     timeout_seconds: Option<i64>,
@@ -101,10 +133,25 @@ pub(crate) struct TaskWaitRequest {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskSendRequest {
-    /// Required. A finished task whose child gets the message.
-    task_id: String,
-    /// Required. The follow-up. The child keeps its whole conversation, so this can refer to it.
+    /// Required. Who gets the message: an alias, `actor://alias`, `actor://<session-id>`, or a
+    /// `task-N` (the actor that ran it).
+    #[serde(
+        alias = "to",
+        alias = "task_id",
+        alias = "actor",
+        alias = "recipient",
+        alias = "id"
+    )]
+    target: String,
+    /// Required. The message. The actor keeps its whole conversation, so this can refer to it.
     message: String,
+    /// Interrupt the actor's current turn so it reads this message next.
+    #[serde(default)]
+    steer: Option<bool>,
+    /// Also tell your parent when this exchange settles (neither side has mail or a turn left),
+    /// so it need not poll. Replies in the exchange keep the setting.
+    #[serde(default)]
+    cc_parent: Option<bool>,
     /// `background` (default) or `wait`, as for `delegate_task`.
     #[serde(default)]
     mode: Option<Mode>,
@@ -116,7 +163,7 @@ pub(crate) struct TaskSendRequest {
 #[tool_router(router = task_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "List the agents you can delegate tasks to, with the models and other settings (such as reasoning effort) each offers, plus your current delegation depth and running-task count.",
+        description = "List the agents you can delegate to, with the models and other settings (such as reasoning effort) each offers, plus your delegation depth and the number of tasks running.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
@@ -147,7 +194,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Start a task on a child agent (choices: `agent_capabilities`). The child sees only `task`, not this conversation, and cannot ask questions. Returns a `task_id` at once; the result arrives as a message, so don't poll, and use `mode: wait` only if you cannot go on without it. `isolation: shared` edits your files directly: give parallel children disjoint files, or use `isolation: worktree`. No secrets in `task`.",
+        description = "Start a child actor on a task; returns once its session is running, or an error with the cause. The child sees only `task`, not this conversation, and cannot ask questions. Its result arrives as a new message, so don't poll; use `mode: wait` only if you cannot go on without it. Give an `alias` to message it again with `task_send`: an alias that names a live actor sends it the task instead of starting a second child. `isolation: shared` edits your files directly: give parallel children disjoint files, or use `isolation: worktree`. No secrets in `task`.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true),
         meta = always_load()
     )]
@@ -156,7 +203,6 @@ impl NoriClientService {
         Parameters(request): Parameters<DelegateTaskRequest>,
     ) -> Result<CallToolResult, McpError> {
         let delegation = Delegation {
-            task: request.task,
             agent: request.agent,
             model: request.model,
             title: request.title,
@@ -166,10 +212,8 @@ impl NoriClientService {
             timeout: seconds(request.timeout_seconds),
             client_request_id: request.client_request_id,
             options: request.options.unwrap_or_default().into_iter().collect(),
-            fork_context: None,
-            fork_source: None,
-            fork_entries: Vec::new(),
-            parent_view: None,
+            alias: request.alias,
+            ..Delegation::new(request.task)
         };
         let inner = Arc::clone(self.orchestrator().inner());
         Ok(outcome(
@@ -178,24 +222,19 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Read one delegated task: `status`, the child's current `activity` and `tool_calls` while it runs, the files its edit tools changed, and its final message once finished. Reading a finished task delivers its result, so it is not also sent as a message.",
+        description = "Read a task (`task-N`), or an actor's latest task of yours: `status`, where its message got (`delivery`: queued = not read yet, delivered, acknowledged), the child's current `activity`, files changed, and its final message once finished. Reading a finished task delivers its result, so it is not also sent as a message. Messages waiting for you arrive in `inbox`. Never poll: results and replies arrive as new messages.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
     pub(crate) async fn task_status(
         &self,
-        Parameters(TaskIdRequest { task_id }): Parameters<TaskIdRequest>,
+        Parameters(TaskTargetRequest { target }): Parameters<TaskTargetRequest>,
     ) -> Result<CallToolResult, McpError> {
-        Ok(outcome(
-            self.orchestrator()
-                .inner()
-                .status(&TaskId::parse(&task_id), true)
-                .await,
-        ))
+        Ok(outcome(self.orchestrator().inner().status(&target).await))
     }
 
     #[tool(
-        description = "Block until the listed tasks finish, one awaits the user's approval, or the timeout passes. Only when you cannot continue without the results; they otherwise arrive as messages.",
+        description = "Block until the listed tasks or actors finish, one awaits the user's approval, a message arrives for you, or the timeout passes. Only when you cannot continue without a child's result. It returns at once for a message to a peer (nothing comes back to it): end your turn instead, replies arrive as new messages.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
@@ -203,23 +242,17 @@ impl NoriClientService {
         &self,
         Parameters(request): Parameters<TaskWaitRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let ids: Vec<TaskId> = request
-            .task_ids
-            .iter()
-            .map(|id| TaskId::parse(id))
-            .collect();
         let timeout = seconds(request.timeout_seconds).unwrap_or(super::DEFAULT_WAIT);
         Ok(outcome(
             self.orchestrator()
                 .inner()
-                .wait(&ids, timeout)
-                .await
-                .map(|tasks| TaskList { tasks }),
+                .wait(&request.targets.into_vec(), timeout)
+                .await,
         ))
     }
 
     #[tool(
-        description = "Send a follow-up to the child that ran a finished task. The child keeps its whole conversation. Starts a new task on that child and returns its `task_id`; its result is delivered like any other.",
+        description = "Send a message to any actor: `target` is a `task-N`, an alias, `actor://alias` or a session id. The same actor always gets it, never a new child. An idle actor takes it now, a working one at its next turn boundary (`steer: true` interrupts its turn first), an ended one is revived with its history. To a child you delegated to it is a task and its answer returns to you; to anyone else it is mail and they answer with their own `task_send`. Returns the task with `delivery` (`queued` = not read yet). Do not wait for a reply: end your turn; set `cc_parent` to be told by your parent's mail when an exchange between you and a peer settles.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -234,13 +267,13 @@ impl NoriClientService {
         Ok(outcome(
             detached(async move {
                 inner
-                    .send(
-                        &TaskId::parse(&request.task_id),
+                    .send_to_address(
+                        &request.target,
                         request.message,
                         request.mode.unwrap_or_default(),
                         seconds(request.timeout_seconds),
-                        super::launch::FollowUp::Tool,
-                        None,
+                        request.steer.unwrap_or(false),
+                        request.cc_parent.unwrap_or(false),
                     )
                     .await
             })
@@ -249,7 +282,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Stop a delegated task, and the tasks it delegated in turn. A task that has already finished keeps its result. A cancelled task's result is not delivered.",
+        description = "Stop a task, or whatever you asked of an actor. The actor stays and can be messaged again. A task that already finished keeps its result; a cancelled task's result is not delivered.",
         annotations(
             destructive_hint = true,
             idempotent_hint = true,
@@ -258,28 +291,21 @@ impl NoriClientService {
     )]
     pub(crate) async fn task_cancel(
         &self,
-        Parameters(TaskIdRequest { task_id }): Parameters<TaskIdRequest>,
+        Parameters(TaskTargetRequest { target }): Parameters<TaskTargetRequest>,
     ) -> Result<CallToolResult, McpError> {
         let inner = Arc::clone(self.orchestrator().inner());
         Ok(outcome(
-            detached(async move { inner.cancel(&TaskId::parse(&task_id)).await }).await,
+            detached(async move { inner.cancel(&target).await }).await,
         ))
     }
 
     #[tool(
-        description = "List every task you delegated in this session with its status.",
+        description = "List the actors you can address (alias, agent, state) and the tasks you gave them with their delivery state. Messages waiting for you arrive in `inbox`.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn task_list(&self) -> Result<CallToolResult, McpError> {
-        Ok(json(&TaskList {
-            tasks: self.orchestrator().inner().list().await,
-        }))
+        Ok(outcome(self.orchestrator().inner().list().await))
     }
-}
-
-#[derive(Serialize)]
-struct TaskList {
-    tasks: Vec<super::task::TaskSnapshot>,
 }
 
 /// Asks Claude Code to keep a tool loaded rather than behind its tool search, for the tools an
@@ -314,6 +340,7 @@ fn json(value: &impl Serialize) -> CallToolResult {
     }
 }
 
+/// A tool result: the value as JSON, or an error the model can read and act on.
 fn outcome(result: Result<impl Serialize, String>) -> CallToolResult {
     match result {
         Ok(value) => json(&value),

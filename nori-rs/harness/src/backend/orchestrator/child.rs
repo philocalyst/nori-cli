@@ -4,43 +4,32 @@
 //! the child does into the parent's stream under the task's view id, asks the user for the child's
 //! permissions through the parent, and reports the turn's end with the child's final message.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::Weak;
-use std::time::Duration;
-
-use nori_protocol::NoriEvent;
-use nori_protocol::SessionEvent;
-use nori_protocol::SessionPhase;
-use nori_protocol::SubagentState;
-use nori_protocol::SubagentWire;
-use nori_protocol::acp::v1 as acp;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use super::Inner;
-use super::task::TaskEnd;
 use super::task::TaskId;
 use crate::runtime::HarnessHandle;
+use nori_protocol::acp::v1 as acp;
 
+mod actor;
+mod final_text;
+mod launch;
+mod phase;
 mod relay;
 
-/// How long an agent may take to start and open a session before the task fails. Agents that
-/// install themselves on first use (npx, uvx) need the margin.
-const LAUNCH_TIMEOUT: Duration = Duration::from_secs(180);
-/// A child whose own delegations all ended is given this long to start the turn that takes their
-/// results before its task ends without one.
-const CHILDREN_SETTLE: Duration = Duration::from_secs(3);
+use actor::Active;
+use final_text::FinalText;
+pub(super) use launch::ChildTerms;
+pub(super) use launch::launch;
+pub(super) use relay::scoped_id;
 
 /// One turn the actor is asked to run.
 pub(super) struct Turn {
     pub(super) task: TaskId,
-    /// The session id the parent's view shows this task's activity under.
+    /// The session id the user's view shows the actor's activity under.
     pub(super) view_id: acp::SessionId,
     pub(super) prompt: String,
-    /// Original typed content for user follow-ups; tool turns use the text prompt.
+    /// Original typed content for user follow-ups; other turns use the text prompt.
     pub(super) content: Option<Vec<acp::ContentBlock>>,
     /// Where the actor reports what the child is doing.
     pub(super) progress: super::task::SharedProgress,
@@ -57,12 +46,15 @@ enum Command {
     Attach(acp::SessionId),
     Activate,
     Run(Turn),
-    Steer(Turn, oneshot::Sender<Result<(), String>>),
-    Promote(oneshot::Sender<Result<(), String>>),
     Cancel(oneshot::Sender<Result<(), String>>),
 }
 
 impl Child {
+    /// The child's actor has stopped: its session is gone, whatever else says so.
+    pub(super) fn is_closed(&self) -> bool {
+        self.turns.is_closed()
+    }
+
     /// Associate an idle adopted session with its public view before admitting turns.
     pub(super) fn attach(&self, view: acp::SessionId) -> Result<(), String> {
         self.turns
@@ -83,24 +75,8 @@ impl Child {
             .map_err(|_| "the child session has ended".to_owned())
     }
 
-    pub(super) async fn steer(&self, turn: Turn) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
-        self.turns
-            .send(Command::Steer(turn, tx))
-            .map_err(|_| "the child session has ended".to_owned())?;
-        rx.await
-            .map_err(|_| "the child session has ended".to_owned())?
-    }
-
-    pub(super) async fn promote(&self) -> Result<(), String> {
-        let (tx, rx) = oneshot::channel();
-        self.turns
-            .send(Command::Promote(tx))
-            .map_err(|_| "the child session has ended".to_owned())?;
-        rx.await
-            .map_err(|_| "the child session has ended".to_owned())?
-    }
-
+    /// Interrupt the turn in progress; the actor ends it silently, as the requester's or the
+    /// user's choice.
     pub(super) async fn cancel(&self) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.turns
@@ -116,535 +92,6 @@ pub(super) struct Launched {
     pub(super) child: Child,
     /// The model the child runs, as the agent names it.
     pub(super) model: Option<String>,
-}
-
-/// Start the agent, open a session, select `model`, and start the child's actor.
-pub(super) async fn launch(
-    inner: &Arc<Inner>,
-    spec: crate::runtime::AgentPrepareSpec,
-    model: Option<&str>,
-    options: &[(String, String)],
-    staged: bool,
-    scope: acp::SessionId,
-) -> Result<Launched, String> {
-    let agent = spec.config.active_agent.clone();
-    let nori_home = spec.config.nori_home.clone();
-    let spec_approval_policy = spec.config.approval_policy;
-    let launch = async {
-        let agent = crate::runtime::prepare_delegated_agent(spec, &inner.seed)
-            .await
-            .map_err(|error| format!("could not start the agent: {error:#}"))?;
-        let mut session = crate::runtime::launch_session(crate::runtime::SessionLaunchSpec {
-            agent,
-            start: crate::runtime::SessionStart::New,
-        });
-        let started = loop {
-            match session.events.recv().await {
-                Some(SessionEvent::Nori(NoriEvent::SessionStarted(started))) => break started,
-                Some(SessionEvent::Nori(NoriEvent::SessionEnded(ended))) => {
-                    return Err(ended.message.unwrap_or_else(|| {
-                        "the agent ended the session as it started".to_owned()
-                    }));
-                }
-                Some(_) => {}
-                None => return Err("the agent exited before its session started".to_owned()),
-            }
-        };
-        Ok((session, started))
-    };
-    let (session, started) = tokio::time::timeout(LAUNCH_TIMEOUT, launch)
-        .await
-        .map_err(|_| {
-            format!(
-                "the agent did not open a session within {}s",
-                LAUNCH_TIMEOUT.as_secs()
-            )
-        })??;
-    super::catalog::remember(&nori_home, &agent, &started.config_options);
-    let injects_model = crate::registry::get_agent_config(&agent)
-        .is_ok_and(|agent| agent.supports_model_injection());
-    let model = match model {
-        Some(requested) => {
-            match super::models::select_model(
-                &session.handle,
-                &started.config_options,
-                requested,
-                injects_model,
-            )
-            .await
-            {
-                Ok(model) => Some(model),
-                Err(error) => {
-                    let _ = session.handle.shutdown().await;
-                    return Err(error);
-                }
-            }
-        }
-        None => super::models::current_model(&started.config_options),
-    };
-    // A permission mode can only be set when the parent runs without approvals, so a child is
-    // never given one broader than its parent's.
-    let may_set_mode = spec_approval_policy == nori_config::AskForApproval::Never;
-    if let Err(error) = super::models::apply_options(
-        &session.handle,
-        &started.config_options,
-        options,
-        may_set_mode,
-    )
-    .await
-    {
-        let _ = session.handle.shutdown().await;
-        return Err(error);
-    }
-    let (turns_tx, turns_rx) = mpsc::unbounded_channel();
-    let child = Child {
-        harness: session.handle.clone(),
-        turns: turns_tx,
-    };
-    tokio::spawn(run_actor(
-        Arc::downgrade(inner),
-        session.handle,
-        started.acp_session_id,
-        session.events,
-        turns_rx,
-        staged,
-        scope,
-    ));
-    Ok(Launched { child, model })
-}
-
-/// The text a turn ends with: what the child said after its last tool call, or, when it said
-/// nothing after it, the last thing it said before.
-#[derive(Default)]
-struct FinalText {
-    after_last_tool: String,
-    before_last_tool: String,
-}
-
-impl FinalText {
-    fn push(&mut self, text: &str) {
-        self.after_last_tool.push_str(text);
-    }
-
-    fn tool(&mut self) {
-        if !self.after_last_tool.trim().is_empty() {
-            self.before_last_tool = std::mem::take(&mut self.after_last_tool);
-        }
-        self.after_last_tool.clear();
-    }
-
-    /// The last line written since the last tool call, shortened, when there is one.
-    fn last_line(&self) -> Option<String> {
-        let text = &self.after_last_tool;
-        let mut start = text.len().saturating_sub(400);
-        while !text.is_char_boundary(start) {
-            start += 1;
-        }
-        let line = text[start..]
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())?;
-        Some(line.trim().chars().take(160).collect())
-    }
-
-    fn finish(self) -> String {
-        if self.after_last_tool.trim().is_empty() {
-            self.before_last_tool
-        } else {
-            self.after_last_tool
-        }
-    }
-}
-
-struct Active {
-    task: TaskId,
-    view_id: acp::SessionId,
-    request_id: acp::RequestId,
-    text: FinalText,
-    progress: super::task::SharedProgress,
-    /// The turn ended while the child's own delegations ran: the task goes on until they end
-    /// and the turn that takes their results ends too.
-    awaiting_children: bool,
-    interrupted: bool,
-}
-
-async fn run_actor(
-    inner: Weak<Inner>,
-    harness: HarnessHandle,
-    mut child_session: acp::SessionId,
-    mut events: mpsc::UnboundedReceiver<SessionEvent>,
-    mut turns: mpsc::UnboundedReceiver<Command>,
-    staged: bool,
-    scope: acp::SessionId,
-) {
-    let mut active: Option<Active> = None;
-    let mut pending = VecDeque::new();
-    let mut views = HashMap::new();
-    let mut channel_open = true;
-    // Activity that arrives between tasks is shown under the task that caused it.
-    let mut last_view: Option<acp::SessionId> = (!staged).then(|| scope.clone());
-    // The child's own delegated tasks still running, by their view ids.
-    let mut delegations: HashSet<acp::SessionId> = HashSet::new();
-    let mut settle_by: Option<tokio::time::Instant> = None;
-    // Staging must not leak notifications or permission requests to the parent before commit.
-    // Keep events in order, while noticing a dead provider so an attach cannot publish it.
-    let mut buffered = VecDeque::new();
-    let mut staging = staged;
-    let mut staged_view = None;
-    let mut session_dead = false;
-    while staging {
-        tokio::select! {
-            command = turns.recv() => match command {
-                Some(Command::Attach(view)) => {
-                    staged_view = Some(view);
-                }
-                Some(Command::Activate) => {
-                    if let Some(view) = staged_view.take() {
-                        if let Some(orchestrator) = inner.upgrade()
-                            && let Some(parent) = orchestrator.parent_for_view(&view).await
-                        {
-                            views.entry(view.clone()).or_insert(parent);
-                        }
-                        last_view = Some(view);
-                        staging = false;
-                    }
-                }
-                Some(Command::Run(turn)) => pending.push_back(turn),
-                Some(Command::Steer(turn, tx)) => {
-                    pending.push_back(turn);
-                    let _ = tx.send(Err("the child is not yet adopted".to_owned()));
-                }
-                Some(Command::Promote(tx) | Command::Cancel(tx)) => {
-                    let _ = tx.send(Err("the child is not yet adopted".to_owned()));
-                }
-                None => { session_dead = true; break; }
-            },
-            event = events.recv() => match event {
-                Some(SessionEvent::Nori(NoriEvent::SessionEnded(_))) | None => {
-                    session_dead = true;
-                    break;
-                }
-                Some(event) => buffered.push_back(event),
-            },
-        }
-    }
-    if !session_dead {
-        loop {
-            tokio::select! {
-                command = turns.recv(), if channel_open => {
-                    match command {
-                        Some(Command::Activate) => {}
-                        Some(Command::Attach(view)) => {
-                            if let Some(orchestrator) = inner.upgrade()
-                                && let Some(parent) = orchestrator.parent_for_view(&view).await
-                            {
-                                views.entry(view.clone()).or_insert(parent);
-                            }
-                            last_view = Some(view);
-                        }
-                        Some(Command::Run(turn)) => {
-                            let view = turn.view_id.clone();
-                            if let Some(orchestrator) = inner.upgrade()
-                                && let Some(parent) = orchestrator.parent_for_view(&view).await
-                            {
-                                views.entry(view.clone()).or_insert(parent);
-                            }
-                            let user_message = turn.content.is_some();
-                            pending.push_back(turn);
-                            if user_message && let Some(orchestrator) = inner.upgrade() {
-                                emit_queue(&orchestrator, &view, &pending).await;
-                            }
-                        }
-                        Some(Command::Steer(turn, tx)) => {
-                            let view = turn.view_id.clone();
-                            if let Some(orchestrator) = inner.upgrade()
-                                && let Some(parent) = orchestrator.parent_for_view(&view).await
-                            {
-                                views.entry(view.clone()).or_insert(parent);
-                            }
-                            pending.push_front(turn);
-                            let result = if let Some(active) = active.as_mut() {
-                                let result = harness.cancel().await.map_err(|error| error.to_string());
-                                if result.is_ok() { active.interrupted = true; }
-                                result
-                            } else { Ok(()) };
-                            if result.is_err() { pending.pop_front(); }
-                            if let Some(orchestrator) = inner.upgrade() {
-                                emit_queue(&orchestrator, &view, &pending).await;
-                            }
-                            let _ = tx.send(result);
-                        }
-                        Some(Command::Promote(tx)) => {
-                            if let Some(orchestrator) = inner.upgrade() {
-                                while let Some(turn) = pending.front() {
-                                    if !orchestrator.task_has_ended(&turn.task).await { break; }
-                                    if let Some(turn) = pending.pop_front() && turn.content.is_some() {
-                                        emit_queue(&orchestrator, &turn.view_id, &pending).await;
-                                    }
-                                }
-                            }
-                            let result = if pending.is_empty() {
-                                Ok(())
-                            } else if let Some(active) = active.as_mut() {
-                                let result = harness.cancel().await.map_err(|error| error.to_string());
-                                if result.is_ok() { active.interrupted = true; }
-                                result
-                            } else {
-                                Ok(())
-                            };
-                            let _ = tx.send(result);
-                        }
-                        Some(Command::Cancel(tx)) => {
-                            let result = if let Some(active) = active.as_mut() {
-                                let result = harness.cancel().await.map_err(|error| error.to_string());
-                                if result.is_ok() { active.interrupted = true; }
-                                result
-                            } else {
-                                Ok(())
-                            };
-                            let _ = tx.send(result);
-                        }
-                        None => channel_open = false,
-                    }
-                }
-                () = std::future::ready(()), if active.is_none() && !pending.is_empty() => {
-                    let Some(turn) = pending.pop_front() else { continue };
-                    let Some(orchestrator) = inner.upgrade() else { break };
-                    if turn.content.is_some() {
-                        emit_queue(&orchestrator, &turn.view_id, &pending).await;
-                    }
-                    if orchestrator.task_has_ended(&turn.task).await {
-                        // Cancelled while it waited for the child.
-                        continue;
-                    }
-                    last_view = Some(turn.view_id.clone());
-                    let content = turn.content.unwrap_or_else(|| vec![acp::ContentBlock::Text(acp::TextContent::new(turn.prompt))]);
-                    match harness.prompt(content).await {
-                        Ok(request_id) => {
-                            orchestrator.task_running(&turn.task).await;
-                            active = Some(Active {
-                                task: turn.task,
-                                view_id: turn.view_id,
-                                request_id,
-                                text: FinalText::default(),
-                                progress: turn.progress,
-                                awaiting_children: false,
-                                interrupted: false,
-                            });
-                        }
-                        Err(error) => {
-                            orchestrator
-                                .task_ended(&turn.task, TaskEnd::Failed { error: format!("{error:#}") }, String::new())
-                                .await;
-                        }
-                    }
-                }
-                () = sleep_until(settle_by), if settle_by.is_some() => {
-                    settle_by = None;
-                    let Some(orchestrator) = inner.upgrade() else { break };
-                    if let Some(ended) = active.take() {
-                        if ended.interrupted {
-                            orchestrator.user_interrupted(&ended.task).await;
-                        }
-                        let end = if ended.interrupted { TaskEnd::Cancelled } else { completed() };
-                        let text = ended.text.finish();
-                        orchestrator.task_ended(&ended.task, end, text).await;
-                    }
-                }
-                event = async {
-                    match buffered.pop_front() {
-                        Some(event) => Some(event),
-                        None => events.recv().await,
-                    }
-                } => {
-                    let Some(orchestrator) = inner.upgrade() else { break };
-                    let Some(event) = event else {
-                        if let Some(active) = active.take() {
-                            let text = active.text.finish();
-                            orchestrator
-                                .task_ended(&active.task, TaskEnd::Failed { error: "the child's agent exited".to_owned() }, text)
-                                .await;
-                        }
-                        break;
-                    };
-                    // Rewind and compact replace the child's provider session. Its orchestrator
-                    // immediately uses that new id for child updates, so refresh before tracking or
-                    // retargeting those updates to the stable view id.
-                    if matches!(&event, SessionEvent::Nori(NoriEvent::Subagent(_)))
-                        && let Ok(current) = harness.current_session_id().await
-                    {
-                        child_session = current;
-                    }
-                    // A turn starting while the task waits on the child's delegations is the one that
-                    // takes their results.
-                    if let SessionEvent::Nori(NoriEvent::SessionPhaseChanged(SessionPhase::Prompting { request_id })) = &event
-                        && let Some(waiting) = active.as_mut().filter(|active| active.awaiting_children)
-                    {
-                        waiting.request_id = request_id.clone();
-                        waiting.awaiting_children = false;
-                        settle_by = None;
-                    }
-                    if let SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update))) = &event
-                        && update.parent_session_id == child_session
-                        && let nori_protocol::Patch::Set(state) = &update.state
-                    {
-                        match state {
-                            SubagentState::Running => {
-                                delegations.insert(update.session_id.clone());
-                            }
-                            SubagentState::Idle | SubagentState::Ended(_) => {
-                                delegations.remove(&update.session_id);
-                                if delegations.is_empty()
-                                    && active.as_ref().is_some_and(|active| active.awaiting_children)
-                                {
-                                    settle_by = Some(tokio::time::Instant::now() + CHILDREN_SETTLE);
-                                }
-                            }
-                        }
-                    }
-                    let view = active.as_ref().map(|active| active.view_id.clone()).or_else(|| last_view.clone());
-                    let session_ended = matches!(&event, SessionEvent::Nori(NoriEvent::SessionEnded(_)));
-                    let end = relay::relay(&orchestrator, &harness, &child_session, &scope, view.as_ref(), active.as_mut(), event).await;
-                    if session_ended {
-                        if let (Some(end), Some(ended)) = (end, active.take()) {
-                            let text = ended.text.finish();
-                            orchestrator.task_ended(&ended.task, end, text).await;
-                        }
-                        break;
-                    }
-                    let Some(end) = end else {
-                        continue;
-                    };
-                    if matches!(end, TaskEnd::Completed { .. }) && !delegations.is_empty() {
-                        if let Some(waiting) = active.as_mut() {
-                            waiting.awaiting_children = true;
-                        }
-                        continue;
-                    }
-                    if let Some(ended) = active.take() {
-                        if ended.interrupted {
-                            orchestrator.user_interrupted(&ended.task).await;
-                        }
-                        let end = if ended.interrupted { TaskEnd::Cancelled } else { end };
-                        let text = ended.text.finish();
-                        orchestrator.task_ended(&ended.task, end, text).await;
-                    }
-                }
-            }
-            if !channel_open && pending.is_empty() && active.is_none() {
-                break;
-            }
-        }
-    }
-    // Turns handed over as the actor stopped would otherwise wait forever.
-    turns.close();
-    if let Some(orchestrator) = inner.upgrade() {
-        while let Ok(command) = turns.try_recv() {
-            match command {
-                Command::Attach(view) => {
-                    if staging {
-                        staged_view = Some(view);
-                    } else if let Some(parent) = orchestrator.parent_for_view(&view).await {
-                        views.entry(view).or_insert(parent);
-                    }
-                }
-                Command::Activate => {
-                    if let Some(view) = staged_view.take()
-                        && let Some(parent) = orchestrator.parent_for_view(&view).await
-                    {
-                        views.entry(view).or_insert(parent);
-                    }
-                }
-                Command::Run(turn) => pending.push_back(turn),
-                Command::Steer(turn, tx) => {
-                    pending.push_back(turn);
-                    let _ = tx.send(Err("the child session ended".to_owned()));
-                }
-                Command::Promote(tx) | Command::Cancel(tx) => {
-                    let _ = tx.send(Err("the child session ended".to_owned()));
-                }
-            }
-        }
-        while let Some(turn) = pending.pop_front() {
-            if turn.content.is_some() {
-                emit_queue(&orchestrator, &turn.view_id, &pending).await;
-            }
-            orchestrator
-                .task_ended(
-                    &turn.task,
-                    TaskEnd::Failed {
-                        error: "the child session ended".to_owned(),
-                    },
-                    String::new(),
-                )
-                .await;
-        }
-    }
-    let _ = harness.shutdown().await;
-    if let Some(orchestrator) = inner.upgrade() {
-        for (session_id, parent_session_id) in views {
-            orchestrator
-                .emit(SessionEvent::Nori(NoriEvent::Subagent(
-                    SubagentWire::Update(nori_protocol::SubagentUpdate {
-                        parent_session_id,
-                        session_id,
-                        agent: nori_protocol::Patch::Keep,
-                        title: nori_protocol::Patch::Keep,
-                        description: nori_protocol::Patch::Keep,
-                        state: nori_protocol::Patch::Set(SubagentState::Ended(
-                            nori_protocol::SubagentOutcome::Closed,
-                        )),
-                    }),
-                )))
-                .await;
-        }
-    }
-}
-
-async fn emit_queue(orchestrator: &Arc<Inner>, view: &acp::SessionId, pending: &VecDeque<Turn>) {
-    let prompts = pending
-        .iter()
-        .filter(|turn| turn.content.is_some() && &turn.view_id == view)
-        .map(|turn| turn.prompt.clone())
-        .collect();
-    orchestrator
-        .emit(SessionEvent::Nori(NoriEvent::SubagentQueueChanged {
-            session_id: view.clone(),
-            prompts,
-        }))
-        .await;
-}
-
-async fn sleep_until(deadline: Option<tokio::time::Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
-}
-
-fn completed() -> TaskEnd {
-    TaskEnd::Completed {
-        stop_reason: acp::StopReason::EndTurn,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn the_final_text_is_what_came_after_the_last_tool() {
-        let mut text = FinalText::default();
-        text.push("Looking at the files.");
-        text.tool();
-        text.push("They hold ");
-        text.push("alpha.");
-        assert_eq!(text.finish(), "They hold alpha.");
-
-        let mut silent_after_tool = FinalText::default();
-        silent_after_tool.push("Done: alpha.");
-        silent_after_tool.tool();
-        assert_eq!(silent_after_tool.finish(), "Done: alpha.");
-    }
+    /// The id of the ACP session behind the actor.
+    pub(super) session: acp::SessionId,
 }
