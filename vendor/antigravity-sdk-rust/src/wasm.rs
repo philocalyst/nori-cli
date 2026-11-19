@@ -1,0 +1,1959 @@
+//! WebAssembly (wasm32-wasip1) Connection Implementation.
+//!
+//! This module provides a WebSocket-based harness connection for WebAssembly environments,
+//! connecting to the host `localharness` process over the network.
+
+/// How long `initial_history()` waits for the harness handshake reply.
+///
+/// A pre-0.1.4 harness never answers; the wait then expires and the session
+/// starts with no replayed history, which is correct for one.
+const HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
+
+/// How long `disconnect()` waits for the harness to acknowledge session end.
+const SESSION_END_TIMEOUT_SECONDS: u64 = 10;
+
+use anyhow::{Result, anyhow};
+use futures_util::stream::{self, BoxStream, StreamExt};
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use tokio::sync::{Mutex, mpsc};
+use tracing;
+
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_tungstenite::tungstenite;
+#[cfg(target_arch = "wasm32")]
+use tungstenite;
+
+use tungstenite::{Message as WsMessage, client::client, handshake::client::Request};
+
+use crate::connection::Connection;
+use crate::hooks::HookRunner;
+use crate::proto::localharness::{
+    FileEditToolConfig, FilesystemWorkspace, FindToolConfig, GenerateImageToolConfig,
+    GrepSearchToolConfig, HarnessConfig, HarnessSideTools, InitializeConversationEvent, InputEvent,
+    ListDirToolConfig, MultipleChoiceAnswer, OutputEvent, ReadUrlContentToolConfig,
+    RunCommandToolConfig, SearchWebToolConfig, StepUpdate, SubagentsConfig,
+    SystemInstructions as ProtoSystemInstructions, Tool as ProtoTool, ToolConfirmation,
+    ToolResponse, UserQuestionAnswer, UserQuestionsConfig, UserQuestionsResponse,
+    ViewFileToolConfig, Workspace as ProtoWorkspace, WriteToFileToolConfig,
+    appended_system_instructions::Section, custom_system_instructions::Part,
+    user_questions_response::QuestionsResponse, workspace::WorkspaceType,
+};
+use crate::tools::ToolRunner;
+use crate::types::{
+    AntigravityExecutionError, AskQuestionEntry, AskQuestionOption, BuiltinTools,
+    CapabilitiesConfig, GeminiConfig, QuestionHookResult, Step, StepSource, StepStatus, StepTarget,
+    StepType, SystemInstructions, ToolCall, ToolResult, UsageMetadata,
+};
+
+/// Internal state tracker for matching `StepUpdate` payloads with active handshakes.
+#[derive(Debug, Default)]
+pub struct StepTracker {
+    state: i32,
+    handled_requests: HashSet<String>,
+}
+
+impl StepTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update_state(&mut self, state: i32) {
+        // Leaving WAITING_FOR_USER ends the request round. Without this the
+        // dedup set persists, so a re-asked question is never answered a second
+        // time and the harness waits forever. STATE_WAITING_FOR_USER = 3.
+        if self.state == 3 && state != 3 {
+            self.handled_requests.clear();
+        }
+        self.state = state;
+    }
+
+    pub fn mark_handled(&mut self, request_name: &str) -> bool {
+        if self.state == 3 && !self.handled_requests.contains(request_name) {
+            self.handled_requests.insert(request_name.to_string());
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+pub static TEST_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// A WASM connection strategy that establishes a connection to a remote localharness
+/// instance running on the host machine.
+#[derive(Debug)]
+pub struct WasmConnectionStrategy {
+    pub gemini_config: GeminiConfig,
+    pub capabilities_config: CapabilitiesConfig,
+    pub system_instructions: Option<SystemInstructions>,
+    pub save_dir: Option<String>,
+    pub workspaces: Vec<String>,
+    pub skills_paths: Vec<String>,
+    pub tool_runner: Option<ToolRunner>,
+    pub hook_runner: Option<HookRunner>,
+    pub conversation_id: String,
+    /// MCP server configurations, emitted on `HarnessConfig.mcp_servers`.
+    pub mcp_servers: Vec<crate::types::McpServerConfig>,
+    /// How the harness retries the model, on `HarnessConfig.retry_config`.
+    pub retry_config: Option<crate::types::RetryConfig>,
+    /// Tool-output truncation policy, on `HarnessConfig.tool_output_truncation`.
+    pub tool_output_truncation: Option<crate::types::ToolOutputTruncation>,
+    /// Named subagents, emitted on `HarnessConfig.custom_subagents`.
+    pub subagents: Vec<crate::types::SubagentConfig>,
+}
+
+impl WasmConnectionStrategy {
+    #[allow(
+        clippy::too_many_lines,
+        clippy::significant_drop_tightening,
+        clippy::option_if_let_else
+    )]
+    pub async fn connect(&self) -> Result<WasmConnection, anyhow::Error> {
+        let api_key = self
+            .gemini_config
+            .models
+            .default
+            .api_key
+            .clone()
+            .or_else(|| self.gemini_config.api_key.clone())
+            .or_else(|| std::env::var("ANTIGRAVITY_API_KEY").ok())
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "A Gemini API key is required. Set it via GeminiConfig or ANTIGRAVITY_API_KEY env var."
+                )
+            })?;
+
+        let host =
+            std::env::var("ANTIGRAVITY_HARNESS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        #[allow(unused_mut)]
+        let mut port =
+            std::env::var("ANTIGRAVITY_HARNESS_PORT").unwrap_or_else(|_| "8000".to_string());
+        #[cfg(test)]
+        {
+            let test_port = TEST_PORT.load(std::sync::atomic::Ordering::SeqCst);
+            if test_port != 0 {
+                port = test_port.to_string();
+            }
+        }
+
+        let ws_url = format!("ws://{host}:{port}/");
+        tracing::info!("Connecting to localharness WebSocket at {}", ws_url);
+
+        let req = Request::builder()
+            .uri(&ws_url)
+            .header("Host", format!("{host}:{port}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .header("x-goog-api-key", &api_key)
+            .body(())?;
+
+        let tcp = TcpStream::connect(format!("{host}:{port}")).map_err(|e| {
+            anyhow!("Failed to connect to localharness TCP socket at {host}:{port}: {e:?}")
+        })?;
+
+        let (mut ws, _) = client(req, tcp)
+            .map_err(|e| anyhow!("WebSocket handshake with localharness failed: {e:?}"))?;
+
+        // Configure TCP stream to be non-blocking for concurrent read/write via Arc/Mutex yielding.
+        ws.get_ref().set_nonblocking(true)?;
+
+        // Build HarnessConfig proto
+        let declared_hook_kinds = match self.hook_runner {
+            Some(ref runner) => runner.declared_kinds().await,
+            None => crate::hook_dispatch::HookKinds::NONE,
+        };
+
+        let mut proto_tools = Vec::new();
+        let mut registered_tool_names: Vec<String> = Vec::new();
+        if let Some(ref runner) = self.tool_runner {
+            let tools = runner.tools.read().await;
+            for t in tools.iter() {
+                registered_tool_names.push(t.name().to_string());
+                proto_tools.push(ProtoTool {
+                    name: Some(t.name().to_string()),
+                    description: Some(t.description().to_string()),
+                    parameters_json_schema: Some(t.parameters_json_schema().to_string()),
+                    response_json_schema: None,
+                    // Deferred tool loading is a 0.1.9 capability this crate
+                    // does not use yet (audit W27).
+                    defer_loading: None,
+                });
+            }
+        }
+
+        let proto_sys = self.system_instructions.as_ref().map(|sys| match sys {
+            SystemInstructions::Custom(custom) => {
+                let instr_part = Part {
+                    part: Some(
+                        crate::proto::localharness::custom_system_instructions::part::Part::Text(
+                            custom.text.clone(),
+                        ),
+                    ),
+                };
+                ProtoSystemInstructions {
+                    r#type: Some(
+                        crate::proto::localharness::system_instructions::Type::Custom(
+                            crate::proto::localharness::CustomSystemInstructions {
+                                part: vec![instr_part],
+                            },
+                        ),
+                    ),
+                }
+            }
+            SystemInstructions::Appended(appended) => {
+                let mut sections = Vec::new();
+                for sec in &appended.appended_sections {
+                    sections.push(Section {
+                        title: Some(sec.title.clone()),
+                        content: Some(sec.content.clone()),
+                    });
+                }
+                ProtoSystemInstructions {
+                    r#type: Some(
+                        crate::proto::localharness::system_instructions::Type::Appended(
+                            crate::proto::localharness::AppendedSystemInstructions {
+                                custom_identity: appended.custom_identity.clone(),
+                                appended_sections: sections,
+                            },
+                        ),
+                    ),
+                }
+            }
+        });
+
+        let mut proto_workspaces = Vec::new();
+        for w in &self.workspaces {
+            proto_workspaces.push(ProtoWorkspace {
+                workspace_type: Some(WorkspaceType::FilesystemWorkspace(FilesystemWorkspace {
+                    // Upstream normalizes on the way out (0.1.1
+                    // local_connection.py:1418), so the harness and the client-side
+                    // policy layer scope the same directories.
+                    directory: Some(crate::wire_path::normalize_wire_path(w)),
+                })),
+            });
+        }
+
+        let all_tools = [
+            BuiltinTools::CreateFile,
+            BuiltinTools::EditFile,
+            BuiltinTools::FindFile,
+            BuiltinTools::ListDir,
+            BuiltinTools::RunCommand,
+            BuiltinTools::SearchDir,
+            BuiltinTools::ViewFile,
+            BuiltinTools::StartSubagent,
+            BuiltinTools::GenerateImage,
+            BuiltinTools::Finish,
+        ];
+        let active_tools: HashSet<BuiltinTools> =
+            self.capabilities_config.enabled_tools.as_ref().map_or_else(
+                || {
+                    if let Some(ref disabled) = self.capabilities_config.disabled_tools {
+                        let disabled_set: HashSet<BuiltinTools> =
+                            disabled.iter().copied().collect();
+                        all_tools
+                            .into_iter()
+                            .filter(|t| !disabled_set.contains(t))
+                            .collect()
+                    } else {
+                        all_tools.into_iter().collect()
+                    }
+                },
+                |enabled| enabled.iter().copied().collect(),
+            );
+
+        let side_tools = HarnessSideTools {
+            // A tool like any other: absent would leave the harness to guess,
+            // and a caller who listed `enabled_tools` had no way to turn either
+            // on or off (C6).
+            search_web: Some(SearchWebToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::SearchWeb)),
+            }),
+            read_url_content: Some(ReadUrlContentToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::ReadUrlContent)),
+            }),
+            tool_search_config: None,
+            find: Some(FindToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::FindFile)),
+            }),
+            run_command: Some(RunCommandToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::RunCommand)),
+            }),
+            subagents: Some(SubagentsConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::StartSubagent)),
+            }),
+            user_questions: Some(UserQuestionsConfig {
+                // Was hardcoded true, so a caller who listed `enabled_tools`
+                // explicitly still got the question panel and no way to turn it
+                // off. It is a tool like any other.
+                enabled: Some(active_tools.contains(&BuiltinTools::AskQuestion)),
+            }),
+            file_edit: Some(FileEditToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::EditFile)),
+            }),
+            view_file: Some(ViewFileToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::ViewFile)),
+            }),
+            write_to_file: Some(WriteToFileToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::CreateFile)),
+            }),
+            grep_search: Some(GrepSearchToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::SearchDir)),
+            }),
+            list_dir: Some(ListDirToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::ListDir)),
+            }),
+            permissions: None,
+            generate_image: Some(GenerateImageToolConfig {
+                enabled: Some(active_tools.contains(&BuiltinTools::GenerateImage)),
+            }),
+        };
+
+        let harness_config = HarnessConfig {
+            cascade_id: Some(self.conversation_id.clone()),
+            // Each of these is its own work package (WP-6 session continuation
+            // and retry, WP-8 hooks, WP-9 MCP and subagents). Explicitly unset
+            // so `cargo build` flags them again when those land.
+            session_continuation_mode: None,
+            retry_config: crate::harness_config::build_retry_config_proto(
+                self.retry_config.as_ref(),
+            ),
+            // Only what a registered hook declared. The harness blocks its
+            // turn waiting for a CallHookResponse for every kind named here,
+            // and `answer_hook_request` is what makes that safe — emitting this
+            // before the router existed would have turned a silent no-op into a
+            // mid-turn deadlock (E5).
+            enabled_hooks: declared_hook_kinds.to_proto(),
+            custom_subagents: crate::harness_config::build_custom_subagents_proto(
+                &self.subagents,
+                &registered_tool_names,
+            )?,
+            mcp_servers: crate::harness_config::build_mcp_servers_proto(&self.mcp_servers),
+            tool_output_truncation: crate::harness_config::build_truncation_proto(
+                self.tool_output_truncation.as_ref(),
+            ),
+            models: crate::harness_config::build_models_proto(
+                &self.gemini_config,
+                self.capabilities_config.image_model.as_deref(),
+            )?,
+            system_instructions: proto_sys,
+            tools: proto_tools,
+            harness_side_tools: Some(side_tools),
+            compaction_threshold: self.capabilities_config.compaction_threshold,
+            workspaces: proto_workspaces,
+            skills_paths: self.skills_paths.clone(),
+            finish_tool_schema_json: self.capabilities_config.finish_tool_schema_json.clone(),
+            initial_trajectory: None,
+            app_data_dir: self.save_dir.clone(),
+        };
+
+        // Send InitializeConversationEvent
+        let init_event = InitializeConversationEvent {
+            config: Some(harness_config),
+        };
+        let init_json = serde_json::to_string(&init_event)?;
+        ws.write(WsMessage::Text(init_json))?;
+        ws.flush()?;
+
+        let socket = Arc::new(Mutex::new(ws));
+
+        // Spawn Background WS Sender Loop
+        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel::<String>();
+        let socket_sender = socket.clone();
+        crate::spawn_task(async move {
+            while let Some(msg) = ws_rx.recv().await {
+                let mut delay = std::time::Duration::from_millis(5);
+                loop {
+                    if let Ok(mut ws_lock) = socket_sender.try_lock() {
+                        if let Err(e) = ws_lock.write(WsMessage::Text(msg)) {
+                            tracing::error!("WS Write Loop Error: {:?}", e);
+                        } else {
+                            let _ = ws_lock.flush();
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(delay).await;
+                    if delay < std::time::Duration::from_millis(50) {
+                        delay *= 2;
+                    }
+                }
+            }
+        });
+
+        // Setup channels for step stream
+        let (step_tx, step_rx) = mpsc::unbounded_channel::<crate::step_extract::StepEvent>();
+        let client_tool_step_counter = Arc::new(AtomicU32::new(50_000));
+
+        // Upstream starts idle (local_connection.py:448-459) and this now
+        // matches. Two earlier attempts were reverted: the first hit a
+        // first-poll hazard the receive_steps() loop restructure removed, the
+        // second a connect-time race where a caller polling receive_steps()
+        // before the harness reported STATE_RUNNING saw idle with an empty
+        // queue and got an empty stream.
+        //
+        // What closes it is the contract, not a flag: `send()` clears idle
+        // before the prompt goes out, so send()-then-receive — which is what
+        // `chat()` and `Conversation` do — can never observe the gap. A caller
+        // that subscribes before sending anything now gets an empty stream
+        // immediately instead of blocking forever on a turn that was never
+        // started, which is the better of the two failure modes and the one
+        // upstream has (C2).
+        let is_idle = Arc::new(AtomicBool::new(true));
+        let (idle_tx, _idle_rx) = tokio::sync::watch::channel(true);
+        let (session_end_tx, _session_end_rx) = tokio::sync::watch::channel(false);
+        let conn_session_end = session_end_tx.clone();
+        let socket_closed = Arc::new(AtomicBool::new(false));
+        let conn_socket_closed = socket_closed.clone();
+        let (initial_history_tx, _initial_history_rx) =
+            tokio::sync::watch::channel::<Option<Vec<Step>>>(None);
+        let conn_initial_history = initial_history_tx.clone();
+        let conn_idle_tx = idle_tx.clone();
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let step_trackers = Arc::new(Mutex::new(HashMap::new()));
+        // Last model text seen on each subagent trajectory, so the
+        // `post_tool_call` that fires when the subagent finishes can carry what
+        // it produced (upstream `_subagent_responses`).
+        let subagent_responses: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let conn_subagent_responses = subagent_responses.clone();
+
+        let conn_ws_tx = ws_tx.clone();
+        let conn_is_idle = is_idle.clone();
+        let conn_is_idle_for_close = is_idle.clone();
+        let conn_cancel_requested = cancel_requested.clone();
+        let conn_step_trackers = step_trackers.clone();
+
+        let tool_runner = self.tool_runner.clone();
+        let hook_runner = self.hook_runner.clone();
+        let conversation_id = self.conversation_id.clone();
+        let learned_id = Arc::new(std::sync::OnceLock::new());
+        let conn_learned_id = learned_id.clone();
+        let conn_cascade_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let conn_cascade_id_for_ws = conn_cascade_id.clone();
+
+        // Spawn WS Reader Loop
+        let pending_builtin_tool_calls =
+            Arc::new(Mutex::new(HashMap::<(String, u32), ToolCall>::new()));
+        let socket_reader = socket.clone();
+
+        crate::spawn_task(async move {
+            loop {
+                let read_res = {
+                    let mut ws_lock = socket_reader.lock().await;
+                    ws_lock.read()
+                };
+                match read_res {
+                    Ok(WsMessage::Text(raw_text)) => {
+                        tracing::debug!("WS raw message: {}", &raw_text[..raw_text.len().min(500)]);
+                        match serde_json::from_str::<OutputEvent>(&raw_text) {
+                            Ok(output_event) => {
+                                if let Some(event) = output_event.event {
+                                    match event {
+                                        crate::proto::localharness::output_event::Event::StepUpdate(step_update) => {
+                                            let traj_id = step_update.trajectory_id.clone().unwrap_or_default();
+                                            let step_idx = step_update.step_index.unwrap_or(0);
+                                            let key = (traj_id.clone(), step_idx);
+
+                                            // The main trajectory is whichever one reports first,
+                                            // unconditionally — upstream event_processor.py:478-480.
+                                            // The previous rule also required cascade_id ==
+                                            // trajectory_id, so on a resumed session, or when a
+                                            // subagent reported first, nothing was ever learned and
+                                            // every trajectory then counted as the main one.
+                                            // (A1; the local transport got this fix first.)
+                                            if !traj_id.is_empty() {
+                                                let mut main_id = conn_cascade_id_for_ws.lock().await;
+                                                let unset = main_id.is_none();
+                                                if unset {
+                                                    *main_id = Some(traj_id.clone());
+                                                }
+                                                drop(main_id);
+                                                if unset {
+                                                    tracing::debug!("main trajectory: {traj_id}");
+                                                    let _ = conn_learned_id.set(traj_id.clone());
+                                                }
+                                            }
+
+                                            // A model step on a trajectory that is not the main one
+                                            // came from a subagent. Keep its text: the completion
+                                            // event carries no result of its own (H12).
+                                            {
+                                                let main_id = conn_cascade_id_for_ws.lock().await.clone();
+                                                let is_subagent = !traj_id.is_empty()
+                                                    && main_id.as_ref().is_some_and(|id| *id != traj_id);
+                                                if is_subagent
+                                                    && step_update.source == Some(3)
+                                                    && let Some(text) = step_update.text.clone().filter(|t| !t.is_empty())
+                                                {
+                                                    conn_subagent_responses.lock().await.insert(traj_id.clone(), text);
+                                                }
+                                            }
+
+                                            let (is_questions_new, is_tool_conf_new) = {
+                                                let mut trackers = conn_step_trackers.lock().await;
+                                                let tracker = trackers.entry(key.clone()).or_insert_with(StepTracker::new);
+                                                if let Some(st) = step_update.state {
+                                                    tracker.update_state(st);
+                                                }
+                                                let is_q = if step_update.questions_request.is_some() {
+                                                    tracker.mark_handled("questions_request")
+                                                } else {
+                                                    false
+                                                };
+                                                let is_tc = if step_update.tool_confirmation_request.is_some() {
+                                                    tracker.mark_handled("tool_confirmation_request")
+                                                } else {
+                                                    false
+                                                };
+                                                (is_q, is_tc)
+                                            };
+
+                                            let step_type = if step_update.compaction.is_some() {
+                                                StepType::Compaction
+                                            } else if step_update.finish.is_some() {
+                                                StepType::Finish
+                                            } else if step_update.list_directory.is_some()
+                                                || step_update.find_file.is_some()
+                                                || step_update.search_directory.is_some()
+                                                || step_update.view_file.is_some()
+                                                || step_update.create_file.is_some()
+                                                || step_update.edit_file.is_some()
+                                                || step_update.run_command.is_some()
+                                                || step_update.invoke_subagent.is_some()
+                                                || step_update.generate_image.is_some()
+                                            {
+                                                StepType::ToolCall
+                                            } else if step_update.text.is_some() {
+                                                StepType::TextResponse
+                                            } else {
+                                                StepType::Unknown
+                                            };
+
+                                            let mut tool_calls = Vec::new();
+                                            if let Some(tc) = crate::step_extract::extract_builtin_tool_call(&step_update) {
+                                                tool_calls.push(tc);
+                                            }
+
+                                            let source = match step_update.source {
+                                                Some(1) => StepSource::System,
+                                                Some(2) => StepSource::User,
+                                                Some(3) => StepSource::Model,
+                                                _ => StepSource::Unknown,
+                                            };
+
+                                            let status = match step_update.state {
+                                                Some(1) => StepStatus::Active,
+                                                Some(2) => StepStatus::Done,
+                                                Some(3) => StepStatus::WaitingForUser,
+                                                // STATE_TERMINAL_ERROR = 5 was removed upstream in
+                                                // 0.1.3; a step that fails now reports STATE_ERROR,
+                                                // and a whole turn failing arrives as
+                                                // TrajectoryStateUpdate.error instead (audit W7/W23).
+                                                Some(4) => StepStatus::TerminalError,
+                                                _ => StepStatus::Unknown,
+                                            };
+
+                                            let target = match step_update.target {
+                                                Some(1) => StepTarget::User,
+                                                Some(2 | 3) => StepTarget::Environment,
+                                                _ => StepTarget::Unknown,
+                                            };
+
+                                            let usage = output_event.usage_metadata.as_ref().map(|u| UsageMetadata {
+                                                prompt_token_count: u.prompt_token_count.unwrap_or(0),
+                                                candidates_token_count: u.candidates_token_count.unwrap_or(0),
+                                                total_token_count: u.total_token_count.unwrap_or(0),
+                                                cached_content_token_count: u.cached_content_token_count.unwrap_or(0),
+                                                thoughts_token_count: u.thoughts_token_count.unwrap_or(0),
+                                            });
+
+                                            let is_complete = Some(
+                                                source == StepSource::Model
+                                                    && status == StepStatus::Done
+                                                    && step_update.text.is_some()
+                                                    && target == StepTarget::User
+                                            );
+
+                                            let structured = step_update.finish.as_ref().and_then(|f| {
+                                                f.output_string.as_ref().and_then(|s| serde_json::from_str(s).ok())
+                                            });
+
+                                            // A step can carry ActionError{error_message,
+                                            // http_code} with an empty top-level message, which
+                                            // reported the failure as blank (audit C14).
+                                            let error_msg = step_update
+                                                .error_message
+                                                .clone()
+                                                .or_else(|| {
+                                                    step_update
+                                                        .error
+                                                        .as_ref()
+                                                        .and_then(|e| e.error_message.clone())
+                                                })
+                                                .unwrap_or_default();
+                                            let http_code = step_update.error.as_ref().and_then(|e| e.http_code).unwrap_or(0);
+
+                                            let step = Step {
+                                                id: format!("{traj_id}_{step_idx}"),
+                                                step_index: step_idx,
+                                                r#type: step_type,
+                                                source,
+                                                target,
+                                                status,
+                                                content: step_update.text.clone().unwrap_or_default(),
+                                                content_delta: step_update.text_delta.clone().unwrap_or_default(),
+                                                thinking: step_update.thinking.clone().unwrap_or_default(),
+                                                thinking_delta: step_update.thinking_delta.clone().unwrap_or_default(),
+                                                tool_calls,
+                                                error: error_msg,
+                                                is_complete_response: is_complete,
+                                                structured_output: structured,
+                                                usage_metadata: usage,
+                                                cascade_id: step_update.cascade_id.clone().unwrap_or_default(),
+                                                trajectory_id: traj_id.clone(),
+                                                http_code,
+                                            };
+
+                                            // Turn-level hooks fire off the step that carries the
+                                            // event, which is the only place either is observable
+                                            // from inside the connection (H1b, H1d).
+                                            if let Some(runner) = hook_runner.as_ref() {
+                                                if step.is_complete_response == Some(true) {
+                                                    let runner = runner.clone();
+                                                    let text = step.content.clone();
+                                                    crate::spawn_task(async move {
+                                                        if let Err(e) = runner.dispatch_post_turn(&text).await {
+                                                            tracing::error!("post_turn hook failed: {e:?}");
+                                                        }
+                                                    });
+                                                }
+                                                if step.r#type == StepType::Compaction {
+                                                    let runner = runner.clone();
+                                                    let compacted = step.clone();
+                                                    crate::spawn_task(async move {
+                                                        if let Err(e) = runner.dispatch_on_compaction(&compacted).await {
+                                                            tracing::error!("on_compaction hook failed: {e:?}");
+                                                        }
+                                                    });
+                                                }
+                                            }
+
+                                            let _ = step_tx.send(crate::step_extract::StepEvent::Step(Box::new(step)));
+
+                                            // Detect platform-level errors (source=SYSTEM) and propagate them.
+                                            if source == StepSource::System
+                                                && status == StepStatus::Error
+                                                && (http_code == 400 || http_code == 401 || http_code == 403)
+                                            {
+                                                let err_str = step_update.error.as_ref().and_then(|e| e.error_message.clone()).unwrap_or_else(|| "System error occurred.".to_string());
+                                                let _ = step_tx.send(crate::step_extract::StepEvent::Error(anyhow!("System step error (HTTP {}): {}", http_code, err_str)));
+                                                break;
+                                            }
+
+                                            // Handle terminal errors — non-recoverable agent execution failure.
+                                            if status == StepStatus::TerminalError {
+                                                let err_msg = step_update.error_message.clone()
+                                                    .unwrap_or_else(|| "Terminal error occurred during execution".to_string());
+                                                let _ = step_tx.send(crate::step_extract::StepEvent::Error(
+                                                    AntigravityExecutionError { message: err_msg }.into()
+                                                ));
+                                                break;
+                                            }
+
+                                            // Dispatch post-tool-call or on-tool-error hooks for built-in tools
+                                            let state_val = step_update.state.unwrap_or(0);
+                                            if state_val == 2 || state_val == 4 {
+                                                let mut pending = pending_builtin_tool_calls.lock().await;
+                                                if let (Some(tc), Some(runner)) = (pending.remove(&key), hook_runner.as_ref()) {
+                                                    if state_val == 2 {
+                                                        let extracted = extract_tool_result(&step_update);
+                                                        let tr = ToolResult {
+                                                            name: tc.name.clone(),
+                                                            id: Some(tc.id.clone()),
+                                                            // Structured per tool, so a hook can read an
+                                                            // exit code or a content path instead of
+                                                            // parsing display text (N3). Falls back to
+                                                            // the text for anything unrecognised.
+                                                            result: crate::tool_output::structured_result(&step_update)
+                                                                .or_else(|| extracted.and_then(|r| r.result))
+                                                                .or_else(|| step_update.text.clone().map(Value::String)),
+                                                            error: None,
+                                                            server_name: None,
+                                                            exception: None,
+                                                        };
+                                                        let runner_clone = runner.clone();
+                                                        crate::spawn_task(async move {
+                                                            let _ = runner_clone.dispatch_post_tool_call(&tr).await;
+                                                        });
+                                                    } else {
+                                                        let err_msg = step_update.error_message.clone().unwrap_or_else(|| "Built-in tool failed".to_string());
+                                                        let err = anyhow!(err_msg);
+                                                        let runner_clone = runner.clone();
+                                                        crate::spawn_task(async move {
+                                                            runner_clone.dispatch_on_tool_error(&err).await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+
+                                            if let (true, Some(q_req)) = (is_questions_new, &step_update.questions_request) {
+                                                let conn_ws_tx = conn_ws_tx.clone();
+                                                let hook_runner = hook_runner.clone();
+                                                let q_req_clone = q_req.clone();
+                                                let trajectory_id = step_update.trajectory_id.clone();
+                                                let step_index = step_update.step_index;
+                                                crate::spawn_task(async move {
+                                                    let mut questions_list = Vec::new();
+                                                    // The hook only sees multiple-choice questions,
+                                                    // so the response index is an index into the
+                                                    // FILTERED list. Carry the original index or
+                                                    // every answer after a non-multiple-choice
+                                                    // question is recorded against the wrong one.
+                                                    let mut original_indices: Vec<usize> = Vec::new();
+                                                    for (original_index, uq) in
+                                                        q_req_clone.questions.iter().enumerate()
+                                                    {
+                                                        if let Some(crate::proto::localharness::user_question::QuestionType::MultipleChoice(ref mc)) = uq.question_type {
+                                                            let mut opts = Vec::new();
+                                                            for (j, choice) in mc.choices.iter().enumerate() {
+                                                                opts.push(AskQuestionOption {
+                                                                    id: (j + 1).to_string(),
+                                                                    text: choice.clone(),
+                                                                });
+                                                            }
+                                                            original_indices.push(original_index);
+                                                            questions_list.push(AskQuestionEntry {
+                                                                question: mc.question.clone().unwrap_or_default(),
+                                                                options: opts,
+                                                                is_multi_select: mc.is_multi_select.unwrap_or(false),
+                                                            });
+                                                        }
+                                                    }
+
+                                                    let mut proto_answers = vec![
+                                                        UserQuestionAnswer {
+                                                            answer: Some(crate::proto::localharness::user_question_answer::Answer::Unanswered(true)),
+                                                        };
+                                                        q_req_clone.questions.len()
+                                                    ];
+
+                                                    if let Some(runner) = hook_runner.as_ref().filter(|_| !questions_list.is_empty()) {
+                                                        let res = runner.dispatch_interaction(&questions_list).await;
+                                                        if let Ok(Some(q_res)) = res {
+                                                            for (filtered_idx, r) in
+                                                                q_res.responses.iter().enumerate()
+                                                            {
+                                                                // A hook may return more responses
+                                                                // than there were questions; ignore
+                                                                // the extras rather than panicking.
+                                                                let Some(&orig_idx) =
+                                                                    original_indices.get(filtered_idx)
+                                                                else {
+                                                                    break;
+                                                                };
+                                                                if !r.skipped {
+                                                                    let mut mc_ans = MultipleChoiceAnswer {
+                                                                        selected_choice_indices: Vec::new(),
+                                                                        freeform_response: Some(r.freeform_response.clone()),
+                                                                    };
+                                                                    if let Some(ref opts) = r.selected_option_ids {
+                                                                        for opt in opts {
+                                                                            if let Ok(idx) = opt.parse::<i32>() {
+                                                                                mc_ans.selected_choice_indices.push(idx - 1);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    proto_answers[orig_idx] = UserQuestionAnswer {
+                                                                        answer: Some(crate::proto::localharness::user_question_answer::Answer::MultipleChoiceAnswer(mc_ans)),
+                                                                    };
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    let resp = UserQuestionsResponse {
+                                                        trajectory_id,
+                                                        step_index,
+                                                        result: Some(crate::proto::localharness::user_questions_response::Result::Response(QuestionsResponse {
+                                                            answers: proto_answers,
+                                                        })),
+                                                    };
+                                                    let input_event = InputEvent {
+                                                        event: Some(crate::proto::localharness::input_event::Event::QuestionResponse(resp)),
+                                                    };
+                                                    if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                                                        let _ = conn_ws_tx.send(raw_json);
+                                                    }
+                                                });
+                                            }
+
+                                            if is_tool_conf_new {
+                                                let conn_ws_tx = conn_ws_tx.clone();
+                                                let hook_runner = hook_runner.clone();
+                                                let step_update_clone = step_update.clone();
+                                                let pending_calls = pending_builtin_tool_calls.clone();
+                                                crate::spawn_task(async move {
+                                                    let mut allow = true;
+                                                    let tool_call = crate::step_extract::extract_builtin_tool_call(&step_update_clone);
+                                                    if let Some(ref tc) = tool_call {
+                                                        // Fails closed: a hook that errors denies.
+                                                        (allow, _) = crate::hooks::HookRunner::gate_tool_call(hook_runner.as_ref(), tc).await;
+                                                        if allow {
+                                                            let key = (step_update_clone.trajectory_id.clone().unwrap_or_default(), step_update_clone.step_index.unwrap_or(0));
+                                                            pending_calls.lock().await.insert(key, tc.clone());
+                                                        }
+                                                    }
+
+                                                    let conf = ToolConfirmation {
+                                                        trajectory_id: step_update_clone.trajectory_id.clone(),
+                                                        step_index: step_update_clone.step_index,
+                                                        accepted: Some(allow),
+                                                    };
+                                                    let input_event = InputEvent {
+                                                        event: Some(crate::proto::localharness::input_event::Event::ToolConfirmation(conf)),
+                                                    };
+                                                    if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                                                        let _ = conn_ws_tx.send(raw_json);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        crate::proto::localharness::output_event::Event::TrajectoryStateUpdate(tsu) => {
+                                            let traj_id = tsu.trajectory_id.clone().unwrap_or_default();
+                                            let main_id = conn_cascade_id_for_ws.lock().await;
+                                            // Only the main trajectory drives idle; subagent
+                                            // trajectories return early (event_processor.py:539-542).
+                                            let is_main = main_id
+                                                .as_ref()
+                                                .is_none_or(|id| traj_id.is_empty() || traj_id == *id);
+                                            drop(main_id);
+
+                                            if !is_main {
+                                                // A subagent finishing is how a START_SUBAGENT call
+                                                // completes — the harness sends no tool response for
+                                                // it. Without this a `post_tool_call` hook saw the
+                                                // pre_tool_call and never a matching completion.
+                                                if tsu.state == Some(2) || tsu.state == Some(3) {
+                                                    let response = conn_subagent_responses
+                                                        .lock()
+                                                        .await
+                                                        .remove(&traj_id)
+                                                        .unwrap_or_else(|| traj_id.clone());
+                                                    if let Some(runner) = hook_runner.as_ref() {
+                                                        let tr = crate::types::ToolResult {
+                                                            name: crate::types::BuiltinTools::StartSubagent
+                                                                .as_str()
+                                                                .to_string(),
+                                                            id: None,
+                                                            result: Some(Value::String(response)),
+                                                            error: None,
+                                                            server_name: None,
+                                                            exception: None,
+                                                        };
+                                                        let runner = runner.clone();
+                                                        crate::spawn_task(async move {
+                                                            let _ = runner.dispatch_post_tool_call(&tr).await;
+                                                        });
+                                                    }
+                                                }
+                                                continue;
+                                            }
+
+                                            // A turn that failed server-side reports its
+                                            // reason here; without this the stream just ends
+                                            // (event_processor.py:554-557).
+                                            if let Some(ref err) = tsu.error
+                                                && !err.is_empty()
+                                            {
+                                                let _ = step_tx.send(
+                                                    crate::step_extract::StepEvent::Error(anyhow!(
+                                                        "{err}"
+                                                    )),
+                                                );
+                                            }
+
+                                            if tsu.state == Some(3) { // STATE_CANCELLED
+                                                conn_cancel_requested.store(false, Ordering::SeqCst);
+                                                let reason = tsu
+                                                    .error
+                                                    .clone()
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "Turn cancelled".to_string());
+                                                let _ = step_tx.send(
+                                                    crate::step_extract::StepEvent::Error(
+                                                        anyhow!(crate::error::AntigravityError::Cancelled(reason)),
+                                                    ),
+                                                );
+                                            } else if tsu.state == Some(2) // STATE_FULLY_IDLE
+                                                && conn_cancel_requested.swap(false, Ordering::SeqCst)
+                                            {
+                                                // A halt the caller asked for. The harness stops
+                                                // the turn and reports ordinary idle, so this is
+                                                // the only point at which the two can be told
+                                                // apart (A3, docs/remaining-work.md).
+                                                let _ = step_tx.send(
+                                                    crate::step_extract::StepEvent::Error(
+                                                        anyhow!(crate::error::AntigravityError::Cancelled(
+                                                            "Cancelled by caller".to_string()
+                                                        )),
+                                                    ),
+                                                );
+                                            }
+
+                                            if tsu.state == Some(2) || tsu.state == Some(3) { // STATE_FULLY_IDLE | STATE_CANCELLED
+                                                conn_is_idle.store(true, Ordering::SeqCst);
+                                                let _ = conn_idle_tx.send(true);
+                                                tracing::debug!("Connection transitioned to IDLE, sending sentinel");
+                                                let _ = step_tx.send(crate::step_extract::StepEvent::Idle);
+                                            }
+                                        }
+                                        crate::proto::localharness::output_event::Event::InitializeConversationResponse(resp) => {
+                                            // The harness's first frame since 0.1.4. Reading it
+                                            // during the handshake — and seeding the conversation
+                                            // with `resp.history` on a resumed session — is WP-6;
+                                            // until then a resumed session silently starts empty.
+                                            // The reader loop is already running when this
+                                            // frame arrives — this transport has no split
+                                            // stream to read from before spawning — so the
+                                            // replayed history is published here and awaited
+                                            // by `initial_history()` (A5).
+                                            tracing::debug!(
+                                                "initialize_conversation_response ({} history steps)",
+                                                resp.history.len()
+                                            );
+                                            let replayed: Vec<Step> = resp
+                                                .history
+                                                .iter()
+                                                .filter_map(crate::step_extract::step_from_update)
+                                                .collect();
+                                            let _ = conn_initial_history.send(Some(replayed));
+                                        }
+                                        crate::proto::localharness::output_event::Event::CallHookRequest(req) => {
+                                            // The harness blocks its turn until a
+                                            // CallHookResponse with this request_id comes
+                                            // back, so this arm must always answer — even
+                                            // when it does not understand the request.
+                                            let hook_runner = hook_runner.clone();
+                                            let conn_ws_tx = conn_ws_tx.clone();
+                                            crate::spawn_task(async move {
+                                                let response = crate::hook_dispatch::answer_hook_request(
+                                                    hook_runner.as_ref(),
+                                                    &req,
+                                                )
+                                                .await;
+                                                let input_event = InputEvent {
+                                                    event: Some(crate::proto::localharness::input_event::Event::CallHookResponse(response)),
+                                                };
+                                                if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                                                    let _ = conn_ws_tx.send(raw_json);
+                                                }
+                                            });
+                                        }
+                                        crate::proto::localharness::output_event::Event::SessionEndResponse(_) => {
+                                            // The harness has flushed the trajectory. Release
+                                            // `disconnect()`, which waits for this before tearing
+                                            // the process down (B7).
+                                            tracing::debug!("session_end_response");
+                                            let _ = conn_session_end.send(true);
+                                        }
+                                        crate::proto::localharness::output_event::Event::ToolCall(tool_call) => {
+                                            let conn_ws_tx = conn_ws_tx.clone();
+                                            let tool_runner = tool_runner.clone();
+                                            let hook_runner = hook_runner.clone();
+                                            let step_tx_clone = step_tx.clone();
+                                            let learned_id_clone = conn_learned_id.clone();
+                                            let counter = client_tool_step_counter.clone();
+                                            crate::spawn_task(async move {
+                                                let args: Value = crate::tool_wire::parse_arguments(tool_call.arguments_json.as_deref());
+                                                let tc = ToolCall {
+                                                    id: tool_call.id.clone().unwrap_or_default(),
+                                                    name: tool_call.name.clone().unwrap_or_default(),
+                                                    args: args.clone(),
+                                                    canonical_path: None,
+                                                    server_name: None,
+                                                };
+                                                tracing::debug!("ToolCall event received: id={}, name={}", tc.id, tc.name);
+
+                                                // Emit ACTIVE step so the UI can show a tool card
+                                                let synth_idx = counter.fetch_add(1, Ordering::SeqCst);
+                                                let traj_id = learned_id_clone.get()
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                let active_step = Step {
+                                                    id: tc.id.clone(),
+                                                    step_index: synth_idx,
+                                                    r#type: StepType::ToolCall,
+                                                    source: StepSource::Model,
+                                                    target: StepTarget::Environment,
+                                                    status: StepStatus::Active,
+                                                    content: tc.name.clone(),
+                                                    tool_calls: vec![tc.clone()],
+                                                    trajectory_id: traj_id.clone(),
+                                                    ..Default::default()
+                                                };
+                                                let _ = step_tx_clone.send(crate::step_extract::StepEvent::Step(Box::new(active_step)));
+
+                                                // Fails closed: a hook that errors denies.
+                                                let (allow, deny_reason) = crate::hooks::HookRunner::gate_tool_call(hook_runner.as_ref(), &tc).await;
+                                                tracing::debug!("Policy decision for tool {}: allow={}", tc.name, allow);
+
+                                                if !allow {
+                                                    // Emit ERROR step for denied tool call
+                                                    let denied_step = Step {
+                                                        id: tc.id.clone(),
+                                                        step_index: synth_idx,
+                                                        r#type: StepType::ToolCall,
+                                                        source: StepSource::Model,
+                                                        target: StepTarget::Environment,
+                                                        status: StepStatus::Error,
+                                                        content: tc.name.clone(),
+                                                        error: if deny_reason.is_empty() {
+                                                            "Execution denied by hook policy".to_string()
+                                                        } else {
+                                                            deny_reason.clone()
+                                                        },
+                                                        tool_calls: vec![tc.clone()],
+                                                        trajectory_id: traj_id,
+                                                        ..Default::default()
+                                                    };
+                                                    let _ = step_tx_clone.send(crate::step_extract::StepEvent::Step(Box::new(denied_step)));
+
+                                                    let resp = ToolResponse {
+                                                        id: tool_call.id.clone(),
+                                                        response_json: Some("{\"error\": \"Execution denied by hook policy\"}".to_string()),
+                                                        error_message: None,
+                                                        supplemental_media: Vec::new(),
+                                                    };
+                                                    let input_event = InputEvent {
+                                                        event: Some(crate::proto::localharness::input_event::Event::ToolResponse(resp)),
+                                                    };
+                                                    if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                                                        let _ = conn_ws_tx.send(raw_json);
+                                                    }
+                                                    return;
+                                                }
+
+                                                let mut result = ToolResult {
+                                                    id: tool_call.id.clone(),
+                                                    name: tc.name.clone(),
+                                                    result: None,
+                                                    error: None,
+                                                    server_name: None,
+                                                    exception: None,
+                                                };
+
+                                                if let Some(ref runner) = tool_runner {
+                                                    tracing::debug!("Executing tool {} with args: {:?}", tc.name, tc.args);
+                                                    let results = runner.process_tool_calls(vec![tc.clone()]).await;
+                                                    if let Some(r) = results.into_iter().next() {
+                                                        result = r;
+                                                    }
+                                                } else {
+                                                    result.error = Some("No tool runner registered".to_string());
+                                                }
+
+                                                if let (Some(err_str), Some(runner)) = (result.error.as_ref(), hook_runner.as_ref()) {
+                                                    // The hook may reword the failure. It may not
+                                                    // turn it into a success: clearing the error
+                                                    // reported a tool that had failed to the model
+                                                    // as having worked (H4).
+                                                    if let Some(message) = runner.dispatch_on_tool_error(&anyhow!(err_str.clone())).await {
+                                                        result.error = Some(message);
+                                                    }
+                                                } else if let Some(runner) = hook_runner.as_ref() {
+                                                    let _ = runner.dispatch_post_tool_call(&result).await;
+                                                }
+
+                                                // Emit DONE or ERROR step with the execution result
+                                                let (final_status, error_msg, result_args) = if result.error.is_some() {
+                                                    (StepStatus::Error, result.error.clone().unwrap_or_default(), Value::Null)
+                                                } else {
+                                                    (StepStatus::Done, String::new(), result.result.clone().unwrap_or(Value::Null))
+                                                };
+                                                let done_step = Step {
+                                                    id: tc.id.clone(),
+                                                    step_index: synth_idx,
+                                                    r#type: StepType::ToolCall,
+                                                    source: StepSource::Model,
+                                                    target: StepTarget::Environment,
+                                                    status: final_status,
+                                                    content: tc.name.clone(),
+                                                    error: error_msg,
+                                                    tool_calls: vec![ToolCall {
+                                                        id: tc.id.clone(),
+                                                        name: tc.name.clone(),
+                                                        args: result_args,
+                                                        canonical_path: None,
+                                                        server_name: None,
+                                                    }],
+                                                    trajectory_id: traj_id,
+                                                    ..Default::default()
+                                                };
+                                                let _ = step_tx_clone.send(crate::step_extract::StepEvent::Step(Box::new(done_step)));
+
+                                                let resp = crate::tool_wire::tool_response(tool_call.id.clone(), &result);
+                                                let input_event = InputEvent {
+                                                    event: Some(crate::proto::localharness::input_event::Event::ToolResponse(resp)),
+                                                };
+                                                if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                                                    tracing::debug!("Sending ToolResponse input_event: {}", raw_json);
+                                                    let _ = conn_ws_tx.send(raw_json);
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to deserialize OutputEvent: {:?}. Raw: {}",
+                                    e,
+                                    &raw_text[..raw_text.len().min(300)]
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(ref e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        // Release lock & yield to let other tasks run (specifically the WS sender)
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(e) => {
+                        let _ = step_tx.send(crate::step_extract::StepEvent::Error(anyhow!(
+                            "WS read error: {e:?}"
+                        )));
+                        break;
+                    }
+                }
+            }
+
+            // The socket is gone. If the turn had not reached idle, it died
+            // mid-turn: say so rather than ending the stream as though the turn
+            // had completed. There is no stderr to quote on this transport —
+            // the local one appends the harness's own last words here.
+            conn_socket_closed.store(true, Ordering::SeqCst);
+            if !conn_is_idle_for_close.load(Ordering::SeqCst) {
+                let _ = step_tx.send(crate::step_extract::StepEvent::Error(anyhow!(
+                    "harness connection closed before the turn finished"
+                )));
+                conn_is_idle_for_close.store(true, Ordering::SeqCst);
+                let _ = conn_idle_tx.send(true);
+                let _ = step_tx.send(crate::step_extract::StepEvent::Idle);
+            }
+        });
+
+        // Hook runners dispatch session start
+        if let Some(ref runner) = self.hook_runner {
+            runner.dispatch_session_start().await?;
+        }
+
+        Ok(WasmConnection {
+            conversation_id,
+            learned_id,
+            is_idle,
+            step_rx: Arc::new(Mutex::new(Some(step_rx))),
+            ws_tx,
+            tool_runner: self.tool_runner.clone(),
+            hook_runner: self.hook_runner.clone(),
+            step_trackers,
+            main_trajectory_id: conn_cascade_id,
+            cancel_requested,
+            steps_consumed: Arc::new(AtomicBool::new(false)),
+            idle_tx,
+            initial_history_tx,
+            session_end_tx,
+            socket_closed,
+            subagent_responses,
+        })
+    }
+}
+
+/// Stateful WebSocket harness connection for WebAssembly.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct WasmConnection {
+    conversation_id: String,
+    learned_id: Arc<std::sync::OnceLock<String>>,
+    is_idle: Arc<AtomicBool>,
+    step_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<crate::step_extract::StepEvent>>>>,
+    ws_tx: mpsc::UnboundedSender<String>,
+    tool_runner: Option<ToolRunner>,
+    hook_runner: Option<HookRunner>,
+    step_trackers: Arc<Mutex<HashMap<(String, u32), StepTracker>>>,
+    /// The trajectory whose idle transitions end a turn. Learned from the first
+    /// `StepUpdate` of each turn and cleared by `send()`, mirroring upstream's
+    /// `reset_for_turn()` (`event_processor.py:379-386`).
+    main_trajectory_id: Arc<Mutex<Option<String>>>,
+    /// Set by [`Connection::send_halt_request`], cleared by the next `send()`
+    /// or by the idle transition that consumes it. See the field of the same
+    /// name on `LocalConnection` for why it is needed.
+    cancel_requested: Arc<AtomicBool>,
+    /// Whether a `receive_steps()` stream is currently live. See that method.
+    steps_consumed: Arc<AtomicBool>,
+    /// Mirrors `is_idle` for [`Connection::wait_for_idle`].
+    idle_tx: tokio::sync::watch::Sender<bool>,
+    /// The handshake reply's replayed history, published by the reader.
+    initial_history_tx: tokio::sync::watch::Sender<Option<Vec<Step>>>,
+    /// Set when the harness answers `session_end_request`.
+    session_end_tx: tokio::sync::watch::Sender<bool>,
+    /// Set once the websocket reader has seen the socket close.
+    socket_closed: Arc<AtomicBool>,
+    /// Last model text per subagent trajectory; see the capture site in the
+    /// reader loop. Cleared per turn.
+    subagent_responses: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl WasmConnection {
+    /// Steps the harness replayed when the conversation was resumed.
+    ///
+    /// Waits for the handshake reply, which arrives on the reader task rather
+    /// than being read inline: this transport shares one socket and has no
+    /// split stream to read from before the reader starts. Returns empty on
+    /// timeout, which is what a pre-0.1.4 harness produces — it never answers.
+    pub async fn initial_history(&self) -> Vec<Step> {
+        let mut rx = self.initial_history_tx.subscribe();
+        let already_here = rx.borrow_and_update().clone();
+        if let Some(history) = already_here {
+            return history;
+        }
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS),
+            rx.wait_for(Option::is_some),
+        )
+        .await;
+        match waited {
+            Ok(Ok(history)) => history.clone().unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl Connection for WasmConnection {
+    fn conversation_id(&self) -> &str {
+        if self.conversation_id.is_empty() {
+            self.learned_id.get().map_or("", String::as_str)
+        } else {
+            &self.conversation_id
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.is_idle.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_idle(&self) {
+        if self.is_idle() {
+            return;
+        }
+        // Watch rather than poll: the reader sets this the moment the harness
+        // reports idle, so a caller learns immediately instead of on the next
+        // tick of a sleep loop.
+        let mut rx = self.idle_tx.subscribe();
+        let _ = rx.wait_for(|idle| *idle).await;
+    }
+
+    fn receive_steps(&self) -> BoxStream<'static, Result<Step, anyhow::Error>> {
+        // One consumer at a time. Two live streams share a single receiver, so
+        // each would take roughly half the steps and neither caller would see a
+        // complete turn — silently. Refusing is the only honest answer; the
+        // claim is released when the first stream is dropped, which is what
+        // makes the per-turn `receive_steps()` call still work.
+        let Some(claim) = crate::step_extract::ConsumerGuard::claim(&self.steps_consumed) else {
+            return stream::once(async {
+                Err(anyhow!(
+                    "receive_steps() is single-consumer and a stream is already active; \
+                     drop it before subscribing again"
+                ))
+            })
+            .boxed();
+        };
+        let step_rx = self.step_rx.clone();
+        let is_idle = self.is_idle.clone();
+        stream::unfold(claim, move |claim| {
+            let step_rx = step_rx.clone();
+            let is_idle = is_idle.clone();
+            async move {
+                loop {
+                    // Head condition, upstream local_connection.py:339-341: the
+                    // stream ends only when the connection is idle AND nothing
+                    // is queued behind the idle event. Returning on the idle
+                    // event itself drops every step queued after it.
+                    let mut guard = step_rx.lock().await;
+                    let Some(rx) = &mut *guard else {
+                        drop(guard);
+                        return None;
+                    };
+                    if is_idle.load(Ordering::SeqCst) && rx.is_empty() {
+                        drop(guard);
+                        return None;
+                    }
+                    let received = rx.recv().await;
+                    drop(guard);
+
+                    match received {
+                        None => return None,
+                        // Falls through to re-evaluate the head condition
+                        // rather than ending the stream: more steps may already
+                        // be queued behind the idle marker.
+                        Some(crate::step_extract::StepEvent::Idle) => {}
+                        Some(crate::step_extract::StepEvent::Step(step)) => {
+                            return Some((Ok(*step), claim));
+                        }
+                        Some(crate::step_extract::StepEvent::Error(e)) => {
+                            return Some((Err(e), claim));
+                        }
+                    }
+                }
+            }
+        })
+        .boxed()
+    }
+
+    async fn send(&self, content: &str) -> Result<(), anyhow::Error> {
+        // Before any state is touched: a denied turn must leave the connection
+        // exactly as it was, not half-reset with a cleared trajectory.
+        crate::hook_dispatch::gate_turn(self.hook_runner.as_ref()).await?;
+
+        self.is_idle.store(false, Ordering::SeqCst);
+        let _ = self.idle_tx.send(false);
+        // A halt applies to the turn it interrupted. Leaving the flag set would
+        // make the *next* turn report itself cancelled the moment it went idle.
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        {
+            // A new turn may run on a new trajectory; relearn it rather than
+            // judging this turn against the last one's (upstream
+            // reset_for_turn(), event_processor.py:379-386).
+            let mut main_id = self.main_trajectory_id.lock().await;
+            *main_id = None;
+        }
+        {
+            // Last turn's subagent text must not be attributed to this turn's
+            // subagents (upstream clears the same map in send()).
+            self.subagent_responses.lock().await.clear();
+        }
+        {
+            let mut guard = self.step_rx.lock().await;
+            if let Some(rx) = &mut *guard {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+
+        let input_event = InputEvent {
+            event: Some(crate::proto::localharness::input_event::Event::UserInput(
+                crate::harness_config::sanitize_prompt(content),
+            )),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_content(&self, content: &crate::types::Content) -> Result<(), anyhow::Error> {
+        crate::hook_dispatch::gate_turn(self.hook_runner.as_ref()).await?;
+
+        self.is_idle.store(false, Ordering::SeqCst);
+        let _ = self.idle_tx.send(false);
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        {
+            let mut main_id = self.main_trajectory_id.lock().await;
+            *main_id = None;
+        }
+        {
+            self.subagent_responses.lock().await.clear();
+        }
+        {
+            let mut guard = self.step_rx.lock().await;
+            if let Some(rx) = &mut *guard {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+
+        let input_event = InputEvent {
+            event: Some(
+                crate::proto::localharness::input_event::Event::ComplexUserInput(
+                    crate::harness_config::build_user_input_proto(content),
+                ),
+            ),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_trigger_notification(&self, content: &str) -> Result<(), anyhow::Error> {
+        let input_event = InputEvent {
+            event: Some(
+                crate::proto::localharness::input_event::Event::AutomatedTrigger(
+                    content.to_string(),
+                ),
+            ),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_halt_request(&self) -> Result<(), anyhow::Error> {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        let input_event = InputEvent {
+            event: Some(crate::proto::localharness::input_event::Event::HaltRequest(
+                true,
+            )),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_tool_confirmation(
+        &self,
+        trajectory_id: &str,
+        step_index: u32,
+        accepted: bool,
+    ) -> Result<(), anyhow::Error> {
+        let conf = ToolConfirmation {
+            trajectory_id: Some(trajectory_id.to_string()),
+            step_index: Some(step_index),
+            accepted: Some(accepted),
+        };
+        let input_event = InputEvent {
+            event: Some(crate::proto::localharness::input_event::Event::ToolConfirmation(conf)),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_tool_response(&self, id: &str, result: ToolResult) -> Result<(), anyhow::Error> {
+        let resp_json = if let Some(ref val) = result.result {
+            if val.is_object() {
+                serde_json::to_string(val)?
+            } else {
+                serde_json::to_string(&serde_json::json!({ "result": val }))?
+            }
+        } else if let Some(ref err) = result.error {
+            serde_json::to_string(&serde_json::json!({ "error": err }))?
+        } else {
+            "{}".to_string()
+        };
+
+        let resp = ToolResponse {
+            id: Some(id.to_string()),
+            response_json: Some(resp_json),
+            error_message: None,
+            supplemental_media: Vec::new(),
+        };
+        let input_event = InputEvent {
+            event: Some(crate::proto::localharness::input_event::Event::ToolResponse(resp)),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn send_question_response(
+        &self,
+        trajectory_id: &str,
+        step_index: u32,
+        answers: QuestionHookResult,
+    ) -> Result<(), anyhow::Error> {
+        let mut proto_answers = Vec::new();
+        for r in answers.responses {
+            if r.skipped {
+                proto_answers.push(UserQuestionAnswer {
+                    answer: Some(
+                        crate::proto::localharness::user_question_answer::Answer::Unanswered(true),
+                    ),
+                });
+            } else {
+                let mut mc_ans = MultipleChoiceAnswer {
+                    selected_choice_indices: Vec::new(),
+                    freeform_response: Some(r.freeform_response.clone()),
+                };
+                if let Some(ref opts) = r.selected_option_ids {
+                    for opt in opts {
+                        if let Ok(idx) = opt.parse::<i32>() {
+                            mc_ans.selected_choice_indices.push(idx - 1);
+                        }
+                    }
+                }
+                proto_answers.push(UserQuestionAnswer {
+                    answer: Some(crate::proto::localharness::user_question_answer::Answer::MultipleChoiceAnswer(mc_ans)),
+                });
+            }
+        }
+
+        let resp = UserQuestionsResponse {
+            trajectory_id: Some(trajectory_id.to_string()),
+            step_index: Some(step_index),
+            result: Some(if answers.cancelled {
+                crate::proto::localharness::user_questions_response::Result::Cancelled(true)
+            } else {
+                crate::proto::localharness::user_questions_response::Result::Response(
+                    QuestionsResponse {
+                        answers: proto_answers,
+                    },
+                )
+            }),
+        };
+
+        let input_event = InputEvent {
+            event: Some(crate::proto::localharness::input_event::Event::QuestionResponse(resp)),
+        };
+        let raw_json = serde_json::to_string(&input_event)?;
+        self.ws_tx.send(raw_json)?;
+        Ok(())
+    }
+
+    async fn disconnect(&self) -> Result<(), anyhow::Error> {
+        // No subprocess to tear down on this transport, but the session-end
+        // hooks still have to run — upstream dispatches them from disconnect()
+        // (0.1.1 local_connection.py:686-690).
+        if let Some(ref runner) = self.hook_runner
+            && let Err(e) = runner.dispatch_session_end().await
+        {
+            tracing::error!("on_session_end hook failed: {e:?}");
+        }
+
+        // Tell the harness the session is over and wait for it to say it has
+        // flushed. Upstream sends this before closing stdin; skipping it meant
+        // shutdown raced the harness's own trajectory write (B7).
+        // Nothing to wait for once the socket is gone — a crashed harness will
+        // never answer, and blocking on it would add the full timeout to every
+        // teardown after a crash.
+        if !self.socket_closed.load(Ordering::SeqCst) {
+            let input_event = InputEvent {
+                event: Some(
+                    crate::proto::localharness::input_event::Event::SessionEndRequest(true),
+                ),
+            };
+            if let Ok(raw_json) = serde_json::to_string(&input_event) {
+                let _ = self.ws_tx.send(raw_json);
+                let mut rx = self.session_end_tx.subscribe();
+                // Bounded: a harness that never answers must not hold shutdown
+                // open, and closing stdin below stops it regardless.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(SESSION_END_TIMEOUT_SECONDS),
+                    rx.wait_for(|acked| *acked),
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn extract_tool_result(step_update: &StepUpdate) -> Option<ToolResult> {
+    let traj_id = step_update.trajectory_id.clone().unwrap_or_default();
+    let step_idx = step_update.step_index.unwrap_or(0);
+    let id = format!("{traj_id}_{step_idx}");
+
+    let tool_call = crate::step_extract::extract_builtin_tool_call(step_update)?;
+    let result = step_update.text.clone().map(Value::String);
+    let error = step_update.error_message.clone();
+
+    Some(ToolResult {
+        id: Some(id),
+        name: tool_call.name,
+        result,
+        error,
+        server_name: None,
+        exception: None,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+    use crate::proto::localharness::{
+        ActionCreateFile, ActionEditFile, ActionFindFile, ActionGenerateImage, ActionListDirectory,
+        ActionRunCommand, ActionViewFile, StepUpdate,
+    };
+    use crate::types::{CapabilitiesConfig, GeminiConfig};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    #[test]
+    fn test_step_tracker_new() {
+        let mut tracker = StepTracker::new();
+        assert!(!tracker.mark_handled("questions_request"));
+    }
+
+    #[test]
+    fn test_step_tracker_update_state() {
+        let mut tracker = StepTracker::new();
+        tracker.update_state(3);
+        assert!(tracker.mark_handled("questions_request"));
+        assert!(!tracker.mark_handled("questions_request"));
+        assert!(tracker.mark_handled("tool_confirmation_request"));
+
+        tracker.update_state(1);
+        assert!(!tracker.mark_handled("another_request"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_extract_builtin_tool_call_all_types() {
+        // 1. FindFile
+        let step_update_find = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(1),
+            find_file: Some(ActionFindFile {
+                directory_path: Some("dir_path".to_string()),
+                query: Some("query_str".to_string()),
+                output: None,
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_find).unwrap();
+        assert_eq!(tc.id, "traj_1_1");
+        assert_eq!(tc.name, "FIND_FILE");
+        assert_eq!(tc.canonical_path, Some("dir_path".to_string()));
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "directory_path": "dir_path",
+                "query": "query_str"
+            })
+        );
+
+        // Test extract_tool_result for FindFile
+        let step_update_find_res = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(1),
+            find_file: Some(ActionFindFile {
+                directory_path: Some("dir_path".to_string()),
+                query: Some("query_str".to_string()),
+                output: None,
+            }),
+            text: Some("result_text".to_string()),
+            error_message: Some("error_text".to_string()),
+            ..Default::default()
+        };
+        let tr = extract_tool_result(&step_update_find_res).unwrap();
+        assert_eq!(tr.id, Some("traj_1_1".to_string()));
+        assert_eq!(tr.name, "FIND_FILE");
+        assert_eq!(
+            tr.result,
+            Some(serde_json::Value::String("result_text".to_string()))
+        );
+        assert_eq!(tr.error, Some("error_text".to_string()));
+
+        // 2. RunCommand
+        let step_update_run = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(2),
+            run_command: Some(ActionRunCommand {
+                command_line: Some("echo hello".to_string()),
+                working_dir: Some("work_dir".to_string()),
+                exit_code: None,
+                combined_output: None,
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_run).unwrap();
+        assert_eq!(tc.id, "traj_1_2");
+        assert_eq!(tc.name, "RUN_COMMAND");
+        assert_eq!(tc.canonical_path, None);
+        // Arguments only. `combined_output` and `exit_code` are results and
+        // were carried here for a while: a `pre_tool_call` predicate reading
+        // them saw them null, because the command has not run, so a rule built
+        // on them silently allowed everything. They reach `post_tool_call` on
+        // the `ToolResult` instead.
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "command_line": "echo hello",
+                "working_dir": "work_dir"
+            })
+        );
+
+        // 3. ViewFile
+        let step_update_view = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(3),
+            view_file: Some(ActionViewFile {
+                file_path: Some("view_path".to_string()),
+                start_line: Some(10),
+                end_line: Some(20),
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_view).unwrap();
+        assert_eq!(tc.id, "traj_1_3");
+        assert_eq!(tc.name, "VIEW_FILE");
+        assert_eq!(tc.canonical_path, Some("view_path".to_string()));
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "file_path": "view_path",
+                "start_line": 10,
+                "end_line": 20
+            })
+        );
+
+        // 4. CreateFile
+        let step_update_create = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(4),
+            create_file: Some(ActionCreateFile {
+                file_path: Some("create_path".to_string()),
+                contents: Some("create_contents".to_string()),
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_create).unwrap();
+        assert_eq!(tc.id, "traj_1_4");
+        assert_eq!(tc.name, "CREATE_FILE");
+        assert_eq!(tc.canonical_path, Some("create_path".to_string()));
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "file_path": "create_path",
+                "contents": "create_contents"
+            })
+        );
+
+        // 5. EditFile
+        let step_update_edit = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(5),
+            edit_file: Some(ActionEditFile {
+                file_path: Some("edit_path".to_string()),
+                diff_block: vec![],
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_edit).unwrap();
+        assert_eq!(tc.id, "traj_1_5");
+        assert_eq!(tc.name, "EDIT_FILE");
+        assert_eq!(tc.canonical_path, Some("edit_path".to_string()));
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "file_path": "edit_path",
+                // The edit itself, so a policy predicate can inspect the change
+                // and not just the path.
+                "diff_block": []
+            })
+        );
+
+        // 5.5 InvokeSubagent
+        let step_update_sub = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(6),
+            invoke_subagent: Some(crate::proto::localharness::ActionInvokeSubagent {}),
+            request_text: Some("Do a subtask".to_string()),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_sub).unwrap();
+        assert_eq!(tc.id, "traj_1_6");
+        assert_eq!(tc.name, "START_SUBAGENT");
+        assert_eq!(tc.canonical_path, None);
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "prompt": "Do a subtask"
+            })
+        );
+
+        // 5.6 ListDirectory
+        let step_update_list = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(8),
+            list_directory: Some(ActionListDirectory {
+                directory_path: Some("list_path".to_string()),
+                results: vec![],
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_list).unwrap();
+        assert_eq!(tc.id, "traj_1_8");
+        assert_eq!(tc.name, "LIST_DIR");
+        assert_eq!(tc.canonical_path, Some("list_path".to_string()));
+        assert_eq!(
+            tc.args,
+            serde_json::json!({
+                "directory_path": "list_path"
+            })
+        );
+
+        // 5.7 GenerateImage
+        let step_update_gen = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(9),
+            generate_image: Some(ActionGenerateImage {
+                aspect_ratio: None,
+                prompt: Some("a gold dragon logo".to_string()),
+                image_paths: vec!["/tmp/dragon.png".to_string()],
+                image_name: Some("dragon_logo".to_string()),
+            }),
+            ..Default::default()
+        };
+        let tc = crate::step_extract::extract_builtin_tool_call(&step_update_gen).unwrap();
+        assert_eq!(tc.id, "traj_1_9");
+        assert_eq!(tc.name, "GENERATE_IMAGE");
+        assert_eq!(tc.canonical_path, None);
+        assert_eq!(tc.args["prompt"], "a gold dragon logo");
+        assert_eq!(tc.args["image_name"], "dragon_logo");
+        assert_eq!(tc.args["image_paths"][0], "/tmp/dragon.png");
+
+        // 6. None
+        let step_update_none = StepUpdate {
+            trajectory_id: Some("traj_1".to_string()),
+            step_index: Some(7),
+            ..Default::default()
+        };
+        assert!(crate::step_extract::extract_builtin_tool_call(&step_update_none).is_none());
+        assert!(extract_tool_result(&step_update_none).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wasm_connection_integration_mock() {
+        // Bind to a free local port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn the mock WebSocket server in the background
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws_stream = accept_async(stream).await.unwrap();
+
+            // 1. Receive the InitializeConversationEvent configuration message
+            let msg = ws_stream.next().await.unwrap().unwrap();
+            let text = msg.to_text().unwrap();
+            assert!(text.contains("InitializeConversationEvent") || text.contains("cascadeId"));
+
+            // 2. Wait for the client's prompt. The connection starts idle
+            // (C2), so the turn only begins once something is sent — the same
+            // send()-then-receive order every real caller uses.
+            let msg2 = ws_stream.next().await.unwrap().unwrap();
+            let text2 = msg2.to_text().unwrap();
+            assert!(text2.contains("hello"));
+
+            // 3. Send trajectoryStateUpdate (RUNNING)
+            let traj_running = serde_json::json!({
+                "trajectoryStateUpdate": {
+                    "trajectoryId": "test_traj",
+                    "state": "STATE_RUNNING"
+                }
+            });
+            ws_stream
+                .send(WsMessage::Text(traj_running.to_string()))
+                .await
+                .unwrap();
+
+            // 4. Send StepUpdate
+            let step_update = serde_json::json!({
+                "stepUpdate": {
+                    "stepIndex": 1,
+                    "cascadeId": "test_traj",
+                    "trajectoryId": "test_traj",
+                    "text": "Hello from mock harness!",
+                    "textDelta": "Hello from mock harness!",
+                    "state": "STATE_ACTIVE",
+                    "source": "SOURCE_MODEL",
+                    "target": "TARGET_USER"
+                }
+            });
+            ws_stream
+                .send(WsMessage::Text(step_update.to_string()))
+                .await
+                .unwrap();
+
+            // 5. Send trajectoryStateUpdate (IDLE)
+            let traj_idle = serde_json::json!({
+                "trajectoryStateUpdate": {
+                    "trajectoryId": "test_traj",
+                    // Renamed from STATE_IDLE upstream in 0.1.9; protojson
+                    // matches on the value name, not the number.
+                    "state": "STATE_FULLY_IDLE"
+                }
+            });
+            ws_stream
+                .send(WsMessage::Text(traj_idle.to_string()))
+                .await
+                .unwrap();
+
+            // Stay up until the client goes away, rather than sleeping a fixed
+            // 50ms and hoping. The client's teardown now includes a session-end
+            // handshake, and a fixed sleep made this test flaky under load —
+            // it failed once in a full run and passed in isolation.
+            while let Some(msg) = ws_stream.next().await {
+                let Ok(WsMessage::Text(text)) = msg else {
+                    break;
+                };
+                if text.contains("sessionEndRequest") {
+                    let ack = serde_json::json!({ "sessionEndResponse": true });
+                    let _ = ws_stream.send(WsMessage::Text(ack.to_string())).await;
+                    // The session is over by definition; nothing follows it.
+                    break;
+                }
+            }
+        });
+
+        // Configure host/port via static atomic variable (safe, no unsafe_code)
+        TEST_PORT.store(port, std::sync::atomic::Ordering::SeqCst);
+
+        // Instantiate strategy
+        let mut gemini_config = GeminiConfig::default();
+        gemini_config.api_key = Some("mock_key".to_string());
+        let strategy = WasmConnectionStrategy {
+            gemini_config,
+            capabilities_config: CapabilitiesConfig::default(),
+            system_instructions: None,
+            save_dir: None,
+            workspaces: vec![],
+            skills_paths: vec![],
+            tool_runner: None,
+            hook_runner: None,
+            conversation_id: "test_traj".to_string(),
+            mcp_servers: Vec::new(),
+            subagents: Vec::new(),
+            retry_config: None,
+            tool_output_truncation: None,
+        };
+
+        // Connect
+        let conn = strategy.connect().await.unwrap();
+        assert_eq!(conn.conversation_id(), "test_traj");
+
+        // Send first: the connection starts idle, so subscribing before a
+        // prompt yields an empty stream rather than blocking on a turn that was
+        // never started.
+        conn.send("hello").await.unwrap();
+
+        // Consume the step stream
+        let mut steps = conn.receive_steps();
+        let step = steps.next().await.unwrap().unwrap();
+        assert_eq!(step.content, "Hello from mock harness!");
+        assert_eq!(step.step_index, 1);
+
+        // Stream should end (returns None) once transitioned to IDLE
+        let next_step = steps.next().await;
+        assert!(next_step.is_none());
+
+        // Join the server task
+        // Close the connection so the server task's read loop ends, then join
+        // it. Dropping the connection is what a real caller's teardown does.
+        conn.disconnect().await.unwrap();
+        drop(conn);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle).await;
+    }
+}

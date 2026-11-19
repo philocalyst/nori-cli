@@ -1,0 +1,76 @@
+[package]
+name = "leptos_ssr_axum"
+authors = ["codeitlikemiley <codeitlikemiley@gmail.com>"]
+description = "Antigravity SDK Chat Interface — Leptos + Spin WASI Example"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.0"
+build = "build.rs"
+
+[lib]
+crate-type = [ "cdylib" ]
+
+[dependencies]
+any_spawner = { version = "0.3.0", features = ["futures-executor"] }
+bytes = "1.7.2"
+console_error_panic_hook = "0.1"
+futures = "0.3.30"
+hydration_context = { version = "0.3.0" }
+leptos = { version = "0.8.19" }
+leptos_meta = { version = "0.8.6" }
+leptos_router = { version = "0.8.13" }
+leptos_wasi = { version = "0.3.1", default-features = false, features = ["wasip3"], optional = true }
+server_fn = { version = "0.8.12", features = ["axum-no-default"] }
+spin-sdk = { version = "6.0.0", features = ["json"], optional = true }
+wasip3 = { version = "0.6.0", features = ["http-compat"], optional = true }
+http = { version = "1.1.0", optional = true }
+http-body = { version = "1.0.0", optional = true }
+wasm-bindgen = { version = "=0.2.114", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["Storage", "Window", "EventSource", "MessageEvent", "ErrorEvent", "Document", "Element", "HtmlMetaElement"], optional = true }
+js-sys = { version = "=0.3.91", optional = true }
+gloo-net = { version = "0.6", optional = true }
+gloo-events = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+antigravity-sdk-rust = { path = "../..", optional = true }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+
+[workspace]
+
+[features]
+csr = ["leptos/csr"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:js-sys", "dep:gloo-net", "dep:gloo-events"]
+ssr = [
+  "leptos/ssr",
+  "leptos_meta/ssr",
+  "leptos_router/ssr",
+  "dep:spin-sdk",
+  "dep:leptos_wasi",
+  "dep:wasip3",
+  "dep:antigravity-sdk-rust",
+  "dep:http",
+  "dep:http-body",
+]
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[package.metadata.leptos]
+output-name = "leptos_ssr_axum"
+tailwind-input-file = "input.css"
+assets-dir = "public"
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
+lib-profile-release = "wasm-release"
+bin-profile-release = "wasm-release"
+bin-target-triple = "wasm32-wasip2"
+bin-target-dir = "target/server"
+

@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target
+*.lock
+
+# Development / Local configuration
+.env
+!.env.local
+*.localharness.bin
+
+# OS specific files
+.DS_Store
+Thumbs.db
+db.json
+
+# IDE configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+.cargo/config.toml.local
+
+# Backup and temp files
+*.rs.bak
+cargo-timing.html
+/bin/
+/.agents/
+/.antigravitycli/
