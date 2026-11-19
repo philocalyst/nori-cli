@@ -10,6 +10,11 @@ pub struct Projection {
     visible: Vec<Record>,
 }
 
+pub(crate) enum Change {
+    Push,
+    Truncate(usize),
+}
+
 impl Projection {
     pub fn visible(&self) -> &[Record] {
         &self.visible
@@ -27,6 +32,13 @@ impl Projection {
     }
 
     pub(crate) fn apply(&mut self, record: &Record) -> io::Result<()> {
+        let change = self.prepare(record)?;
+        self.commit(record, change);
+        Ok(())
+    }
+
+    /// Validate before durable append without copying the visible transcript.
+    pub(crate) fn prepare(&self, record: &Record) -> io::Result<Change> {
         match &record.event {
             Event::Rewind { head } => {
                 let length = match head {
@@ -40,16 +52,24 @@ impl Projection {
                             io::Error::new(io::ErrorKind::InvalidData, "rewind head is not visible")
                         })?,
                 };
-                self.visible.truncate(length);
+                Ok(Change::Truncate(length))
             }
             Event::Fork { source } => {
-                if self.slice(*source).is_none() {
+                let start = self
+                    .visible
+                    .iter()
+                    .position(|record| record.id == source.start);
+                let end = self
+                    .visible
+                    .iter()
+                    .position(|record| record.id == source.end);
+                if !matches!((start, end), (Some(start), Some(end)) if start <= end) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "fork slice is not visible",
                     ));
                 }
-                self.visible.push(record.clone());
+                Ok(Change::Push)
             }
             Event::Message { .. }
             | Event::ToolCall { .. }
@@ -57,8 +77,14 @@ impl Projection {
             | Event::Operation { .. }
             | Event::Command { .. }
             | Event::SessionEvent { .. }
-            | Event::Unknown { .. } => self.visible.push(record.clone()),
+            | Event::Unknown { .. } => Ok(Change::Push),
         }
-        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self, record: &Record, change: Change) {
+        match change {
+            Change::Push => self.visible.push(record.clone()),
+            Change::Truncate(length) => self.visible.truncate(length),
+        }
     }
 }

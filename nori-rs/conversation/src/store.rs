@@ -40,10 +40,6 @@ impl ConversationStore for FileStore {
         Ok(bytes)
     }
     fn append(&mut self, expected_version: i64, bytes: &[u8]) -> io::Result<()> {
-        let actual = i64::try_from(self.read()?.len()).map_err(io::Error::other)?;
-        if actual != expected_version {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "journal changed"));
-        }
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]

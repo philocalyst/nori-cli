@@ -8,6 +8,7 @@ license = { workspace = true }
 workspace = true
 
 [dependencies]
+nori-pkl = { path = "../pkl" }
 serde_json = { workspace = true }
 
 [dev-dependencies]

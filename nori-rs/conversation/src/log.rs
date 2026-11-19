@@ -47,6 +47,7 @@ impl ConversationLog {
         let mut records: Vec<Record> = Vec::new();
         let mut projection = Projection::default();
         let mut interrupted = false;
+        let mut command_ids = std::collections::HashSet::new();
         for bytes in data.split_inclusive(|b| *b == b'\n') {
             if !bytes.ends_with(b"\n") {
                 interrupted = true;
@@ -68,7 +69,7 @@ impl ConversationLog {
                 ));
             }
             if let Some(id) = &record.command_id
-                && records.iter().any(|r| r.command_id.as_ref() == Some(id))
+                && !command_ids.insert(id.clone())
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -84,6 +85,33 @@ impl ConversationLog {
         self.interrupted = interrupted;
         self.poisoned = false;
         Ok(())
+    }
+
+    /// Read the records of the log at `path` in order, without loading the whole log, until `f`
+    /// breaks. Records are not checked against each other and nothing is projected, so this is
+    /// for reading a few facts (metadata, a first message, a count) out of a long log quickly.
+    /// A record cut short by a crash ends the scan.
+    pub fn scan(
+        path: impl AsRef<Path>,
+        mut f: impl FnMut(Record) -> std::ops::ControlFlow<()>,
+    ) -> io::Result<()> {
+        use std::io::BufRead;
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+                return Ok(());
+            }
+            let text = line.trim_end_matches('\n');
+            if text.ends_with(INTERRUPTED) {
+                continue;
+            }
+            if f(codec::decode(text)?).is_break() {
+                return Ok(());
+            }
+        }
     }
 
     /// Resolve a slice at an earlier event, including a branch hidden by rewind.
@@ -154,56 +182,68 @@ impl ConversationLog {
                 "unknown events cannot be appended",
             ));
         }
-        self.refresh()?;
-        if let Some(id) = &command_id
-            && let Some(record) = self
-                .records
-                .iter()
-                .find(|r| r.command_id.as_ref() == Some(id))
-        {
-            if record.event == event {
-                return Ok(record.clone());
+        let mut refreshed = false;
+        loop {
+            if let Some(id) = &command_id
+                && let Some(record) = self
+                    .records
+                    .iter()
+                    .find(|r| r.command_id.as_ref() == Some(id))
+            {
+                if record.event == event {
+                    return Ok(record.clone());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "command id already used for another event",
+                ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "command id already used for another event",
-            ));
-        }
-        if self.projection.head() != expected_head {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "conversation head changed",
-            ));
-        }
-        let record = Record {
-            id: self.next_id()?,
-            command_id,
-            event,
-        };
-        let mut projection = self.projection.clone();
-        projection.apply(&record)?;
-        let mut bytes = Vec::new();
-        if self.interrupted {
-            bytes.extend_from_slice(format!("{INTERRUPTED}\n").as_bytes());
-        }
-        bytes.extend_from_slice(codec::encode(&record)?.as_bytes());
-        self.poisoned = true;
-        if let Err(error) = self.store.append(self.version, &bytes) {
-            // A failed CAS is guaranteed not to have written anything. Keep
-            // the instance usable so the caller can refresh and retry.
-            if error.kind() == io::ErrorKind::WouldBlock {
-                self.poisoned = false;
+            if self.projection.head() != expected_head {
+                if !refreshed {
+                    self.refresh()?;
+                    refreshed = true;
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "conversation head changed",
+                ));
             }
-            return Err(error);
+            let record = Record {
+                id: self.next_id()?,
+                command_id: command_id.clone(),
+                event: event.clone(),
+            };
+            let change = self.projection.prepare(&record)?;
+            let mut bytes = Vec::new();
+            if self.interrupted {
+                bytes.extend_from_slice(format!("{INTERRUPTED}\n").as_bytes());
+            }
+            bytes.extend_from_slice(codec::encode(&record)?.as_bytes());
+            let version = self
+                .version
+                .checked_add(i64::try_from(bytes.len()).map_err(io::Error::other)?)
+                .ok_or_else(|| io::Error::other("journal version exhausted"))?;
+            self.poisoned = true;
+            if let Err(error) = self.store.append(self.version, &bytes) {
+                // Failed comparisons cannot write bytes. Reload only on contention;
+                // normal streamed events never reparse or clone the transcript.
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    self.poisoned = false;
+                    if !refreshed {
+                        self.refresh()?;
+                        refreshed = true;
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+            self.poisoned = false;
+            self.version = version;
+            self.interrupted = false;
+            self.projection.commit(&record, change);
+            self.records.push(record.clone());
+            return Ok(record);
         }
-        self.poisoned = false;
-        self.version = self
-            .version
-            .checked_add(i64::try_from(bytes.len()).map_err(io::Error::other)?)
-            .ok_or_else(|| io::Error::other("journal version exhausted"))?;
-        self.interrupted = false;
-        self.projection = projection;
-        self.records.push(record.clone());
-        Ok(record)
     }
 }

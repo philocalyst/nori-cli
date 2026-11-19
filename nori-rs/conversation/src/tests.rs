@@ -18,6 +18,45 @@ fn message(content: &str) -> Event {
 }
 
 #[test]
+fn literal_journal_parser_handles_structural_formatting_without_evaluating_fields() {
+    let expected = message("café 🙂 \\(read(\"env:NEVER_EVALUATED\"))");
+    let record = crate::Record {
+        id: 1,
+        command_id: None,
+        event: expected,
+    };
+    let encoded = crate::codec::encode(&record).unwrap();
+    let reformatted = encoded
+        .replace(" = new {", "=new Dynamic {/* retained comment */")
+        .replace(
+            "; data =",
+            "; ignored = throw(\"never evaluate replay\");data=",
+        );
+    assert_eq!(
+        crate::codec::decode(reformatted.trim_end()).unwrap(),
+        record
+    );
+}
+
+#[test]
+fn journal_replay_rejects_computed_known_payloads_and_preserves_future_syntax() {
+    let computed =
+        "event_1 = new { kind = \"message\"; data = read(\"file:/nori-no-evaluation\") }";
+    assert!(crate::codec::decode(computed).is_err());
+    let future = "event_2 = new { kind = \"future-kind\"; data = throw(\"never execute\") }";
+    assert_eq!(
+        crate::codec::decode(future).unwrap(),
+        crate::Record {
+            id: 2,
+            command_id: None,
+            event: Event::Unknown {
+                form: future.to_owned()
+            },
+        }
+    );
+}
+
+#[test]
 fn rewind_keeps_history_and_replay_reconstructs_branch() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.pkl");
@@ -276,4 +315,107 @@ fn log_can_refresh_and_retry_after_a_concurrent_compare_and_append_conflict() {
         .unwrap();
     assert_eq!(retried.id, 2);
     assert_eq!(loser.projection().head(), Some(2));
+}
+
+#[test]
+fn streamed_appends_do_not_reload_the_journal() {
+    struct CountingStore {
+        store: crate::MemoryStore,
+        reads: Arc<AtomicUsize>,
+    }
+    impl crate::ConversationStore for CountingStore {
+        fn read(&self) -> io::Result<Vec<u8>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.store.read()
+        }
+        fn append(&mut self, expected_version: i64, bytes: &[u8]) -> io::Result<()> {
+            self.store.append(expected_version, bytes)
+        }
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let store = crate::MemoryStore::default();
+    let mut log = ConversationLog::with_store(CountingStore {
+        store: store.clone(),
+        reads: reads.clone(),
+    })
+    .unwrap();
+    for index in 0..512 {
+        log.append(message(&format!("stream chunk {index}")))
+            .unwrap();
+    }
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let replay = ConversationLog::with_store(store).unwrap();
+    assert_eq!(replay.records(), log.records());
+    assert_eq!(replay.projection(), log.projection());
+}
+
+#[test]
+fn contention_with_a_rewound_head_refreshes_ids_before_append() {
+    let store = crate::MemoryStore::default();
+    let mut first = ConversationLog::with_store(store.clone()).unwrap();
+    first.append(message("root")).unwrap();
+    let mut stale = ConversationLog::with_store(store.clone()).unwrap();
+    first.append(message("hidden")).unwrap();
+    first.append(Event::Rewind { head: Some(1) }).unwrap();
+    let record = stale
+        .append_with_id(Some(1), "after-rewind", message("replacement"))
+        .unwrap();
+    assert_eq!(record.id, 4);
+    let replay = ConversationLog::with_store(store).unwrap();
+    assert_eq!(stale.records(), replay.records());
+    assert_eq!(stale.projection(), replay.projection());
+}
+
+#[test]
+fn invalid_projection_change_does_not_write_or_mutate_the_branch() {
+    let store = crate::MemoryStore::default();
+    let mut log = ConversationLog::with_store(store.clone()).unwrap();
+    log.append(message("root")).unwrap();
+    let expected = log.projection().clone();
+    assert_eq!(
+        log.append(Event::Rewind { head: Some(99) })
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(log.projection(), &expected);
+    let replay = ConversationLog::with_store(store).unwrap();
+    assert_eq!(log.records(), replay.records());
+    assert_eq!(log.append(message("next")).unwrap().id, 2);
+}
+
+#[test]
+fn incomplete_append_requires_recovery_without_advancing_projection() {
+    struct InterruptedStore {
+        store: crate::MemoryStore,
+        interrupt: bool,
+    }
+    impl crate::ConversationStore for InterruptedStore {
+        fn read(&self) -> io::Result<Vec<u8>> {
+            self.store.read()
+        }
+        fn append(&mut self, version: i64, bytes: &[u8]) -> io::Result<()> {
+            if self.interrupt {
+                self.interrupt = false;
+                self.store.append(version, &bytes[..bytes.len() / 2])?;
+                return Err(io::Error::other("interrupted durable append"));
+            }
+            self.store.append(version, bytes)
+        }
+    }
+    let store = crate::MemoryStore::default();
+    let mut log = ConversationLog::with_store(InterruptedStore {
+        store: store.clone(),
+        interrupt: true,
+    })
+    .unwrap();
+    assert!(log.append(message("partial")).is_err());
+    assert_eq!(log.records(), &[]);
+    assert_eq!(log.projection().head(), None);
+    assert!(log.append(message("must wait for recovery")).is_err());
+    log.refresh().unwrap();
+    assert_eq!(log.append(message("recovered")).unwrap().id, 1);
+    let replay = ConversationLog::with_store(store).unwrap();
+    assert_eq!(replay.records(), log.records());
+    assert_eq!(replay.projection(), log.projection());
 }
