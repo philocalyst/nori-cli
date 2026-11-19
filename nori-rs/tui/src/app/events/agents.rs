@@ -194,7 +194,8 @@ impl App {
                     return Ok(true);
                 }
                 if self.is_model_session_route(route_token, &config_id, &value) {
-                    if !success && route_fallback_eligible && self.advance_model_route().await {
+                    let why = error.as_deref().unwrap_or("the agent refused it");
+                    if !success && route_fallback_eligible && self.advance_model_route(why).await {
                         return Ok(true);
                     }
                     self.model_route_fallback = None;

@@ -56,15 +56,15 @@ impl App {
                             self.candidate_agent = None;
                             self.pending_candidate_model = None;
                             let model_selection = self.model_route_fallback.is_some();
+                            let why = error.to_string();
                             if crate::app::model_routes::eligible_error(&error)
-                                && self.advance_model_route().await
+                                && self.advance_model_route(&why).await
                             {
                                 return Ok(true);
                             }
-                            self.model_route_fallback = None;
+                            self.end_model_choice(&why);
                             if model_selection {
                                 self.manual_model_handoff = None;
-                                tui.show_toast(format!("Couldn't select model: {error}"));
                                 return Ok(true);
                             }
                             self.chat_widget.set_login_agent_override(Some(agent_name));

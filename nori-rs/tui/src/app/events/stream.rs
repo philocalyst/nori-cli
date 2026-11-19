@@ -170,13 +170,13 @@ impl App {
                                             }
                                             Err(error) => {
                                                 self.discard_candidate();
-                                                if self.advance_model_route().await {
+                                                let why = format!(
+                                                    "it couldn't keep the effort setting ({error})"
+                                                );
+                                                if self.advance_model_route(&why).await {
                                                     return Ok(true);
                                                 }
                                                 self.manual_model_handoff = None;
-                                                tui.show_toast(format!(
-                                                    "Couldn't retain effort setting: {error}"
-                                                ));
                                                 return Ok(true);
                                             }
                                         }
@@ -190,13 +190,12 @@ impl App {
                                 Err((eligible, error)) => {
                                     self.discard_candidate();
                                     let model_selection = self.model_route_fallback.is_some();
-                                    if eligible && self.advance_model_route().await {
+                                    if eligible && self.advance_model_route(&error).await {
                                         return Ok(true);
                                     }
-                                    self.model_route_fallback = None;
+                                    self.end_model_choice(&error);
                                     if model_selection {
                                         self.manual_model_handoff = None;
-                                        tui.show_toast(format!("Couldn't select model: {error}"));
                                         return Ok(true);
                                     }
                                     self.chat_widget.add_error_message(format!(
@@ -306,15 +305,15 @@ impl App {
                         }) = candidate
                         {
                             widget.shutdown_harness_session();
-                            if activation_route_eligible && self.advance_model_route().await {
+                            if activation_route_eligible && self.advance_model_route(&message).await
+                            {
                                 return Ok(true);
                             }
-                            self.model_route_fallback = None;
+                            self.end_model_choice(&message);
                             self.chat_widget.set_login_agent_override(Some(agent_name));
                         }
                         if model_selection {
                             self.manual_model_handoff = None;
-                            tui.show_toast(format!("Couldn't select model: {message}"));
                             return Ok(true);
                         }
                         self.chat_widget.add_error_message(message);

@@ -37,11 +37,12 @@ impl App {
                         tokio::spawn((*agent).shutdown());
                         self.pending_candidate_model = None;
                         if self.manual_model_handoff.is_some() {
-                            if self.advance_model_route().await {
+                            let why = error.to_string();
+                            if self.advance_model_route(&why).await {
                                 return Ok(true);
                             }
+                            self.end_model_choice(&why);
                             self.manual_model_handoff = None;
-                            tui.show_toast(format!("Couldn't activate model: {error}"));
                             return Ok(true);
                         }
                         self.manual_model_handoff = None;
