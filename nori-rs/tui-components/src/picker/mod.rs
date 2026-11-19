@@ -11,6 +11,7 @@ use ratatui::text::Line;
 
 use crate::ProviderKind;
 
+pub mod helix;
 mod hit;
 mod render;
 

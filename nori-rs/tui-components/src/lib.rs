@@ -5,6 +5,7 @@
 //! caller-owned state, and render the resulting widgets.
 
 pub mod block_meter;
+pub mod charts;
 pub mod detail;
 pub mod markdown;
 pub mod menu;
@@ -50,9 +51,30 @@ pub use picker::PickerMode;
 pub use picker::PickerOutcome;
 pub use picker::PickerState;
 pub use picker::SearchMode;
+pub use picker::helix::Field;
+pub use picker::helix::Filter;
+pub use picker::helix::FilterKey;
+pub use picker::helix::HelixConfig;
+pub use picker::helix::HelixEvent;
+pub use picker::helix::HelixItem;
+pub use picker::helix::HelixState;
+pub use picker::helix::Highlights;
+pub use picker::helix::Hit;
+pub use picker::helix::ItemAction;
+pub use picker::helix::Preview;
+pub use picker::helix::PreviewAnchor;
+pub use picker::helix::PreviewRequest;
+pub use picker::helix::RowContext;
+pub use picker::helix::SearchRequest;
+pub use picker::helix::VisibleRow;
+pub use picker::helix::fit_snippet;
+pub use picker::helix::highlight_indices;
+pub use picker::helix::highlight_terms;
 pub use primitives::EmptyState;
 pub use primitives::KeyHint;
 pub use primitives::KeyHints;
 pub use primitives::MessageLevel;
 pub use primitives::SemanticMessage;
+pub use theme::BadgeTheme;
+pub use theme::SyntaxTheme;
 pub use theme::Theme;

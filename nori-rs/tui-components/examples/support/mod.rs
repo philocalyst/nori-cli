@@ -2,10 +2,11 @@ use std::io::Stdout;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::cursor::MoveTo;
 use crossterm::event;
 use crossterm::execute;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
+use crossterm::terminal::Clear;
+use crossterm::terminal::ClearType;
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::enable_raw_mode;
 use nori_tui_components::Theme;
@@ -21,7 +22,7 @@ impl StorybookTerminal {
     pub fn enter() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         let theme = Theme::for_terminal_background(relative_terminal_background());
         Ok(Self { terminal, theme })
@@ -56,7 +57,11 @@ fn relative_terminal_background() -> Option<(u8, u8, u8)> {
 impl Drop for StorybookTerminal {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        );
         let _ = self.terminal.show_cursor();
     }
 }
