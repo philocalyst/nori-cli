@@ -114,6 +114,28 @@ pub struct AcpConnection {
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// How long a process whose output closed is given to exit by itself before it is stopped.
+const OUTPUT_CLOSED_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How a connection is set up beyond its transport.
+struct ConnectionOptions {
+    advertise_subagents: bool,
+    /// The slug of the agent this connection was started for: who an `_auth/status_update`
+    /// on it is about.
+    agent_slug: String,
+    children: SharedChildren,
+    /// A subprocess agent: notice that its output closed while it lives.
+    output_watch: Option<OutputWatch>,
+}
+
+/// What the connection needs to notice a live process whose output closed.
+struct OutputWatch {
+    exit_rx: tokio::sync::watch::Receiver<Option<std::process::ExitStatus>>,
+    kill: std::sync::Arc<tokio::sync::Notify>,
+    /// Fires when the agent's standard output reaches its end.
+    closed: oneshot::Receiver<()>,
+}
+
 /// Claims the `session/update` notifications that announce subagents.
 ///
 /// The pinned ACP schema has no types for them, so the typed notification handler cannot parse
@@ -265,10 +287,16 @@ async fn establish_connection(
     event_tx: mpsc::Sender<ConnectionEvent>,
     event_rx: mpsc::Receiver<ConnectionEvent>,
     initialize_event_tx: Option<mpsc::Sender<AcpEvent>>,
-    advertise_subagents: bool,
-    children: SharedChildren,
+    options: ConnectionOptions,
 ) -> Result<AcpConnection> {
+    let ConnectionOptions {
+        advertise_subagents,
+        agent_slug,
+        children,
+        output_watch,
+    } = options;
     let connection_event_tx = event_tx.clone();
+    let event_tx_for_closed = event_tx.clone();
     let event_tx_for_notifications = event_tx.clone();
     let event_tx_for_initialize = event_tx.clone();
     let session_config_state =
@@ -358,7 +386,16 @@ async fn establish_connection(
             .on_receive_notification(
                 {
                     let event_tx = event_tx.clone();
+                    let agent_slug = agent_slug.clone();
                     async move |notification: UntypedMessage, _connection: ConnectionTo<Agent>| {
+                        if notification.method() == nori_acp_kit::AUTH_STATUS_UPDATE {
+                            if let Some(status) =
+                                nori_acp_kit::AuthStatus::from_params(notification.params())
+                            {
+                                crate::accounts::record_identity(&agent_slug, &status);
+                            }
+                            return Ok(());
+                        }
                         if notification.method() == "_nori/user_input_cancelled" {
                             let raw = serde_json::value::RawValue::from_string(
                                 notification.params().to_string(),
@@ -544,9 +581,12 @@ async fn establish_connection(
             .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
                 let initialize = acp::InitializeRequest::new(ProtocolVersion::LATEST)
                     .client_capabilities(
-                        acp::ClientCapabilities::new().fs(acp::FileSystemCapabilities::new()
-                            .read_text_file(true)
-                            .write_text_file(true)),
+                        acp::ClientCapabilities::new()
+                            .fs(acp::FileSystemCapabilities::new()
+                                .read_text_file(true)
+                                .write_text_file(true))
+                            // Nori runs an agent's terminal sign-in itself (`sign_in`).
+                            .auth(acp::AuthCapabilities::new().terminal(true)),
                     )
                     .client_info(
                         acp::Implementation::new("nori", env!("CARGO_PKG_VERSION"))
@@ -611,6 +651,34 @@ async fn establish_connection(
             debug!("ACP connection task ended: {e}");
         }
     });
+
+    // The agent's output ended. A process that exited says so itself, through its exit watcher.
+    // One that is still alive without its standard output can never answer again: it is stopped,
+    // and the session is told, instead of waiting on it forever.
+    if let Some(watch) = output_watch {
+        tokio::spawn(async move {
+            if watch.closed.await.is_err() {
+                return;
+            }
+            let mut exit = watch.exit_rx;
+            let exited = tokio::select! {
+                () = async { let _ = exit.wait_for(std::option::Option::is_some).await; } => true,
+                () = tokio::time::sleep(OUTPUT_CLOSED_GRACE) => false,
+            };
+            if !exited {
+                warn!("ACP agent closed its standard output but is still running; stopping it");
+                watch.kill.notify_one();
+                let _ = event_tx_for_closed
+                    .send(ConnectionEvent::ChildExited {
+                        status: None,
+                        stderr_tail: "the agent closed its standard output but kept running, so \
+                                      Nori stopped it"
+                            .to_owned(),
+                    })
+                    .await;
+            }
+        });
+    }
 
     let (cx, capabilities, initialize_meta) = init_rx
         .await
@@ -812,16 +880,27 @@ impl AcpConnection {
         );
 
         let incoming_logger = wire_logger;
-        let incoming_lines = Box::pin(BufReader::new(stdout.compat()).lines().map(
-            move |line_result| {
-                if let Ok(line) = &line_result
-                    && let Some(logger) = &incoming_logger
-                {
-                    logger.record(WireDirection::AgentToClient, line);
-                }
-                line_result
-            },
-        ));
+        let (output_closed_tx, output_closed_rx) = oneshot::channel::<()>();
+        let incoming_lines = Box::pin(
+            BufReader::new(stdout.compat())
+                .lines()
+                .map(move |line_result| {
+                    if let Ok(line) = &line_result
+                        && let Some(logger) = &incoming_logger
+                    {
+                        logger.record(WireDirection::AgentToClient, line);
+                    }
+                    line_result
+                })
+                // After the last line, say so: the protocol layer does not surface an end of
+                // output while its connection is otherwise idle.
+                .chain(
+                    futures::stream::once(async move {
+                        let _ = output_closed_tx.send(());
+                    })
+                    .filter_map(|()| async { None }),
+                ),
+        );
         let transport = Lines::new(outgoing_sink, incoming_lines);
 
         // Race initialization against the child dying: an agent that exits
@@ -839,8 +918,16 @@ impl AcpConnection {
             event_tx,
             event_rx,
             initialize_event_tx,
-            config.advertise_subagents,
-            SharedChildren::default(),
+            ConnectionOptions {
+                advertise_subagents: config.advertise_subagents,
+                agent_slug: config.provider_slug.clone(),
+                children: SharedChildren::default(),
+                output_watch: Some(OutputWatch {
+                    exit_rx: child_handle.exit_rx.clone(),
+                    kill: std::sync::Arc::clone(&child_handle.kill),
+                    closed: output_closed_rx,
+                }),
+            },
         );
         let init_result = tokio::select! {
             result = init => result,
@@ -900,10 +987,24 @@ impl AcpConnection {
             )
         })?;
         let spec = crate::in_process::with_environment(spec, &config.env);
+        // The account's home as the agent will see it: the provider's variable and its value (a
+        // path), never the rest of the environment.
+        let home_variable = nori_config::PROVIDERS
+            .iter()
+            .find(|provider| provider.native_agent == spec.agent)
+            .and_then(|provider| provider.home)
+            .and_then(|variable| {
+                spec.environment
+                    .get(variable.name)
+                    .map(|value| format!("{}={value}", variable.name))
+            });
         debug!(
-            "Starting built-in agent {} in {}",
+            "Starting built-in agent {} for {} in {} (home {:?}, {})",
             spec.agent,
-            cwd.display()
+            config.provider_slug,
+            cwd.display(),
+            spec.home,
+            home_variable.as_deref().unwrap_or("no home variable")
         );
 
         let (client_end, agent_end) = tokio::io::duplex(IN_PROCESS_PIPE_BYTES);
@@ -912,7 +1013,7 @@ impl AcpConnection {
         let (stopped_tx, mut stopped_rx) = oneshot::channel::<String>();
         let agent_name = spec.agent.clone();
         let agent_task = tokio::spawn(async move {
-            let reason = match launcher(spec, agent_end).await {
+            let reason = match launcher(spec, agent_end, crate::in_process::Host::Nori).await {
                 Ok(()) => format!("built-in agent {agent_name} ended before it answered"),
                 Err(error) => {
                     warn!("built-in agent {agent_name} stopped: {error}");
@@ -943,8 +1044,12 @@ impl AcpConnection {
                 event_tx,
                 event_rx,
                 initialize_event_tx,
-                config.advertise_subagents,
-                SharedChildren::default(),
+                ConnectionOptions {
+                    advertise_subagents: config.advertise_subagents,
+                    agent_slug: config.provider_slug.clone(),
+                    children: SharedChildren::default(),
+                    output_watch: None,
+                },
             ) => result,
             Ok(reason) = &mut stopped_rx => Err(anyhow::anyhow!(reason)),
         };
@@ -954,6 +1059,24 @@ impl AcpConnection {
                 // the connection is.
                 connection.stderr_task = Some(agent_task);
                 connection.in_process = true;
+                // Watch the agent for the connection's whole life, as the exit watcher does a
+                // subprocess: an agent that ends or panics mid-turn is a dead connection, and the
+                // ordered inbox says so. Without this its death is a silent EOF and the turn it
+                // was in never ends. An intentional shutdown aborts the task, which the
+                // closed channel and the session's shutdown flag make harmless.
+                let event_tx = connection.event_tx.clone();
+                let agent_name = config.command.clone();
+                tokio::spawn(async move {
+                    let reason = stopped_rx
+                        .await
+                        .unwrap_or_else(|_| format!("built-in agent {agent_name} stopped"));
+                    let _ = event_tx
+                        .send(ConnectionEvent::ChildExited {
+                            status: None,
+                            stderr_tail: reason,
+                        })
+                        .await;
+                });
                 Ok(connection)
             }
             Err(error) => {
@@ -1204,19 +1327,26 @@ impl AcpConnection {
         prompt: Vec<acp::ContentBlock>,
     ) -> Result<acp::StopReason> {
         let (_, result) = self
-            .prompt_with_request_id(session_id, prompt, None, None)
+            .prompt_attempt(session_id, prompt, None, None, None, true)
             .await;
         result
     }
 
-    /// Send a prompt and report its transport-assigned request ID as soon as
-    /// the request is issued.
-    pub async fn prompt_with_request_id(
+    /// Send a prompt and report its transport-assigned request ID as soon as the request is
+    /// issued.
+    ///
+    /// A caller that may try again passes `mirror_failure: false`, so a failed attempt is not
+    /// published as the turn's response, and `report_as` (the first attempt's ID) so that the
+    /// response of a later attempt is published under the one ID the turn has. Such a caller
+    /// publishes a failure it gives up on with [`Self::announce_prompt_failure`].
+    pub async fn prompt_attempt(
         &self,
         session_id: acp::SessionId,
         prompt: Vec<acp::ContentBlock>,
         prompt_meta: Option<acp::Meta>,
         request_started: Option<oneshot::Sender<Result<RequestId>>>,
+        report_as: Option<RequestId>,
+        mirror_failure: bool,
     ) -> (RequestId, Result<acp::StopReason>) {
         debug!(
             target: "acp_event_flow",
@@ -1232,13 +1362,15 @@ impl AcpConnection {
             let _ = request_started.send(Ok(request_id.clone()));
         }
         let response = request.block_task().await;
-        let _ = self
-            .event_tx
-            .send(ConnectionEvent::Acp(Box::new(AcpEvent::Response {
-                request_id: request_id.clone(),
-                response: response.clone().map(acp::AgentResponse::PromptResponse),
-            })))
-            .await;
+        if response.is_ok() || mirror_failure {
+            let _ = self
+                .event_tx
+                .send(ConnectionEvent::Acp(Box::new(AcpEvent::Response {
+                    request_id: report_as.unwrap_or_else(|| request_id.clone()),
+                    response: response.clone().map(acp::AgentResponse::PromptResponse),
+                })))
+                .await;
+        }
         let result = response.context("ACP prompt failed").map(|response| {
             debug!(
                 target: "acp_event_flow",
@@ -1249,6 +1381,37 @@ impl AcpConnection {
             response.stop_reason
         });
         (request_id, result)
+    }
+
+    /// Publish the failure of a prompt whose attempts were not mirrored as its response, once
+    /// the caller has given up on it. Does nothing when `error` carries no ACP error.
+    pub async fn announce_prompt_failure(&self, request_id: RequestId, error: &anyhow::Error) {
+        let Some(error) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<acp::Error>())
+        else {
+            return;
+        };
+        let _ = self
+            .event_tx
+            .send(ConnectionEvent::Acp(Box::new(AcpEvent::Response {
+                request_id,
+                response: Err(error.clone()),
+            })))
+            .await;
+    }
+
+    /// Publish the end of a prompt that no attempt completed, such as a retry the user cancelled.
+    pub async fn announce_prompt_stop(&self, request_id: RequestId, stop_reason: acp::StopReason) {
+        let _ = self
+            .event_tx
+            .send(ConnectionEvent::Acp(Box::new(AcpEvent::Response {
+                request_id,
+                response: Ok(acp::AgentResponse::PromptResponse(
+                    acp::PromptResponse::new(stop_reason),
+                )),
+            })))
+            .await;
     }
 
     /// Wait until the harness has handled preceding connection events.

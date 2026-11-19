@@ -2,68 +2,51 @@
 //!
 //! An ACP agent normally is a program Nori starts and talks to over its stdin and stdout. A
 //! built-in one is a library instead: Nori gives it one end of an in-memory pipe, keeps the other
-//! end for its own ACP client, and no process is started. The agents themselves live in crates
-//! `acp-host` does not depend on; the application registers a launcher for each by name at
-//! startup, and a distribution of `native = { agent = "..." }` selects it.
+//! end for its own ACP client, and no process is started. The agents live in crates `acp-host`
+//! does not depend on, each built on `nori-acp-kit`; the application hands the host each crate's
+//! [`Registration`] at startup, and a distribution of `native = { agent = "..." }` selects one.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
-use tokio::io::DuplexStream;
+pub use nori_acp_kit::Host;
+pub use nori_acp_kit::InProcessSpec;
+pub use nori_acp_kit::Launcher;
+pub use nori_acp_kit::Prewarmer;
+pub use nori_acp_kit::Registration;
 
-/// What an in-process agent is started with.
-#[derive(Clone, PartialEq, Eq)]
-pub struct InProcessSpec {
-    /// The built-in agent's name, e.g. `codex`.
-    pub agent: String,
-    /// Where this agent's state and login live. Per agent, because a process-wide environment
-    /// variable cannot tell two accounts apart.
-    pub home: Option<PathBuf>,
-    /// `key=value` overrides, as `codex -c` takes them.
-    pub config: Vec<String>,
-    /// Per-agent environment overrides, forwarded only to the agent's own subprocess.
-    pub environment: HashMap<String, String>,
+fn registrations() -> &'static RwLock<HashMap<&'static str, Registration>> {
+    static REGISTRATIONS: OnceLock<RwLock<HashMap<&'static str, Registration>>> = OnceLock::new();
+    REGISTRATIONS.get_or_init(Default::default)
 }
 
-impl std::fmt::Debug for InProcessSpec {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("InProcessSpec")
-            .field("agent", &self.agent)
-            .field("home", &self.home)
-            .field("config", &self.config)
-            .field("environment", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Runs an agent on `pipe` until the connection ends.
-pub type Launcher = Arc<
-    dyn Fn(InProcessSpec, DuplexStream) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Starts what an agent needs for a session ahead of time, for the working directory and the
-/// client's MCP servers (as the JSON array ACP sends in `session/new`). Returns at once.
-pub type Prewarmer = Arc<dyn Fn(InProcessSpec, PathBuf, serde_json::Value) + Send + Sync>;
-
-fn prewarmers() -> &'static RwLock<HashMap<String, Prewarmer>> {
-    static PREWARMERS: OnceLock<RwLock<HashMap<String, Prewarmer>>> = OnceLock::new();
-    PREWARMERS.get_or_init(Default::default)
-}
-
-/// Let the built-in agent `name` start sessions ahead of time.
-pub fn register_in_process_prewarm(name: &str, prewarmer: Prewarmer) {
-    prewarmers()
+/// Make a built-in agent available to `native` distributions, replacing an earlier registration
+/// of the same name.
+pub fn register(registration: Registration) {
+    registrations()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(name.to_owned(), prewarmer);
+        .insert(registration.name, registration);
+}
+
+fn registration(name: &str) -> Option<Registration> {
+    registrations()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(name)
+        .cloned()
+}
+
+/// The launcher registered for `name`, if this build has one.
+pub fn in_process_launcher(name: &str) -> Option<Launcher> {
+    registration(name).map(|registration| registration.launch)
+}
+
+/// Whether this build can run the built-in agent `name`.
+pub fn in_process_available(name: &str) -> bool {
+    registration(name).is_some()
 }
 
 /// Have the built-in agent `config` runs start a session for `cwd` ahead of time, so switching to
@@ -76,213 +59,90 @@ pub fn prewarm(
     let Some(spec) = &config.in_process else {
         return;
     };
-    let Some(prewarmer) = prewarmers()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&spec.agent)
-        .cloned()
-    else {
+    let Some(registration) = registration(&spec.agent) else {
         return;
     };
-    prewarmer(with_environment(spec, &config.env), cwd, mcp_servers);
+    let Some(prewarm) = registration.prewarm.clone() else {
+        return;
+    };
+    prewarm(with_environment(spec, &config.env), cwd, mcp_servers);
 }
 
-/// `spec` with the environment an adapter would have read turned into explicit options, since
-/// a process shared with other agents has no per-agent environment.
+/// `spec` with the environment an adapter would have read turned into explicit options, since a
+/// process shared with other agents has no per-agent environment. How is the agent's own
+/// business: it registered the resolver that does it.
 pub(crate) fn with_environment(
     spec: &InProcessSpec,
     env: &HashMap<String, String>,
 ) -> InProcessSpec {
     let mut spec = spec.clone();
     spec.environment.extend(env.clone());
-    match spec.agent.as_str() {
-        "codex" => {
-            spec.config.extend(codex_overrides_from_env(env));
-            spec.config.retain(|pair| {
-                !matches!(
-                    pair.split_once('=').map(|(key, _)| key.trim()),
-                    Some(
-                        "approval_policy"
-                            | "sandbox_mode"
-                            | "default_permissions"
-                            | "permission_profile"
-                    )
-                )
-            });
-            spec.config.push("approval_policy=\"never\"".to_owned());
-            spec.config
-                .push("sandbox_mode=\"danger-full-access\"".to_owned());
+    // An account's home reaches the agent through the provider's own variable.
+    if let Some(home) = &spec.home
+        && let Some(provider) = nori_config::PROVIDERS
+            .iter()
+            .find(|provider| provider.native_agent == spec.agent)
+    {
+        for (name, value) in provider.environment(home) {
+            spec.environment.entry(name).or_insert(value);
         }
-        "claude" => spec.config.extend(claude_overrides_from_env(env)),
-        _ => {}
     }
-    spec
+    match registration(&spec.agent).and_then(|registration| registration.resolve) {
+        Some(resolve) => resolve(spec, env),
+        None => spec,
+    }
 }
 
-fn launchers() -> &'static RwLock<HashMap<String, Launcher>> {
-    static LAUNCHERS: OnceLock<RwLock<HashMap<String, Launcher>>> = OnceLock::new();
-    LAUNCHERS.get_or_init(Default::default)
-}
-
-/// Make the built-in agent `name` available to `native` distributions.
-pub fn register_in_process_agent(name: &str, launcher: Launcher) {
-    launchers()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(name.to_owned(), launcher);
-}
-
-/// The launcher registered for `name`, if this build has one.
-pub fn in_process_launcher(name: &str) -> Option<Launcher> {
-    launchers()
+/// The built-in agents this build has, by name.
+pub fn available_agents() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = registrations()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(name)
-        .cloned()
+        .keys()
+        .copied()
+        .collect();
+    names.sort_unstable();
+    names
 }
 
-/// Whether this build can run the built-in agent `name`.
-pub fn in_process_available(name: &str) -> bool {
-    in_process_launcher(name).is_some()
-}
+/// Serve the built-in agent `spec.agent` over this process's stdin and stdout, so any ACP client
+/// can run it. `environment` is what a custom adapter would have read (the process environment,
+/// plus overrides); the agent's resolver folds it into options. Returns when the client closes
+/// stdin and the agent has shut down.
+pub async fn serve_stdio(
+    spec: InProcessSpec,
+    environment: &HashMap<String, String>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
 
-/// The `CODEX_CONFIG` environment variable an adapter would read, as the `key=value` overrides an
-/// in-process Codex takes: nested objects become dotted keys (`{"features":{"goals":false}}` is
-/// `features.goals=false`).
-pub fn codex_overrides_from_env(env: &HashMap<String, String>) -> Vec<String> {
-    let Some(json) = env
-        .get("CODEX_CONFIG")
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-    else {
-        return Vec::new();
-    };
-    let mut overrides = Vec::new();
-    flatten(&mut overrides, String::new(), &json);
-    overrides
-}
-
-/// The environment an adapter would read for Claude Code, as the `key=value` options the
-/// in-process driver takes: which `claude` to run (how an account is chosen) and the model.
-pub fn claude_overrides_from_env(env: &HashMap<String, String>) -> Vec<String> {
-    let mut overrides = Vec::new();
-    if let Some(path) = env.get("CLAUDE_CODE_EXECUTABLE").filter(|v| !v.is_empty()) {
-        overrides.push(format!("cli_path={path}"));
-    }
-    if let Some(model) = env.get("ANTHROPIC_MODEL").filter(|v| !v.is_empty()) {
-        overrides.push(format!("model={model}"));
-    }
-    overrides
-}
-
-fn flatten(out: &mut Vec<String>, prefix: String, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                let key = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                flatten(out, key, value);
-            }
-        }
-        // A JSON string, number or boolean is also a valid TOML one, which is what `-c` parses.
-        scalar if !prefix.is_empty() => out.push(format!("{prefix}={scalar}")),
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codex_config_json_becomes_dotted_overrides() {
-        let env = HashMap::from([(
-            "CODEX_CONFIG".to_owned(),
-            r#"{"model":"o3","features":{"goals":false},"model_reasoning_effort":"high"}"#
-                .to_owned(),
-        )]);
-        let mut overrides = codex_overrides_from_env(&env);
-        overrides.sort();
-        assert_eq!(
-            overrides,
-            vec![
-                "features.goals=false",
-                "model=\"o3\"",
-                "model_reasoning_effort=\"high\"",
-            ]
-        );
-        assert!(codex_overrides_from_env(&HashMap::new()).is_empty());
-    }
-
-    #[test]
-    fn native_codex_enforces_full_access_after_account_and_environment_overrides() {
-        let spec = InProcessSpec {
-            agent: "codex".into(),
-            home: Some("/account".into()),
-            config: vec![
-                "model=\"gpt-example\"".into(),
-                "approval_policy=\"on-request\"".into(),
-                "default_permissions=\"custom\"".into(),
-            ],
-            environment: HashMap::new(),
-        };
-        let env = HashMap::from([(
-            "CODEX_CONFIG".to_owned(),
-            r#"{"sandbox_mode":"read-only","model_reasoning_effort":"high"}"#.to_owned(),
-        )]);
-        let resolved = with_environment(&spec, &env);
-        assert_eq!(resolved.home, spec.home);
-        assert!(
-            resolved
-                .config
-                .contains(&"model=\"gpt-example\"".to_owned())
-        );
-        assert!(
-            resolved
-                .config
-                .contains(&"model_reasoning_effort=\"high\"".to_owned())
-        );
-        assert_eq!(
-            &resolved.config[resolved.config.len() - 2..],
-            &[
-                "approval_policy=\"never\"",
-                "sandbox_mode=\"danger-full-access\""
-            ]
-        );
-        assert!(
-            !resolved
-                .config
-                .iter()
-                .any(|value| value.contains("read-only")
-                    || value.starts_with("default_permissions="))
-        );
-    }
-
-    #[test]
-    fn claude_environment_becomes_driver_options() {
-        let env = HashMap::from([
-            (
-                "CLAUDE_CODE_EXECUTABLE".to_owned(),
-                "/bin/claude2".to_owned(),
+    let Some(registration) = registration(&spec.agent) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "this build of Nori has no built-in agent {:?}; it has: {}",
+                spec.agent,
+                available_agents().join(", ")
             ),
-            ("ANTHROPIC_MODEL".to_owned(), "opus".to_owned()),
-        ]);
-        assert_eq!(
-            claude_overrides_from_env(&env),
-            vec!["cli_path=/bin/claude2", "model=opus"]
-        );
-        assert!(claude_overrides_from_env(&HashMap::new()).is_empty());
-    }
-
-    #[test]
-    fn a_registered_agent_is_found_by_name_and_others_are_not() {
-        register_in_process_agent(
-            "echo-test",
-            Arc::new(|_spec, _pipe| Box::pin(async { Ok(()) })),
-        );
-        assert!(in_process_available("echo-test"));
-        assert!(!in_process_available("not-registered"));
-    }
+        ));
+    };
+    let spec = with_environment(&spec, environment);
+    let (host_end, agent_end) = tokio::io::duplex(1 << 16);
+    let (mut from_agent, mut to_agent) = tokio::io::split(host_end);
+    let inbound = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let copied = tokio::io::copy(&mut stdin, &mut to_agent).await;
+        // End of stdin is the client leaving: let the agent see the pipe close.
+        let _ = to_agent.shutdown().await;
+        copied
+    });
+    let outbound = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut from_agent, &mut stdout).await?;
+        stdout.flush().await
+    });
+    let served = (registration.launch)(spec, agent_end, Host::External).await;
+    inbound.abort();
+    // The agent's end of the pipe is closed, so the output drains and ends.
+    let drained = outbound.await.map_err(std::io::Error::other)?;
+    served.and(drained)
 }

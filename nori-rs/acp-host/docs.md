@@ -143,6 +143,18 @@ The dependency direction stays `nori-harness -> nori-acp-host`.
   Selecting one routes through injection exactly like a `[default_models]` custom
   id. `OtherModel` is re-exported from `nori-harness` for that picker.
 
+**`in_process.rs`** keeps the `Registration`s of the agents built into the binary (types from
+`nori-acp-kit`; see `docs/native-agents.md`). The application registers each agent crate's
+`registration()` at startup; a `native = { agent = "..." }` distribution or a built-in `AgentKind`
+with a registered agent then starts it on one end of an in-memory pipe instead of spawning a
+process. The agent's own resolver folds the configured environment into explicit options.
+
+**`antigravity_cli.rs`** finds the official `agy` (on `PATH`, or under
+`$XDG_DATA_HOME/nori/antigravity-cli/<version>/agy`), takes the newest by `agy --version`
+(cached per file modification time), and refuses a release older than 1.5.10 with the installed
+version and `agy update`. `AgentKind::Antigravity` starts it as `agy acp --process-per-session`
+and reads the agent's capabilities from its own `initialize` response.
+
 ### Things to Know
 
 - The dependency direction is `nori-harness -> nori-acp-host`, never the

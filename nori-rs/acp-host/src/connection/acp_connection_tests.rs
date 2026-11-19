@@ -969,18 +969,19 @@ async fn test_cancelled_spawn_reaps_child_during_initialization() {
         AcpConnection::spawn(&config, &cwd, nori_config::AcpProxyConfig::disabled()).await
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !pidfile.exists() {
+    let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("script agent should record its pid during initialization");
-    let pid = std::fs::read_to_string(&pidfile)
-        .expect("read pid")
-        .trim()
-        .parse()
-        .expect("pid parses");
+    .expect("script agent should finish recording its pid during initialization");
 
     spawn.abort();
     let _ = spawn.await;
@@ -1226,8 +1227,8 @@ async fn test_spawn_failure_surfaces_child_stderr() {
         "spawn error must include the child's stderr, got: {err_text}"
     );
     assert_eq!(
-        crate::categorize_acp_error(&err_text),
-        crate::AcpErrorCategory::Authentication,
+        crate::classify_text(&err_text),
+        crate::FailureClass::Auth,
         "the surfaced stderr must drive categorization (auth, not init failure)"
     );
 }
@@ -1407,11 +1408,11 @@ async fn test_resume_session_failure_categorizes_as_session_not_found() {
         .resume_session("gone-session", temp_dir.path(), Vec::new())
         .await
         .expect_err("resume_session should fail when the agent rejects the id");
-    let details = crate::categorize_acp_error_chain(&err);
+    let details = crate::classify_failure(&err);
     assert_eq!(
-        (details.category, details.detail.as_deref()),
+        (details.class, details.detail.as_deref()),
         (
-            crate::AcpErrorCategory::SessionNotFound,
+            crate::FailureClass::SessionNotFound,
             Some("the session is no longer claimed")
         )
     );
@@ -1477,7 +1478,7 @@ async fn test_close_session_failure_categorizes_as_session_not_found() {
         .await
         .expect_err("close_session should fail when the agent rejects the id");
     assert_eq!(
-        crate::categorize_acp_error_chain(&err).category,
-        crate::AcpErrorCategory::SessionNotFound
+        crate::classify_failure(&err).class,
+        crate::FailureClass::SessionNotFound
     );
 }

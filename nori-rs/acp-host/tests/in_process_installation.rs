@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use nori_acp_host::in_process::register_in_process_agent;
+use nori_acp_host::in_process::Registration;
+use nori_acp_host::in_process::register;
 use nori_acp_host::registry::AcpAgentInfo;
 use nori_acp_host::registry::AgentKind;
 
@@ -19,7 +20,12 @@ fn built_in_agents_are_installed_without_their_cli_on_path() {
         ("codex", AgentKind::Codex),
         ("claude", AgentKind::ClaudeCode),
     ] {
-        register_in_process_agent(name, Arc::new(|_, _| Box::pin(async { Ok(()) })));
+        register(Registration {
+            name,
+            launch: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
+            prewarm: None,
+            resolve: None,
+        });
 
         let info = AcpAgentInfo::from_agent(agent);
 
