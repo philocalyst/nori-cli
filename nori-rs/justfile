@@ -1,5 +1,13 @@
 set positional-arguments
 
+# Mitts does not yet resolve all of our renamed dependency aliases.
+cargo := `command -v cargo-stock || command -v cargo`
+
+# Keep local builds and tests on the same lightweight, incremental artifacts.
+# Explicit caller settings still win when debugging needs line tables.
+export CARGO_PROFILE_DEV_DEBUG := env_var_or_default("CARGO_PROFILE_DEV_DEBUG", "0")
+export CARGO_PROFILE_TEST_DEBUG := env_var_or_default("CARGO_PROFILE_TEST_DEBUG", "0")
+
 # Display help
 help:
     just -l
@@ -7,30 +15,30 @@ help:
 # `nori`
 alias n := nori
 nori *args:
-    cargo run --bin nori -- "$@"
+    {{cargo}} run --bin nori -- "$@"
 
 # format code
 fmt:
-    cargo fmt -- --config imports_granularity=Item
+    {{cargo}} fmt -- --config imports_granularity=Item
 
 fix *args:
-    cargo clippy --fix --all-features --tests --allow-dirty "$@"
+    {{cargo}} clippy --fix --all-features --tests --allow-dirty "$@"
 
 clippy:
-    cargo clippy --all-features --tests "$@"
+    {{cargo}} clippy --all-features --tests "$@"
 
 install:
     rustup show active-toolchain
-    cargo fetch
+    {{cargo}} fetch
 
 # Prefer running targeted tests on single packages,
 # for faster work within the monorepo
 test *args:
-    cargo test "$@"
+    {{cargo}} test "$@"
 
 # Run `cargo nextest` since it's faster than `cargo test`, though including
 # --no-fail-fast is important to ensure all tests are run.
 #
 # Run `cargo install cargo-nextest` if you don't have it installed.
 nextest:
-    cargo nextest run --no-fail-fast
+    {{cargo}} nextest run --no-fail-fast
