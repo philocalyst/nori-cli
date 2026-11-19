@@ -11,6 +11,7 @@ use crate::thread::backends::CodexThreadImpl;
 use crate::thread::client::SessionClient;
 use crate::thread::errors::turn_error;
 use crate::thread::exec::ActiveCommand;
+use crate::thread::log_preview::Preview;
 use crate::thread::permissions::PendingPermissionInteraction;
 use crate::thread::usage::token_count_report;
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
@@ -66,6 +67,7 @@ use tokio::sync::oneshot;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::trace;
 use tracing::warn;
 
 pub(super) enum SubmissionState {
@@ -241,13 +243,13 @@ impl PromptState {
                 }
             }
             EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item , started_at_ms: _}) => {
-                info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
+                debug!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {}", Preview(&item));
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
                 ..
             }) => {
-                info!("User message: {message:?}");
+                debug!("User message: {}", Preview(&message));
             }
             EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent {
                 thread_id,
@@ -255,7 +257,7 @@ impl PromptState {
                 item_id,
                 delta,
             }) => {
-                info!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {delta:?}");
+                trace!("Agent message content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, delta: {}", Preview(&delta));
                 self.seen_message_deltas = true;
                 client.send_agent_text_with_id(delta, item_id);
             }
@@ -273,7 +275,7 @@ impl PromptState {
                 delta,
                 content_index: index,
             }) => {
-                info!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {delta:?}");
+                trace!("Agent reasoning content delta received: thread_id: {thread_id}, turn_id: {turn_id}, item_id: {item_id}, index: {index}, delta: {}", Preview(&delta));
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought(delta);
             }
@@ -281,20 +283,20 @@ impl PromptState {
                 item_id,
                 summary_index,
             }) => {
-                info!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
+                debug!("Agent reasoning section break received:  item_id: {item_id}, index: {summary_index}");
                 // Make sure the section heading actually get spacing
                 self.seen_reasoning_deltas = true;
                 client.send_agent_thought("\n\n");
             }
             EventMsg::AgentMessage(AgentMessageEvent { message , .. }) => {
-                info!("Agent message (non-delta) received: {message:?}");
+                debug!("Agent message (non-delta) received: {}", Preview(&message));
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_message_deltas) {
                     client.send_agent_text(message);
                 }
             }
             EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
-                info!("Agent reasoning (non-delta) received: {text:?}");
+                debug!("Agent reasoning (non-delta) received: {}", Preview(&text));
                 // We didn't receive this message via streaming
                 if !std::mem::take(&mut self.seen_reasoning_deltas) {
                     client.send_agent_thought(text);
@@ -444,12 +446,13 @@ impl PromptState {
                 turn_id,
                 item,
                 .. }) => {
-                info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
+                debug!("Item completed: thread_id={thread_id}, turn_id={turn_id}, item={}", Preview(&item));
             }
             EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id, .. }) => {
                 info!(
-                    "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
-                    self.event_count
+                    "Task {turn_id} completed successfully after {} events. Last agent message: {}",
+                    self.event_count,
+                    Preview(&last_agent_message)
                 );
                 self.detach_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -510,10 +513,10 @@ impl PromptState {
                 )]).locations(vec![ToolCallLocation::new(path.to_path_buf())])));
             }
             EventMsg::EnteredReviewMode(review_request) => {
-                info!("Review begin: request={review_request:?}");
+                info!("Review begin: request={}", Preview(&review_request));
             }
             EventMsg::ExitedReviewMode(event) => {
-                info!("Review end: output={event:?}");
+                info!("Review end: output={}", Preview(&event));
                 if let Err(err) = self.review_mode_exit(client, event)
                     && let Some(response_tx) = self.response_tx.take()
                 {
@@ -659,7 +662,7 @@ impl PromptState {
                 warn!("Unexpected event: {:?}", e);
             }
                     other => {
-                debug!("Ignoring event with no ACP equivalent: {other:?}");
+                debug!("Ignoring event with no ACP equivalent: {}", Preview(&other));
             }
         }
     }

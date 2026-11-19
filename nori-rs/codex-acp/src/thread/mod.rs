@@ -19,6 +19,7 @@ mod config_options;
 mod errors;
 mod exec;
 mod guardian;
+mod log_preview;
 mod mcp_approval;
 mod media;
 mod modes;
