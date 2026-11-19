@@ -1,0 +1,27 @@
+[package]
+name = "nori-acp-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The one place for the plumbing every in-process agent needs. It depends on the ACP library
+# the host speaks and on `nori-host-tools`, and on neither the host (`nori-acp-host`) nor any
+# agent, so any agent crate can build on it and the host can build on it too.
+[dependencies]
+agent-client-protocol = { workspace = true, features = ["unstable"] }
+async-trait = { workspace = true }
+futures = { workspace = true, features = ["std", "alloc"] }
+nori-host-tools = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["compat"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
