@@ -1,0 +1,28 @@
+[package]
+name = "codex-apply-patch"
+version = "0.169.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Vendored from openai/codex rust-v0.169.0 with tree-sitter set to the version Nori links, since only one
+# copy of that native library may exist in the build.
+
+[lib]
+name = "codex_apply_patch"
+path = "src/lib.rs"
+doctest = false
+
+[[bin]]
+name = "apply_patch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+codex-exec-server = { path = "../codex/exec-server" }
+codex-utils-absolute-path = { path = "../codex/utils/absolute-path" }
+codex-utils-path-uri = { path = "../codex/utils/path-uri" }
+similar = "2.7.0"
+thiserror = "2.0.17"
+tokio = { version = "1", features = ["macros", "rt"] }
+tree-sitter = "0.27.2"
+tree-sitter-bash = "0.25.1"
