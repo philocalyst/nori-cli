@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/rex-record --output DIR [--session ID] [--block ID]
+       [--duration SECONDS] [--interval SECONDS]
+
+Records bounded Rex VT/HTML frames and writes manifest.json, player.html, and
+durable frames/*.vt + frames/*.html. The player has play/pause and a scrubber.
+EOF
+}
+
+python3 - "$@" <<'PY'
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--session", "-s", default=None)
+parser.add_argument("--block", "-b", default=None)
+parser.add_argument("--output", "-o", default=None)
+parser.add_argument("--duration", type=float, default=12.0)
+parser.add_argument("--interval", type=float, default=0.5)
+parser.add_argument("--help", "-h", action="store_true")
+args = parser.parse_args()
+if args.help:
+    parser.print_help()
+    raise SystemExit(0)
+if not args.output:
+    parser.error("--output is required")
+session = args.session or __import__("os").environ.get("REX_SESSION")
+block = args.block or __import__("os").environ.get("REX_BLOCK")
+if not session or not block:
+    parser.error("--session and --block (or REX_SESSION/REX_BLOCK) are required")
+if not 1.0 <= args.duration <= 30.0:
+    parser.error("--duration must be between 1 and 30 seconds")
+if not 0.1 <= args.interval <= 5.0:
+    parser.error("--interval must be between 0.1 and 5 seconds")
+out = pathlib.Path(args.output).expanduser()
+if out.exists() and any(out.iterdir()):
+    parser.error(f"output directory is not empty: {out}")
+out.mkdir(parents=True, exist_ok=True)
+frames_dir = out / "frames"
+frames_dir.mkdir()
+
+def rex_call(method, payload):
+    command = ["rex", "block", "call", method, "-s", session, "-b", block, json.dumps(payload)]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+started = time.monotonic()
+frames = []
+while True:
+    elapsed = time.monotonic() - started
+    if frames and elapsed >= args.duration:
+        break
+    vt = rex_call("format", {"format": "vt", "trim": True, "extra_palette": True, "extra_style": True, "extra_cursor": True})["content"]
+    html = rex_call("format", {"format": "html", "trim": True, "extra_palette": True, "extra_style": True, "extra_cursor": True})["content"]
+    size = rex_call("size", {})
+    number = len(frames) + 1
+    vt_path = frames_dir / f"{number:05d}.vt"
+    html_path = frames_dir / f"{number:05d}.html"
+    vt_path.write_text(vt, encoding="utf-8")
+    html_path.write_text(html, encoding="utf-8")
+    timestamp = time.time()
+    frames.append({"index": number, "timestamp": timestamp, "elapsed": elapsed, "vt": str(vt_path.relative_to(out)), "html": str(html_path.relative_to(out)), "size": size})
+    remaining = args.duration - (time.monotonic() - started)
+    if remaining <= 0:
+        break
+    time.sleep(min(args.interval, remaining))
+
+manifest = {"version": 1, "captured_at": time.time(), "session": session, "block": block, "duration": args.duration, "interval": args.interval, "frames": frames}
+(out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+frame_data = json.dumps([{"elapsed": f["elapsed"], "rows": f["size"].get("rows"), "cell_height": f["size"].get("cell_height_px"), "html": (out / f["html"]).read_text(encoding="utf-8")} for f in frames]).replace("</", "<\\/")
+player = f'''<!doctype html><meta charset="utf-8"><title>Nori Rex recording</title>
+<style>body{{margin:0;background:#111;color:#ddd;font:14px system-ui}}main{{max-width:1200px;margin:auto;padding:16px}}iframe{{width:100%;height:70vh;min-height:240px;border:1px solid #555;background:#111}}input{{width:70%}}button{{margin-right:8px}}</style>
+<main><button id="play">Play</button><button id="pause">Pause</button><input id="scrub" type="range" min="0" max="{len(frames)-1}" value="0"><span id="label"></span><iframe id="screen" title="Recorded Rex terminal"></iframe></main>
+<script>const frames={frame_data};let i=0,timer=null;const frame=document.querySelector('#screen'),scrub=document.querySelector('#scrub'),label=document.querySelector('#label');frame.onload=()=>{{const doc=frame.contentDocument;if(doc)frame.contentWindow.scrollTo(0,doc.documentElement.scrollHeight)}};function show(n){{i=Number(n);scrub.value=i;frame.srcdoc=frames[i].html;label.textContent=frames[i].elapsed.toFixed(2)+'s'}}function stop(){{if(timer)clearTimeout(timer);timer=null}}function play(){{stop();function step(){{if(i+1>=frames.length)return stop();const delay=Math.max(40,(frames[i+1].elapsed-frames[i].elapsed)*1000);timer=setTimeout(()=>{{show(i+1);step()}},delay)}}step()}}document.querySelector('#play').onclick=play;document.querySelector('#pause').onclick=stop;scrub.oninput=e=>{{stop();show(e.target.value)}};show(0)</script>'''
+(out / "player.html").write_text(player, encoding="utf-8")
+print(out)
+PY

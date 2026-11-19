@@ -103,4 +103,6 @@ CHANGELOG.ignore.md
 # Local code/doc references for ACP work
 /other-repos
 
+.nori-captures/
+
 __pycache__

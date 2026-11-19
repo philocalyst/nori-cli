@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/rex-capture capture NAME [--output DIR] [--session ID] [--block ID]
+  scripts/rex-capture replay CAPTURE_DIR [--session ID] [--block ID] [--tab]
+
+capture writes screen.vt, screen.html, screen.txt, and metadata.json. With
+--freeze it also opens a Rex split containing the exact VT rendering.
+EOF
+}
+
+mode=${1:-}
+shift || true
+case "$mode" in
+  capture|replay) ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+session=${REX_SESSION:-}
+block=${REX_BLOCK:-}
+output_dir=""
+freeze=0
+direction=right
+ratio=50
+tab=0
+replay_dir=""
+if [[ $mode == replay ]]; then
+  replay_dir=${1:?missing capture directory}
+  shift
+fi
+
+while (($#)); do
+  case "$1" in
+    --session|-s) session=${2:?missing session}; shift 2 ;;
+    --block|-b) block=${2:?missing block}; shift 2 ;;
+    --output|-o) output_dir=${2:?missing output directory}; shift 2 ;;
+    --freeze) freeze=1; shift ;;
+    --split) direction=${2:?missing split direction}; shift 2 ;;
+    --ratio) ratio=${2:?missing ratio}; shift 2 ;;
+    --tab) tab=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      if [[ $mode == capture && -z $output_dir ]]; then
+        output_dir=$1
+        shift
+      else
+        echo "unknown argument: $1" >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+if [[ -z $session || ( -z $block && ( $mode == capture || $tab == 0 ) ) ]]; then
+  echo "capture/replay needs --session and --block (or REX_SESSION/REX_BLOCK), unless replaying with --tab" >&2
+  exit 2
+fi
+
+command -v rex >/dev/null || { echo "rex is required" >&2; exit 1; }
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+case "$direction" in right|left|above|below) ;; *) echo "invalid --split: $direction" >&2; exit 2 ;; esac
+[[ $ratio =~ ^[0-9]+$ && $ratio -ge 1 && $ratio -le 99 ]] || {
+  echo "--ratio must be an integer from 1 to 99" >&2
+  exit 2
+}
+
+if [[ $mode == capture ]]; then
+  name=${output_dir:-capture}
+  if [[ $name == */* ]]; then
+    dir=$name
+  else
+    dir="${NORI_CAPTURE_DIR:-$PWD/.nori-captures}/$name"
+  fi
+  mkdir -p "$dir"
+  format_args='{"format":"FORMAT","trim":true,"extra_palette":true,"extra_style":true,"extra_cursor":true}'
+  rex block call format -s "$session" -b "$block" "${format_args/FORMAT/vt}" \
+    | jq -r '.content' > "$dir/screen.vt"
+  rex block call format -s "$session" -b "$block" "${format_args/FORMAT/html}" \
+    | jq -r '.content' > "$dir/screen.html"
+  rex capture -s "$session" -b "$block" --format=text --trim > "$dir/screen.txt"
+  size_json=$(rex block call size -s "$session" -b "$block")
+  read -r text_rows text_columns < <(awk 'BEGIN { rows = 0; columns = 0 } { rows++; if (length($0) > columns) columns = length($0) } END { print rows, columns }' "$dir/screen.txt")
+  {
+    printf '{\n'
+    printf '  "captured_at": %s,\n' "$(date -u +%s)"
+    printf '  "session": %s,\n' "$(printf '%s' "$session" | jq -Rs .)"
+    printf '  "block": %s,\n' "$(printf '%s' "$block" | jq -Rs .)"
+    printf '  "command": %s,\n' "$(printf '%s' "${NORI_CAPTURE_COMMAND:-}" | jq -Rs .)"
+    printf '  "screen_snapshot": true,\n'
+    printf '  "text_rows": %s,\n' "${text_rows:-0}"
+    printf '  "text_columns": %s,\n' "${text_columns:-0}"
+    printf '  "terminal_size": %s,\n' "$size_json"
+    printf '  "process": '
+    rex block call -s "$session" -b "$block" process || printf '{}'
+    printf ',\n  "modes": '
+    rex block call -s "$session" -b "$block" modes || printf '{}'
+    printf '\n}\n'
+  } > "$dir/metadata.json"
+  printf '%s\n' "$dir"
+  if ((freeze)); then
+    replay_args=(--session "$session" --block "$block" --split "$direction" --ratio "$ratio")
+    ((tab)) && replay_args+=(--tab)
+    exec "$0" replay "$dir" "${replay_args[@]}"
+  fi
+else
+  dir=$replay_dir
+  [[ -f "$dir/screen.vt" ]] || { echo "missing $dir/screen.vt" >&2; exit 1; }
+  dir=$(cd "$dir" && pwd -P)
+  if ((tab)); then
+    result=$(rex window new -s "$session" "capture:$(basename "$dir")" --keep-open --json -- \
+      sh -c 'cat "$1/screen.vt"; printf "\\n\\n[ frozen capture ]\\n"; read -r' sh "$dir")
+  else
+    result=$(rex split -s "$session" -b "$block" --split "$direction" --ratio "$ratio" \
+      --label "capture:$(basename "$dir")" --keep-open --json -- \
+      sh -c 'cat "$1/screen.vt"; printf "\\n\\n[ frozen capture ]\\n"; read -r' sh "$dir")
+  fi
+  printf '%s\n' "$result"
+fi
