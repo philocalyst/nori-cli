@@ -1,0 +1,81 @@
+---
+source: brush-parser/src/tokenizer.rs
+expression: "test_tokenizer(r\"cat <<-HERE\n\tSOMETHING\n\tHERE\n\")?"
+---
+TokenizerResult(
+  input: "cat <<-HERE\n\tSOMETHING\n\tHERE\n",
+  result: [
+    Word("cat", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 0,
+        line: 1,
+        column: 1,
+      ),
+      end: SourcePosition(
+        byte_offset: 3,
+        line: 1,
+        column: 4,
+      ),
+    )),
+    Operator("<<-", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 4,
+        line: 1,
+        column: 5,
+      ),
+      end: SourcePosition(
+        byte_offset: 7,
+        line: 1,
+        column: 8,
+      ),
+    )),
+    Word("HERE", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 7,
+        line: 1,
+        column: 8,
+      ),
+      end: SourcePosition(
+        byte_offset: 11,
+        line: 1,
+        column: 12,
+      ),
+    )),
+    Word("SOMETHING\n", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 12,
+        line: 2,
+        column: 1,
+      ),
+      end: SourcePosition(
+        byte_offset: 29,
+        line: 4,
+        column: 1,
+      ),
+    )),
+    Word("HERE", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 29,
+        line: 4,
+        column: 1,
+      ),
+      end: SourcePosition(
+        byte_offset: 29,
+        line: 4,
+        column: 1,
+      ),
+    )),
+    Operator("\n", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 11,
+        line: 1,
+        column: 12,
+      ),
+      end: SourcePosition(
+        byte_offset: 12,
+        line: 2,
+        column: 1,
+      ),
+    )),
+  ],
+)

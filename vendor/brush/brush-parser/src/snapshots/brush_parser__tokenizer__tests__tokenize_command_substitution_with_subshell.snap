@@ -1,0 +1,21 @@
+---
+source: brush-parser/src/tokenizer.rs
+expression: "test_tokenizer(\"$( (:) )\")?"
+---
+TokenizerResult(
+  input: "$( (:) )",
+  result: [
+    Word("$( (:) )", SourceSpan(
+      start: SourcePosition(
+        byte_offset: 0,
+        line: 1,
+        column: 1,
+      ),
+      end: SourcePosition(
+        byte_offset: 8,
+        line: 1,
+        column: 9,
+      ),
+    )),
+  ],
+)

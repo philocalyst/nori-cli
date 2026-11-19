@@ -1,0 +1,153 @@
+use std::borrow::Cow;
+use std::io::Write;
+
+use brush_core::{ExecutionResult, Shell, builtins};
+
+/// Unset a variable.
+#[derive(winnow_args::Args)]
+#[arg(disable_help_short, disable_version_flag, disable_help_subcommand)]
+pub(crate) struct UnsetCommand {
+    #[arg(flatten)]
+    name_interpretation: UnsetNameInterpretation,
+
+    /// Names of variables to unset.
+    #[arg(positional)]
+    names: Vec<String>,
+}
+
+// Only `-f` with `-v` is rejected, and at execution time: `-n` combines with either.
+#[derive(winnow_args::Args)]
+pub(crate) struct UnsetNameInterpretation {
+    /// Treat each name as a shell function.
+    #[arg(short = 'f')]
+    shell_functions: bool,
+
+    /// Treat each name as a shell variable.
+    #[arg(short = 'v')]
+    shell_variables: bool,
+
+    /// Treat each name as a name reference.
+    #[arg(short = 'n')]
+    name_references: bool,
+}
+
+impl UnsetNameInterpretation {
+    pub const fn unspecified(&self) -> bool {
+        !self.shell_functions && !self.shell_variables && !self.name_references
+    }
+}
+
+brush_winnow_args_adapter::impl_parse_args!(UnsetCommand);
+
+impl<SE: brush_core::ShellExtensions> builtins::Builtin<SE> for UnsetCommand {
+    type Error = brush_core::Error;
+
+    async fn execute(
+        self,
+        context: brush_core::ExecutionContext<'_, SE>,
+    ) -> Result<brush_core::ExecutionResult, Self::Error> {
+        if self.name_interpretation.shell_functions && self.name_interpretation.shell_variables {
+            writeln!(
+                context.stderr(),
+                "{}: cannot simultaneously unset a function and a variable",
+                context.command_name
+            )?;
+            return Ok(ExecutionResult::general_error());
+        }
+
+        //
+        // TODO(nameref): implement nameref
+        //
+        if self.name_interpretation.name_references {
+            return brush_core::error::unimp("unset: name references are not yet implemented");
+        }
+
+        let unspecified = self.name_interpretation.unspecified();
+        let mut failure = None;
+
+        #[expect(clippy::needless_continue)]
+        for name in &self.names {
+            if unspecified || self.name_interpretation.shell_variables {
+                // Try to parse the name as a parameter. If we can't, don't bail; it may not be a
+                // valid variable name/parameter but could still be a function name.
+                if let Ok(parameter) =
+                    brush_parser::word::parse_parameter(name, &context.shell.parser_options())
+                {
+                    let result = match parameter {
+                        brush_parser::word::Parameter::Positional(_) => continue,
+                        brush_parser::word::Parameter::Special(_) => continue,
+                        brush_parser::word::Parameter::Named(name) => context
+                            .shell
+                            .env_mut()
+                            .unset(name.as_str())
+                            .map(|v| v.is_some()),
+                        brush_parser::word::Parameter::NamedWithIndex { name, index } => {
+                            unset_array_index(context.shell, name.as_str(), index.as_str())
+                        }
+                        brush_parser::word::Parameter::NamedWithAllIndices {
+                            name: _,
+                            concatenate: _,
+                        } => continue,
+                    };
+
+                    match result {
+                        Ok(true) => continue,
+                        Ok(false) => (),
+                        // Like bash, a name that can't be unset (a readonly one, say) doesn't stop
+                        // the rest. The first such error is returned once they're done, so in
+                        // POSIX mode it still ends the shell, as any special builtin's error does.
+                        Err(e) => {
+                            failure.get_or_insert(e);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // TODO(unset): Deal with readonly functions
+            if unspecified || self.name_interpretation.shell_functions {
+                if context.shell.undefine_func(name) {
+                    continue;
+                }
+            }
+        }
+
+        failure.map_or(Ok(ExecutionResult::success()), Err)
+    }
+}
+
+fn unset_array_index(
+    shell: &mut Shell<impl brush_core::ShellExtensions>,
+    name: &str,
+    index: &str,
+) -> Result<bool, brush_core::Error> {
+    // `unset_index` refuses a readonly array too, but only after the subscript is evaluated;
+    // bash refuses it first, so `unset 'a[i++]'` leaves `i` alone.
+    if shell
+        .env()
+        .get(name)
+        .is_some_and(|(_, var)| var.is_readonly())
+    {
+        return Err(brush_core::ErrorKind::ReadonlyVariable.into());
+    }
+
+    // First check to see if it's an associative array.
+    let is_assoc_array = shell
+        .env()
+        .get(name)
+        .is_some_and(|(_, var)| var.value().is_associative_array());
+
+    // Compute which index we should actually use. For indexed arrays, we need to evaluate
+    // the index string as an arithmetic expression first.
+    let index_to_use: Cow<'_, str> = if is_assoc_array {
+        index.into()
+    } else {
+        // First evaluate the index expression.
+        let index_as_expr = brush_parser::arithmetic::parse(index)?;
+        let evaluated_index = shell.eval_arithmetic(&index_as_expr)?;
+        evaluated_index.to_string().into()
+    };
+
+    // Now we can try to unset, and return the result.
+    shell.env_mut().unset_index(name, index_to_use.as_ref())
+}

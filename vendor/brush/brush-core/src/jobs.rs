@@ -1,0 +1,582 @@
+//! Job management
+
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::fmt::Display;
+
+use futures::FutureExt;
+
+use crate::ExecutionResult;
+use crate::error;
+use crate::processes;
+use crate::sys;
+use crate::tasks;
+use crate::trace_categories;
+use crate::traps;
+
+pub(crate) type JobResult = (Job, Result<ExecutionResult, error::Error>);
+
+/// Pids handed out to background jobs that have no process of their own (a subshell, a function
+/// or a group run in the background): these run as tasks inside this process. They sit far above
+/// any real pid so `$!`, `wait <pid>` and `kill <pid>` can name such a job like any other.
+const SYNTHETIC_PID_BASE: sys::process::ProcessId = 2_000_000_000;
+
+/// Manages the jobs that are currently managed by the shell.
+pub struct JobManager {
+    /// The jobs that are currently managed by the shell.
+    pub jobs: Vec<Job>,
+
+    /// The pid `$!` expands to: that of the most recent background job.
+    last_background_pid: Option<sys::process::ProcessId>,
+
+    /// The next pid for a job without a process of its own.
+    next_synthetic_pid: sys::process::ProcessId,
+
+    /// Exit statuses of background jobs that finished and were swept before anyone waited for
+    /// them, by pid: `wait <pid>` still reports them, as bash does.
+    reaped: std::collections::HashMap<sys::process::ProcessId, u8>,
+}
+
+impl Default for JobManager {
+    fn default() -> Self {
+        Self {
+            jobs: Vec::new(),
+            last_background_pid: None,
+            next_synthetic_pid: SYNTHETIC_PID_BASE,
+            reaped: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Represents a task that is part of a job.
+pub enum JobTask {
+    /// An external process.
+    External(processes::ChildProcess),
+    /// An internal asynchronous task.
+    Internal(tasks::TaskHandle<Result<ExecutionResult, error::Error>>),
+}
+
+/// Represents the result of waiting on a job task.
+pub enum JobTaskWaitResult {
+    /// The task has completed.
+    Completed(ExecutionResult),
+    /// The task was stopped.
+    Stopped,
+}
+
+impl JobTask {
+    /// Returns whether the task is an external process.
+    pub const fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+
+    /// Waits for the task to complete. Returns the result of the wait.
+    pub async fn wait(&mut self) -> Result<JobTaskWaitResult, error::Error> {
+        match self {
+            Self::External(process) => {
+                let wait_result = process.wait().await?;
+                match wait_result {
+                    processes::ProcessWaitResult::Completed(result) => {
+                        Ok(JobTaskWaitResult::Completed(result))
+                    }
+                    processes::ProcessWaitResult::Stopped => Ok(JobTaskWaitResult::Stopped),
+                }
+            }
+            Self::Internal(handle) => Ok(JobTaskWaitResult::Completed(handle.await??)),
+        }
+    }
+
+    /// Polls the task for completion. Returns `Some(result)` if the task has completed,
+    /// or `None` if it is still running. The result is the execution result of the task.
+    /// Behaves in a best-effort manner; if an internal error occurs during polling,
+    /// it will return `None`.
+    fn poll(&mut self) -> Option<Result<ExecutionResult, error::Error>> {
+        match self {
+            Self::External(process) => process.poll(),
+            Self::Internal(handle) => {
+                let checkable_handle = handle;
+                checkable_handle.now_or_never().and_then(|r| r.ok())
+            }
+        }
+    }
+}
+
+impl JobManager {
+    /// Returns a new job manager.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a job to the job manager and marks it as the current job;
+    /// returns an immutable reference to the job.
+    ///
+    /// # Arguments
+    ///
+    /// * `job` - The job to add.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "push() guarantees the vector length is >= 1"
+    )]
+    pub fn add_as_current(&mut self, mut job: Job) -> &Job {
+        for j in &mut self.jobs {
+            if matches!(j.annotation, JobAnnotation::Current) {
+                j.annotation = JobAnnotation::Previous;
+                break;
+            }
+        }
+
+        let id = self.jobs.len() + 1;
+        job.id = id;
+        job.annotation = JobAnnotation::Current;
+        let pid = job.representative_pid().unwrap_or_else(|| {
+            self.next_synthetic_pid += 1;
+            self.next_synthetic_pid
+        });
+        job.reported_pid = Some(pid);
+        self.last_background_pid = Some(pid);
+        self.jobs.push(job);
+
+        #[allow(clippy::unwrap_used, reason = "we just pushed an element")]
+        self.jobs.last().unwrap()
+    }
+
+    /// Returns the pid `$!` expands to: that of the most recent background job.
+    pub const fn last_background_pid(&self) -> Option<sys::process::ProcessId> {
+        self.last_background_pid
+    }
+
+    /// Finds the job a pid names: the pid it was reported under, or one of its processes.
+    pub fn resolve_pid(&mut self, pid: sys::process::ProcessId) -> Option<&mut Job> {
+        self.jobs.iter_mut().find(|job| {
+            job.reported_pid == Some(pid)
+                || job
+                    .tasks
+                    .iter()
+                    .any(|task| matches!(task, JobTask::External(p) if p.pid() == Some(pid)))
+        })
+    }
+
+    /// Takes the exit status of a job that finished and was swept before it was waited for.
+    pub fn take_reaped_status(&mut self, pid: sys::process::ProcessId) -> Option<u8> {
+        self.reaped.remove(&pid)
+    }
+
+    fn note_reaped(&mut self, job: &Job, result: &Result<ExecutionResult, error::Error>) {
+        if let Some(pid) = job.reported_pid {
+            let status = match result {
+                Ok(result) => u8::from(result.exit_code),
+                Err(_) => 1,
+            };
+            self.reaped.insert(pid, status);
+        }
+    }
+
+    /// Returns the current job, if there is one.
+    pub fn current_job(&self) -> Option<&Job> {
+        self.jobs
+            .iter()
+            .find(|j| matches!(j.annotation, JobAnnotation::Current))
+    }
+
+    /// Returns a mutable reference to the current job, if there is one.
+    pub fn current_job_mut(&mut self) -> Option<&mut Job> {
+        self.jobs
+            .iter_mut()
+            .find(|j| matches!(j.annotation, JobAnnotation::Current))
+    }
+
+    /// Returns the previous job, if there is one.
+    pub fn prev_job(&self) -> Option<&Job> {
+        self.jobs
+            .iter()
+            .find(|j| matches!(j.annotation, JobAnnotation::Previous))
+    }
+
+    /// Returns a mutable reference to the previous job, if there is one.
+    pub fn prev_job_mut(&mut self) -> Option<&mut Job> {
+        self.jobs
+            .iter_mut()
+            .find(|j| matches!(j.annotation, JobAnnotation::Previous))
+    }
+
+    /// Tries to resolve the given job specification to a job.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_spec` - The job specification to resolve.
+    pub fn resolve_job_spec(&mut self, job_spec: &str) -> Option<&mut Job> {
+        let remainder = job_spec.strip_prefix('%')?;
+
+        match remainder {
+            "%" | "+" => self.current_job_mut(),
+            "-" => self.prev_job_mut(),
+            s if s.chars().all(char::is_numeric) => {
+                let id = s.parse::<usize>().ok()?;
+                self.jobs.iter_mut().find(|j| j.id == id)
+            }
+            _ => {
+                tracing::warn!(target: trace_categories::UNIMPLEMENTED, "unimplemented: job spec naming command: '{job_spec}'");
+                None
+            }
+        }
+    }
+
+    /// Waits for all managed jobs to complete.
+    pub async fn wait_all(&mut self) -> Result<Vec<Job>, error::Error> {
+        for job in &mut self.jobs {
+            // The caller wants the jobs, not their statuses: `wait` with no operands returns 0
+            // whatever they were.
+            let _ = job.wait().await?;
+        }
+
+        Ok(self.sweep_completed_jobs())
+    }
+
+    /// Polls all managed jobs for completion.
+    pub fn poll(&mut self) -> Result<Vec<JobResult>, error::Error> {
+        let mut results = Vec::with_capacity(self.jobs.len());
+
+        let mut i = 0;
+        while i != self.jobs.len() {
+            if let Some(result) = self.jobs[i].poll_done()? {
+                let job = self.jobs.remove(i);
+                self.note_reaped(&job, &result);
+                results.push((job, result));
+            } else if matches!(self.jobs[i].state, JobState::Done) {
+                // TODO(jobs): This is a workaround to remove jobs that are done but for which we
+                // don't know what happened.
+                let job = self.jobs.remove(i);
+                let result = Ok(ExecutionResult::success());
+                self.note_reaped(&job, &result);
+                results.push((job, result));
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn sweep_completed_jobs(&mut self) -> Vec<Job> {
+        let mut completed_jobs = vec![];
+
+        let mut i = 0;
+        while i != self.jobs.len() {
+            if self.jobs[i].tasks.is_empty() {
+                let job = self.jobs.remove(i);
+                if let (Some(pid), Some(status)) = (job.reported_pid, job.finished_status) {
+                    self.reaped.insert(pid, status);
+                }
+                completed_jobs.push(job);
+            } else {
+                i += 1;
+            }
+        }
+
+        completed_jobs
+    }
+}
+
+/// Represents the current execution state of a job.
+#[derive(Clone)]
+pub enum JobState {
+    /// Unknown state.
+    Unknown,
+    /// The job is running.
+    Running,
+    /// The job is stopped.
+    Stopped,
+    /// The job has completed.
+    Done,
+}
+
+impl Display for JobState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "Unknown"),
+            Self::Running => write!(f, "Running"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Done => write!(f, "Done"),
+        }
+    }
+}
+
+/// Represents an annotation for a job.
+#[derive(Clone)]
+pub enum JobAnnotation {
+    /// No annotation.
+    None,
+    /// The job is the current job.
+    Current,
+    /// The job is the previous job.
+    Previous,
+}
+
+impl Display for JobAnnotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, ""),
+            Self::Current => write!(f, "+"),
+            Self::Previous => write!(f, "-"),
+        }
+    }
+}
+
+/// Encapsulates a set of processes managed by the shell as a single unit.
+pub struct Job {
+    /// The tasks that make up the job.
+    tasks: VecDeque<JobTask>,
+
+    /// The annotation of the job (e.g., current, previous).
+    annotation: JobAnnotation,
+
+    /// The shell-internal ID of the job.
+    pub id: usize,
+
+    /// The command line of the job.
+    pub command_line: String,
+
+    /// The current operational state of the job.
+    pub state: JobState,
+
+    /// The pid the job is known by (`$!`): its process's, or one made up for a job that runs
+    /// inside this process.
+    pub reported_pid: Option<sys::process::ProcessId>,
+
+    /// The exit status the job finished with, once it did.
+    finished_status: Option<u8>,
+}
+
+impl Display for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}]{:3}{}\t{}",
+            self.id, self.annotation, self.state, self.command_line
+        )
+    }
+}
+
+impl Job {
+    /// Returns a new job object.
+    ///
+    /// # Arguments
+    ///
+    /// * `children` - The job's known child processes.
+    /// * `command_line` - The command line of the job.
+    /// * `state` - The current operational state of the job.
+    pub(crate) fn new<I>(tasks: I, command_line: String, state: JobState) -> Self
+    where
+        I: IntoIterator<Item = JobTask>,
+    {
+        Self {
+            id: 0,
+            tasks: tasks.into_iter().collect(),
+            annotation: JobAnnotation::None,
+            command_line,
+            state,
+            reported_pid: None,
+            finished_status: None,
+        }
+    }
+
+    /// Returns a pid-style string for the job.
+    pub fn to_pid_style_string(&self) -> String {
+        let display_pid = self
+            .representative_pid()
+            .map_or(Cow::Borrowed("<pid unknown>"), |pid| {
+                Cow::Owned(pid.to_string())
+            });
+        std::format!("[{}]{}\t{}", self.id, self.annotation, display_pid)
+    }
+
+    /// Returns the annotation of the job.
+    pub fn annotation(&self) -> JobAnnotation {
+        self.annotation.clone()
+    }
+
+    /// Returns the command name of the job.
+    pub fn command_name(&self) -> &str {
+        self.command_line
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// Returns whether the job is the current job.
+    pub const fn is_current(&self) -> bool {
+        matches!(self.annotation, JobAnnotation::Current)
+    }
+
+    /// Returns whether the job is the previous job.
+    pub const fn is_prev(&self) -> bool {
+        matches!(self.annotation, JobAnnotation::Previous)
+    }
+
+    /// Polls whether the job has completed.
+    pub fn poll_done(
+        &mut self,
+    ) -> Result<Option<Result<ExecutionResult, error::Error>>, error::Error> {
+        let mut result: Option<Result<ExecutionResult, error::Error>> = None;
+
+        tracing::debug!(target: trace_categories::JOBS, "Polling job {} for completion...", self.id);
+
+        while !self.tasks.is_empty() {
+            let task = &mut self.tasks[0];
+            match task.poll() {
+                Some(r) => {
+                    self.tasks.remove(0);
+                    result = Some(r);
+                }
+                None => {
+                    return Ok(None);
+                }
+            }
+        }
+
+        tracing::debug!(target: trace_categories::JOBS, "Job {} has completed.", self.id);
+
+        self.state = JobState::Done;
+
+        Ok(result)
+    }
+
+    /// Waits for the job to complete.
+    pub async fn wait(&mut self) -> Result<ExecutionResult, error::Error> {
+        // A job already waited for reports the status it finished with, as bash's `wait` does.
+        if self.tasks.is_empty()
+            && let Some(status) = self.finished_status
+        {
+            return Ok(ExecutionResult::new(status));
+        }
+        let mut result = ExecutionResult::success();
+
+        while let Some(task) = self.tasks.back_mut() {
+            match task.wait().await? {
+                JobTaskWaitResult::Completed(execution_result) => {
+                    result = execution_result;
+                    self.tasks.pop_back();
+                }
+                JobTaskWaitResult::Stopped => {
+                    self.state = JobState::Stopped;
+                    return Ok(ExecutionResult::stopped());
+                }
+            }
+        }
+
+        self.state = JobState::Done;
+        self.finished_status = Some(u8::from(result.exit_code));
+
+        Ok(result)
+    }
+
+    /// Moves the job to execute in the background.
+    pub fn move_to_background(&mut self) -> Result<(), error::Error> {
+        self.continue_job()
+    }
+
+    /// Moves the job to execute in the foreground.
+    pub fn move_to_foreground(&mut self) -> Result<(), error::Error> {
+        // The job gets the terminal before it's continued, so that it doesn't find itself in the
+        // background and stop again on reading from the terminal. (Without a terminal, as in a
+        // script that enables job control, there's none to give it, and it's continued anyway.)
+        if let Some(pgid) = self.own_process_group()
+            && let Err(err) = sys::terminal::move_to_foreground(pgid)
+        {
+            tracing::debug!(target: trace_categories::JOBS, "not giving job {} the terminal: {err}", self.id);
+        }
+
+        self.continue_job()
+    }
+
+    /// Continues the job, and records it running.
+    fn continue_job(&mut self) -> Result<(), error::Error> {
+        if matches!(self.state, JobState::Stopped) {
+            self.continue_processes()?;
+            self.state = JobState::Running;
+        } else {
+            // As bash does for `fg`, continue it anyway: it may have been stopped without the
+            // shell noticing yet (e.g., by reading from the terminal in the background).
+            let _ = self.continue_processes();
+        }
+
+        Ok(())
+    }
+
+    /// Continues the job's stopped processes: all of its process group, if it has one.
+    fn continue_processes(&self) -> Result<(), error::Error> {
+        if let Some(pgid) = self.own_process_group() {
+            sys::signal::continue_process_group(pgid)
+        } else if let Some(pid) = self.representative_pid() {
+            sys::signal::continue_process(pid)
+        } else {
+            Err(error::ErrorKind::FailedToSendSignal.into())
+        }
+    }
+
+    /// Checks whether the job can be signaled.
+    pub fn check_signalable(&self) -> Result<(), error::Error> {
+        if let Some(pgid) = self.own_process_group() {
+            sys::signal::check_process_group_signalable(pgid)
+        } else if let Some(pid) = self.representative_pid() {
+            sys::signal::check_signalable(pid)
+        } else {
+            Err(error::ErrorKind::FailedToSendSignal.into())
+        }
+    }
+
+    /// Kills the job: sends the signal to all of its process group, if it has one. A job sent
+    /// SIGTERM or SIGHUP is also continued, so that it acts on it if it's stopped.
+    ///
+    /// # Arguments
+    ///
+    /// * `signal` - The signal to send to the job.
+    pub fn kill(&mut self, signal: traps::TrapSignal) -> Result<(), error::Error> {
+        if let Some(pgid) = self.own_process_group() {
+            sys::signal::kill_process_group(pgid, signal)?;
+        } else if let Some(pid) = self.representative_pid() {
+            sys::signal::kill_process(pid, signal)?;
+        } else {
+            return Err(error::ErrorKind::FailedToSendSignal.into());
+        }
+
+        // As bash does, continue a stopped job sent SIGTERM or SIGHUP, so that it acts on it;
+        // and one not known to be stopped, which may have stopped without the shell's noticing.
+        if sys::signal::continue_stopped_on(signal) {
+            self.continue_job()?;
+        }
+
+        Ok(())
+    }
+
+    /// Tries to retrieve a "representative" pid for the job.
+    pub fn representative_pid(&self) -> Option<sys::process::ProcessId> {
+        for task in &self.tasks {
+            match task {
+                JobTask::External(p) => {
+                    if let Some(pid) = p.pid() {
+                        return Some(pid);
+                    }
+                }
+                JobTask::Internal(_) => (),
+            }
+        }
+        None
+    }
+
+    /// Tries to retrieve the process group ID (PGID) of the job: that of its own process group,
+    /// if it has one, or else its representative pid.
+    pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
+        self.own_process_group()
+            .or_else(|| self.representative_pid())
+    }
+
+    /// Returns the job's own process group, if it has one: under job control, its processes
+    /// run in a group of their own, which needn't be led by the first of them.
+    fn own_process_group(&self) -> Option<sys::process::ProcessId> {
+        self.tasks.iter().find_map(|task| match task {
+            JobTask::External(child) => child.pgid(),
+            JobTask::Internal(_) => None,
+        })
+    }
+}
