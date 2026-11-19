@@ -1,5 +1,13 @@
 //! Scriptable, terminal-independent execution over Nori's ACP harness.
 
+mod headless;
+
+pub use headless::HeadlessOptions;
+pub use headless::HeadlessOutcome;
+pub use headless::Sinks;
+pub use headless::parse_wait;
+pub use headless::run_headless;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,60 +37,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-/// Completed output from a finite plaintext execution.
-pub struct PlaintextOutcome {
-    /// Complete assistant text emitted during the prompt turn.
-    pub output: String,
-    /// Whether a permission request could not be allowed because it offered no allow option.
-    pub permission_denied: bool,
-}
-
-/// Execute one prompt and collect its final assistant text.
-pub async fn run_plaintext(
-    config: Arc<NoriConfig>,
-    cli_version: String,
-    prompt: String,
-    analytics: Option<AnalyticsReporter>,
-) -> anyhow::Result<PlaintextOutcome> {
-    let mut launched = prepare_and_launch_session(
-        AgentPrepareSpec {
-            handoff: None,
-            config,
-            cli_version,
-            session_context: None,
-            initial_context: None,
-        },
-        SessionStart::New,
-    );
-    if let Some(reporter) = analytics.as_ref() {
-        launched.handle = reporter.attach(launched.handle);
-    }
-    let request_id = launched
-        .handle
-        .prompt(vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))])
-        .await?;
-    let result = collect_prompt(&launched.handle, &mut launched.events, request_id).await;
-    let shutdown_result = launched.handle.shutdown().await;
-    let outcome = match result {
-        Ok(result) => {
-            shutdown_result?;
-            Ok(PlaintextOutcome {
-                output: result.output,
-                permission_denied: result.permission_denied,
-            })
-        }
-        Err(error) => Err(error),
-    };
-    if let Some(reporter) = analytics {
-        reporter.flush();
-    }
-    outcome
-}
-
 struct PromptResult {
     output: String,
     response: acp::PromptResponse,
-    permission_denied: bool,
 }
 
 async fn collect_prompt(
@@ -91,7 +48,6 @@ async fn collect_prompt(
     prompt_request_id: acp::RequestId,
 ) -> anyhow::Result<PromptResult> {
     let mut output = String::new();
-    let mut permission_denied = false;
     while let Some(event) = events.recv().await {
         match event {
             SessionEvent::Acp(AcpEvent::Notification(
@@ -108,8 +64,6 @@ async fn collect_prompt(
                 request: acp::AgentRequest::RequestPermissionRequest(request),
             }) => {
                 let response = allow_permission(&request);
-                permission_denied |=
-                    matches!(response.outcome, acp::RequestPermissionOutcome::Cancelled);
                 handle
                     .respond_to_agent(
                         request_id,
@@ -127,11 +81,9 @@ async fn collect_prompt(
                 response,
             }) if request_id == prompt_request_id => {
                 return match response {
-                    Ok(acp::AgentResponse::PromptResponse(response)) => Ok(PromptResult {
-                        output,
-                        response,
-                        permission_denied,
-                    }),
+                    Ok(acp::AgentResponse::PromptResponse(response)) => {
+                        Ok(PromptResult { output, response })
+                    }
                     Ok(_) => {
                         anyhow::bail!("ACP agent returned the wrong response to session/prompt")
                     }
@@ -153,7 +105,9 @@ async fn collect_prompt(
     anyhow::bail!("ACP session ended before session/prompt completed")
 }
 
-fn allow_permission(request: &acp::RequestPermissionRequest) -> acp::RequestPermissionResponse {
+pub(crate) fn allow_permission(
+    request: &acp::RequestPermissionRequest,
+) -> acp::RequestPermissionResponse {
     let allowed = request.options.iter().find(|option| {
         matches!(
             option.kind,

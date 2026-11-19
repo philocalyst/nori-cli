@@ -1,6 +1,6 @@
 # Headless execution
 
-`nori exec` runs a configured ACP agent without starting the terminal UI. It has two intentionally separate interfaces: a plaintext command for one-off shell use and a standard ACP stdio facade for programmatic callers.
+`nori exec` runs a configured ACP agent without starting the terminal UI. It has two intentionally separate interfaces: a plaintext (or `--json`) command for one-off shell use and a standard ACP stdio facade for programmatic callers.
 
 ## Plaintext mode
 
@@ -43,7 +43,29 @@ until an unrelated pipe closed. Supplying no prompt from any source is an error.
 A piped prompt is capped at 10 MiB; anything larger is rejected rather than
 buffered.
 
-The complete assistant response is the only content written to stdout. Diagnostics and failures are written to stderr, so stdout can be redirected or piped without filtering terminal rendering or progress messages.
+Answer text is written to stdout as it streams; consecutive messages (for example the text before and after a tool call) are separated by a newline. Diagnostics, failures and progress are written to stderr, so stdout can be redirected or piped without filtering terminal rendering or progress messages. A route change (the session moved to another model or agent after a failure) is a line of its own on stdout: `· continued on X instead of Y: reason`.
+
+### It waits for everything the prompt set going
+
+`nori exec` drives the same turn ledger as the interactive CLI (see [turn-lifecycle.md](turn-lifecycle.md)) and does not stop at the first answer. It finishes when the root agent is idle **and** nothing is pending: no running delegated tasks, no results or wakes owed, no queued mail, no working provider subagents. Wake turns that hand delegated results back to the agent stream like any turn, and delegated-child progress appears as compact lines on stderr (`◈ child: running`, `✉ a → b: ...`).
+
+`--max-wait <DURATION>` (`90s`, `5m`, `2h`, or plain seconds) bounds how long exec waits for pending work once the root is idle. When it expires exec prints, for example, `nori exec: stopped waiting with 2 tasks still running`, shuts the session down, and exits with status 124.
+
+### Exit status
+
+The exit status is the truth about the **final** turn:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | The final turn completed (`end_turn`) and nothing was left pending |
+| 1 | The final turn failed or was cancelled, stopped early (`max_tokens`, refusal, ...), the connection or session was lost, a permission request offered no allow option, or the session could not be shut down cleanly |
+| 124 | `--max-wait` expired with work still pending |
+
+The cause is always printed on stderr first. exec never prints a success line for a failed path.
+
+### JSON output
+
+`nori exec --json "..."` writes every session event to stdout as one JSON object per line instead of the plaintext answer (the normalized `SessionEvent` stream: ACP notifications, requests and responses, and Nori events such as phase changes, route changes, notices and subagent updates), for scripts, live tests and benchmarks. Exit status and the wait for pending work are the same; stderr carries only failures.
 
 Nori starts headless sessions with full access and automatically selects an allow option for ACP permission requests. If an agent offers no allow option, the request is cancelled. These settings also apply to interactive sessions. Provider-internal tools may execute without an ACP permission request and are governed by the provider itself.
 
