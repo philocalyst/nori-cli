@@ -1,46 +1,43 @@
 [package]
-name = "codex-acp"
+name = "nori-codex-acp"
 version = "0.16.0"
 edition = "2024"
 authors = ["Zed <hi@zed.dev>"]
 license = "Apache-2.0"
-description = "An ACP-compatible coding agent powered by Codex"
+description = "Codex as an in-process ACP agent for Nori, built on nori-acp-kit"
 repository = "https://github.com/zed-industries/codex-acp"
 homepage = "https://github.com/zed-industries/codex-acp"
 
-[[bin]]
-name = "codex-acp"
-path = "src/main.rs"
-
 [lib]
 doctest = false
-name = "codex_acp"
+name = "nori_codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-agent-client-protocol = { version = "=0.14.0", features = ["unstable"] }
 anyhow = "1"
-clap = "4"
-codex-apply-patch = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-arg0 = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-history = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-utils-path-uri = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-http-client = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-core-api = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-config = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-core = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-exec-server = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-extension-api = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-models-manager = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-protocol = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-login = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-shell-command = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-thread-store = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-utils-approval-presets = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
-codex-utils-cli = { git = "https://github.com/openai/codex", tag = "rust-v0.169.0" }
+# Vendored from openai/codex rust-v0.169.0; see `vendor/codex/README.md`. Path
+# dependencies keep resolvers from having to scan the Codex repository, whose
+# workspace is nested in `codex-rs/`.
+codex-apply-patch = { path = "../../vendor/codex-apply-patch" }
+codex-history = { path = "../../vendor/codex/history" }
+codex-utils-path-uri = { path = "../../vendor/codex/utils/path-uri" }
+codex-http-client = { path = "../../vendor/codex/http-client" }
+codex-core-api = { path = "../../vendor/codex/core-api" }
+codex-config = { path = "../../vendor/codex/config" }
+codex-features = { path = "../../vendor/codex/features" }
+codex-core = { path = "../../vendor/codex/core" }
+codex-models-manager = { path = "../../vendor/codex/models-manager" }
+codex-protocol = { path = "../../vendor/codex/protocol" }
+codex-login = { path = "../../vendor/codex/login" }
+codex-shell-command = { path = "../../vendor/codex-shell-command" }
+codex-thread-store = { path = "../../vendor/codex/thread-store" }
+codex-utils-approval-presets = { path = "../../vendor/codex/utils/approval-presets" }
+codex-utils-cli = { path = "../../vendor/codex/utils/cli" }
 diffy = { version = "0.5.0", features = ["std"] }
 # The tools Nori hands an agent built into its own process.
+nori-acp-kit = { workspace = true }
 nori-host-tools = { path = "../host-tools" }
+nori-protocol = { path = "../nori-protocol" }
 itertools = "0.14.0"
 serde = { version = "1", features = ["derive"] }
 # codex-cli depends on codex-tui, which enables serde_json/preserve_order; match
@@ -48,9 +45,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 shlex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = "0.7"
 tracing = { version = "0.1", features = ["log"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 heck = "0.5.0"
 unicode-segmentation = "1.11.0"
 uuid = { version = "1", features = ["v4"] }

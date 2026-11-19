@@ -1,66 +1,16 @@
-# ACP adapter for Codex
+# nori-codex-acp
 
-> [!IMPORTANT]
-> Development has moved to [agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
-> The new adapter is built on the new Codex App Server, and we are pooling implementation
-> and maintenance work across teams there. Use `@agentclientprotocol/codex-acp`
-> for new installs.
+Codex as an in-process ACP agent for Nori, built on `nori-acp-kit`. Nori links Codex's core into
+its own process, so there is no adapter binary: the crate's one entry point is `registration()`,
+which the `nori` binary hands to the ACP host for `native = { agent = "codex" }` distributions.
 
-Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
+Vendored from zed-industries/codex-acp (see `UPSTREAM.md`) and reworked: the connection, request
+routing and session table belong to the kit, and the translation of Codex's events into ACP updates
+is split by event family under `src/thread/` (see the module docs there). The ACP identity it
+reports is still `codex-acp`; Nori keys Codex-specific behaviour on that name.
 
-This tool implements an ACP adapter around the Codex CLI, supporting:
-
-- Context @-mentions
-- Images
-- Tool calls (with permission requests)
-- Following
-- Edit review
-- TODO lists
-- Slash commands:
-  - /review (with optional instructions)
-  - /review-branch
-  - /review-commit
-  - /init
-  - /compact
-  - /logout
-- Client MCP servers
-- Auth Methods:
-  - ChatGPT subscription (requires paid subscription and doesn't work in remote projects)
-  - CODEX_API_KEY
-  - OPENAI_API_KEY
-
-Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
-
-## How to use
-
-### Zed
-
-The latest version of Zed can already use this adapter out of the box.
-
-To use Codex, open the Agent Panel and click "New Codex Thread" from the `+` button menu in the top-right.
-
-Read the docs on [External Agent](https://zed.dev/docs/ai/external-agents) support.
-
-### Other clients
-
-Or try it with any of the other [ACP compatible clients](https://agentclientprotocol.com/overview/clients)!
-
-#### Installation
-
-Install the adapter from the latest release for your architecture and OS: https://github.com/zed-industries/codex-acp/releases
-
-You can then use `codex-acp` as a regular ACP agent:
-
-```
-OPENAI_API_KEY=sk-... codex-acp
-```
-
-Or via npm:
-
-```
-npx @zed-industries/codex-acp
-```
-
-## License
-
-Apache-2.0
+- Usage: each `TokenCount` event becomes a `usage_update` whose `_meta.nori` carries the model, the
+  last response's token breakdown and Codex's rate-limit windows.
+- Failures: a failed turn carries Codex's own error class (`codex_error_info`) plus the kit's
+  structured fields, so the host can retry, fall back or ask for a login without parsing prose.
+- Host tools: Nori's tools reach the model as Codex dynamic tools (`src/host_tools.rs`).

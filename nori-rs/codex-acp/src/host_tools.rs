@@ -156,6 +156,7 @@ pub(crate) fn remove_goal_context(
 /// Run the host tool the model called and hand core its answer. Core waits for the answer, so
 /// one is always sent: an error when the tool fails, or when this session has no host tools
 /// (a thread saved with them, resumed by a client that does not give them).
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn answer(
     tools: Option<Arc<dyn HostTools>>,
     thread: Arc<dyn CodexThreadImpl>,

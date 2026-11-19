@@ -1,9 +1,38 @@
 //! Forward activity from Codex child threads on their own ACP session ids.
 
-use super::*;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
+
 use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
+use codex_protocol::turn_input::TurnInputSubmission;
+use nori_acp_kit::TurnGate;
+use nori_acp_kit::TurnPolicy;
+use nori_acp_kit::acp::Error;
+use nori_acp_kit::schema::ContentBlock;
+use nori_acp_kit::schema::PromptRequest;
+use nori_acp_kit::schema::SessionId;
+use nori_acp_kit::schema::StopReason;
+use nori_host_tools::HostTools;
+use serde_json::json;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+use tracing::warn;
+
+use crate::thread::ThreadMessage;
+use crate::thread::backends::CodexThreadImpl;
+use crate::thread::client::SessionClient;
+use crate::thread::prompt::PromptState;
+use crate::thread::submit::build_prompt_items;
+use crate::thread::submit::user_turn_op;
 
 pub(crate) enum ChildPrompt {
     Prompt(PromptRequest, oneshot::Sender<Result<StopReason, Error>>),
@@ -102,6 +131,8 @@ fn forward(
     Box::pin(async move {
         let (resolution_tx, mut resolution_rx) = mpsc::unbounded_channel();
         let mut submissions: HashMap<String, PromptState> = HashMap::new();
+        // Same start-or-steer rule as a root session.
+        let gate = TurnGate::new(TurnPolicy::Steerable);
         let mut children = manager.map(|(manager, prompts)| ChildStreams::new(manager, prompts));
         loop {
             tokio::select! {
@@ -109,6 +140,7 @@ fn forward(
                     let (request, response_tx) = match command {
                         ChildPrompt::Prompt(request, response_tx) => (request, response_tx),
                         ChildPrompt::Cancel(response_tx) => {
+                            gate.cancel();
                             let result = thread
                                 .submit(Op::Interrupt)
                                 .await
@@ -118,6 +150,7 @@ fn forward(
                             continue;
                         }
                         ChildPrompt::Close(response_tx) => {
+                            gate.cancel();
                             let result = thread
                                 .submit(Op::Interrupt)
                                 .await
@@ -136,6 +169,13 @@ fn forward(
                         ContentBlock::Text(text) => Some(text.text.as_str()),
                         _ => None,
                     }).collect::<Vec<_>>().join("\n");
+                    let turn = match gate.begin().await {
+                        Ok(turn) => turn,
+                        Err(error) => {
+                            drop(response_tx.send(Err(error.into())));
+                            continue;
+                        }
+                    };
                     let items = build_prompt_items(request.prompt);
                     let mut replies = Vec::new();
                     let op = user_turn_op(items, &mut replies);
@@ -150,6 +190,7 @@ fn forward(
                                     client.send_user_message(text);
                                     let mut state = PromptState::new(id.clone(), thread.clone(), resolution_tx.clone(), response_tx);
                                     state.host_tools = host_tools.clone();
+                                    state.turn = Some(turn);
                                     submissions.insert(id, state);
                                 }
                                 Ok(TurnInputSubmission::Steered { .. } | TurnInputSubmission::Accepted) => {
@@ -234,9 +275,21 @@ fn forward(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
+    use codex_protocol::error::CodexErr;
+    use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+    use codex_protocol::protocol::TurnAbortedEvent;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    use nori_acp_kit::schema::RequestPermissionRequest;
+    use nori_acp_kit::schema::RequestPermissionResponse;
+    use nori_acp_kit::schema::SessionNotification;
+    use nori_acp_kit::schema::SessionUpdate;
     use pretty_assertions::assert_eq;
     use tokio::sync::Mutex as AsyncMutex;
+
+    use super::*;
+    use crate::thread::client::ClientSender;
 
     struct EventThread {
         events: mpsc::UnboundedSender<Event>,
