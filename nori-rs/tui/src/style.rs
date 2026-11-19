@@ -60,8 +60,10 @@ mod tests {
         let composer = user_message_style().bg;
         insta::assert_snapshot!(
             format!("Message rows: {backgrounds}\nComposer: {composer:?}"),
-            @"Message rows: Some(Reset), Some(Reset), Some(Reset)
-        Composer: Some(Reset)"
+            @"
+        Message rows: Some(Reset), Some(Reset), Some(Reset)
+        Composer: Some(Reset)
+        "
         );
     }
 }

@@ -1,8 +1,10 @@
 use ratatui::layout::Rect;
 
+pub mod bash_highlight;
 pub mod highlight;
 pub mod line_utils;
 pub mod renderable;
+pub mod syntax_theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Insets {

@@ -5,8 +5,6 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use std::path::Path;
 use syntect::highlighting::FontStyle;
-use syntect::highlighting::Theme;
-use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 /// Maximum input size (512 KB) before we fall back to plain text.
@@ -19,18 +17,6 @@ fn syntax_set() -> &'static SyntaxSet {
     use std::sync::OnceLock;
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     SS.get_or_init(two_face::syntax::extra_newlines)
-}
-
-fn current_theme() -> &'static Theme {
-    use std::sync::OnceLock;
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(|| {
-        let ts = ThemeSet::from(two_face::theme::extra());
-        ts.themes
-            .get("Catppuccin Mocha")
-            .cloned()
-            .unwrap_or_else(|| ts.themes.into_values().next().unwrap_or_default())
-    })
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -53,7 +39,9 @@ fn syntect_style_to_ratatui(style: syntect::highlighting::Style) -> Style {
     if style.font_style.contains(FontStyle::BOLD) {
         ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
     }
-    // Suppress italic and underline per requirements.
+    if style.font_style.contains(FontStyle::ITALIC) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+    }
     ratatui_style
 }
 
@@ -85,7 +73,7 @@ impl LineHighlighter {
     /// `None` when the language is unknown; such blocks are shown plain.
     pub(crate) fn for_lang(lang: &str) -> Option<Self> {
         let syntax = syntax_set().find_syntax_by_token(lang)?;
-        let highlighter = syntect::highlighting::Highlighter::new(current_theme());
+        let highlighter = syntect::highlighting::Highlighter::new(super::syntax_theme::current());
         let highlight = syntect::highlighting::HighlightState::new(
             &highlighter,
             syntect::parsing::ScopeStack::new(),
@@ -127,6 +115,15 @@ impl LineHighlighter {
     }
 }
 
+/// Languages the shell highlighter owns, so a fenced `bash` block, an exec cell and the
+/// composer's `!` mode all paint a command the same way.
+pub(crate) fn is_shell_language(lang: &str) -> bool {
+    matches!(
+        lang.trim().to_ascii_lowercase().as_str(),
+        "bash" | "sh" | "shell" | "zsh" | "console" | "shell-session" | "shellsession"
+    )
+}
+
 fn plain_lines(text: &str) -> Vec<Line<'static>> {
     text.lines()
         .map(|l| Line::from(l.to_string()))
@@ -151,13 +148,17 @@ pub(crate) fn highlight_code_to_lines(code: &str, lang: &str) -> Vec<Line<'stati
         return plain_lines(code);
     }
 
+    if is_shell_language(lang) {
+        return super::bash_highlight::highlight_bash_script(code);
+    }
+
     let ss = syntax_set();
     let syntax = match ss.find_syntax_by_token(lang) {
         Some(s) => s,
         None => return plain_lines(code),
     };
 
-    let theme = current_theme();
+    let theme = super::syntax_theme::current();
     let mut highlighter = syntect::easy::HighlightLines::new(syntax, theme);
 
     let mut result: Vec<Line<'static>> = Vec::new();
@@ -193,7 +194,7 @@ pub(crate) fn highlight_code_to_lines_for_path(code: &str, path: &Path) -> Vec<L
         Ok(None) | Err(_) => return plain_lines(code),
     };
 
-    let theme = current_theme();
+    let theme = super::syntax_theme::current();
     let mut highlighter = syntect::easy::HighlightLines::new(syntax, theme);
     let mut result: Vec<Line<'static>> = Vec::new();
 
@@ -226,13 +227,6 @@ pub(crate) fn highlight_code_to_lines_for_path(code: &str, path: &Path) -> Vec<L
     }
 }
 
-/// Highlight a bash script into styled ratatui `Line`s.
-///
-/// This is a convenience wrapper around [`highlight_code_to_lines`].
-pub(crate) fn highlight_bash_to_lines(script: &str) -> Vec<Line<'static>> {
-    highlight_code_to_lines(script, "bash")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,7 +254,7 @@ mod tests {
 
     #[test]
     fn highlight_bash_produces_colored_spans() {
-        let lines = highlight_bash_to_lines("echo hello");
+        let lines = highlight_code_to_lines("echo hello", "bash");
         assert!(
             has_non_default_fg(&lines),
             "expected at least one span with a non-default fg color, got: {lines:?}"
@@ -319,7 +313,7 @@ mod tests {
     #[test]
     fn highlight_bash_to_lines_preserves_text() {
         let input = "echo \"hello world\"\nls -la\n";
-        let lines = highlight_bash_to_lines(input);
+        let lines = highlight_code_to_lines(input, "bash");
         let text = reconstructed(&lines);
         // Each Line represents a line without its trailing newline, so joining
         // with "\n" does not reproduce a trailing newline from the original input.
@@ -331,7 +325,7 @@ mod tests {
         // A piped shell command like "df -h --total 2>/dev/null | tail -1"
         // should produce spans with at least two distinct foreground colors,
         // confirming that the highlighter treats different tokens differently.
-        let lines = highlight_bash_to_lines("df -h --total 2>/dev/null | tail -1");
+        let lines = highlight_code_to_lines("df -h --total 2>/dev/null | tail -1", "bash");
         let distinct_colors: std::collections::HashSet<_> = lines
             .iter()
             .flat_map(|l| l.spans.iter())
