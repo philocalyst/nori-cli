@@ -1,20 +1,49 @@
 //! The native Pkl conversation-program tool.
 use super::*;
 
-const PROGRAM_HELP: &str = "Pkl syntax: commands = List(new Dynamic { op = \"spawn\"; actor = \"reviewer\"; agent = \"claude\" }, new Dynamic { op = \"send\"; recipient = \"reviewer\"; message = \"Review this\" }). Valid operations and fields: prompt(text); spawn(actor, agent); send(recipient, message); config(key, value); tool-request(id, tool, input: JSON string); tool-result(id, output); fork(actor, start, end); rewind(head: integer or null); select-context(start, end); unsafe(program, optional args and cwd). There is no wait operation. send queues child work and returns without waiting; do not invent a wait or prompt field. Pkl actor sends do not return a task ID or wait for a reply. Use delegate_task and task_wait for a separate tracked delegation when you need a result. prompt targets the current session only.";
+const PROGRAM_HELP: &str = "A program is a Pkl module: `amends \"nori:Program\"`, `name`, `actors { [\"alias\"] { agent = \"claude-code\"; model = \"opus\" } }` and `steps { ... }` of typed steps. Steps: Send(to, message, await_reply = true, delivery = \"queue\"|\"steer\"), Await(receipt), Spawn(actor), Prompt(text), Config(key, value), Call(tool, args), Unsafe(program, args, cwd), SelectContext(start, end), Fork(actor, start, end), Rewind(head), Sequence, Par(branches), Race(branches), FanOut(over, each, steps), Loop(max_iterations, until, steps), When(check, steps, otherwise), Guard(phase, check, feedback, steps), Budget(tokens, steps), Within(world, steps), Retry(steps), Recover(steps, fallback), Emit(topic, payload), AwaitSignal(topic), Interrupt(prompt), Delay(duration), Pin(fact), Checkpoint(name). Every step may set `id`, `bind` (names its value for later `{{name}}` references and checks), `timeout` and `recovery { retry { ... } fallback { chain = ... } }`. An actor may also declare `tools` (the Nori tools it is given), `skills`, a `sandbox { allowed_tools = ...; allowed_paths = ... }` enforced on its `bash`, and a `world` (own worktree, optionally its own Nori home). `Send` to an actor the program declares starts it on first use; address an existing actor as `actor://alias`. Example: `amends \"nori:Program\"\nname = \"review\"\nactors { [\"dev\"] { agent = \"claude-code\" }; [\"rev\"] { agent = \"codex\" } }\nsteps {\n  new Send { to = \"dev\"; message = \"Implement X\"; bind = \"patch\" }\n  new Send { to = \"rev\"; message = \"Review: {{patch}}\"; bind = \"verdict\" }\n}\nresult = \"verdict\"`. Errors name the file, line and step path.";
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConversationProgramRequest {
-    /// Pkl module with ordered commands and an optional explicit unsafe block.
-    source: String,
+    /// Pkl module that amends `nori:Program`.
+    pub(super) source: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConversationContextRequest {
+    /// Inclusive visible event ID. Omit for the most recent records.
+    start: Option<i64>,
+    /// Inclusive visible event ID. Omit for the current head.
+    end: Option<i64>,
+    /// Maximum records to return, 1 to 200; default 50.
+    limit: Option<i64>,
 }
 
 #[tool_router(router = conversation_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "Evaluate and apply a Pkl conversation program. Example: commands = List(new Dynamic { op = \"spawn\"; actor = \"reviewer\"; agent = \"claude\" }, new Dynamic { op = \"send\"; recipient = \"reviewer\"; message = \"Review this\" }). Each command uses op and exactly these fields: prompt(text); spawn(actor, agent); send(recipient, message); config(key, value); tool-request(id, tool, input as JSON string); tool-result(id, output); fork(actor, start, end); rewind(head as integer or null); select-context(start, end); unsafe(program, optional args and cwd). There is no wait operation. send queues child work and returns without waiting; Pkl actor sends do not return a task ID or wait for a reply. prompt targets the current session only; do not use it to address an actor. Use delegate_task and task_wait for a separate tracked delegation when you need a result. Commands and results are recorded before effects; replay never executes them."
+        description = "Read recorded transcript entries, identity, current head, and visible event IDs (`start`/`end` inclusive, `limit` 1–200, default last 50). Use returned IDs with `conversation` for `select-context`, `fork`, or `rewind`.",
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
+    )]
+    pub(crate) async fn conversation_context(
+        &self,
+        Parameters(request): Parameters<ConversationContextRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = self
+            .shared
+            .orchestrator
+            .conversation_context(request.start, request.end, request.limit)
+            .await
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        Ok(tool_success(result))
+    }
+
+    #[tool(
+        description = "Run a Nori program: a Pkl module that amends `nori:Program`, declaring actors (agent sessions) and typed steps (send, await, par, race, fan_out, loop, guard, budget, retry, recover, emit, ...) with retry and fallback recovery. Every step is journaled under `.nori/runs/<run>/journal.jsonl` with a re-loadable `state.pkl`; the result names both. A `Send` waits for the actor's reply by default; set `await_reply = false` to queue it and `Await` later. Use `delegate_task` + `task_wait` for a single tracked delegation instead."
     )]
     pub(crate) async fn conversation(
         &self,
@@ -37,19 +66,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn conversation_definition_and_errors_explain_real_program_commands() {
+    fn conversation_definition_and_errors_explain_real_program_steps() {
         let definition = NoriClientService::all_tools()
             .into_iter()
             .find(|tool| tool.name == "conversation")
             .unwrap();
         let description = definition.description.unwrap();
+        assert!(description.contains("nori:Program"));
         for term in [
-            "spawn(actor, agent)",
-            "send(recipient, message)",
-            "prompt(text)",
-            "There is no wait operation",
+            "Send(to, message",
+            "Await(receipt)",
+            "bind",
+            "actor://alias",
         ] {
-            assert!(description.contains(term), "{term}");
             assert!(PROGRAM_HELP.contains(term), "{term}");
         }
     }

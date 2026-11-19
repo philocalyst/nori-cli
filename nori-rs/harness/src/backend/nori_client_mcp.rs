@@ -18,7 +18,16 @@
 //! An agent built into Nori's own process gets the same tools with no server at all: they are
 //! handed to it as host tools (see [`super::host_tools`]), and this server is not started.
 
+mod bash_report;
+mod bash_tool;
+mod caller;
 mod conversation_tools;
+mod goal_tools;
+mod monitor_tools;
+mod server;
+mod session_capabilities;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +67,6 @@ use rmcp::model::ServerInfo;
 use rmcp::schemars;
 use rmcp::service::RequestContext;
 use rmcp::tool;
-use rmcp::tool_handler;
 use rmcp::tool_router;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -69,48 +77,6 @@ use tokio::sync::Mutex;
 
 use super::thread_goal::GoalStatus;
 use super::*;
-
-const DUPLICATE_CREATE_GOAL_ERROR: &str = "cannot create a new goal because this thread already has a goal; use update_goal only when the existing goal is complete";
-
-#[derive(Deserialize, schemars::JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(deny_unknown_fields)]
-pub(super) struct CreateGoalRequest {
-    /// Required. The concrete objective to start pursuing. This starts a new
-    /// active goal only when no goal is currently defined; if a goal already
-    /// exists, this tool fails.
-    objective: String,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(deny_unknown_fields)]
-pub(super) struct UpdateGoalRequest {
-    /// Required. Set to `complete` only when the objective is achieved and no
-    /// required work remains. Set to `blocked` only after the same blocking
-    /// condition has repeated and the agent is at an impasse.
-    status: GoalCompletion,
-}
-
-/// The only goal transitions the agent may drive through `update_goal`. Other
-/// statuses (active/paused/usage_limited/budget_limited) are owned by the user
-/// or the backend, so they are intentionally not representable here.
-#[derive(Deserialize, schemars::JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "lowercase")]
-pub(super) enum GoalCompletion {
-    Complete,
-    Blocked,
-}
-
-impl From<GoalCompletion> for GoalStatus {
-    fn from(value: GoalCompletion) -> Self {
-        match value {
-            GoalCompletion::Complete => GoalStatus::Complete,
-            GoalCompletion::Blocked => GoalStatus::Blocked,
-        }
-    }
-}
 
 /// The Arcs the `nori-client` tools operate on, shared across every request the
 /// streamable-HTTP transport spawns. Cloned (cheaply) into each per-session
@@ -127,6 +93,9 @@ pub(crate) struct NoriClientShared {
     /// Where the git and forge tools work.
     workspace: Option<Workspace>,
     pub(super) tool_selection: Option<nori_host_tools::ToolSelection>,
+    /// Persistent per-caller in-process Bash sessions (keyed by caller session ID, or `""` for root).
+    bash_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<nori_bash::BashSession>>>>>,
+    caller_key: String,
 }
 
 /// Where a session's tools work: its directory, and the workflow whose rules they apply.
@@ -156,6 +125,8 @@ impl NoriClientShared {
             orchestrator,
             workspace: None,
             tool_selection: None,
+            bash_sessions: Arc::new(Mutex::new(HashMap::new())),
+            caller_key: String::new(),
         }
     }
 
@@ -175,7 +146,6 @@ pub(crate) struct NoriClientService {
     tool_router: ToolRouter<Self>,
 }
 
-#[tool_router]
 impl NoriClientService {
     pub(super) async fn take_goal_context(&self) -> Option<String> {
         let mut state = self.shared.thread_goal_state.lock().await;
@@ -199,33 +169,14 @@ impl NoriClientService {
     }
 
     pub(super) fn new(shared: NoriClientShared) -> Self {
-        let mut tool_router = Self::tool_router()
+        let mut tool_router = Self::goal_tool_router()
+            + Self::bash_tool_router()
             + Self::task_tool_router()
             + Self::git_tool_router()
             + Self::forge_tool_router()
+            + Self::monitor_tool_router()
             + Self::conversation_tool_router();
-        if let Some(selection) = &shared.tool_selection {
-            for route in tool_router.map.values_mut() {
-                if let Some(description) = selection.descriptions.get(route.attr.name.as_ref()) {
-                    route.attr.description = Some(description.clone().into());
-                }
-            }
-            let names = tool_router
-                .list_all()
-                .into_iter()
-                .map(|tool| tool.name.to_string())
-                .collect::<Vec<_>>();
-            for name in names {
-                if selection
-                    .enabled
-                    .as_ref()
-                    .is_some_and(|enabled| !enabled.contains(&name))
-                    || selection.disabled.contains(&name)
-                {
-                    tool_router.remove_route(&name);
-                }
-            }
-        }
+        bash_tool::apply_tool_selection(&mut tool_router, shared.tool_selection.as_ref());
         Self {
             shared,
             tool_router,
@@ -240,81 +191,33 @@ impl NoriClientService {
         self.tool_router.has_route(name)
     }
 
-    /// Every tool, as `tools/list` describes it. The same for every session.
-    pub(super) fn all_tools() -> Vec<rmcp::model::Tool> {
-        (Self::tool_router()
-            + Self::task_tool_router()
-            + Self::git_tool_router()
-            + Self::forge_tool_router()
-            + Self::conversation_tool_router())
-        .list_all()
-    }
-
-    #[tool(
-        description = "Inspect this thread's goal when needed. Goal changes are delivered in conversation context; do not routinely poll this tool.",
-        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
-    )]
-    pub(super) async fn get_goal(&self) -> Result<CallToolResult, McpError> {
-        let state = self.shared.thread_goal_state.lock().await;
-        let goal = state.snapshot(thread_goal::now_seconds()).map(goal_json);
-        Ok(tool_success(serde_json::json!({ "goal": goal })))
-    }
-
-    #[tool(
-        description = "Start a goal, only when the user or the system asks for one; never infer one from an ordinary task. Fails if a goal exists."
-    )]
-    pub(super) async fn create_goal(
-        &self,
-        Parameters(CreateGoalRequest { objective }): Parameters<CreateGoalRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let objective = objective.trim().to_string();
-        let result = {
-            let now = thread_goal::now_seconds();
-            let mut state = self.shared.thread_goal_state.lock().await;
-            if state.snapshot(now).is_some() {
-                return Ok(tool_error(DUPLICATE_CREATE_GOAL_ERROR));
-            }
-            state.set_objective(objective, Some(GoalStatus::Active), now)
-        };
-        Ok(self.respond_with_goal(result).await)
-    }
-
-    #[tool(
-        description = "Mark the goal `complete` (achieved, verified) or `blocked` (the same obstacle keeps recurring). Other transitions belong to the user or the system."
-    )]
-    pub(super) async fn update_goal(
-        &self,
-        Parameters(UpdateGoalRequest { status }): Parameters<UpdateGoalRequest>,
-    ) -> Result<CallToolResult, McpError> {
-        let result = {
-            let now = thread_goal::now_seconds();
-            let mut state = self.shared.thread_goal_state.lock().await;
-            state.set_status(status.into(), now)
-        };
-        Ok(self.respond_with_goal(result).await)
-    }
-
-    /// Emit a `ThreadGoalUpdated` client event and render the tool reply for a
-    /// state mutation, or surface the validation error as a tool error.
-    async fn respond_with_goal(
-        &self,
-        result: Result<thread_goal::ThreadGoalSnapshot, String>,
-    ) -> CallToolResult {
-        match result {
-            Ok(goal) => {
-                let _ = self
-                    .shared
-                    .backend_event_tx
-                    .send(BackendEvent::Public(nori_protocol::SessionEvent::Nori(
-                        nori_protocol::NoriEvent::GoalChanged(Some(
-                            goal.clone().into_client_goal(),
-                        )),
-                    )))
-                    .await;
-                tool_success(serde_json::json!({ "goal": goal_json(goal) }))
-            }
-            Err(err) => tool_error(err),
+    pub(super) fn instructions(&self) -> String {
+        let mut out = tool_instructions();
+        if ["git_status", "git_diff", "git_log", "git_commit"]
+            .iter()
+            .any(|tool| self.has_tool(tool))
+        {
+            out.push_str("\n\n");
+            out.push_str(super::git_tools::INSTRUCTIONS);
         }
+        if ["ci_status", "pull_request"]
+            .iter()
+            .any(|tool| self.has_tool(tool))
+        {
+            out.push_str("\n\n");
+            out.push_str(super::forge_tools::INSTRUCTIONS);
+        }
+        out
+    }
+
+    /// Every default model-facing tool, as `tools/list` describes it.
+    pub(super) fn all_tools() -> Vec<rmcp::model::Tool> {
+        let tool_router = Self::goal_tool_router()
+            + Self::bash_tool_router()
+            + Self::task_tool_router()
+            + Self::monitor_tool_router()
+            + Self::conversation_tool_router();
+        tool_router.list_all()
     }
 }
 
@@ -325,8 +228,30 @@ impl NoriClientService {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for NoriClientService {
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = caller::session_from_meta(&context.meta)?;
+        let service = self.for_caller(caller, request.name.as_ref()).await?;
+        let call = rmcp::handler::server::tool::ToolCallContext::new(&service, request, context);
+        service.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
@@ -418,8 +343,8 @@ pub(super) fn tool_instructions() -> String {
         "{}\n\n{}\n\n{}\n\n{}",
         thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
         super::orchestrator::TASK_INSTRUCTIONS,
-        super::git_tools::INSTRUCTIONS,
-        super::forge_tools::INSTRUCTIONS,
+        nori_host_tools::MONITOR_INSTRUCTIONS,
+        bash_tool::BASH_INSTRUCTIONS,
     )
 }
 
@@ -431,1117 +356,20 @@ pub(super) fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![Content::text(message.into())])
 }
 
-fn goal_json(goal: thread_goal::ThreadGoalSnapshot) -> serde_json::Value {
-    serde_json::json!({
-        "objective": goal.objective,
-        "status": status_label(goal.status),
-        "tokens_used": goal.tokens_used,
-        "token_budget": null,
-        "tokens_remaining": null,
-        "time_used_seconds": goal.time_used_seconds,
-        "created_at": goal.created_at,
-        "updated_at": goal.updated_at,
-    })
-}
-
-fn status_label(status: GoalStatus) -> &'static str {
-    match status {
-        GoalStatus::Active => "active",
-        GoalStatus::Paused => "paused",
-        GoalStatus::Blocked => "blocked",
-        GoalStatus::UsageLimited => "usage_limited",
-        GoalStatus::BudgetLimited => "budget_limited",
-        GoalStatus::Complete => "complete",
-    }
-}
-
-/// The command, and the arguments before the socket path, that relays an agent's stdio to the
-/// `nori-client` socket. Set once by the binary that can do it; without it, only agents that
-/// speak HTTP MCP get the server.
-static STDIO_BRIDGE: std::sync::OnceLock<(std::path::PathBuf, Vec<String>)> =
-    std::sync::OnceLock::new();
-
-/// Let agents without HTTP MCP reach the `nori-client` server by running `command args… <socket>`,
-/// which must relay its stdin and stdout to the unix socket it is given.
-pub fn set_stdio_bridge(command: std::path::PathBuf, args: Vec<String>) {
-    let _ = STDIO_BRIDGE.set((command, args));
-}
-
-/// Whether an agent can be given the `nori-client` server.
-pub(super) fn reachable(connection: &AcpConnection) -> bool {
-    connection.capabilities().mcp_capabilities.http || (cfg!(unix) && STDIO_BRIDGE.get().is_some())
-}
-
-/// Loopback `nori-client` MCP server. Bound on first use and torn down on drop.
-pub(crate) struct NoriClientServer {
-    pub(super) local_tools: Arc<dyn nori_host_tools::HostTools>,
-    url: String,
-    authorization_header_value: String,
-    task: tokio::task::JoinHandle<()>,
-    /// The stdio server for agents without HTTP MCP, when this agent needs it.
-    #[cfg(unix)]
-    socket: Option<SocketServer>,
-}
-
-/// The `nori-client` service on a unix socket in a directory only this user can enter.
-#[cfg(unix)]
-struct SocketServer {
-    directory: std::path::PathBuf,
-    path: std::path::PathBuf,
-    task: tokio::task::JoinHandle<()>,
-}
-
-#[cfg(unix)]
-impl SocketServer {
-    fn spawn(shared: NoriClientShared) -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
-
-        let directory = std::env::temp_dir().join(format!(
-            "nori-mcp-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .context("failed to create the nori-client socket directory")?;
-        let path = directory.join("mcp.sock");
-        let listener = tokio::net::UnixListener::bind(&path)
-            .context("failed to bind the nori-client socket")?;
-        let task = tokio::spawn(async move {
-            // Dropping the set when the server is torn down ends every connection.
-            let mut connections = tokio::task::JoinSet::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                let service = NoriClientService::new(shared.clone());
-                connections.spawn(async move {
-                    match rmcp::ServiceExt::serve(service, stream).await {
-                        Ok(running) => {
-                            let _ = running.waiting().await;
-                        }
-                        Err(err) => tracing::debug!("nori-client socket connection failed: {err}"),
-                    }
-                });
-            }
-        });
-        Ok(Self {
-            directory,
-            path,
-            task,
-        })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for SocketServer {
-    fn drop(&mut self) {
-        self.task.abort();
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
-}
-
-impl NoriClientServer {
-    /// The server, with a stdio entry point unless the agent speaks HTTP MCP.
-    pub(crate) async fn spawn(shared: NoriClientShared, http: bool) -> Result<Self> {
-        #[cfg(unix)]
-        let socket = if http {
-            None
-        } else {
-            Some(SocketServer::spawn(shared.clone())?)
-        };
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .context("failed to bind local nori-client MCP server")?;
-        let url = format!("http://{}/mcp", listener.local_addr()?);
-        let authorization_header_value = format!("Bearer {}", uuid::Uuid::new_v4());
-        let expected_authorization = Arc::new(authorization_header_value.clone());
-
-        let local_tools = super::host_tools::from_shared(shared.clone());
-        let service = StreamableHttpService::new(
-            move || Ok(NoriClientService::new(shared.clone())),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig {
-                stateful_mode: false,
-                sse_keep_alive: None,
-                ..Default::default()
-            },
-        );
-        let router = axum::Router::new().nest_service("/mcp", service).layer(
-            middleware::from_fn_with_state(expected_authorization, require_bearer_token),
-        );
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _ = ready_tx.send(());
-            if let Err(err) = axum::serve(listener, router).await {
-                tracing::debug!("nori-client MCP server stopped: {err}");
-            }
-        });
-        ready_rx
-            .await
-            .context("nori-client MCP server task exited before becoming ready")?;
-
-        Ok(Self {
-            local_tools,
-            url,
-            authorization_header_value,
-            task,
-            #[cfg(unix)]
-            socket,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn url(&self) -> &str {
-        &self.url
-    }
-
-    fn authorization_header(&self) -> acp::HttpHeader {
-        acp::HttpHeader::new("Authorization", self.authorization_header_value.clone())
-    }
-
-    pub(super) fn as_mcp_server(&self) -> acp::McpServer {
-        #[cfg(unix)]
-        if let (Some(socket), Some((command, args))) = (&self.socket, STDIO_BRIDGE.get()) {
-            let mut args = args.clone();
-            args.push(socket.path.display().to_string());
-            return acp::McpServer::Stdio(
-                acp::McpServerStdio::new("nori-client", command.clone()).args(args),
-            );
-        }
-        acp::McpServer::Http(
-            acp::McpServerHttp::new("nori-client", self.url.clone())
-                .headers(vec![self.authorization_header()]),
-        )
-    }
-}
-
-impl Drop for NoriClientServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-/// How the session's agent reaches the `nori-client` tools.
-pub(crate) enum NoriClient {
-    /// A loopback MCP server, for an agent in another process.
-    Mcp(NoriClientServer),
-    /// Host tools handed straight to an agent built into this process. The connection sends them
-    /// with every session request, so they need no entry in the session's MCP servers; holding
-    /// the registration keeps them findable.
-    Host {
-        _registration: nori_host_tools::Registration,
-    },
-}
-
-impl NoriClient {
-    /// Continuations require both goal inspection and completion tools.
-    pub(super) fn has_goal_tools(&self) -> bool {
-        let tools = match self {
-            Self::Mcp(server) => Some(Arc::clone(&server.local_tools)),
-            Self::Host { _registration } => {
-                nori_host_tools::from_session_meta(Some(&_registration.session_meta()))
-            }
-        };
-        tools.is_some_and(|tools| {
-            let specs = tools.specs();
-            ["get_goal", "update_goal"]
-                .iter()
-                .all(|name| specs.iter().any(|spec| spec.name == *name))
-        })
-    }
-}
-
-pub(super) struct PendingNoriClientServer {
-    server: Option<NoriClient>,
-    connected: Arc<AtomicBool>,
-    previous_connected: bool,
-    committed: bool,
-}
-
-impl PendingNoriClientServer {
-    /// Whether the tools go to the agent as host tools rather than over MCP.
-    pub(super) fn is_host(&self) -> bool {
-        matches!(self.server, Some(NoriClient::Host { .. }))
-    }
-
-    pub(super) async fn commit(mut self, http_server: &Arc<Mutex<Option<NoriClient>>>) {
-        *http_server.lock().await = self.server.take();
-        self.committed = true;
-    }
-}
-
-impl Drop for PendingNoriClientServer {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.connected
-                .store(self.previous_connected, Ordering::Relaxed);
-        }
-    }
-}
-
-async fn require_bearer_token(
-    State(expected): State<Arc<String>>,
-    request: Request<Body>,
-    next: Next,
-) -> std::result::Result<Response, StatusCode> {
-    if request
-        .headers()
-        .get(AUTHORIZATION)
-        .is_some_and(|value| value.as_bytes() == expected.as_bytes())
-    {
-        Ok(next.run(request).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
-pub(super) fn capabilities_update_for_session(
-    connection: &AcpConnection,
-    connected: &AtomicBool,
-    goal_tools_available: bool,
-) -> crate::normalized::SessionCapabilitiesView {
-    capabilities_update_for_nori_client(
-        connection,
-        reachable(connection) || super::host_tools::accepted_by(connection),
-        connected.load(Ordering::Relaxed),
-        goal_tools_available,
-    )
-}
-
-pub(super) fn capabilities_update_for_nori_client(
-    connection: &AcpConnection,
-    nori_client_advertised: bool,
-    nori_client_initialized: bool,
-    goal_tools_available: bool,
-) -> crate::normalized::SessionCapabilitiesView {
-    let goal_ext_advertised =
-        goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta()).is_some();
-    capabilities_update(
-        agent_capabilities_view(connection),
-        nori_client_advertised,
-        nori_client_initialized,
-        goal_ext_advertised,
-        goal_tools_available,
-    )
-}
-
-/// Project the agent's ACP capabilities into the client-facing view.
-pub(crate) fn agent_capabilities_view(
-    connection: &AcpConnection,
-) -> crate::normalized::AgentCapabilitiesView {
-    let capabilities = connection.capabilities();
-    crate::normalized::AgentCapabilitiesView {
-        http_mcp: capabilities.mcp_capabilities.http,
-        load_session: capabilities.load_session,
-        session_list: capabilities.session_capabilities.list.is_some(),
-        session_resume: capabilities.session_capabilities.resume.is_some(),
-        session_close: capabilities.session_capabilities.close.is_some(),
-        session_fork: capabilities.session_capabilities.fork.is_some(),
-    }
-}
-
-fn capabilities_update(
-    agent: crate::normalized::AgentCapabilitiesView,
-    nori_client_advertised: bool,
-    nori_client_initialized: bool,
-    goal_ext_advertised: bool,
-    goal_tools_available: bool,
-) -> crate::normalized::SessionCapabilitiesView {
-    let goal_available = goal_tools_available || goal_ext_advertised;
-    crate::normalized::SessionCapabilitiesView {
-        agent,
-        nori_client: crate::normalized::NoriClientCapabilitiesView {
-            advertised: nori_client_advertised,
-            initialized: nori_client_initialized,
-        },
-        builtin_commands: HashMap::from([(
-            "goal".to_string(),
-            nori_protocol::CommandAvailability {
-                enabled: goal_available,
-                reason: (!goal_available).then(|| {
-                    if nori_client_advertised {
-                        "Nori goal tools are disabled by session policy.".to_owned()
-                    } else {
-                        "The active agent advertises neither HTTP MCP support nor the goal extension, so /goal is unavailable.".to_owned()
-                    }
-                }),
-            },
-        )]),
-    }
-}
-
-pub(super) async fn register_for_session(
-    connection: &AcpConnection,
-    mcp_servers: &mut Vec<acp::McpServer>,
-    thread_goal_state: Arc<Mutex<thread_goal::ThreadGoalState>>,
-    backend_event_tx: mpsc::Sender<BackendEvent>,
-    connected: Arc<AtomicBool>,
-    orchestrator: super::orchestrator::Orchestrator,
-    workspace: Workspace,
-) -> Result<Option<PendingNoriClientServer>> {
-    let host_tools = super::host_tools::accepted_by(connection);
-    if !host_tools && !reachable(connection) {
-        return Ok(None);
-    }
-
-    let selection = workspace
-        .workflow
-        .lock()
-        .await
-        .active
-        .as_ref()
-        .and_then(|workflow| workflow.tools.as_ref())
-        .map(|tools| nori_host_tools::ToolSelection {
-            enabled: tools
-                .enabled
-                .as_ref()
-                .map(|names| names.iter().cloned().collect()),
-            disabled: tools.disabled.iter().cloned().collect(),
-            descriptions: tools.descriptions.clone(),
-            instructions: tools.instructions.clone(),
-        });
-    let shared = NoriClientShared::new(
-        thread_goal_state,
-        backend_event_tx,
-        Arc::clone(&connected),
-        agent_capabilities_view(connection),
-        true,
-        goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta()).is_some(),
-        orchestrator,
-    )
-    .with_workspace(workspace);
-    let mut shared = shared;
-    shared.tool_selection = selection;
-    let previous_connected = connected.load(Ordering::Relaxed);
-    let next_server = if host_tools {
-        NoriClient::Host {
-            _registration: super::host_tools::hand_to(connection, shared, &connected),
-        }
-    } else {
-        let server =
-            NoriClientServer::spawn(shared, connection.capabilities().mcp_capabilities.http)
-                .await?;
-        connected.store(false, Ordering::Relaxed);
-        mcp_servers.push(server.as_mcp_server());
-        NoriClient::Mcp(server)
-    };
-
-    Ok(Some(PendingNoriClientServer {
-        server: Some(next_server),
-        connected,
-        previous_connected,
-        committed: false,
-    }))
-}
-
 #[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-
-    use super::*;
-
-    fn test_agent_capabilities() -> crate::normalized::AgentCapabilitiesView {
-        crate::normalized::AgentCapabilitiesView {
-            http_mcp: true,
-            load_session: false,
-            session_list: false,
-            session_resume: false,
-            session_close: false,
-            session_fork: false,
-        }
-    }
-
-    #[test]
-    fn goal_command_enabled_by_goal_extension_without_nori_client() {
-        let view = capabilities_update(test_agent_capabilities(), false, false, true, false);
-        let goal = view.builtin_commands.get("goal").expect("goal command");
-        assert!(goal.enabled);
-        assert_eq!(goal.reason, None);
-    }
-
-    #[test]
-    fn disabled_goal_tools_do_not_hide_nori_client_capability() {
-        let view = capabilities_update(test_agent_capabilities(), true, true, false, false);
-        assert!(view.nori_client.advertised);
-        assert!(view.nori_client.initialized);
-        let goal = view.builtin_commands.get("goal").unwrap();
-        assert!(!goal.enabled);
-        assert_eq!(
-            goal.reason.as_deref(),
-            Some("Nori goal tools are disabled by session policy.")
-        );
-    }
-
-    #[test]
-    fn goal_command_disabled_without_nori_client_or_goal_extension() {
-        let view = capabilities_update(test_agent_capabilities(), false, false, false, false);
-        let goal = view.builtin_commands.get("goal").expect("goal command");
-        assert!(!goal.enabled);
-        assert!(goal.reason.as_deref().is_some_and(|reason| {
-            reason.contains("neither HTTP MCP support nor the goal extension")
-        }));
-    }
-
-    fn test_orchestrator() -> super::super::orchestrator::Orchestrator {
-        let (events, _events_rx) = mpsc::channel(8);
-        super::super::orchestrator::Orchestrator::new(
-            super::super::orchestrator::Seed::root(
-                Arc::new(crate::config::NoriConfig::default()),
-                "test".to_owned(),
-            ),
-            events,
-        )
-        .0
-    }
-
-    fn service() -> NoriClientService {
-        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        NoriClientService::new(NoriClientShared::new(
-            Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
-            backend_event_tx,
-            Arc::new(AtomicBool::new(false)),
-            test_agent_capabilities(),
-            true,
-            false,
-            test_orchestrator(),
-        ))
-    }
-
-    fn tool_text(result: &CallToolResult) -> &str {
-        result.content[0]
-            .as_text()
-            .expect("tool result should contain text content")
-            .text
-            .as_str()
-    }
-
-    fn is_error(result: &CallToolResult) -> bool {
-        result.is_error.unwrap_or(false)
-    }
-
-    fn parsed_tool_text(result: &CallToolResult) -> serde_json::Value {
-        serde_json::from_str(tool_text(result)).expect("tool text should be json")
-    }
-
-    async fn create(service: &NoriClientService, objective: &str) -> CallToolResult {
-        service
-            .create_goal(Parameters(CreateGoalRequest {
-                objective: objective.to_string(),
-            }))
-            .await
-            .expect("create_goal should not fail at the protocol level")
-    }
-
-    async fn get(service: &NoriClientService) -> CallToolResult {
-        service
-            .get_goal()
-            .await
-            .expect("get_goal should not fail at the protocol level")
-    }
-
-    async fn update(service: &NoriClientService, status: GoalCompletion) -> CallToolResult {
-        service
-            .update_goal(Parameters(UpdateGoalRequest { status }))
-            .await
-            .expect("update_goal should not fail at the protocol level")
-    }
-
-    fn authenticated_transport(
-        url: String,
-        authorization_header_value: String,
-    ) -> impl rmcp::transport::Transport<rmcp::RoleClient> {
-        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-
-        let bearer_token = authorization_header_value
-            .strip_prefix("Bearer ")
-            .expect("generated Authorization header should be a bearer token")
-            .to_string();
-        let config = StreamableHttpClientTransportConfig::with_uri(url).auth_header(bearer_token);
-        rmcp::transport::StreamableHttpClientTransport::from_config(config)
-    }
-
-    #[test]
-    fn get_info_advertises_nori_client_surface() {
-        let info = service().get_info();
-        assert_eq!(info.server_info.name, "nori-client");
-        assert!(info.capabilities.tools.is_some());
-        assert!(info.capabilities.resources.is_some());
-        assert!(info.capabilities.prompts.is_some());
-    }
-
-    #[tokio::test]
-    async fn get_goal_returns_null_without_goal() {
-        let result = get(&service()).await;
-        assert!(!is_error(&result));
-        assert_eq!(parsed_tool_text(&result), json!({ "goal": null }));
-    }
-
-    #[tokio::test]
-    async fn git_tools_commit_a_batch_and_report_what_remains() {
-        let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .expect("git runs");
-            assert!(out.status.success(), "git {args:?}");
-            String::from_utf8(out.stdout).expect("utf8")
-        };
-        let temp = tempfile::tempdir().expect("tempdir");
-        let dir = temp.path().canonicalize().expect("canonical");
-        git(&dir, &["init", "-q", "-b", "main"]);
-        git(&dir, &["config", "user.name", "Test"]);
-        git(&dir, &["config", "user.email", "test@example.com"]);
-        std::fs::write(dir.join("a.txt"), "a\n").expect("a");
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "base"]);
-        std::fs::write(dir.join("a.txt"), "a2\n").expect("edit");
-        std::fs::write(dir.join("b.txt"), "b\n").expect("new");
-
-        let (backend_event_tx, _rx) = mpsc::channel(8);
-        let service = NoriClientService::new(
-            NoriClientShared::new(
-                Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
-                backend_event_tx,
-                Arc::new(AtomicBool::new(false)),
-                test_agent_capabilities(),
-                true,
-                false,
-                test_orchestrator(),
-            )
-            .with_workspace(Workspace {
-                cwd: dir.clone(),
-                workflow: Arc::default(),
-            }),
-        );
-
-        let status: serde_json::Value =
-            serde_json::from_str(tool_text(&service.git_status().await.expect("status")))
-                .expect("json");
-        assert_eq!(status["branch"], "main");
-        assert_eq!(status["changes"].as_array().expect("changes").len(), 2);
-
-        let committed = service
-            .git_commit(Parameters(super::super::git_tools::GitCommitRequest {
-                paths: vec!["a.txt".into()],
-                message: "fix: update a".into(),
-            }))
-            .await
-            .expect("commit");
-        assert!(!is_error(&committed), "{}", tool_text(&committed));
-        let body: serde_json::Value = serde_json::from_str(tool_text(&committed)).expect("json");
-        assert_eq!(body["remaining_changes"], 1);
-        assert_eq!(
-            git(&dir, &["log", "-1", "--format=%s"]).trim(),
-            "fix: update a"
-        );
-        assert_eq!(git(&dir, &["status", "--porcelain"]).trim(), "?? b.txt");
-
-        let empty = service
-            .git_commit(Parameters(super::super::git_tools::GitCommitRequest {
-                paths: vec![],
-                message: "nothing".into(),
-            }))
-            .await
-            .expect("empty");
-        assert!(is_error(&empty));
-    }
-
-    #[tokio::test]
-    async fn create_goal_creates_active_goal_and_emits_event() {
-        let (backend_event_tx, mut backend_event_rx) = mpsc::channel(8);
-        let service = NoriClientService::new(NoriClientShared::new(
-            Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
-            backend_event_tx,
-            Arc::new(AtomicBool::new(false)),
-            test_agent_capabilities(),
-            true,
-            false,
-            test_orchestrator(),
-        ));
-
-        let create_result = create(&service, "Ship the ACP goal bridge").await;
-        assert!(!is_error(&create_result));
-        assert!(tool_text(&create_result).contains("Ship the ACP goal bridge"));
-
-        let emitted_event = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            backend_event_rx.recv(),
-        )
-        .await
-        .expect("create_goal should emit a client event before timeout")
-        .expect("create_goal should emit a client event");
-        match emitted_event {
-            BackendEvent::Public(SessionEvent::Nori(nori_protocol::NoriEvent::GoalChanged(
-                Some(goal),
-            ))) => assert_eq!(goal.objective, "Ship the ACP goal bridge"),
-            other => panic!("expected thread goal update, got {other:?}"),
-        }
-
-        let get_result = get(&service).await;
-        let goal = &parsed_tool_text(&get_result)["goal"];
-        assert_eq!(goal["status"], "active");
-        assert_eq!(goal["objective"], "Ship the ACP goal bridge");
-    }
-
-    #[tokio::test]
-    async fn create_goal_rejects_existing_goal() {
-        let service = service();
-        assert!(!is_error(&create(&service, "First goal").await));
-
-        let second = create(&service, "Second goal").await;
-        assert!(is_error(&second));
-        assert!(tool_text(&second).contains("already has a goal"));
-
-        let goal = parsed_tool_text(&get(&service).await);
-        assert_eq!(goal["goal"]["objective"], "First goal");
-    }
-
-    #[tokio::test]
-    async fn update_goal_marks_goal_complete() {
-        let service = service();
-        assert!(!is_error(&create(&service, "Finish completely").await));
-
-        let complete = update(&service, GoalCompletion::Complete).await;
-        assert!(!is_error(&complete));
-        assert_eq!(parsed_tool_text(&complete)["goal"]["status"], "complete");
-    }
-
-    #[tokio::test]
-    async fn update_goal_marks_goal_blocked() {
-        let service = service();
-        assert!(!is_error(&create(&service, "Finish carefully").await));
-
-        let blocked = update(&service, GoalCompletion::Blocked).await;
-        assert!(!is_error(&blocked));
-        assert_eq!(parsed_tool_text(&blocked)["goal"]["status"], "blocked");
-    }
-
-    #[tokio::test]
-    async fn update_goal_reports_missing_goal() {
-        let result = update(&service(), GoalCompletion::Complete).await;
-        assert!(is_error(&result));
-        assert!(tool_text(&result).contains("no goal exists"));
-    }
-
-    /// End-to-end: a real spec-compliant rmcp client connects to the loopback
-    /// server over HTTP, exercising the streamable-HTTP transport, the
-    /// `initialize` handshake (which must flip `connected`), tool discovery, and
-    /// a `create_goal` round-trip, i.e. the path a real ACP agent takes.
-    /// An agent without HTTP MCP is given a stdio command that relays to a private unix socket;
-    /// the same service, task tools included, answers there.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_socket_serves_the_same_tools_to_agents_without_http() {
-        use rmcp::ServiceExt;
-
-        set_stdio_bridge(
-            std::path::PathBuf::from("nori"),
-            vec!["stdio-to-uds".to_owned()],
-        );
-        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(
-            NoriClientShared::new(
-                Arc::new(Mutex::new(thread_goal::ThreadGoalState::default())),
-                backend_event_tx,
-                Arc::new(AtomicBool::new(false)),
-                test_agent_capabilities(),
-                true,
-                false,
-                test_orchestrator(),
-            ),
-            false,
-        )
-        .await
-        .expect("nori-client server should spawn");
-        let acp::McpServer::Stdio(stdio) = server.as_mcp_server() else {
-            panic!("an agent without HTTP MCP is given a stdio server");
-        };
-        let socket = stdio.args.last().cloned().expect("the socket path");
-        assert_eq!(stdio.args[0], "stdio-to-uds");
-        let stream = tokio::net::UnixStream::connect(&socket)
-            .await
-            .expect("connect to the nori-client socket");
-        let client = ().serve(stream).await.expect("initialize over the socket");
-        let tools = client.list_all_tools().await.expect("list tools");
-        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        for tool in [
-            "delegate_task",
-            "task_status",
-            "task_wait",
-            "task_send",
-            "task_cancel",
-            "get_goal",
-            "git_status",
-            "git_commit",
-        ] {
-            assert!(names.contains(&tool), "{tool} missing from {names:?}");
-        }
-        let delegate = tools
-            .iter()
-            .find(|tool| tool.name == "delegate_task")
-            .expect("delegate_task");
-        assert!(delegate.meta.as_ref().is_some_and(
-            |meta| meta.0.get("anthropic/alwaysLoad") == Some(&serde_json::Value::Bool(true))
-        ));
-        let _ = client.cancel().await;
-        let directory = std::path::Path::new(&socket)
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .expect("socket directory");
-        drop(server);
-        assert!(
-            !directory.exists(),
-            "the socket directory is removed with the server"
-        );
-    }
-
-    #[tokio::test]
-    async fn configured_mcp_catalog_and_dispatch_use_the_same_policy() {
-        use rmcp::ServiceExt;
-        use rmcp::model::CallToolRequestParam;
-        let (events, _rx) = mpsc::channel(8);
-        let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
-        let mut shared = NoriClientShared::new(
-            Arc::clone(&state),
-            events,
-            Arc::new(AtomicBool::new(false)),
-            test_agent_capabilities(),
-            true,
-            false,
-            test_orchestrator(),
-        );
-        shared.tool_selection = Some(nori_host_tools::ToolSelection {
-            enabled: Some(["get_goal".to_owned()].into_iter().collect()),
-            descriptions: [("get_goal".to_owned(), "Read the selected goal".to_owned())]
-                .into_iter()
-                .collect(),
-            instructions: vec!["Follow the configured prompt".to_owned()],
-            ..Default::default()
-        });
-        let server = NoriClientServer::spawn(shared, true).await.unwrap();
-        let transport = authenticated_transport(
-            server.url().to_string(),
-            server.authorization_header_value.clone(),
-        );
-        let client = ().serve(transport).await.unwrap();
-        let instructions = client
-            .peer()
-            .peer_info()
-            .unwrap()
-            .instructions
-            .as_ref()
-            .unwrap();
-        assert!(instructions.contains("Follow the configured prompt"));
-        let tools = client.list_all_tools().await.unwrap();
-        assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.name.as_ref())
-                .collect::<Vec<_>>(),
-            vec!["get_goal"]
-        );
-        assert_eq!(
-            tools[0].description.as_deref(),
-            Some("Read the selected goal")
-        );
-        let result = client
-            .call_tool(CallToolRequestParam {
-                name: "create_goal".into(),
-                arguments: serde_json::json!({"objective": "must not run"})
-                    .as_object()
-                    .cloned(),
-            })
-            .await;
-        assert!(result.is_err() || result.unwrap().is_error == Some(true));
-        let goal = client
-            .call_tool(CallToolRequestParam {
-                name: "get_goal".into(),
-                arguments: None,
-            })
-            .await
-            .unwrap();
-        assert!(goal.content.iter().any(|content| {
-            content
-                .as_text()
-                .is_some_and(|text| text.text.contains("null"))
-        }));
-        let _ = client.cancel().await;
-    }
-
-    #[tokio::test]
-    async fn real_mcp_client_round_trips_over_http() {
-        use rmcp::ServiceExt;
-        use rmcp::model::CallToolRequestParam;
-
-        let connected = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
-        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(
-            NoriClientShared::new(
-                Arc::clone(&state),
-                backend_event_tx,
-                Arc::clone(&connected),
-                test_agent_capabilities(),
-                true,
-                false,
-                test_orchestrator(),
-            ),
-            true,
-        )
-        .await
-        .expect("nori-client server should spawn");
-
-        let transport = authenticated_transport(
-            server.url().to_string(),
-            server.authorization_header_value.clone(),
-        );
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("rmcp client should complete the initialize handshake");
-
-        assert!(
-            connected.load(Ordering::Relaxed),
-            "initialize handshake must flip the connected gate"
-        );
-        let instructions = client
-            .peer()
-            .peer_info()
-            .and_then(|info| info.instructions.as_deref())
-            .expect("initialized nori-client instructions");
-        assert!(instructions.contains(thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS));
-
-        let tools = client
-            .list_all_tools()
-            .await
-            .expect("client should list tools");
-        let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
-        assert!(tool_names.contains(&"get_goal"));
-        assert!(tool_names.contains(&"create_goal"));
-        assert!(tool_names.contains(&"update_goal"));
-
-        let create = client
-            .call_tool(CallToolRequestParam {
-                name: "create_goal".into(),
-                arguments: serde_json::json!({ "objective": "Round-trip over real MCP" })
-                    .as_object()
-                    .cloned(),
-            })
-            .await
-            .expect("create_goal call should succeed");
-        assert_eq!(create.is_error, Some(false));
-
-        let get = client
-            .call_tool(CallToolRequestParam {
-                name: "get_goal".into(),
-                arguments: None,
-            })
-            .await
-            .expect("get_goal call should succeed");
-        let goal_text = get.content[0]
-            .as_text()
-            .expect("get_goal returns text")
-            .text
-            .as_str();
-        let goal: serde_json::Value = serde_json::from_str(goal_text).expect("goal json");
-        assert_eq!(goal["goal"]["objective"], "Round-trip over real MCP");
-        assert_eq!(goal["goal"]["status"], "active");
-
-        client.cancel().await.expect("client should shut down");
-    }
-
-    #[tokio::test]
-    async fn real_mcp_client_discovers_context_resources_over_http() {
-        use std::collections::BTreeSet;
-
-        use rmcp::ServiceExt;
-        use rmcp::model::ReadResourceRequestParam;
-        use rmcp::model::ResourceContents;
-
-        let connected = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
-        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(
-            NoriClientShared::new(
-                Arc::clone(&state),
-                backend_event_tx,
-                Arc::clone(&connected),
-                test_agent_capabilities(),
-                true,
-                false,
-                test_orchestrator(),
-            ),
-            true,
-        )
-        .await
-        .expect("nori-client server should spawn");
-
-        let transport = authenticated_transport(
-            server.url().to_string(),
-            server.authorization_header_value.clone(),
-        );
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("rmcp client should complete the initialize handshake");
-
-        let resources = client
-            .list_all_resources()
-            .await
-            .expect("client should list resources");
-        let resource_uris: BTreeSet<&str> = resources
-            .iter()
-            .map(|resource| resource.raw.uri.as_str())
-            .collect();
-        assert_eq!(
-            resource_uris,
-            BTreeSet::from([
-                "nori://context/cli",
-                "nori://context/repo",
-                "nori://help/acp-wire-logs",
-                "nori://help/custom-acp-agent",
-            ])
-        );
-
-        let context = client
-            .read_resource(ReadResourceRequestParam {
-                uri: "nori://context/cli".to_string(),
-            })
-            .await
-            .expect("client should read CLI context");
-        assert_eq!(context.contents.len(), 1);
-        let ResourceContents::TextResourceContents { text, .. } = &context.contents[0] else {
-            panic!("CLI context should be text");
-        };
-        assert!(text.contains("terminal harness for agent sessions"));
-        assert!(text.contains("internal-only, backend-owned MCP server"));
-        assert!(text.contains("https://github.com/tilework-tech/nori-cli"));
-
-        let repo = client
-            .read_resource(ReadResourceRequestParam {
-                uri: "nori://context/repo".to_string(),
-            })
-            .await
-            .expect("client should read repo source context");
-        let ResourceContents::TextResourceContents { text, .. } = &repo.contents[0] else {
-            panic!("repo context should be text");
-        };
-        assert!(text.contains("answering Nori CLI questions"));
-        assert!(text.contains("nori-rs/acp"));
-        assert!(text.contains("nori-rs/tui"));
-
-        let custom_agent = client
-            .read_resource(ReadResourceRequestParam {
-                uri: "nori://help/custom-acp-agent".to_string(),
-            })
-            .await
-            .expect("client should read custom ACP agent help");
-        let ResourceContents::TextResourceContents { text, .. } = &custom_agent.contents[0] else {
-            panic!("custom ACP agent help should be text");
-        };
-        assert!(text.contains("[[agents]]"));
-        assert!(text.contains("exactly one distribution block"));
-        assert!(text.contains("[agents.distribution.uvx]"));
-
-        let wire_logs = client
-            .read_resource(ReadResourceRequestParam {
-                uri: "nori://help/acp-wire-logs".to_string(),
-            })
-            .await
-            .expect("client should read ACP wire logs help");
-        let ResourceContents::TextResourceContents { text, .. } = &wire_logs.contents[0] else {
-            panic!("ACP wire logs help should be text");
-        };
-        assert!(text.contains("off by default"));
-        assert!(text.contains("many MB per log file"));
-        assert!(text.contains("sensitive environment variables or command output"));
-        assert!(text.contains("[acp_proxy]"));
-        assert!(text.contains("$NORI_HOME/acp-wire"));
-        assert!(text.contains("direction"));
-
-        client.cancel().await.expect("client should shut down");
-    }
-
-    #[tokio::test]
-    async fn real_mcp_client_discovers_workflow_prompts_over_http() {
-        use std::collections::BTreeSet;
-
-        use rmcp::ServiceExt;
-        use rmcp::model::GetPromptRequestParam;
-        use rmcp::model::PromptMessageContent;
-
-        let connected = Arc::new(AtomicBool::new(false));
-        let state = Arc::new(Mutex::new(thread_goal::ThreadGoalState::default()));
-        let (backend_event_tx, _backend_event_rx) = mpsc::channel(8);
-        let server = NoriClientServer::spawn(
-            NoriClientShared::new(
-                Arc::clone(&state),
-                backend_event_tx,
-                Arc::clone(&connected),
-                test_agent_capabilities(),
-                true,
-                false,
-                test_orchestrator(),
-            ),
-            true,
-        )
-        .await
-        .expect("nori-client server should spawn");
-
-        let transport = authenticated_transport(
-            server.url().to_string(),
-            server.authorization_header_value.clone(),
-        );
-        let client = ()
-            .serve(transport)
-            .await
-            .expect("rmcp client should complete the initialize handshake");
-
-        let prompts = client
-            .list_all_prompts()
-            .await
-            .expect("client should list prompts");
-        let prompt_names: BTreeSet<&str> =
-            prompts.iter().map(|prompt| prompt.name.as_str()).collect();
-        assert_eq!(
-            prompt_names,
-            BTreeSet::from([
-                "answer_nori_cli_question",
-                "debug_acp_wire_protocol",
-                "register_custom_acp_agent",
-            ])
-        );
-
-        let prompt = client
-            .get_prompt(GetPromptRequestParam {
-                name: "answer_nori_cli_question".to_string(),
-                arguments: None,
-            })
-            .await
-            .expect("client should get source Q&A prompt");
-        assert_eq!(prompt.messages.len(), 1);
-        let PromptMessageContent::Text { text } = &prompt.messages[0].content else {
-            panic!("source Q&A prompt should be text");
-        };
-        assert!(text.contains("nori://context/repo"));
-        assert!(text.contains("Nori CLI"));
-
-        let prompt = client
-            .get_prompt(GetPromptRequestParam {
-                name: "debug_acp_wire_protocol".to_string(),
-                arguments: None,
-            })
-            .await
-            .expect("client should get ACP wire debug prompt");
-        let PromptMessageContent::Text { text } = &prompt.messages[0].content else {
-            panic!("ACP wire debug prompt should be text");
-        };
-        assert!(text.contains("nori://help/acp-wire-logs"));
-        assert!(text.contains("timestamp-ordered request/response timeline"));
-        assert!(text.contains("first divergent protocol boundary"));
-
-        client.cancel().await.expect("client should shut down");
-    }
-}
+pub(super) use goal_tools::CreateGoalRequest;
+#[cfg(test)]
+pub(super) use goal_tools::GoalCompletion;
+#[cfg(test)]
+pub(super) use goal_tools::UpdateGoalRequest;
+pub(crate) use server::NoriClient;
+#[cfg(test)]
+pub(crate) use server::NoriClientServer;
+pub(super) use server::PendingNoriClientServer;
+pub(super) use server::reachable;
+pub(super) use server::register_for_session;
+pub use server::set_stdio_bridge;
+pub(super) use session_capabilities::agent_capabilities_view;
+use session_capabilities::capabilities_update;
+pub(super) use session_capabilities::capabilities_update_for_nori_client;
+pub(super) use session_capabilities::capabilities_update_for_session;
