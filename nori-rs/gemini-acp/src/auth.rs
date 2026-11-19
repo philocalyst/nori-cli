@@ -1,9 +1,11 @@
 //! Select an explicit Core authentication path without changing providers or billing.
-use agent_client_protocol as acp;
+use nori_acp_kit::AgentError;
 use std::collections::HashMap;
 use std::ffi::OsString;
 
-pub(crate) fn select(environment: &HashMap<OsString, OsString>) -> acp::Result<&'static str> {
+pub(crate) fn select(
+    environment: &HashMap<OsString, OsString>,
+) -> Result<&'static str, AgentError> {
     let get = |key: &str| {
         environment
             .get(&OsString::from(key))
@@ -14,12 +16,15 @@ pub(crate) fn select(environment: &HashMap<OsString, OsString>) -> acp::Result<&
         return match mode.to_str() {
             Some("gemini") => Ok("gemini"),
             Some("vertex") => Ok("vertex"),
-            _ => Err(acp::Error::invalid_params().data("Native Gemini auth must be gemini or vertex; use the official Gemini CLI for Google account login")),
+            _ => Err(AgentError::invalid(
+                "Native Gemini auth must be gemini or vertex; use the official Gemini CLI for Google account login",
+            )),
         };
     }
     if get("GOOGLE_GENAI_USE_GCA").is_some_and(|value| value == "true") {
-        return Err(acp::Error::auth_required()
-            .data("Use the official Gemini CLI for Google account authentication"));
+        return Err(AgentError::AuthRequired(
+            "Use the official Gemini CLI for Google account authentication".to_owned(),
+        ));
     }
     if get("GOOGLE_GENAI_USE_VERTEXAI").is_some_and(|value| value == "true") {
         return Ok("vertex");
@@ -27,6 +32,7 @@ pub(crate) fn select(environment: &HashMap<OsString, OsString>) -> acp::Result<&
     if get("GEMINI_API_KEY").is_some_and(|value| !value.is_empty()) {
         return Ok("gemini");
     }
-    Err(acp::Error::auth_required()
-        .data("Select Gemini API or Vertex authentication, or use the official Gemini CLI"))
+    Err(AgentError::AuthRequired(
+        "Select Gemini API or Vertex authentication, or use the official Gemini CLI".to_owned(),
+    ))
 }

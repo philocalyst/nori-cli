@@ -7,6 +7,18 @@ const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 for (const level of ['log', 'info', 'warn', 'debug']) console[level] = (...args) => console.error(...args);
 const core = await import(pathToFileURL(process.env.NORI_GEMINI_CORE_MODULE).href);
 let config, client, controller, active = false;
+// Core reports token counts on each Finished event; sum them over the prompt's model calls.
+let usage;
+const addUsage = (metadata) => {
+  const sum = usage ?? (usage = {prompt: 0, candidates: 0, cached: 0, thoughts: 0});
+  sum.prompt += metadata.promptTokenCount ?? 0; sum.candidates += metadata.candidatesTokenCount ?? 0;
+  sum.cached += metadata.cachedContentTokenCount ?? 0; sum.thoughts += metadata.thoughtsTokenCount ?? 0;
+  sum.lastPrompt = metadata.promptTokenCount ?? 0;
+};
+const done = (reason) => {
+  const report = usage && {...usage, model: config.getModel(), contextSize: core.tokenLimit?.(config.getModel())};
+  write(report ? {type:'done', reason, usage:report} : {type:'done', reason});
+};
 const pending = new Set();
 const seenPermissions = new Set();
 const toolStatuses = new Map();
@@ -47,13 +59,14 @@ async function init(message) {
 }
 async function prompt(message) {
   if (active) throw new Error('Prompt already active');
-  active = true; controller = new AbortController();
+  active = true; controller = new AbortController(); usage = undefined;
   try {
     let parts = message.parts;
     while (true) {
       const calls = [];
       let stopReason = "end_turn";
       for await (const event of client.sendMessageStream(parts, controller.signal, randomUUID())) {
+        if (event.type === core.GeminiEventType.Finished && event.value?.usageMetadata) addUsage(event.value.usageMetadata);
         if (event.type === core.GeminiEventType.ToolCallRequest) { calls.push(event.value); write({type:'tool', callId:event.value.callId, name:event.value.name, args:event.value.args, display:event.value.display, status:'pending'}); }
         else if (event.type === core.GeminiEventType.Content || event.type === core.GeminiEventType.Thought) write({type:event.type, value:event.value});
         else if (event.type === core.GeminiEventType.Error) throw new Error(JSON.stringify(event.value));
@@ -63,13 +76,13 @@ async function prompt(message) {
         else if (event.type === core.GeminiEventType.Finished && ['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT'].includes(event.value?.reason)) stopReason = 'refusal';
         else if ([core.GeminiEventType.LoopDetected, core.GeminiEventType.InvalidStream, core.GeminiEventType.AgentExecutionBlocked, core.GeminiEventType.AgentExecutionStopped].includes(event.type)) throw new Error(`Gemini stopped: ${event.type}`);
       }
-      if (controller.signal.aborted) { write({type:'done', reason:'cancelled'}); return; }
-      if (!calls.length) { write({type:'done', reason:stopReason}); return; }
+      if (controller.signal.aborted) { done('cancelled'); return; }
+      if (!calls.length) { done(stopReason); return; }
       const completed = await core.scheduleAgentTools(config, calls, {schedulerId:'root', toolRegistry:config.getToolRegistry(), signal:controller.signal});
       parts = completed.flatMap((call) => call.response.responseParts);
     }
   } catch (error) {
-    if (controller.signal.aborted) write({type:'done', reason:'cancelled'});
+    if (controller.signal.aborted) done('cancelled');
     else throw error;
   } finally { active = false; controller = undefined; pending.clear(); seenPermissions.clear(); toolStatuses.clear(); }
 }
