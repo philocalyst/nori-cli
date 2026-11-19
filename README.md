@@ -85,6 +85,19 @@ Want your AI agent to configure this automatically? Point it at the raw skill fi
 
 See the [ACP roadmap](ROADMAP.md) for what is done, what is in progress, and what is planned next.
 
+## Local development
+
+Use `just build` to build `nori-rs/target/debug/nori` incrementally, or `just dev`
+to build and run it. These commands prefer stock Cargo when it is installed,
+since the Mitts shim cannot resolve every renamed dependency in this workspace.
+The first build still compiles dependencies; later builds reuse them and the
+incremental Rust cache. Local builds strip symbol names to reduce the embedded
+runtime's size and macOS launch validation cost. For debugging, set
+`CARGO_PROFILE_DEV_STRIP=none CARGO_PROFILE_DEV_DEBUG=line-tables-only` to keep
+symbol names and file locations in stack backtraces. `just release` builds a distribution binary with fat LTO
+and one codegen unit, so its final optimization/link step can take minutes after
+even a small source change.
+
 ## Attribution
 
 Nori CLI is built on the great work within [OpenAI Codex CLI](https://github.com/openai/codex).

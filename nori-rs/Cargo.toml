@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    "acp-kit",
+    "fake-agent",
+    "antigravity-acp",
+    "bash",
+    "conduit",
     "conversation",
     "workflow",
     "pkl",
@@ -42,6 +47,7 @@ members = [
     "host-tools",
     "installed",
     "mock-acp-agent",
+    "world",
     "nori-protocol",
     "script",
     "tui-pty-e2e",
@@ -73,6 +79,9 @@ codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-sandbox = { path = "sandbox" }
 nori-acp-host = { path = "acp-host" }
+nori-acp-kit = { path = "acp-kit" }
+nori-fake-agent = { path = "fake-agent" }
+nori-world = { path = "world" }
 nori-config = { path = "nori-config" }
 nori-conversation = { path = "conversation" }
 codex-login = { path = "login" }
@@ -99,6 +108,9 @@ nori-installed = { path = "installed" }
 nori-script = { path = "script" }
 nori-workflow = { path = "workflow" }
 nori-pkl = { path = "pkl" }
+nori-conduit = { path = "conduit" }
+nori-bash = { path = "bash" }
+nori-antigravity-acp = { path = "antigravity-acp" }
 
 # External
 allocative = "0.3.3"
@@ -288,9 +300,15 @@ unwrap_used = "deny"
 ignored = ["icu_provider", "codex-utils-readiness"]
 
 [profile.dev]
+# Keep local edit/build cycles incremental, independently of release packaging.
+incremental = true
 # Line tables keep file:line in backtraces while avoiding the full DWARF that
 # makes the final link memory-bound (slow, can thrash) on low-RAM machines.
 debug = "line-tables-only"
+# Embedded runtimes make the symbol table large enough to slow macOS validation.
+# Keep incremental compilation, but omit distributable symbol names by default.
+# Use CARGO_PROFILE_DEV_STRIP=none when debugging needs them.
+strip = "symbols"
 
 [profile.release]
 lto = "fat"
@@ -316,6 +334,7 @@ opt-level = 0
 incremental = false
 
 [patch.crates-io]
+v8 = { path = "../vendor/rusty-v8" }
 claude-code-agent-sdk = { path = "claude-acp/vendor/claude-code-agent-sdk" }
 # What the upstream Codex crates (codex-acp) are built against; revisions follow openai/codex's own
 # [patch] section at the pinned tag.
@@ -333,7 +352,9 @@ crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fe
 [patch."ssh://git@github.com/openai-oss-forks/tungstenite-rs.git"]
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "bc589d684755a8c02da0fc7e58d0861cbfc306f1" }
 
-# The upstream crates that use tree-sitter, built against the version Nori links.
-[patch."https://github.com/openai/codex"]
-codex-apply-patch = { path = "codex-acp/vendor/codex-apply-patch" }
-codex-shell-command = { path = "codex-acp/vendor/codex-shell-command" }
+# The upstream Codex crates are vendored as path dependencies under the repository-root `vendor/codex`
+# instead of a git dependency on openai/codex, whose workspace lives in the nested
+# `codex-rs/` directory. Resolvers have to scan a git repository for manifests, and
+# some Cargo-compatible tools (for example Mitts) only look at the repository root,
+# so the nested workspace makes every build fail to find any Codex package.
+# See `../vendor/codex/README.md` for how the vendor tree is produced.

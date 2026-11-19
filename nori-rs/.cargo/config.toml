@@ -13,6 +13,8 @@ rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
 rustflags = ["--remap-path-prefix", "$CARGO_MANIFEST_DIR=."]
 
 [env]
+# The pinned Codex V8 fork publishes its matching binaries on Codex releases.
+RUSTY_V8_MIRROR = "https://github.com/openai/codex/releases/download/rusty-v8-v{version}/{file}"
 # Limit test parallelism to half the available cores (4 on 8-core system).
 # Prevents the test suite from consuming all CPU and making the system unusable.
 RUST_TEST_THREADS = "4"
