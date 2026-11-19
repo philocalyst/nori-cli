@@ -22,6 +22,7 @@ use crate::model::CommitStyle;
 use crate::model::Hook;
 use crate::model::HookEvent;
 use crate::model::PrRules;
+use crate::model::Route;
 use crate::model::Upstream;
 use crate::model::Workflow;
 
@@ -240,8 +241,9 @@ fn fallback_models(args: &[SteelVal]) -> Result<SteelVal> {
         }
         selected.push(id);
     }
-    workflow.fallback_models = selected;
-    workflow.fallback_ranked = false;
+    let fallback = &mut workflow.recovery.base.fallback;
+    fallback.chain = selected.iter().map(|id| Route::parse_legacy(id)).collect();
+    fallback.ranked = false;
     args::into_value(workflow)
 }
 
@@ -250,8 +252,9 @@ fn fallback_ranked_models(args: &[SteelVal]) -> Result<SteelVal> {
     const FORM: &str = "fallback-ranked-models";
     let [workflow] = args::exact::<1>(FORM, "(fallback-ranked-models)", args)?;
     let mut workflow = args::workflow(FORM, workflow)?;
-    workflow.fallback_models.clear();
-    workflow.fallback_ranked = true;
+    let fallback = &mut workflow.recovery.base.fallback;
+    fallback.chain.clear();
+    fallback.ranked = true;
     args::into_value(workflow)
 }
 

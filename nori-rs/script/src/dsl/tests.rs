@@ -98,23 +98,27 @@ fn commit_review_designates_an_agent_without_changing_commit_rules() {
 fn fallback_models_are_ordered_replaced_and_validated() {
     assert_eq!(
         eval(r#"(~> (workflow "w") (fallback-models "a") (fallback-ranked-models))"#),
-        Workflow {
-            fallback_ranked: true,
-            ..Workflow::named("w")
-        }
+        Workflow::named("w")
     );
     assert_eq!(
         eval(
             r#"(~> (workflow "w") (fallback-models "provider/first" "second") (fallback-models "third" "provider/fourth"))"#
         ),
-        Workflow {
-            fallback_models: vec!["third".to_owned(), "provider/fourth".to_owned()],
-            ..Workflow::named("w")
+        {
+            let mut expected = Workflow::named("w");
+            expected.recovery.base.fallback.chain =
+                ["third", "provider/fourth"].map(Route::parse_legacy).into();
+            expected.recovery.base.fallback.ranked = false;
+            expected
         }
     );
     assert_eq!(
         eval(r#"(~> (workflow "w") (fallback-models "a") (fallback-models))"#),
-        Workflow::named("w")
+        {
+            let mut expected = Workflow::named("w");
+            expected.recovery.base.fallback.ranked = false;
+            expected
+        }
     );
     for source in [
         r#"(~> (workflow "w") (fallback-models ""))"#,

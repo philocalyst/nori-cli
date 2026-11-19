@@ -64,12 +64,24 @@ fn fallback_policy_loads_from_global_and_can_be_replaced_by_project() {
     let global = load(Some(&home.global), None).expect("global loads");
     let project = load(Some(&home.global), Some(&home.project)).expect("project loads");
     assert_eq!(
-        global.default_workflow().expect("default").fallback_models,
-        vec!["provider/a", "provider/b"]
+        global
+            .default_workflow()
+            .expect("default")
+            .recovery
+            .base
+            .fallback
+            .chain,
+        ["provider/a", "provider/b"].map(nori_workflow::Route::parse_legacy)
     );
     assert_eq!(
-        project.default_workflow().expect("default").fallback_models,
-        vec!["provider/c", "provider/a"]
+        project
+            .default_workflow()
+            .expect("default")
+            .recovery
+            .base
+            .fallback
+            .chain,
+        ["provider/c", "provider/a"].map(nori_workflow::Route::parse_legacy)
     );
 }
 
