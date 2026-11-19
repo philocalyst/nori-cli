@@ -1,31 +1,77 @@
 //! Translate one OpenCode v2 execution into ordered ACP updates.
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use acp::Client;
-use acp::ConnectionTo;
-use acp::UntypedMessage;
-use acp::schema::ContentBlock;
-use acp::schema::PromptRequest;
-use acp::schema::PromptResponse;
-use acp::schema::StopReason;
-use agent_client_protocol as acp;
 use futures::StreamExt;
+use nori_acp_kit::AgentError;
+use nori_acp_kit::ContextUsage;
+use nori_acp_kit::Cx;
+use nori_acp_kit::Sink;
+use nori_acp_kit::TokenBreakdown;
+use nori_acp_kit::Turn;
+use nori_acp_kit::UsageReport;
+use nori_acp_kit::acp;
+use nori_acp_kit::schema::PromptRequest;
+use nori_acp_kit::schema::PromptResponse;
+use nori_acp_kit::schema::StopReason;
+use nori_acp_kit::schema::Usage;
 use reqwest::Method;
 use serde_json::Value;
 use serde_json::json;
 
 use crate::agent::Session;
+use crate::children::Children;
+use crate::children::Parent;
+use crate::prompt::PromptInput;
+use crate::provider_error;
+use crate::server::failure;
+
+type KnownChildren = Arc<tokio::sync::Mutex<HashMap<String, Arc<Session>>>>;
+type ResponseTx = tokio::sync::oneshot::Sender<acp::Result<PromptResponse>>;
+
+/// Token counts over the turn, and how full the context was after the last step.
+#[derive(Default)]
+struct StepUsage {
+    total: TokenBreakdown,
+    context_used: Option<i64>,
+}
+
+impl StepUsage {
+    fn record(&mut self, tokens: &Value) {
+        let step = TokenBreakdown {
+            input: tokens["input"].as_i64().unwrap_or_default(),
+            output: tokens["output"].as_i64().unwrap_or_default(),
+            reasoning: tokens["reasoning"].as_i64().unwrap_or_default(),
+            cache_read: tokens["cache"]["read"].as_i64().unwrap_or_default(),
+            cache_write: tokens["cache"]["write"].as_i64().unwrap_or_default(),
+        };
+        self.total.add(&step);
+        self.context_used = Some(step.total());
+    }
+
+    /// The response's own usage, with the totals the model reported.
+    fn response_usage(&self) -> Usage {
+        let total = &self.total;
+        let optional = |count: i64| u64::try_from(count).ok();
+        Usage::new(
+            optional(total.total()).unwrap_or_default(),
+            optional(total.input).unwrap_or_default(),
+            optional(total.output).unwrap_or_default(),
+        )
+        .thought_tokens(optional(total.reasoning))
+        .cached_read_tokens(optional(total.cache_read))
+        .cached_write_tokens(optional(total.cache_write))
+    }
+}
 
 pub(crate) async fn run(
     session: Arc<Session>,
     request: PromptRequest,
-    client: ConnectionTo<Client>,
-    known_children: Arc<tokio::sync::Mutex<HashMap<String, Arc<Session>>>>,
-    turn: tokio::sync::OwnedMutexGuard<()>,
+    client: Cx,
+    known_children: KnownChildren,
+    turn: Turn,
 ) -> acp::Result<PromptResponse> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -46,127 +92,66 @@ pub(crate) async fn run(
     response_rx.await.map_err(acp::Error::into_internal_error)?
 }
 
+/// Run the prompt. The response goes out as soon as the session's own execution ends, unless
+/// children are still working; the task then keeps following them with the turn released.
 async fn run_with_children(
     session: Arc<Session>,
     request: PromptRequest,
-    client: ConnectionTo<Client>,
-    response_tx: &mut Option<tokio::sync::oneshot::Sender<acp::Result<PromptResponse>>>,
-    known_children: Arc<tokio::sync::Mutex<HashMap<String, Arc<Session>>>>,
-    turn: tokio::sync::OwnedMutexGuard<()>,
+    client: Cx,
+    response_tx: &mut Option<ResponseTx>,
+    known_children: KnownChildren,
+    turn: Turn,
 ) -> acp::Result<PromptResponse> {
+    let cancel = turn.token();
     let mut turn = Some(turn);
-    let mut text = Vec::new();
-    let mut files = Vec::new();
-    let mut synthetic = Vec::new();
-    for part in request.prompt {
-        match part {
-            ContentBlock::Text(part) => {
-                let audience = part
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| annotations.audience.as_ref());
-                if audience
-                    .is_some_and(|audience| !audience.contains(&acp::schema::Role::Assistant))
-                {
-                    continue;
-                }
-                if audience.is_some_and(|audience| !audience.contains(&acp::schema::Role::User)) {
-                    synthetic.push(part.text);
-                } else {
-                    text.push(part.text);
-                }
-            }
-            ContentBlock::Image(part) => {
-                let uri = if part.data.is_empty() {
-                    part.uri.ok_or_else(|| {
-                        acp::Error::invalid_params().data("Image has no data or URI")
-                    })?
-                } else {
-                    format!("data:{};base64,{}", part.mime_type, part.data)
-                };
-                if uri.starts_with("data:") || uri.starts_with("file://") {
-                    files.push(json!({"uri":uri,"name":"image"}));
-                } else {
-                    text.push(format!("[image]({uri})"));
-                }
-            }
-            ContentBlock::Resource(part) => match part.resource {
-                acp::schema::EmbeddedResourceResource::TextResourceContents(resource) => {
-                    text.push(format!("[{}]\n{}", resource.uri, resource.text))
-                }
-                acp::schema::EmbeddedResourceResource::BlobResourceContents(resource) => {
-                    if let Some(mime) = resource.mime_type {
-                        let uri = if resource.uri.starts_with("data:") {
-                            resource.uri
-                        } else {
-                            format!("data:{mime};base64,{}", resource.blob)
-                        };
-                        files.push(json!({"uri":uri,"name":"file"}));
-                    }
-                }
-                _ => return Err(acp::Error::invalid_params().data("Unsupported embedded resource")),
-            },
-            ContentBlock::ResourceLink(part) if part.uri.starts_with("file://") => {
-                files.push(json!({"uri":part.uri,"name":part.name}))
-            }
-            ContentBlock::ResourceLink(part) => text.push(format!("[{}]({})", part.name, part.uri)),
-            ContentBlock::Audio(_) => {}
-            _ => return Err(acp::Error::invalid_params().data("Unsupported prompt content")),
-        }
+    if let Some(mcp) = &session.mcp {
+        crate::session_mcp::SessionMcp::prepare(mcp, &session.server).await?;
     }
+    let input = PromptInput::from_blocks(request.prompt)?;
     let id = request.session_id.to_string();
-    let mut events = session
-        .server
-        .events()
-        .await
-        .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-    if !synthetic.is_empty() {
-        session.server.request(Method::POST, &["session", &id, "synthetic"], Some(&json!({"text":synthetic.join("\n\n"),"description":"ACP embedded context","delivery":"steer","resume":false})))
-            .await.map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-    }
-    let text = text.join("\n");
-    let command = text.strip_prefix('/').and_then(|text| {
-        let (name, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-        if name.is_empty() {
-            None
-        } else {
-            Some((name.to_owned(), args.trim_start().to_owned()))
-        }
-    });
-    let known_command = if let Some((name, _)) = &command {
+    let mut events = session.server.events().await.map_err(failure)?;
+    if !input.synthetic.is_empty() {
         session
+            .server
+            .request(
+                Method::POST,
+                &["session", &id, "synthetic"],
+                Some(&json!({"text":input.synthetic.join("\n\n"),"description":"ACP embedded context","delivery":"steer","resume":false})),
+            )
+            .await
+            .map_err(failure)?;
+    }
+    let command = input.slash_command();
+    let known_command = match &command {
+        Some((name, _)) => session
             .catalog
             .lock()
             .await
             .commands()
             .iter()
-            .any(|item| item["name"] == *name)
-    } else {
-        false
+            .any(|item| item["name"] == *name),
+        None => false,
     };
-    let compact_id = if command.as_ref().is_some_and(|(name, _)| name == "compact") {
-        Some(format!("msg_{}", uuid::Uuid::new_v4().simple()))
-    } else {
-        None
-    };
-    let (method, body) = if let Some(compact_id) = &compact_id {
-        ("compact", json!({"id":compact_id}))
-    } else if known_command {
-        let (name, args) = command.expect("known command");
-        (
+    let compact_id = command
+        .as_ref()
+        .is_some_and(|(name, _)| name == "compact")
+        .then(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
+    let files = &input.files;
+    let (method, body) = match (&compact_id, command) {
+        (Some(compact_id), _) => ("compact", json!({"id":compact_id})),
+        (None, Some((name, args))) if known_command => (
             "command",
             json!({"name":name,"text":args,"files":files,"delivery":"steer"}),
-        )
-    } else {
-        (
+        ),
+        _ => (
             "prompt",
-            json!({"text":text,"files":files,"delivery":"steer"}),
-        )
+            json!({"text":input.text,"files":files,"delivery":"steer"}),
+        ),
     };
     let prompt_path = ["session", &id, method];
     let result = tokio::select! {
-        result = session.server.request(Method::POST, &prompt_path, Some(&body)) => result.map_err(|e| acp::Error::internal_error().data(e.to_string()))?,
-        _ = session.cancel_notify.notified() => return Ok(PromptResponse::new(StopReason::Cancelled)),
+        result = session.server.request(Method::POST, &prompt_path, Some(&body)) => result.map_err(failure)?,
+        () = cancel.cancelled() => return Ok(PromptResponse::new(StopReason::Cancelled)),
     };
     let message_id = if let Some(id) = compact_id.as_deref() {
         Some(id)
@@ -174,29 +159,27 @@ async fn run_with_children(
         None
     } else {
         Some(result["data"]["id"].as_str().ok_or_else(|| {
-            acp::Error::internal_error().data("OpenCode did not return the submitted message id")
+            AgentError::internal("OpenCode did not return the submitted message id")
         })?)
     };
+    let sink = Sink::new(&client, request.session_id.clone());
     let mut started = false;
-    let mut children = HashMap::<String, (String, i64, Option<String>)>::new();
+    let mut children = Children::default();
     let mut tools = HashMap::<(String, String), (String, Value)>::new();
-    let mut open_children = HashSet::new();
-    let mut running_children = HashSet::new();
-    let mut terminal = None;
+    let mut terminal = None::<Result<StopReason, AgentError>>;
     let mut step_error = None::<Value>;
     let mut finish = None::<String>;
     let mut compactions = HashMap::<String, String>::new();
-    let mut usage = [0_i64; 5];
-    let mut last_usage = None::<i64>;
+    let mut usage = StepUsage::default();
     let mut cancel_since = None::<std::time::Instant>;
     loop {
         let event = tokio::select! {
             event = events.next() => match event { Some(event) => event, None => break },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 if session.closed.load(Ordering::SeqCst) {
                     return Ok(PromptResponse::new(StopReason::Cancelled));
                 }
-                if response_tx.is_some() && session.cancelled.load(Ordering::SeqCst) {
+                if response_tx.is_some() && cancel.is_cancelled() {
                     let since = cancel_since.get_or_insert_with(std::time::Instant::now);
                     if !started || since.elapsed() >= std::time::Duration::from_secs(5) {
                         return Ok(PromptResponse::new(StopReason::Cancelled));
@@ -205,9 +188,8 @@ async fn run_with_children(
                 continue;
             }
         };
-        let event = event.map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        let value: Value =
-            serde_json::from_str(&event.data).map_err(acp::Error::into_internal_error)?;
+        let event = event.map_err(AgentError::internal)?;
+        let value: Value = serde_json::from_str(&event.data).map_err(AgentError::from)?;
         let Some(kind) = value["type"].as_str() else {
             continue;
         };
@@ -217,47 +199,24 @@ async fn run_with_children(
             .or_else(|| data["form"]["sessionID"].as_str())
             .unwrap_or_default();
         if kind == "session.created" {
-            if event_session.is_empty() || children.contains_key(event_session) {
-                continue;
-            }
-            let Some(parent) = data["parentID"].as_str() else {
-                continue;
-            };
-            let depth = if parent == id && response_tx.is_some() {
-                1
-            } else if let Some((_, depth, _)) = children.get(parent) {
-                depth + 1
-            } else {
-                continue;
-            };
-            let title = data["title"].as_str().map(ToOwned::to_owned);
-            known_children
-                .lock()
-                .await
-                .insert(event_session.to_owned(), session.clone());
-            children.insert(
-                event_session.to_owned(),
-                (parent.to_owned(), depth, title.clone()),
-            );
-            open_children.insert(event_session.to_owned());
-            send_child(&client, parent, event_session, title.as_deref(), "created")?;
-            // Publish the child's own controls after its identity is announced.
-            // Loading the catalog is independent of the parent event stream.
-            let child_id = event_session.to_owned();
-            let server = session.server.clone();
-            let child_client = client.clone();
-            tokio::spawn(async move {
-                let result = async {
-                    let child = server.request(Method::GET, &["session", &child_id], None).await.map_err(|error| error.to_string())?;
-                    let catalog = crate::config::Catalog::load(&server, &child["data"]).await.map_err(|error| error.to_string())?;
-                    let options = catalog.options().map_err(|error| error.to_string())?;
-                    let event = UntypedMessage::new("session/update", json!({"sessionId":child_id,"update":{"sessionUpdate":"config_option_update","configOptions":options}})).map_err(|error| error.to_string())?;
-                    child_client.send_notification(event).map_err(|error| error.to_string())
-                }.await;
-                if let Err(error) = result {
-                    tracing::warn!(%error, "Failed to load native child configuration");
-                }
-            });
+            children
+                .on_created(
+                    &Parent {
+                        session: &session,
+                        id: &id,
+                        response_pending: response_tx.is_some(),
+                        known_children: &known_children,
+                    },
+                    &client,
+                    event_session,
+                    data,
+                )
+                .await?;
+            continue;
+        }
+        if kind == "session.model.selected"
+            && children.on_model_selected(&client, event_session, data)?
+        {
             continue;
         }
         // Once the parent response has been sent, this subscriber only tracks
@@ -281,15 +240,14 @@ async fn run_with_children(
         if !started {
             continue;
         }
-        let child = children.get(event_session);
-        if event_session != id && child.is_none() {
+        let is_child = children.identity(event_session).is_some();
+        if event_session != id && !is_child {
             continue;
         }
         if event_session == id
             && kind == "session.retry.scheduled"
-            && crate::provider_error::is_exhausted(&data["error"])
+            && provider_error::is_exhausted(&data["error"])
         {
-            let error = crate::provider_error::data(&data["error"]);
             let _ = session
                 .server
                 .request(
@@ -298,10 +256,10 @@ async fn run_with_children(
                     Some(&json!({})),
                 )
                 .await;
-            if session.cancelled.load(Ordering::SeqCst) {
+            if cancel.is_cancelled() {
                 return Ok(PromptResponse::new(StopReason::Cancelled));
             }
-            return Err(acp::Error::internal_error().data(error));
+            return Err(provider_error::failure(&data["error"]).into());
         }
         if event_session == id
             && matches!(
@@ -331,24 +289,17 @@ async fn run_with_children(
                 "session.compaction.ended" => "completed",
                 _ => "failed",
             };
-            client.send_notification(UntypedMessage::new("session/update", json!({"sessionId":id,"update":{"sessionUpdate":"session_info_update","_meta":{"opencode/compaction":{"status":status,"messageId":message_id,"reason":data["reason"]}}}}))?)?;
+            client.send_notification(acp::UntypedMessage::new("session/update", json!({"sessionId":id,"update":{"sessionUpdate":"session_info_update","_meta":{"opencode/compaction":{"status":status,"messageId":message_id,"reason":data["reason"]}}}}))?)?;
             continue;
         }
         if kind == "permission.asked" {
-            let server = session.clone();
+            let session = session.clone();
             let client = client.clone();
             let client_session = request.session_id.clone();
             let event = data.clone();
-            let child = child.map(|(parent, depth, title)| {
-                (
-                    event_session.to_owned(),
-                    parent.clone(),
-                    *depth,
-                    title.clone(),
-                )
-            });
+            let child = children.identity(event_session);
             tokio::spawn(async move {
-                crate::permission::ask_permission(server, client, client_session, event, child)
+                crate::permission::ask_permission(session, client, client_session, event, child)
                     .await;
             });
             continue;
@@ -375,83 +326,35 @@ async fn run_with_children(
                         None,
                     )
                     .await
-                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+                    .map_err(failure)?;
             }
             continue;
         }
-        if let Some((parent, _depth, title)) = child {
-            let status = match kind {
-                "session.execution.started" => Some("running"),
-                "session.execution.succeeded" => Some("completed"),
-                "session.execution.failed" => Some("failed"),
-                "session.execution.interrupted" => Some("interrupted"),
-                _ => None,
-            };
-            if let Some(status) = status {
-                if status == "running" {
-                    open_children.insert(event_session.to_owned());
-                    if running_children.insert(event_session.to_owned()) {
-                        send_child(&client, parent, event_session, title.as_deref(), status)?;
-                    }
-                } else if open_children.remove(event_session) {
-                    running_children.remove(event_session);
-                    send_child(&client, parent, event_session, title.as_deref(), status)?;
-                }
-            }
+        if is_child {
+            children.on_execution(&client, event_session, kind)?;
         } else {
             if matches!(kind, "session.step.ended" | "session.step.failed")
                 && data["tokens"].is_object()
             {
-                let tokens = &data["tokens"];
-                let step = [
-                    tokens["input"].as_i64().unwrap_or_default(),
-                    tokens["output"].as_i64().unwrap_or_default(),
-                    tokens["reasoning"].as_i64().unwrap_or_default(),
-                    tokens["cache"]["read"].as_i64().unwrap_or_default(),
-                    tokens["cache"]["write"].as_i64().unwrap_or_default(),
-                ];
-                for (total, count) in usage.iter_mut().zip(step) {
-                    *total = total.saturating_add(count);
-                }
-                last_usage = Some(step.into_iter().fold(0_i64, i64::saturating_add));
+                usage.record(&data["tokens"]);
             }
             match kind {
                 "session.step.started" => step_error = None,
                 "session.step.failed" => step_error = Some(data["error"].clone()),
                 "session.step.ended" => finish = data["finish"].as_str().map(ToOwned::to_owned),
                 "session.execution.succeeded" => {
-                    terminal = Some(if let Some(error) = &step_error {
-                        match error["type"].as_str() {
-                            Some("provider.auth") => Err(acp::Error::auth_required()),
-                            Some("aborted") => Ok(PromptResponse::new(StopReason::Cancelled)),
-                            Some("provider.content-filter") => {
-                                Ok(PromptResponse::new(StopReason::Refusal))
-                            }
-                            _ => Err(acp::Error::internal_error()
-                                .data(crate::provider_error::data(error))),
-                        }
-                    } else {
-                        let reason = match finish.as_deref() {
+                    terminal = Some(match &step_error {
+                        Some(error) => provider_error::outcome(error),
+                        None => Ok(match finish.as_deref() {
                             Some("length") => StopReason::MaxTokens,
                             Some("content-filter") => StopReason::Refusal,
                             _ => StopReason::EndTurn,
-                        };
-                        Ok(PromptResponse::new(reason))
+                        }),
                     });
                 }
-                "session.execution.interrupted" => {
-                    terminal = Some(Ok(PromptResponse::new(StopReason::Cancelled)))
-                }
+                "session.execution.interrupted" => terminal = Some(Ok(StopReason::Cancelled)),
                 "session.execution.failed" => {
-                    terminal = Some(match data["error"]["type"].as_str() {
-                        Some("provider.auth") => Err(acp::Error::auth_required()),
-                        Some("aborted") => Ok(PromptResponse::new(StopReason::Cancelled)),
-                        Some("provider.content-filter") => {
-                            Ok(PromptResponse::new(StopReason::Refusal))
-                        }
-                        _ => Err(acp::Error::internal_error()
-                            .data(crate::provider_error::data(&data["error"]))),
-                    })
+                    terminal = Some(provider_error::outcome(&data["error"]));
                 }
                 _ => {}
             }
@@ -484,36 +387,31 @@ async fn run_with_children(
         if let Some(update) = crate::event::update_for_event(kind, &enriched) {
             // A child's updates use its own session ID, allowing the host to route them
             // without guessing from titles, tool status, or private metadata.
-            client.send_notification(UntypedMessage::new(
+            client.send_notification(acp::UntypedMessage::new(
                 "session/update",
                 json!({"sessionId":event_session,"update":update}),
             )?)?;
         }
         if let Some(result) = terminal.take() {
-            let response = if session.cancelled.load(Ordering::SeqCst) {
-                PromptResponse::new(StopReason::Cancelled)
+            let stop = if cancel.is_cancelled() {
+                StopReason::Cancelled
             } else {
                 result?
             };
-            if let Some(used) = last_usage {
-                if let Some(size) = session.catalog.lock().await.context_limit() {
-                    client.send_notification(UntypedMessage::new("session/update", json!({"sessionId":id,"update":{"sessionUpdate":"usage_update","used":used,"size":size}}))?)?;
+            let mut response = PromptResponse::new(stop);
+            if let Some(used) = usage.context_used {
+                let (model, size) = {
+                    let catalog = session.catalog.lock().await;
+                    (catalog.current_model(), catalog.context_limit())
+                };
+                let mut report = UsageReport::default().tokens(usage.total);
+                if let Some(model) = model {
+                    report = report.model(model);
                 }
-                let mut response =
-                    serde_json::to_value(response).map_err(acp::Error::into_internal_error)?;
-                response["usage"] = json!({"inputTokens":usage[0],"outputTokens":usage[1],"thoughtTokens":usage[2],"cachedReadTokens":usage[3],"cachedWriteTokens":usage[4],"totalTokens":usage.into_iter().fold(0_i64, i64::saturating_add)});
-                let response =
-                    serde_json::from_value(response).map_err(acp::Error::into_internal_error)?;
-                if open_children.is_empty() {
-                    return Ok(response);
-                }
-                drop(turn.take());
-                if let Some(response_tx) = response_tx.take() {
-                    let _ = response_tx.send(Ok(response));
-                }
-                continue;
+                sink.usage(size.map(|size| ContextUsage { used, size }), &report)?;
+                response = response.usage(usage.response_usage());
             }
-            if open_children.is_empty() {
+            if !children.has_open() {
                 return Ok(response);
             }
             drop(turn.take());
@@ -521,70 +419,9 @@ async fn run_with_children(
                 let _ = response_tx.send(Ok(response));
             }
         }
-        if response_tx.is_none() && open_children.is_empty() {
+        if response_tx.is_none() && !children.has_open() {
             return Ok(PromptResponse::new(StopReason::EndTurn));
         }
     }
-    Err(acp::Error::internal_error().data("OpenCode event stream ended during a prompt"))
-}
-
-fn send_child(
-    client: &ConnectionTo<Client>,
-    parent: &str,
-    child: &str,
-    title: Option<&str>,
-    status: &str,
-) -> acp::Result<()> {
-    let state = match status {
-        "created" => None,
-        "running" => Some(json!({"state":"running"})),
-        "completed" => Some(json!({"state":"idle", "stopReason":"end_turn"})),
-        "failed" => Some(json!({"state":"failed"})),
-        "interrupted" => Some(json!({"state":"cancelled"})),
-        _ => return Err(acp::Error::internal_error().data("Unknown OpenCode child state")),
-    };
-    let mut update = json!({"sessionUpdate":"subagent_update", "sessionId":child});
-    if let Some(state) = state {
-        update["state"] = state;
-    }
-    if let Some(title) = title {
-        update["title"] = title.into();
-    }
-    client.send_notification(UntypedMessage::new(
-        "session/update",
-        json!({"sessionId":parent, "update":update}),
-    )?)
-}
-
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-
-    use crate::event::update_for_event;
-
-    #[test]
-    fn maps_text_reasoning_and_tool_results() {
-        let text = json!({"assistantMessageID":"msg_1", "delta":"hello"});
-        assert_eq!(
-            update_for_event("session.text.delta", &text),
-            Some(
-                json!({"sessionUpdate":"agent_message_chunk", "messageId":"msg_1", "content":{"type":"text","text":"hello"}})
-            )
-        );
-        let thought = json!({"assistantMessageID":"msg_1", "ordinal":2, "delta":"thinking"});
-        assert_eq!(
-            update_for_event("session.reasoning.delta", &thought),
-            Some(
-                json!({"sessionUpdate":"agent_thought_chunk", "messageId":"msg_1:reasoning:2", "content":{"type":"text","text":"thinking"}})
-            )
-        );
-        let result = json!({"id":"tool_1", "content":[{"type":"text","text":"done"}], "metadata":{"ok":true}});
-        assert_eq!(
-            update_for_event("session.tool.success", &result),
-            Some(
-                json!({"sessionUpdate":"tool_call_update", "toolCallId":"tool_1", "status":"completed", "content":[{"type":"content","content":{"type":"text","text":"done"}}], "rawOutput":{"id":"tool_1", "content":[{"type":"text","text":"done"}], "metadata":{"ok":true}}})
-            )
-        );
-    }
+    Err(AgentError::internal("OpenCode event stream ended during a prompt").into())
 }

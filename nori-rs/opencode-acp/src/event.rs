@@ -62,10 +62,8 @@ pub(crate) fn update_for_event(kind: &str, data: &Value) -> Option<Value> {
                 // ACP and MCP share content blocks. Unknown or malformed blocks stay in
                 // rawOutput instead of making the whole notification invalid.
                 .filter(|item| {
-                    serde_json::from_value::<agent_client_protocol::schema::ContentBlock>(
-                        (*item).clone(),
-                    )
-                    .is_ok()
+                    serde_json::from_value::<nori_acp_kit::schema::ContentBlock>((*item).clone())
+                        .is_ok()
                 })
                 .map(|item| json!({"type":"content", "content":item}))
                 .collect::<Vec<_>>();

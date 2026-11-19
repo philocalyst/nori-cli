@@ -1,7 +1,7 @@
 //! OpenCode's model and effort selections as ACP session config options.
 
-use acp::schema::SessionConfigOption;
-use agent_client_protocol as acp;
+use acp::schema::v1::SessionConfigOption;
+use nori_acp_kit::acp;
 use reqwest::Method;
 use serde_json::Value;
 use serde_json::json;
@@ -89,6 +89,15 @@ impl Catalog {
 
     pub(crate) fn commands(&self) -> &[Value] {
         &self.commands
+    }
+
+    /// The selected model as `provider/id`, the form the model option uses.
+    pub(crate) fn current_model(&self) -> Option<String> {
+        Some(format!(
+            "{}/{}",
+            self.current["providerID"].as_str()?,
+            self.current["id"].as_str()?
+        ))
     }
 
     pub(crate) fn context_limit(&self) -> Option<i64> {

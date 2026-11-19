@@ -8,95 +8,113 @@ use futures::Stream;
 use futures::StreamExt;
 use reqwest::Method;
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
 use tokio::process::Child;
-use tokio::process::Command;
+
+/// A failed call to the OpenCode server as the error the host sees: an unreachable server is
+/// said to be unreachable, anything else keeps its message.
+pub(crate) fn failure(error: Box<dyn std::error::Error + Send + Sync>) -> nori_acp_kit::AgentError {
+    match error.downcast_ref::<reqwest::Error>() {
+        Some(source) if source.is_connect() || source.is_timeout() => {
+            nori_acp_kit::AgentError::Unreachable(error.to_string())
+        }
+        Some(_) | None => nori_acp_kit::AgentError::internal(error),
+    }
+}
 
 /// An isolated OpenCode v2 server and its authenticated API client.
 pub struct OpenCodeServer {
-    child: Child,
+    child: Option<Child>,
     client: reqwest::Client,
     base_url: reqwest::Url,
     password: String,
 }
 
 impl OpenCodeServer {
-    /// Start a loopback-only server in `cwd`. Its credentials are unique to this process.
+    /// Connect to the already running OpenCode HTTP server.
+    ///
+    /// Nori deliberately does not spawn `opencode`: the server is owned by the
+    /// user's OpenCode installation and can be shared by the CLI, desktop app,
+    /// and other ACP clients. Set `OPENCODE_SERVER_URL` (or
+    /// `NORI_OPENCODE_URL`) to override the standard loopback endpoint.
     pub async fn start(
-        executable: &Path,
         cwd: &Path,
         environment: &HashMap<OsString, OsString>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let server = Self::start_engine(executable, cwd, environment).await?;
-        let entries = server.request(Method::GET, &["config"], None).await?;
-        let inline = environment
-            .get(std::ffi::OsStr::new("OPENCODE_CONFIG_CONTENT"))
+        let url = environment
+            .get(std::ffi::OsStr::new("NORI_OPENCODE_URL"))
+            .or_else(|| environment.get(std::ffi::OsStr::new("OPENCODE_SERVER_URL")))
             .cloned()
-            .or_else(|| std::env::var_os("OPENCODE_CONFIG_CONTENT"));
-        let Some(content) = crate::nesting_defaults::overlay(&entries, inline.as_deref())? else {
+            .or_else(|| std::env::var_os("NORI_OPENCODE_URL"))
+            .or_else(|| std::env::var_os("OPENCODE_SERVER_URL"));
+        let password = environment
+            .get(std::ffi::OsStr::new("OPENCODE_PASSWORD"))
+            .cloned()
+            .or_else(|| std::env::var_os("OPENCODE_PASSWORD"));
+        if let Some(url) = url {
+            return Self::connect(
+                url.to_string_lossy().as_ref(),
+                password.unwrap_or_default().to_string_lossy().as_ref(),
+                cwd,
+            )
+            .await;
+        }
+        if let Some(registration) = crate::service_discovery::read(environment) {
+            let password = password.map_or(registration.password, |value| {
+                value.to_string_lossy().into_owned()
+            });
+            let server = Self::connect(&registration.url, &password, cwd).await?;
+            let info = tokio::time::timeout(
+                Duration::from_secs(10),
+                server.request(Method::GET, &["info"], None),
+            )
+            .await??;
+            if info["pid"].as_i64() != Some(registration.pid)
+                || registration
+                    .version
+                    .as_deref()
+                    .is_some_and(|version| info["version"].as_str() != Some(version))
+            {
+                return Err(
+                    "OpenCode service registration does not match its health response".into(),
+                );
+            }
             return Ok(server);
-        };
-        server.shutdown().await?;
-        let mut environment = environment.clone();
-        environment.insert("OPENCODE_CONFIG_CONTENT".into(), content.into());
-        Self::start_engine(executable, cwd, &environment).await
+        }
+        Self::connect(
+            "http://127.0.0.1:4096",
+            password.unwrap_or_default().to_string_lossy().as_ref(),
+            cwd,
+        )
+        .await
     }
 
-    async fn start_engine(
-        executable: &Path,
-        cwd: &Path,
-        environment: &HashMap<OsString, OsString>,
+    /// Connect to an OpenCode v2 server without taking ownership of its process.
+    pub async fn connect(
+        address: &str,
+        password: &str,
+        _cwd: &Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let password = uuid::Uuid::new_v4().to_string();
-        let mut child = Command::new(executable)
-            .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
-            .current_dir(cwd)
-            .envs(environment)
-            .env("OPENCODE_PASSWORD", &password)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("missing OpenCode server stdout")?;
-        let mut lines = BufReader::new(stdout).lines();
-        let base_url: reqwest::Url = tokio::time::timeout(Duration::from_secs(30), async {
-            while let Some(line) = lines.next_line().await? {
-                if let Some(address) = line.strip_prefix("server listening on ") {
-                    let url: reqwest::Url = address.parse()?;
-                    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
-                        return Err("OpenCode server reported a non-loopback address".into());
-                    }
-                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(url.join("/api/")?);
-                }
-            }
-            Err("OpenCode server exited before reporting its address".into())
-        })
-        .await??;
-        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-        let mut server = Self {
-            child,
+        let mut base_url: reqwest::Url = address.parse()?;
+        if base_url.path().is_empty() || base_url.path() == "/" {
+            base_url.set_path("/api/");
+        } else if !base_url.path().ends_with('/') {
+            base_url.set_path(&format!("{}/", base_url.path()));
+        }
+        let server = Self {
+            child: None,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             base_url,
-            password,
+            password: password.to_owned(),
         };
-        for _ in 0..100 {
-            if let Some(status) = server.child.try_wait()? {
-                return Err(format!("OpenCode server exited during startup: {status}").into());
-            }
-            if server.request(Method::GET, &["info"], None).await.is_ok() {
-                return Ok(server);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Err("OpenCode server did not become ready within 10 seconds".into())
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            server.request(Method::GET, &["info"], None),
+        )
+        .await??;
+        Ok(server)
     }
 
     /// Send a v2 JSON API request. Each path element is escaped as one URL segment.
@@ -152,8 +170,10 @@ impl OpenCodeServer {
             .client
             .request(method, url)
             .query(query)
-            .basic_auth("opencode", Some(&self.password))
             .timeout(Duration::from_secs(30));
+        if !self.password.is_empty() {
+            request = request.basic_auth("opencode", Some(&self.password));
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -179,19 +199,21 @@ impl OpenCodeServer {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let url = self.base_url.join("event")?;
-        let response = self
-            .client
-            .get(url)
-            .basic_auth("opencode", Some(&self.password))
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut request = self.client.get(url);
+        if !self.password.is_empty() {
+            request = request.basic_auth("opencode", Some(&self.password));
+        }
+        let response = request.send().await?.error_for_status()?;
         Ok(response.bytes_stream().eventsource().boxed())
     }
 
     /// Stop the server and wait until the process has exited.
     pub async fn shutdown(mut self) -> std::io::Result<()> {
-        self.child.kill().await
+        if let Some(mut child) = self.child.take() {
+            child.kill().await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -210,6 +232,37 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::OpenCodeServer;
+
+    #[tokio::test]
+    async fn discovers_and_authenticates_the_registered_service() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]).to_ascii_lowercase();
+                assert!(request.contains("authorization: basic b3blbmnvzgu6dgvzda=="));
+                let body = r#"{"pid":42,"version":"2.1.4"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir(state.path().join("opencode")).unwrap();
+        std::fs::write(state.path().join("opencode/service.json"), json!({"url": format!("http://{address}"), "pid": 42, "version":"2.1.4", "password":"test"}).to_string()).unwrap();
+        let environment = HashMap::from([(
+            OsString::from("XDG_STATE_HOME"),
+            state.path().as_os_str().to_owned(),
+        )]);
+        let server = OpenCodeServer::start(Path::new("/"), &environment).await;
+        assert!(server.is_ok());
+        responder.await.unwrap();
+    }
 
     #[tokio::test]
     async fn catalog_retries_only_temporary_service_unavailable() {
@@ -240,7 +293,7 @@ mod tests {
                 .spawn()
                 .unwrap();
             let server = OpenCodeServer {
-                child,
+                child: Some(child),
                 client: reqwest::Client::builder().no_proxy().build().unwrap(),
                 base_url: format!("http://{address}/api/").parse().unwrap(),
                 password: "test".into(),
@@ -252,6 +305,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_server_session_and_event_stream() {
+        if std::env::var_os("NORI_OPENCODE_URL").is_none()
+            && std::env::var_os("OPENCODE_SERVER_URL").is_none()
+        {
+            return;
+        }
         let Ok(output) = std::process::Command::new("which").arg("opencode").output() else {
             return;
         };
@@ -282,7 +340,7 @@ mod tests {
         ] {
             environment.insert(name.into(), home.join(path).into());
         }
-        let server = OpenCodeServer::start(Path::new(executable.trim()), &home, &environment)
+        let server = OpenCodeServer::start(&home, &environment)
             .await
             .expect("start OpenCode v2");
         let config = server
@@ -313,13 +371,12 @@ mod tests {
             .await
             .expect("create session");
         assert!(session["data"]["id"].as_str().is_some());
-        crate::mcp::register(
+        let _ = crate::mcp::register(
             &server,
-            vec![agent_client_protocol::schema::McpServer::Http(
-                agent_client_protocol::schema::McpServerHttp::new(
-                    "test-server",
-                    "http://127.0.0.1:1",
-                ),
+            "test-session",
+            &home,
+            vec![nori_acp_kit::schema::McpServer::Http(
+                nori_acp_kit::schema::McpServerHttp::new("test-server", "http://127.0.0.1:1"),
             )],
         )
         .await
@@ -327,7 +384,7 @@ mod tests {
         drop(events);
         server.shutdown().await.expect("stop server");
         environment.insert("OPENCODE_CONFIG_CONTENT".into(), json!({"experimental":{"subagent_depth":1},"agents":{"general":{"permissions":[{"action":"subagent","resource":"*","effect":"deny"}]}}}).to_string().into());
-        let server = OpenCodeServer::start(Path::new(executable.trim()), &home, &environment)
+        let server = OpenCodeServer::start(&home, &environment)
             .await
             .expect("start OpenCode with explicit restrictions");
         let config = server
@@ -372,5 +429,37 @@ mod tests {
         );
         server.shutdown().await.expect("stop restricted server");
         std::fs::remove_dir_all(home).expect("remove temporary home");
+    }
+
+    #[tokio::test]
+    async fn external_connection_does_not_own_or_kill_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let _ = stream.read(&mut buffer).await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let server = OpenCodeServer::connect(&format!("http://{address}"), "", Path::new("/tmp"))
+            .await
+            .expect("connect to existing server");
+        assert!(server.child.is_none());
+        server
+            .shutdown()
+            .await
+            .expect("external shutdown is a no-op");
+        let response = reqwest::get(format!("http://{address}/api/info"))
+            .await
+            .expect("server remains available");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        responder.await.expect("responder completed");
     }
 }

@@ -3,10 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use acp::Client;
-use acp::ConnectionTo;
 use acp::UntypedMessage;
-use agent_client_protocol as acp;
+use nori_acp_kit::Cx;
+use nori_acp_kit::acp;
 use reqwest::Method;
 use serde_json::Value;
 use serde_json::json;
@@ -77,7 +76,7 @@ fn answer(form: &Value, response: &Value) -> Option<Value> {
     Some(json!({"answer":answer}))
 }
 
-pub(crate) async fn ask(session: Arc<Session>, client: ConnectionTo<Client>, form: Value) {
+pub(crate) async fn ask(session: Arc<Session>, client: Cx, form: Value) {
     let (Some(session_id), Some(form_id)) = (form["sessionID"].as_str(), form["id"].as_str())
     else {
         return;

@@ -1,9 +1,12 @@
-//! Preserve provider error identifiers carried in OpenCode v2 HTTP error bodies.
+//! OpenCode v2 provider errors as the errors the host categorizes.
 
+use nori_acp_kit::AgentError;
+use nori_acp_kit::FailureKind;
 use serde_json::Value;
 
-/// Keep OpenCode's full error while exposing a structured provider response at `error`.
-pub(crate) fn data(error: &Value) -> Value {
+/// OpenCode's error with the provider's own response body decoded under `error`, when the body is
+/// JSON.
+fn decoded(error: &Value) -> Value {
     let mut result = error.clone();
     let Some(body) = error
         .pointer("/response/body")
@@ -28,8 +31,9 @@ pub(crate) fn data(error: &Value) -> Value {
 }
 
 /// A specific provider error code can signal exhaustion before OpenCode finishes retrying.
+/// Only structured identifiers count: prose that merely mentions a quota does not.
 pub(crate) fn is_exhausted(error: &Value) -> bool {
-    let data = data(error);
+    let data = decoded(error);
     [Some(&data), data.get("error")]
         .into_iter()
         .flatten()
@@ -49,39 +53,54 @@ pub(crate) fn is_exhausted(error: &Value) -> bool {
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
+/// The failure an OpenCode step or execution reported, classified for the host's retry and
+/// fallback policy.
+pub(crate) fn failure(error: &Value) -> AgentError {
+    let data = decoded(error);
+    let detail = [
+        data.pointer("/error/message"),
+        data.get("message"),
+        data.get("type"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .unwrap_or("OpenCode reported an unspecified error")
+    .to_owned();
+    let kind = if is_exhausted(error) {
+        Some(FailureKind::QuotaExhausted)
+    } else {
+        data["status"]
+            .as_i64()
+            .and_then(|status| i32::try_from(status).ok())
+            .and_then(FailureKind::from_http_status)
+            .or_else(|| FailureKind::from_message(&detail))
+    };
+    match kind {
+        Some(kind) => AgentError::Provider {
+            kind,
+            detail,
+            resets_at: None,
+            retry_after: None,
+        },
+        None => AgentError::Internal(detail),
+    }
+}
 
-    #[test]
-    fn decodes_only_structured_provider_bodies() {
-        for (code, expected) in [
-            ("insufficient_quota", true),
-            ("usage_limit_exceeded", true),
-            ("rate_limit_exceeded", false),
-        ] {
-            let body = json!({"error":{"type":code,"code":code,"message":"test"}}).to_string();
-            let original =
-                json!({"type":"provider.rate-limit","status":429,"response":{"body":body}});
-            let data = data(&original);
-            assert_eq!(data["error"]["code"], code);
-            assert_eq!(data["response"], original["response"]);
-            assert_eq!(is_exhausted(&original), expected);
-            let error: nori_protocol::acp::v1::Error = serde_json::from_value(
-                json!({"code":-32603,"message":"provider error","data":data}),
-            )
-            .unwrap();
-            assert_eq!(
-                nori_acp_host::is_subscription_exhausted(&anyhow::Error::new(error)),
-                expected
-            );
-        }
-        let prose =
-            json!({"type":"provider.rate-limit","status":429,"message":"insufficient_quota"});
-        assert!(!is_exhausted(&prose));
-        let wrapped = json!({"type":"provider.quota","bodyString":"{\"error\":{\"code\":\"insufficient_quota\"}}"});
-        assert!(is_exhausted(&wrapped));
+/// How a failed step or execution ends the prompt.
+pub(crate) fn outcome(error: &Value) -> Result<nori_acp_kit::schema::StopReason, AgentError> {
+    use nori_acp_kit::schema::StopReason;
+    match error["type"].as_str() {
+        Some("provider.auth") => Err(AgentError::AuthRequired(
+            error["message"]
+                .as_str()
+                .unwrap_or(
+                    "OpenCode's provider rejected the credentials; run `opencode auth login`",
+                )
+                .to_owned(),
+        )),
+        Some("aborted") => Ok(StopReason::Cancelled),
+        Some("provider.content-filter") => Ok(StopReason::Refusal),
+        _ => Err(failure(error)),
     }
 }

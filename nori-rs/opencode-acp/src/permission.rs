@@ -1,15 +1,14 @@
 //! Forward OpenCode permission requests and reject late replies after cancellation.
 
 use crate::agent::Session;
-use acp::Client;
-use acp::ConnectionTo;
-use acp::schema::PermissionOption;
-use acp::schema::PermissionOptionKind;
-use acp::schema::RequestPermissionOutcome;
-use acp::schema::RequestPermissionRequest;
-use acp::schema::ToolCallUpdate;
-use acp::schema::ToolCallUpdateFields;
-use agent_client_protocol as acp;
+use acp::schema::v1::PermissionOption;
+use acp::schema::v1::PermissionOptionKind;
+use acp::schema::v1::RequestPermissionOutcome;
+use acp::schema::v1::RequestPermissionRequest;
+use acp::schema::v1::ToolCallUpdate;
+use acp::schema::v1::ToolCallUpdateFields;
+use nori_acp_kit::Cx;
+use nori_acp_kit::acp;
 use reqwest::Method;
 use serde_json::Value;
 use serde_json::json;
@@ -18,8 +17,8 @@ use std::sync::atomic::Ordering;
 
 pub(crate) async fn ask_permission(
     session: Arc<Session>,
-    client: ConnectionTo<Client>,
-    root: acp::schema::SessionId,
+    client: Cx,
+    root: acp::schema::v1::SessionId,
     data: Value,
     child: Option<(String, String, i64, Option<String>)>,
 ) {

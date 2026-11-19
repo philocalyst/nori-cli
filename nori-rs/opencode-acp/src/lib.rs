@@ -5,18 +5,21 @@
 //! remaining differences from OpenCode's upstream ACP adapter.
 
 mod agent;
+mod children;
 mod config;
 mod directories;
 mod event;
 mod lifecycle;
 mod mcp;
-mod nesting_defaults;
 mod permission;
+mod prompt;
 mod provider_error;
 mod question;
 mod replay;
 mod server;
+mod service_discovery;
+mod session_mcp;
 mod turn;
 
-pub use agent::serve_over_pipe;
+pub use agent::registration;
 pub use server::OpenCodeServer;

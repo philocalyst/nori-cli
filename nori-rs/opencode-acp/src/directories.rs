@@ -5,7 +5,7 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
-use agent_client_protocol as acp;
+use nori_acp_kit::acp;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;

@@ -245,7 +245,30 @@ pub(super) async fn exercise_nested(
             break;
         }
     }
-    assert!(child.is_some(), "missing child announcement");
+    let child = child.expect("missing child announcement");
+    let child_announcement = observed
+        .iter()
+        .position(|message| {
+            message["method"] == "session/update"
+                && message["params"]["sessionId"] == parent
+                && message["params"]["update"]["sessionUpdate"] == "subagent_update"
+                && message["params"]["update"]["sessionId"] == child
+        })
+        .expect("child announcement event");
+    let first_child_content = observed
+        .iter()
+        .position(|message| {
+            message["method"] == "session/update"
+                && message["params"]["sessionId"] == child
+                && message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+        })
+        .expect("child content event");
+    assert!(
+        child_announcement < first_child_content,
+        "child content must not arrive before its parent has announced the child: {observed:#?}"
+    );
     assert!(
         grandchild.is_some(),
         "missing nested announcement on its immediate parent: {observed:#?}"

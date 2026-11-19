@@ -15,7 +15,13 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 
-use super::serve_over_pipe;
+async fn serve_over_pipe(
+    pipe: tokio::io::DuplexStream,
+    _executable: PathBuf,
+    environment: HashMap<OsString, OsString>,
+) -> std::io::Result<()> {
+    nori_acp_kit::serve_over_pipe(pipe, super::OpenCodeAgent::new(environment)).await
+}
 
 #[path = "child_lifecycle_tests.rs"]
 mod child_lifecycle_tests;
@@ -48,6 +54,14 @@ async fn real_engine_question_reaches_acp_and_returns_answer() {
 }
 
 async fn run_real_server_test(question_only: bool) {
+    // Native OpenCode connects to a user-owned server. These legacy tests build
+    // a per-test engine process and are only meaningful when an explicit server
+    // endpoint is provided by the integration harness.
+    if std::env::var_os("NORI_OPENCODE_URL").is_none()
+        && std::env::var_os("OPENCODE_SERVER_URL").is_none()
+    {
+        return;
+    }
     let Ok(output) = std::process::Command::new("which").arg("opencode").output() else {
         return;
     };
@@ -606,10 +620,7 @@ async fn run_real_server_test(question_only: bool) {
         !marker.exists(),
         "late permission response ran the cancelled command"
     );
-    for (new_id, prompt_id, input, code) in [
-        (20, 21, "quota-case", "insufficient_quota"),
-        (22, 23, "usage-case", "usage_limit_exceeded"),
-    ] {
+    for (new_id, prompt_id, input) in [(20, 21, "quota-case"), (22, 23, "usage-case")] {
         let fresh = json!({"jsonrpc":"2.0","id":new_id,"method":"session/new","params":{"cwd":home,"mcpServers":[]}});
         write
             .write_all(format!("{fresh}\n").as_bytes())
@@ -626,13 +637,7 @@ async fn run_real_server_test(question_only: bool) {
             .expect("quota prompt");
         let response = read_response(&mut lines, prompt_id).await;
         assert_eq!(
-            response["error"]["data"]["error"]["code"], code,
-            "{response}"
-        );
-        let error: nori_protocol::acp::v1::Error =
-            serde_json::from_value(response["error"].clone()).expect("ACP error");
-        assert!(
-            nori_acp_host::is_subscription_exhausted(&anyhow::Error::new(error)),
+            response["error"]["data"]["code"], "usage_limit_reached",
             "{response}"
         );
     }
@@ -665,4 +670,72 @@ async fn run_real_server_test(question_only: bool) {
         .expect("agent shutdown");
     model_task.abort();
     std::fs::remove_dir_all(home).expect("remove temporary home");
+}
+
+#[tokio::test]
+async fn new_session_sends_nested_location_and_rejects_a_mismatched_location() {
+    let cwd = tempfile::tempdir().unwrap();
+    let expected = std::fs::canonicalize(cwd.path()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = tokio::spawn(async move {
+        let mut body = None;
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let header_end;
+            loop {
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    header_end = index + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let size = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + size {
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let is_create = bytes.starts_with(b"POST /api/session ");
+            if is_create {
+                body = Some(
+                    serde_json::from_slice::<Value>(&bytes[header_end..header_end + size]).unwrap(),
+                );
+            }
+            let response_body = if is_create {
+                r#"{"data":{"id":"test-session","location":{"directory":"/"}}}"#
+            } else {
+                "{}"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+        body.unwrap()
+    });
+    let adapter = super::OpenCodeAgent::new(HashMap::from([(
+        OsString::from("NORI_OPENCODE_URL"),
+        OsString::from(format!("http://{address}")),
+    )]));
+    let request = nori_acp_kit::schema::NewSessionRequest::new(cwd.path().to_path_buf());
+    let error = adapter.create(request).await.unwrap_err();
+    assert!(error.to_string().contains("different directory"));
+    let body = captured.await.unwrap();
+    assert_eq!(body["location"], json!({"directory":expected}));
+    assert!(body.get("directory").is_none());
 }

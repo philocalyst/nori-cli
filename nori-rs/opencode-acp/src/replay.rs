@@ -3,11 +3,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use acp::Client;
-use acp::ConnectionTo;
 use acp::UntypedMessage;
-use agent_client_protocol as acp;
 use base64::Engine;
+use nori_acp_kit::Cx;
+use nori_acp_kit::acp;
 use reqwest::Method;
 use serde_json::Value;
 use serde_json::json;
@@ -16,7 +15,7 @@ use crate::OpenCodeServer;
 
 pub(crate) async fn history(
     server: &OpenCodeServer,
-    client: &ConnectionTo<Client>,
+    client: &Cx,
     id: &str,
     cwd: &Path,
 ) -> acp::Result<()> {
