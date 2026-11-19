@@ -6,6 +6,10 @@ use serde::Serialize;
 
 use crate::acp;
 use crate::acp::v1::RequestId;
+use crate::monitor::MonitorWire;
+use crate::route::AttemptSuperseded;
+use crate::route::RetryScheduled;
+use crate::route::RouteChanged;
 use crate::subagent::SubagentWire;
 
 /// An event emitted by one Nori harness session.
@@ -70,19 +74,100 @@ pub enum NoriEvent {
     PromptSummaryUpdated(PromptSummary),
     Notice(Notice),
     RequestFailed(RequestFailure),
-    /// An explicitly exhausted provider may be replaced using the workflow policy.
+    /// The session moved to another route after a failure; it now runs on `to`.
+    RouteChanged(RouteChanged),
+    /// A failed request will be retried on the same route after a wait.
+    RetryScheduled(RetryScheduled),
+    /// The failed attempt's output so far is obsolete; the request starts over.
+    AttemptSuperseded(AttemptSuperseded),
+    /// Journals written before routes record an exhausted provider this way. Never emitted
+    /// now; kept so older transcripts still load.
     SubscriptionExhausted(SubscriptionExhausted),
     /// A subagent session was announced, changed state, or exchanged a message.
     Subagent(SubagentWire),
     /// The results of tasks the session delegated were handed to its agent in a turn of
     /// their own.
     TaskResultsDelivered(TaskResultsDelivered),
+    /// The monitors the session's agent armed: how many watch, and what they reported to it.
+    Monitor(MonitorWire),
     /// A request the client was asked to answer no longer needs an answer, such as a delegated
     /// task's permission request after the task ended.
     RequestWithdrawn(RequestId),
+    /// The agent is asking for permission in a turn that outlived the request that started it:
+    /// it kept working after its turn ended, or after the user cancelled and it ignored the
+    /// cancel. The permission request itself follows as an ordinary request; this says what
+    /// the user is being asked to decide. When `after_cancel` is set the user may also stop the
+    /// agent (`stop_agent`) instead of allowing or denying.
+    AgentContinued(AgentContinued),
+    /// Permission requests answered as cancelled because the user cancelled their turn. One
+    /// event per tool per window: `count` grows while the agent keeps asking.
+    RequestDeclined(RequestDeclined),
+    /// Only in a replay: the journal ends on a prompt the agent never answered, because the
+    /// session ended (crash, quit) before it did. The prompt is offered back; it was not
+    /// lost and was not answered.
+    PromptUnanswered(PromptUnanswered),
+    /// Prompts typed ahead in a session that ended before they started, restored when it was
+    /// resumed. They are not running and nothing starts them by itself: the user sends the
+    /// oldest (promotes it) or drops one by its id. Published whenever that list changes, and
+    /// empty when the last one is gone.
+    QueueRestored(QueueRestored),
+    /// A prompt is outstanding and the agent has done nothing at all for `silent_for_secs`: no
+    /// text, tool update, request, or session fact. This is not a failure and nothing is
+    /// cancelled: a long silent tool and a lost response look the same from here. It says what
+    /// the user needs to decide, and Esc cancels through the normal path. Republished as the
+    /// silence grows; cleared by [`NoriEvent::AgentHeard`].
+    AgentSilent(AgentSilent),
+    /// The agent that was silent did something. Any activity clears the silence.
+    AgentHeard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSilent {
+    pub silent_for_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRestored {
+    pub prompts: Vec<RestoredPrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredPrompt {
+    /// Names the prompt to drop it.
+    pub id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptUnanswered {
+    /// What the user had typed.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentContinued {
+    /// The agent's display name.
+    pub agent: String,
+    /// The permission request the user is about to be asked to answer.
+    pub request_id: RequestId,
+    /// What the agent wants to do, as the agent titled it.
+    pub tool: String,
+    pub cause: AgentTurnCause,
+    /// The user cancelled and the agent ignored it.
+    pub after_cancel: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestDeclined {
+    pub tool: String,
+    pub count: i64,
+    /// Which child the declined requests came from, when they were relayed from one.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Legacy journal record; see [`NoriEvent::SubscriptionExhausted`].
 pub struct SubscriptionExhausted {
     pub request_id: RequestId,
     pub echo_id: Option<String>,
@@ -129,16 +214,48 @@ pub struct SessionStarted {
     /// from the first frame instead of waiting for an update.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_options: Vec<acp::v1::SessionConfigOption>,
+    /// Set when the harness replaced the session's agent in the middle of the conversation:
+    /// this session continues it, so a front end updates its header and status in place
+    /// instead of starting a new conversation card. The `RouteChanged` that precedes it is the
+    /// one thing to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap: Option<nori_workflow::RouteCause>,
 }
 
-/// The harness-owned phase of the active streaming operation.
+/// Why the agent is working without a request of ours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnCause {
+    /// The agent kept working after the local request that started it ended.
+    Detached,
+    /// The agent declared a turn through Nori status metadata, for example a turn another
+    /// frontend started.
+    Observed,
+    /// The agent produced activity with no request and no status hint.
+    Unprompted,
+}
+
+/// The harness-owned phase of the session's single turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum SessionPhase {
     Idle,
-    Loading { request_id: RequestId },
-    Prompting { request_id: RequestId },
-    Cancelling { request_id: RequestId },
+    Loading {
+        request_id: RequestId,
+    },
+    Prompting {
+        request_id: RequestId,
+    },
+    Cancelling {
+        request_id: RequestId,
+    },
+    /// The agent is working without a local request. `cancelling` means `session/cancel` has
+    /// been sent and the agent has not gone quiet yet.
+    Agent {
+        cause: AgentTurnCause,
+        #[serde(default)]
+        cancelling: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -105,9 +105,27 @@ pub struct SubagentUpdate {
     /// Canonical provider slug, when known by the owning backend.
     #[serde(default)]
     pub agent: Patch<String>,
+    /// Provider/model identifier reported by the child backend, when known.
+    #[serde(default)]
+    pub model: Patch<String>,
     pub title: Patch<String>,
     pub description: Patch<String>,
     pub state: Patch<SubagentState>,
+}
+
+/// How far a peer message got. Providers' own session messages carry no state (`None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    /// Accepted into the recipient's mailbox; no turn of the recipient has read it.
+    Queued,
+    /// A turn of the recipient started with the message in its input.
+    Delivered,
+    /// The recipient's turn that contained it ended, or the recipient replied to the sender.
+    Acknowledged,
+    /// It will never be delivered: its task failed or was cancelled before a turn read it, or the
+    /// recipient ended first. Terminal; `SubagentMessage::failure` says why.
+    Undeliverable,
 }
 
 /// A message exchanged between sessions, e.g. the prompt a parent sent to a child.
@@ -123,6 +141,19 @@ pub struct SubagentMessage {
     pub text: String,
     /// The text continues an earlier message with the same id.
     pub chunk: bool,
+    /// Display names of the two parties (actor alias, or agent name), when the sender of the
+    /// message knows them.
+    #[serde(default)]
+    pub sender_label: Option<String>,
+    #[serde(default)]
+    pub recipient_label: Option<String>,
+    /// Delivery state of a Nori peer message; the same `message_id` is re-announced as it
+    /// advances.
+    #[serde(default)]
+    pub delivery: Option<MessageDelivery>,
+    /// Why the message is `Undeliverable`.
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 /// What the subagent-related `session/update` kinds decode to.
@@ -163,6 +194,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("sessionId")?,
             agent: Patch::Keep,
+            model: text_field("model"),
             title: text_field("title"),
             description: text_field("description"),
             state: state_field(),
@@ -171,6 +203,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("subagentSessionId")?,
             agent: Patch::Keep,
+            model: text_field("model"),
             title: text_field("name"),
             description: text_field("task"),
             state: Patch::Set(SubagentState::Running),
@@ -179,6 +212,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             parent_session_id: SessionId::new(delivered_on),
             session_id: session_field("subagentSessionId")?,
             agent: Patch::Keep,
+            model: text_field("model"),
             title: Patch::Keep,
             description: Patch::Keep,
             state: state_field(),
@@ -194,6 +228,10 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
                 recipient_session_id: session_field("recipientSessionId"),
                 text: update.get("content").map(message_text).unwrap_or_default(),
                 chunk: kind == "session_message_chunk",
+                sender_label: None,
+                recipient_label: None,
+                delivery: None,
+                failure: None,
             }))
         }
         _ => None,
@@ -268,6 +306,7 @@ mod tests {
         }))
         .expect("older announcement");
         assert_eq!(update.agent, Patch::Keep);
+        assert_eq!(update.model, Patch::Keep);
     }
 
     #[test]
@@ -277,6 +316,7 @@ mod tests {
             "update": {
                 "sessionUpdate": "subagent_update",
                 "sessionId": "child",
+                "model": "anthropic/claude-sonnet-4",
                 "title": "general-purpose",
                 "description": "Read a.txt contents",
                 "capabilities": {"cancel": {}},
@@ -289,6 +329,7 @@ mod tests {
                 parent_session_id: SessionId::new("root"),
                 session_id: SessionId::new("child"),
                 agent: Patch::Keep,
+                model: Patch::Set("anthropic/claude-sonnet-4".into()),
                 title: Patch::Set("general-purpose".into()),
                 description: Patch::Set("Read a.txt contents".into()),
                 state: Patch::Set(SubagentState::Running),
@@ -387,6 +428,10 @@ mod tests {
                 recipient_session_id: Some(SessionId::new("child")),
                 text: "Read the file".into(),
                 chunk: false,
+                sender_label: None,
+                recipient_label: None,
+                delivery: None,
+                failure: None,
             }))
         );
     }

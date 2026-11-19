@@ -3,17 +3,29 @@
 //! ACP owns agent/client semantics. Nori adds only the lifecycle and product
 //! notifications that ACP does not define.
 
+mod message_flow;
+mod monitor;
+mod route;
 mod session_event;
 mod subagent;
+mod usage;
 
 pub use agent_client_protocol_schema as acp;
+pub use message_flow::*;
+pub use monitor::*;
+pub use route::*;
 pub use session_event::*;
 pub use subagent::*;
+pub use usage::*;
 
 /// ACP `_meta` key correlating a prompt with user-message chunks that echo it.
 pub const PROMPT_ECHO_ID_META_KEY: &str = "nori.dev/promptEchoId";
 /// Internal marker for a user prompt retried after an engine handoff.
 pub const HANDOFF_RETRY_META_KEY: &str = "nori.dev/handoffRetry";
+
+/// Prefix used to carry backend warnings through ACP's standard text stream.
+/// The TUI renders these as separate warning cells.
+pub const AGENT_WARNING_PREFIX: &str = "\u{001f}nori-warning:\n";
 
 /// Identity of one submitted prompt, carried in `_meta` under [`PROMPT_ECHO_ID_META_KEY`] on the
 /// prompt and on every user-message chunk that echoes it.

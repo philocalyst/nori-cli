@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 agent-client-protocol-schema = { workspace = true, features = ["unstable"] }
+nori-workflow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
