@@ -69,6 +69,9 @@ impl SelectedTools {
         {
             lines.push(crate::DELEGATION_INSTRUCTIONS.to_owned());
         }
+        if specs.iter().any(|spec| spec.name == "monitor_start") {
+            lines.push(crate::MONITOR_INSTRUCTIONS.to_owned());
+        }
         lines.extend(selection.instructions.iter().cloned());
         Self {
             inner,

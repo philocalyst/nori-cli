@@ -25,7 +25,7 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
   loads from `$NORI_HOME/init.pkl` and trusted `.nori/nori.pkl`. Hooks, commit
   guidance, a designated reviewer, and ranked subscription fallback use the
   same captured machine properties. Hook turns have no default policy cap.
-  [Conversation programs](conversation-programs.md) dispatch journaled effects.
+  [Programs](programs.md) run declarative multi-actor workflows with journaled steps.
 - **Forge** ([forge.md](forge.md)). Crate `nori-forge` is a GitHub REST client with
   conditional reads; nothing shells out to `gh`. Built and unit-tested (14 crate tests, with
   wiremock for the GitHub calls).
@@ -70,7 +70,7 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
   - A branch pushed to a fork opens nothing upstream: the repository is the push remote's.
   - Only GitHub is supported.
 - **Claude process cleanup: written, not tested**
-  - `nori-rs/claude-acp/src/session/session.rs` reads the session's process tree before
+  - `nori-rs/claude-acp/src/session/session/mod.rs` reads the session's process tree before
     disconnecting, waits up to `CLI_EXIT_GRACE` (2 s) for the CLI to exit, then terminates the
     tree (`terminate`, 300 ms grace).
   - `nori-rs/claude-acp/src/utils/descendants.rs` holds `session_tree`, with the test
@@ -95,7 +95,7 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
   - `policy_change_is_applied_to_the_active_session` (tui-pty-e2e) failed in the full run. It
     has not been rerun, so it is unknown whether it is flaky or caused by this work.
   - `just fmt` and `just fix -p` have not been rerun on nori-forge, nori-config, nori-script,
-    nori-harness, nori-tui and claude-code-acp-rs since the last edits.
+    nori-harness, nori-tui and nori-claude-acp since the last edits.
 - **Nix**
   - `nix build .#nori` failed when the new `nori-forge` crate was untracked: the flake only
     copies git-tracked files. The new files are marked intent-to-add with `git add -N`
@@ -116,8 +116,11 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
     - `harness shell::tests::{detects_sh, detects_zsh, fish_fallback_to_zsh}` (Nix zsh path),
     - `tui remote_control::tests::disable_disconnects_the_controller_and_stops_every_listener`,
     - `acp-host remote_ws one_server_listens_on_loopback_...`, which hangs.
-  - The default `cargo` here is a `mitts` shim that breaks on renamed dependencies; use
-    `~/.local/share/cargo/bin/cargo`.
+  - The default `cargo` here is a `mitts` shim that cannot resolve renamed dependencies such as the
+    `crossterm_0_29` alias used by `ratatui-crossterm`. Use `just release` or
+    `cargo-stock build --release --bin nori` for release builds. The Codex crates are vendored under
+    `vendor/codex`, so dependency resolution no longer depends on scanning a nested workspace inside
+    a git repository.
 - **Housekeeping**
   - Decide whether to commit or delete `PERF_PLAN.md` (untracked, repo root).
   - Commit the work when asked; commit messages end with
