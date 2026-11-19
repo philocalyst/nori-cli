@@ -7,6 +7,13 @@ Path: @/nori-rs/mock-acp-agent
 `mock-acp-agent` is the deterministic ACP agent used by host, harness, and TUI
 integration tests. It is a test binary, not a production client component.
 
+New fixtures should be worlds, not environment-variable scenarios: [fake-worlds.md](../../docs/fake-worlds.md)
+describes the scriptable fake agent (`nori-fake-agent`) and its driver (`nori-world`), which cover
+multi-agent trees, permissions, usage, structured errors and wire-level faults. This binary keeps
+its own scenarios and recorded wire replay for the existing terminal fixtures; it is not a shim
+over the fake agent, because its behavior is selected by environment variables that tests set per
+process and its wire replay reproduces a recorded adapter byte for byte.
+
 ### How it fits into the larger codebase
 
 The binary uses the official `agent-client-protocol` SDK on the agent side and
@@ -79,6 +86,8 @@ than calling host internals. This makes the public `AcpEvent::Request` and
   current value (its own model-injection channel), so tests can verify that an
   out-of-catalog model forced through spawn-time injection becomes the session's
   current model.
+- `MOCK_AGENT_MODEL_VALUE_MOCK_MODEL_ALT` overrides the versioned model value
+  advertised by `mock-model-alt`, allowing two mock providers to expose distinct routes.
 - `MOCK_AGENT_RESPONSE_<MODEL>` overrides the generic `MOCK_AGENT_RESPONSE`.
   The suffix uppercases the model name and replaces hyphens with underscores
   (for example, `MOCK_AGENT_RESPONSE_MOCK_MODEL_ALT`). Multi-agent PTY tests

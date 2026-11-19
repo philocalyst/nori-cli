@@ -3,7 +3,10 @@
 mod browser_modify;
 mod context_usage;
 mod mcp_calls;
+mod prompt_content;
+mod prompt_log;
 mod runaway_search;
+mod scenarios;
 mod stream_file;
 mod timeline;
 mod wire_replay;
@@ -33,10 +36,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 fn last_prompt_text_block(prompt: &[acp::ContentBlock]) -> Option<&str> {
-    prompt.iter().rev().find_map(|block| match block {
-        acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    })
+    prompt.iter().rev().find_map(prompt_content::user_text)
 }
 
 #[cfg(unix)]
@@ -156,8 +156,11 @@ fn config_options_for_state(config: &MockSessionConfig) -> Vec<acp::SessionConfi
         } else {
             "GPT 6.1 Sol"
         };
-        let value =
-            std::env::var("MOCK_AGENT_MODEL_VALUE").unwrap_or_else(|_| default_value.into());
+        let value = (model_name == "mock-model-alt")
+            .then(|| std::env::var("MOCK_AGENT_MODEL_VALUE_MOCK_MODEL_ALT").ok())
+            .flatten()
+            .or_else(|| std::env::var("MOCK_AGENT_MODEL_VALUE").ok())
+            .unwrap_or_else(|| default_value.into());
         let display =
             std::env::var("MOCK_AGENT_MODEL_DISPLAY").unwrap_or_else(|_| default_display.into());
         models.push(acp::SessionConfigSelectOption::new(value, display));
@@ -480,32 +483,26 @@ impl MockAgent {
         let prompt_text: String = arguments
             .prompt
             .iter()
-            .filter_map(|content| match content {
-                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
+            .filter_map(prompt_content::user_text)
             .collect();
         // MOCK_AGENT_PROMPT_LOG: every prompt, as a JSON line naming the agent and session.
         if let Ok(log) = std::env::var("MOCK_AGENT_PROMPT_LOG") {
-            use std::io::Write as _;
             let line = json!({
                 "agent": std::env::var("MOCK_AGENT_MODEL_NAME").unwrap_or_default(),
                 "pid": std::process::id(),
                 "session": session_id.to_string(),
-                "text": prompt_text,
+                "text": arguments.prompt.iter().filter_map(prompt_content::model_text).collect::<String>(),
+                "user_text": prompt_text,
                 "content": arguments.prompt,
             });
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log)
-            {
-                let _ = writeln!(file, "{line}");
-            }
+            let _ = prompt_log::append(log, &line);
         }
 
         if std::env::var("MOCK_AGENT_FAIL_TEXT").is_ok_and(|text| prompt_text == text) {
             return Err(acp::Error::new(-32001, "Mock child prompt failure"));
+        }
+        if let Some(scenario) = scenarios::Scenario::from_env() {
+            return self.run_scenario(scenario, session_id, &prompt_text).await;
         }
         let fixture_prompt = last_prompt_text_block(&arguments.prompt);
         if fixture_prompt == Some("fixture:withdraw-user-question")
@@ -600,14 +597,11 @@ impl MockAgent {
         }
 
         if std::env::var("MOCK_AGENT_PROMPT_MATCHING_UNOWNED_USER_NOTIFICATION").is_ok()
-            && let Some(acp::ContentBlock::Text(text)) = arguments
-                .prompt
-                .iter()
-                .find(|content| matches!(content, acp::ContentBlock::Text(_)))
+            && let Some(text) = arguments.prompt.iter().find_map(prompt_content::user_text)
         {
             self.send_user_chunk(
                 session_id.clone(),
-                acp::ContentBlock::Text(acp::TextContent::new(text.text.clone())),
+                acp::ContentBlock::Text(acp::TextContent::new(text)),
             )
             .await?;
         }
@@ -645,10 +639,7 @@ impl MockAgent {
         let prompt_text = arguments
             .prompt
             .iter()
-            .filter_map(|block| match block {
-                acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })
+            .filter_map(prompt_content::user_text)
             .collect::<Vec<_>>()
             .join(" ");
         if prompt_text.contains("CONTEXT CHECKPOINT COMPACTION") {
@@ -725,10 +716,7 @@ impl MockAgent {
             let user_text = arguments
                 .prompt
                 .iter()
-                .filter_map(|block| match block {
-                    acp::ContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
+                .filter_map(prompt_content::user_text)
                 .collect::<Vec<_>>()
                 .join(" ");
 
@@ -1149,15 +1137,12 @@ impl MockAgent {
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
 
-        // Echo back the full prompt text for verifying context injection.
+        // Echo human prompt text; assistant-only context stays model-visible and in wire traces.
         if std::env::var("MOCK_AGENT_ECHO_PROMPT").is_ok() {
             let user_text = arguments
                 .prompt
                 .iter()
-                .filter_map(|block| match block {
-                    acp::ContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
+                .filter_map(prompt_content::user_text)
                 .collect::<Vec<_>>()
                 .join("\n");
             self.send_text_chunk(session_id.clone(), &user_text).await?;
@@ -1168,10 +1153,7 @@ impl MockAgent {
             let user_text = arguments
                 .prompt
                 .iter()
-                .filter_map(|block| match block {
-                    acp::ContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
+                .filter_map(prompt_content::user_text)
                 .collect::<Vec<_>>()
                 .join("\n");
 
