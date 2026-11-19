@@ -6,11 +6,13 @@
 //! updates for them are absorbed instead of resurrecting them.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use nori_protocol::Patch;
 use nori_protocol::SubagentMessage;
 use nori_protocol::SubagentOutcome;
 use nori_protocol::SubagentState;
@@ -28,19 +30,53 @@ use crate::presentation::ClientEventNormalizer;
 use crate::presentation::ToolPhase;
 use crate::presentation::ToolSnapshot;
 
+mod reactivation;
+
 /// A child that finished, ready to become a scrollback cell.
 #[derive(Debug, Clone)]
 pub(crate) struct FinishedSubagent {
+    pub(crate) node_id: NodeId,
     pub(crate) label: String,
     pub(crate) kind: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) model: Option<String>,
     pub(crate) outcome: SubagentOutcome,
     pub(crate) tool_count: usize,
     pub(crate) elapsed: Duration,
     /// What the child said after its last tool call.
     pub(crate) message: String,
     pub(crate) detail: Vec<Arc<dyn HistoryCell>>,
+    /// Compact summaries of descendants that finished under this child. These
+    /// stay one line in the parent summary while their full cells remain in
+    /// `detail` for the transcript view.
+    pub(crate) nested: Vec<Arc<super::SubagentSummaryCell>>,
     /// How deep in the tree the child was, for indenting its summary.
     pub(crate) depth: usize,
+}
+
+/// A message from one actor to another, ready to be a card.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerMessage {
+    pub(crate) from: crate::history_cell::PeerParty,
+    pub(crate) to: crate::history_cell::PeerParty,
+    pub(crate) delivery: crate::history_cell::PeerHandle,
+    pub(crate) text: String,
+}
+
+/// Bring a card's delivery state up to what `message` says. A provider's own session message
+/// carries none and was, by being on the wire, delivered.
+fn apply_delivery(handle: &crate::history_cell::PeerHandle, message: &SubagentMessage) {
+    use crate::history_cell::PeerDelivery;
+    match message.delivery {
+        Some(nori_protocol::MessageDelivery::Queued) => handle.advance(PeerDelivery::Queued),
+        Some(nori_protocol::MessageDelivery::Acknowledged) => {
+            handle.advance(PeerDelivery::Acknowledged);
+        }
+        Some(nori_protocol::MessageDelivery::Delivered) | None => {
+            handle.advance(PeerDelivery::Delivered);
+        }
+        Some(nori_protocol::MessageDelivery::Undeliverable) => handle.fail(message.failure.clone()),
+    }
 }
 
 /// A child that finished, kept so the subagent switcher can still show what it did.
@@ -54,6 +90,7 @@ pub(super) struct EndedRecord {
     pub(super) finished: FinishedSubagent,
     /// The label of the running subagent that started it, when it had one.
     pub(super) parent: Option<String>,
+    pub(super) parent_id: Option<NodeId>,
     pub(super) ended_at: Instant,
 }
 
@@ -64,8 +101,8 @@ const MAX_ENDED_KEPT: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Link {
     Live(NodeId),
-    /// The child finished; anything more for it is dropped.
-    Ended,
+    /// The child completed but may be reused for a later turn.
+    Ended(NodeId),
 }
 
 /// Which node an update for a child belongs to.
@@ -90,13 +127,29 @@ pub(crate) struct SubagentTree {
     /// Merges launcher tool-call updates, which carry only the changed fields.
     launcher_normalizer: ClientEventNormalizer,
     finished: Vec<FinishedSubagent>,
+    /// The revival flag of each committed root summary card, by child.
+    summary_revivals: HashMap<NodeId, Arc<std::sync::atomic::AtomicBool>>,
+    /// Counts every change to what the lanes show; what is cached for a frame is valid for one
+    /// value of it.
+    pub(super) revision: u64,
+    pub(super) created_at: Instant,
+    pub(super) below_memo: std::cell::RefCell<super::lanes::BelowMemo>,
+    pub(super) lane_cache: std::cell::RefCell<Option<super::lanes::LaneCache>>,
+    /// Peer messages that are whole, waiting to become cards.
+    peers: Vec<(Instant, PeerMessage)>,
+    /// The delivery state of each peer message already drawn, by message id, oldest first.
+    peer_handles: Vec<(String, crate::history_cell::PeerHandle)>,
+    /// Streamed peer messages still receiving chunks, by message id.
+    peer_open: Vec<(String, PeerMessage)>,
     /// Every finished child, by node id, for the switcher.
     pub(super) ended: BTreeMap<NodeId, EndedRecord>,
+    /// Finished nodes whose root summary waits for live descendants.
+    pub(super) pending: BTreeMap<NodeId, FinishedSubagent>,
+    pending_children: HashMap<NodeId, BTreeSet<NodeId>>,
+    pub(super) pending_nested: HashMap<NodeId, BTreeMap<NodeId, Arc<super::SubagentSummaryCell>>>,
     /// Nodes that a later node took the place of: `(old, new)`.
     pub(super) replaced: Vec<(NodeId, NodeId)>,
     next_id: i64,
-    /// Live-block rows built so far, for tests that count work.
-    pub(super) rows_built: std::cell::Cell<usize>,
 }
 
 impl SubagentTree {
@@ -110,14 +163,25 @@ impl SubagentTree {
             context: CellContext { cwd, animations },
             launcher_normalizer: ClientEventNormalizer::default(),
             finished: Vec::new(),
+            summary_revivals: HashMap::new(),
+            revision: 0,
+            created_at: Instant::now(),
+            below_memo: std::cell::RefCell::default(),
+            lane_cache: std::cell::RefCell::new(None),
+            peers: Vec::new(),
+            peer_handles: Vec::new(),
+            peer_open: Vec::new(),
             ended: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            pending_children: HashMap::new(),
+            pending_nested: HashMap::new(),
             replaced: Vec::new(),
             next_id: 0,
-            rows_built: std::cell::Cell::new(0),
         }
     }
 
     pub(crate) fn set_root(&mut self, session_id: SessionId) {
+        self.revision += 1;
         self.root_session_id = Some(session_id);
     }
 
@@ -127,11 +191,6 @@ impl SubagentTree {
 
     pub(crate) fn animations(&self) -> bool {
         self.context.animations
-    }
-
-    #[cfg(test)]
-    pub(crate) fn rows_built(&self) -> usize {
-        self.rows_built.get()
     }
 
     pub(crate) fn running_count(&self) -> usize {
@@ -144,13 +203,21 @@ impl SubagentTree {
         self.running_count() > 0
     }
 
-    pub(crate) fn visible_count(&self) -> usize {
-        self.live.len() + self.ended.len()
-    }
-
     /// Children that finished since the last call, in completion order.
     pub(crate) fn take_finished(&mut self) -> Vec<FinishedSubagent> {
         std::mem::take(&mut self.finished)
+    }
+
+    /// A committed summary card's revival flag, so that the child coming back flips the card.
+    pub(crate) fn register_summary(
+        &mut self,
+        node_id: NodeId,
+        revival: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if self.summary_revivals.len() >= 512 {
+            self.summary_revivals.clear();
+        }
+        self.summary_revivals.insert(node_id, revival);
     }
 
     /// The label to show for a request that came from `session_id`, if it is a running child.
@@ -177,7 +244,7 @@ impl SubagentTree {
     fn node_for_session(&mut self, session_id: &SessionId, now: Instant) -> Option<NodeId> {
         match self.by_session.get(session_id) {
             Some(Link::Live(id)) => return Some(*id),
-            Some(Link::Ended) => return None,
+            Some(Link::Ended(_)) => return None,
             None => {}
         }
         let id = self.create(now);
@@ -188,11 +255,72 @@ impl SubagentTree {
         Some(id)
     }
 
+    fn reactivate_session(&mut self, session_id: &SessionId, now: Instant) -> Option<NodeId> {
+        let Some(Link::Ended(id)) = self.by_session.get(session_id).copied() else {
+            return None;
+        };
+        let record = self.ended.get(&id)?;
+        // A child that failed on one route can go on, on another: it runs again.
+        if !matches!(
+            record.finished.outcome,
+            SubagentOutcome::Completed { .. } | SubagentOutcome::Failed { .. }
+        ) {
+            return None;
+        }
+        // Its failure, if it is still held back, never happened as far as the transcript goes.
+        self.finished.retain(|finished| finished.node_id != id);
+        let mut node = Node::new(now);
+        node.session_id = Some(session_id.clone());
+        node.agent = record.agent.clone();
+        node.model = record.finished.model.clone();
+        if let Some(kind) = &record.finished.kind {
+            node.title = Some(kind.clone());
+            node.description = Some(record.finished.label.clone());
+        } else {
+            node.title = Some(record.finished.label.clone());
+        }
+        node.history_parent = record.history_parent;
+        node.archived = record.finished.detail.clone();
+        node.nested_by_id = record
+            .finished
+            .nested
+            .iter()
+            .map(|summary| (summary.node_id(), Arc::clone(summary)))
+            .collect();
+        node.parent = record.parent_id;
+        if let Some(children) = self.pending_children.remove(&id) {
+            node.children.extend(children);
+        }
+        if let Some(nested) = self.pending_nested.remove(&id) {
+            node.nested_by_id.extend(nested);
+        }
+        node.nested = node.nested_by_id.values().cloned().collect();
+        // Current child summaries replace their archived versions. Their own
+        // transcript retains previous turns, so showing both repeats content.
+        node.archived.retain(|cell| {
+            !cell
+                .as_any()
+                .downcast_ref::<super::SubagentSummaryCell>()
+                .is_some_and(|summary| node.nested_by_id.contains_key(&summary.node_id()))
+        });
+        self.pending.remove(&id);
+        let descendants: Vec<NodeId> = self
+            .live
+            .iter()
+            .filter_map(|(child, node)| (node.parent == Some(id)).then_some(*child))
+            .collect();
+        node.children.extend(descendants);
+        self.restore_ancestor_chain(id, node.parent);
+        self.live.insert(id, node);
+        self.by_session.insert(session_id.clone(), Link::Live(id));
+        Some(id)
+    }
+
     /// The running node for a launcher tool call, created on first sight; `None` once it finished.
     fn node_for_launcher(&mut self, call_id: &str, now: Instant) -> Option<NodeId> {
         match self.by_launcher.get(call_id) {
             Some(Link::Live(id)) => return Some(*id),
-            Some(Link::Ended) => return None,
+            Some(Link::Ended(_)) => return None,
             None => {}
         }
         let id = self.create(now);
@@ -207,11 +335,16 @@ impl SubagentTree {
     /// it. An agent that contradicts itself cannot make a cycle, which would hide both nodes.
     fn adopt(&mut self, parent: NodeId, child: NodeId) {
         let mut ancestor = Some(parent);
+        let mut seen = BTreeSet::new();
         while let Some(id) = ancestor {
-            if id == child {
+            if id == child || !seen.insert(id) {
                 return;
             }
-            ancestor = self.live.get(&id).and_then(|node| node.parent);
+            ancestor = self
+                .live
+                .get(&id)
+                .and_then(|node| node.parent)
+                .or_else(|| self.ended.get(&id).and_then(|record| record.parent_id));
         }
         let Some(node) = self.live.get_mut(&child) else {
             return;
@@ -228,7 +361,27 @@ impl SubagentTree {
 
     /// An announcement, or a change to a child already announced.
     pub(crate) fn on_update(&mut self, update: SubagentUpdate, now: Instant) {
-        let Some(id) = self.node_for_session(&update.session_id, now) else {
+        self.revision += 1;
+        let id = if matches!(update.state, Patch::Set(SubagentState::Running)) {
+            self.reactivate_session(&update.session_id, now)
+                .or_else(|| self.node_for_session(&update.session_id, now))
+        } else {
+            self.node_for_session(&update.session_id, now)
+        };
+        let Some(id) = id else {
+            if let Some(record) = self
+                .ended
+                .values_mut()
+                .find(|record| record.session_id.as_ref() == Some(&update.session_id))
+            {
+                update.agent.clone().apply_to(&mut record.agent);
+                update.model.apply_to(&mut record.finished.model);
+                update.title.apply_to(&mut record.finished.kind);
+                let mut label = Some(std::mem::take(&mut record.finished.label));
+                update.description.apply_to(&mut label);
+                record.finished.label = label.unwrap_or_default();
+                record.revision = record.revision.saturating_add(1);
+            }
             return;
         };
         if let Some(Link::Live(parent)) = self.by_session.get(&update.parent_session_id).copied() {
@@ -243,6 +396,7 @@ impl SubagentTree {
             update.title.apply_to(&mut node.title);
             update.description.apply_to(&mut node.description);
             update.agent.apply_to(&mut node.agent);
+            update.model.apply_to(&mut node.model);
             node.touch();
         }
         match update.state {
@@ -265,24 +419,34 @@ impl SubagentTree {
 
     /// A message between sessions. The prompt a parent sent to a child names the parent's launcher
     /// tool call, which links the call to the child: the child's node takes over the launcher's.
+    /// Any other message is one actor talking to another, and becomes a card.
     pub(crate) fn on_message(&mut self, message: SubagentMessage, now: Instant) {
+        self.revision += 1;
+        if self.link_launcher(&message, now) {
+            return;
+        }
+        self.record_peer_message(message);
+    }
+
+    /// Link the child a launcher's prompt went to. Whether `message` was such a prompt.
+    fn link_launcher(&mut self, message: &SubagentMessage, now: Instant) -> bool {
         let (Some(call_id), Some(recipient)) = (
             message.message_id.as_deref(),
             message.recipient_session_id.as_ref(),
         ) else {
-            return;
+            return false;
         };
         let Some(Link::Live(launcher)) = self.by_launcher.get(call_id).copied() else {
-            return;
+            return false;
         };
         let Some(child) = self.node_for_session(recipient, now) else {
-            return;
+            return false;
         };
         if launcher == child {
-            return;
+            return true;
         }
         let Some(stand_in) = self.live.remove(&launcher) else {
-            return;
+            return true;
         };
         self.replaced.push((launcher, child));
         self.by_launcher
@@ -317,6 +481,126 @@ impl SubagentTree {
             }
             node.touch();
         }
+        true
+    }
+
+    /// What an actor is called in the transcript: `main` for the root session, the subagent's
+    /// label while it runs or after it finished, else the start of its session id.
+    pub(crate) fn actor_label(&self, session_id: &SessionId) -> String {
+        if self.is_root(session_id) {
+            return "main".to_owned();
+        }
+        match self.by_session.get(session_id) {
+            Some(Link::Live(id)) => self.live.get(id).map(|node| node.label().to_owned()),
+            Some(Link::Ended(id)) => self
+                .ended
+                .get(id)
+                .map(|record| record.finished.label.clone()),
+            None => None,
+        }
+        .unwrap_or_else(|| session_id.0.chars().take(8).collect())
+    }
+
+    /// One end of a peer message: its name (the sender's own, else what the tree calls it) and
+    /// what runs it.
+    fn party(
+        &self,
+        session_id: &SessionId,
+        label: Option<String>,
+    ) -> crate::history_cell::PeerParty {
+        let (agent, model) = match self.by_session.get(session_id) {
+            Some(Link::Live(id)) => self
+                .live
+                .get(id)
+                .map(|node| (node.agent.clone(), node.model.clone()))
+                .unwrap_or_default(),
+            Some(Link::Ended(id)) => self
+                .ended
+                .get(id)
+                .map(|record| (record.agent.clone(), record.finished.model.clone()))
+                .unwrap_or_default(),
+            None => (None, None),
+        };
+        crate::history_cell::PeerParty {
+            name: label.unwrap_or_else(|| self.actor_label(session_id)),
+            agent,
+            model,
+        }
+    }
+
+    /// A message between two actors, drawn as a card once it is whole: a streamed one waits for
+    /// its last chunk (the next whole message, or the end of the turn).
+    fn record_peer_message(&mut self, message: SubagentMessage) {
+        let (Some(sender), Some(recipient)) = (
+            message.sender_session_id.as_ref(),
+            message.recipient_session_id.as_ref(),
+        ) else {
+            return;
+        };
+        // The harness announces the same message again as its delivery advances; the card was
+        // drawn when it was first seen, and the later states are not drawn again.
+        let handle = match message.message_id.as_ref().filter(|_| !message.chunk) {
+            Some(id) => {
+                if let Some((_, known)) = self.peer_handles.iter().find(|(seen, _)| seen == id) {
+                    apply_delivery(known, &message);
+                    return;
+                }
+                let handle =
+                    crate::history_cell::PeerHandle::new(crate::history_cell::PeerDelivery::Queued);
+                apply_delivery(&handle, &message);
+                if self.peer_handles.len() >= 512 {
+                    self.peer_handles.remove(0);
+                }
+                self.peer_handles.push((id.clone(), handle.clone()));
+                handle
+            }
+            None => {
+                let handle =
+                    crate::history_cell::PeerHandle::new(crate::history_cell::PeerDelivery::Queued);
+                apply_delivery(&handle, &message);
+                handle
+            }
+        };
+        let peer = PeerMessage {
+            from: self.party(sender, message.sender_label.clone()),
+            to: self.party(recipient, message.recipient_label.clone()),
+            delivery: handle,
+            text: message.text.clone(),
+        };
+        let key = message
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("{}>{}", peer.from.name, peer.to.name));
+        if message.chunk {
+            match self.peer_open.iter_mut().find(|(open, _)| *open == key) {
+                Some((_, open)) => open.text.push_str(&peer.text),
+                None => self.peer_open.push((key, peer)),
+            }
+            return;
+        }
+        // A whole message closes the one it completes, and any other left open.
+        self.close_peer_messages();
+        self.peers.push((Instant::now(), peer));
+    }
+
+    /// The streamed messages still open are complete: the turn is over, or something else was
+    /// said.
+    pub(crate) fn close_peer_messages(&mut self) {
+        let open = std::mem::take(&mut self.peer_open);
+        let now = Instant::now();
+        self.peers
+            .extend(open.into_iter().map(|(_, peer)| (now, peer)));
+    }
+
+    /// Peer messages that became whole since the last call, in the order they were said.
+    /// Peer messages that became whole since the last call, in the order they were said. Their
+    /// cards read the delivery state each frame they are on screen, so there is nothing to wait
+    /// for.
+    pub(crate) fn take_peer_messages(&mut self) -> Vec<PeerMessage> {
+        std::mem::take(&mut self.peers)
+            .into_iter()
+            .map(|(_, peer)| peer)
+            .collect()
     }
 
     /// A root-session tool call that launches a subagent, or an update to one.
@@ -326,6 +610,7 @@ impl SubagentTree {
         async_launch: bool,
         now: Instant,
     ) {
+        self.revision += 1;
         let Some(snapshot) = self
             .launcher_normalizer
             .push_session_update(update)
@@ -383,6 +668,7 @@ impl SubagentTree {
         update: &acp::SessionUpdate,
         now: Instant,
     ) {
+        self.revision += 1;
         let id = match target {
             ChildTarget::Session(session_id) => self.node_for_session(session_id, now),
             ChildTarget::Launcher(call_id) => self.node_for_launcher(call_id, now),
@@ -421,26 +707,38 @@ impl SubagentTree {
         }
         let session_id = node.session_id.take();
         if let Some(session_id) = &session_id {
-            self.by_session.insert(session_id.clone(), Link::Ended);
+            self.by_session.insert(session_id.clone(), Link::Ended(id));
         }
         if let Some(call_id) = node.launcher_call_id.take() {
-            self.by_launcher.insert(call_id, Link::Ended);
+            self.by_launcher.insert(call_id, Link::Ended(id));
         }
-        // Running grandchildren outlive their parent and move up to the top of the block.
-        for child in &node.children {
-            if let Some(child) = self.live.get_mut(child) {
-                child.parent = None;
-            }
+        let parent_id = node.parent;
+        let waiting_for = node.children.clone();
+        let nested = node.nested.clone();
+        let (mut detail, final_message) = node.take_detail(&self.context.cwd);
+        if let Some(previous) = self.ended.get(&id) {
+            let mut prior = previous.finished.detail.clone();
+            prior.retain(|cell| {
+                !cell
+                    .as_any()
+                    .downcast_ref::<super::SubagentSummaryCell>()
+                    .is_some_and(|summary| node.nested_by_id.contains_key(&summary.node_id()))
+            });
+            prior.extend(detail);
+            detail = prior;
         }
-        let (detail, final_message) = node.take_detail(&self.context.cwd);
         let finished = FinishedSubagent {
+            node_id: id,
             label: node.label().to_owned(),
             kind: node.kind().map(str::to_owned),
+            agent: node.agent.clone(),
+            model: node.model.clone(),
             outcome,
             tool_count: node.tool_count,
             elapsed: now.saturating_duration_since(node.started_at),
             message: message.unwrap_or(final_message),
             detail,
+            nested: nested.clone(),
             depth,
         };
         let parent_label = node
@@ -457,36 +755,156 @@ impl SubagentTree {
                 revision: i64::MIN,
                 finished: finished.clone(),
                 parent: parent_label,
+                parent_id,
                 ended_at: now,
             },
         );
-        if self.ended.len() > MAX_ENDED_KEPT {
-            self.ended.pop_first();
+        if !waiting_for.is_empty() {
+            self.pending.insert(id, finished.clone());
+            self.pending_children.insert(id, waiting_for.clone());
+            self.pending_nested.insert(
+                id,
+                nested
+                    .iter()
+                    .map(|summary| (summary.node_id(), summary.clone()))
+                    .collect(),
+            );
         }
-        if let Some(parent) = node.parent.and_then(|parent| self.live.get_mut(&parent)) {
+        while self.ended.len() > MAX_ENDED_KEPT {
+            let Some(evict) = self.ended.keys().copied().find(|candidate| {
+                if self.pending.contains_key(candidate) {
+                    return false;
+                }
+                let mut ancestor = self
+                    .ended
+                    .get(candidate)
+                    .and_then(|record| record.parent_id);
+                while let Some(parent) = ancestor {
+                    if self.pending.contains_key(&parent) {
+                        return false;
+                    }
+                    ancestor = self.ended.get(&parent).and_then(|record| record.parent_id);
+                }
+                true
+            }) else {
+                break;
+            };
+            self.ended.remove(&evict);
+        }
+        if waiting_for.is_empty() {
+            self.complete_finished(id, finished);
+        }
+    }
+
+    fn complete_finished(&mut self, id: NodeId, finished: FinishedSubagent) {
+        let parent_id = self.ended.get(&id).and_then(|record| record.parent_id);
+        let Some(parent_id) = parent_id else {
+            self.finished.push(finished);
+            return;
+        };
+        let summary = Arc::new(super::SubagentSummaryCell::new(finished.clone()));
+        if let Some(parent) = self.live.get_mut(&parent_id) {
             parent.children.remove(&id);
-            parent
-                .nested
-                .push(Arc::new(super::SubagentSummaryCell::new(finished.clone())));
+            parent.nested_by_id.insert(id, summary);
+            parent.nested = parent.nested_by_id.values().cloned().collect();
             parent.touch();
+            return;
         }
+        if self.pending.contains_key(&parent_id) {
+            self.pending_nested
+                .entry(parent_id)
+                .or_default()
+                .insert(id, summary);
+            if let Some(record) = self.ended.get_mut(&parent_id)
+                && let Some(ordered) = self.pending_nested.get(&parent_id)
+            {
+                record.finished.nested = ordered.values().cloned().collect();
+            }
+            if let Some(children) = self.pending_children.get_mut(&parent_id) {
+                children.remove(&id);
+                if children.is_empty() {
+                    self.pending_children.remove(&parent_id);
+                    let ordered = self.pending_nested.remove(&parent_id).unwrap_or_default();
+                    if let Some(parent) = self.pending.remove(&parent_id) {
+                        let mut parent = parent;
+                        parent.nested = ordered.values().cloned().collect();
+                        parent.detail.retain(|cell| {
+                            !cell
+                                .as_any()
+                                .downcast_ref::<super::SubagentSummaryCell>()
+                                .is_some_and(|summary| ordered.contains_key(&summary.node_id()))
+                        });
+                        parent.detail.extend(
+                            ordered
+                                .values()
+                                .cloned()
+                                .map(|cell| cell as Arc<dyn HistoryCell>),
+                        );
+                        if let Some(record) = self.ended.get_mut(&parent_id) {
+                            record.finished = parent.clone();
+                        }
+                        self.complete_finished(parent_id, parent);
+                    }
+                }
+            }
+            return;
+        }
+        // The parent was already emitted (for example after a cancelled
+        // subtree); preserve visibility rather than dropping the completion.
         self.finished.push(finished);
     }
 
     pub(super) fn depth_of(&self, id: NodeId) -> usize {
         let mut depth = 0;
+        let mut seen = BTreeSet::from([id]);
         let mut current = self.live.get(&id).and_then(|node| node.parent);
         while let Some(parent) = current {
+            if !seen.insert(parent) {
+                break;
+            }
             depth += 1;
-            current = self.live.get(&parent).and_then(|node| node.parent);
+            current = self
+                .live
+                .get(&parent)
+                .and_then(|node| node.parent)
+                .or_else(|| self.ended.get(&parent).and_then(|record| record.parent_id));
         }
         depth
+    }
+
+    /// Live nodes in display order, each with its depth: a child follows its parent, children in
+    /// the order they appeared. Stops after `limit` nodes.
+    #[cfg(test)]
+    pub(super) fn display_order(&self, limit: usize) -> Vec<(NodeId, &Node, usize)> {
+        let mut out = Vec::new();
+        let mut stack: Vec<(NodeId, usize)> = Vec::new();
+        for (id, node) in &self.live {
+            if node
+                .parent
+                .is_some_and(|parent| self.live.contains_key(&parent))
+            {
+                continue;
+            }
+            stack.push((*id, self.depth_of(*id)));
+            while let Some((id, depth)) = stack.pop() {
+                if out.len() == limit {
+                    return out;
+                }
+                let Some(node) = self.live.get(&id) else {
+                    continue;
+                };
+                out.push((id, node, depth));
+                stack.extend(node.children.iter().rev().map(|child| (*child, depth + 1)));
+            }
+        }
+        out
     }
 
     /// The root turn ended. Children that were only ever a launcher call (no announcement) were
     /// kept running because the launcher returned at once; they end with the turn. When the turn
     /// was cancelled every running child is shown cancelled.
     pub(crate) fn on_root_turn_end(&mut self, cancelled: bool, now: Instant) {
+        self.revision += 1;
         let ending: Vec<NodeId> = self
             .live
             .iter()
@@ -501,37 +919,6 @@ impl SubagentTree {
             };
             self.finish(id, outcome, None, now);
         }
-    }
-
-    /// Live nodes in display order, each with its depth: a child follows its parent, children
-    /// in the order they appeared. Stops after `limit` nodes, so a frame visits only the nodes it
-    /// shows.
-    pub(super) fn display_order(&self, limit: usize) -> Vec<(NodeId, &Node, usize)> {
-        let mut out = Vec::new();
-        let mut stack: Vec<(NodeId, usize)> = Vec::new();
-        for (id, node) in &self.live {
-            if node.parent.is_some() {
-                continue;
-            }
-            stack.push((*id, 0));
-            while let Some((id, depth)) = stack.pop() {
-                if out.len() == limit {
-                    return out;
-                }
-                let Some(node) = self.live.get(&id) else {
-                    continue;
-                };
-                out.push((id, node, depth));
-                let child_depth = depth + 1;
-                stack.extend(
-                    node.children
-                        .iter()
-                        .rev()
-                        .map(|child| (*child, child_depth)),
-                );
-            }
-        }
-        out
     }
 }
 

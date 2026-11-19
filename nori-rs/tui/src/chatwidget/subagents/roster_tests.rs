@@ -29,6 +29,7 @@ fn announce(tree: &mut SubagentTree, parent: &acp::SessionId, index: usize, now:
             parent_session_id: parent.clone(),
             session_id: session(index),
             agent: Patch::Keep,
+            model: Patch::Keep,
             title: Patch::Set("general-purpose".into()),
             description: Patch::Set(format!("task {index}")),
             state: Patch::Set(SubagentState::Running),
@@ -43,6 +44,7 @@ fn end(tree: &mut SubagentTree, index: usize, outcome: SubagentOutcome, now: Ins
             parent_session_id: acp::SessionId::new("root"),
             session_id: session(index),
             agent: Patch::Keep,
+            model: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(outcome)),
@@ -126,7 +128,13 @@ fn a_nested_child_names_its_parent_even_after_the_parent_is_gone() {
     announce(&mut tree, &root, 1, base);
     announce(&mut tree, &session(1), 2, base);
     let (entries, _) = tree.entries(base);
-    assert_eq!(find(&entries, 2).parent.as_deref(), Some("task 1"));
+    assert_eq!(
+        find(&entries, 2)
+            .parent
+            .as_ref()
+            .map(|parent| parent.label.as_str()),
+        Some("task 1")
+    );
     assert_eq!(find(&entries, 1).parent, None);
 
     end(
@@ -137,7 +145,10 @@ fn a_nested_child_names_its_parent_even_after_the_parent_is_gone() {
     );
     let (entries, _) = tree.entries(base);
     assert_eq!(
-        find(&entries, 2).parent.as_deref(),
+        find(&entries, 2)
+            .parent
+            .as_ref()
+            .map(|parent| parent.label.as_str()),
         Some("task 1"),
         "a finished child keeps the name of the parent it ran under"
     );
@@ -163,6 +174,10 @@ fn a_launcher_call_is_replaced_by_the_session_it_started() {
             recipient_session_id: Some(session(1)),
             text: "go".into(),
             chunk: false,
+            sender_label: None,
+            recipient_label: None,
+            delivery: None,
+            failure: None,
         },
         base,
     );
@@ -241,6 +256,7 @@ fn idle_child_resumes_with_the_same_history_and_identity() {
         parent_session_id: root.clone(),
         session_id: session(1),
         agent: Patch::Keep,
+        model: Patch::Keep,
         title: Patch::Keep,
         description: Patch::Keep,
         state: Patch::Set(state),
@@ -268,9 +284,10 @@ fn announced_agent_identity_survives_child_completion() {
     let (mut tree, root) = new_tree();
     tree.on_update(
         SubagentUpdate {
-            parent_session_id: root,
+            parent_session_id: root.clone(),
             session_id: session(1),
             agent: Patch::Set("claude-code".to_owned()),
+            model: Patch::Set("anthropic/claude-sonnet-4".to_owned()),
             title: Patch::Set("Research".to_owned()),
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Running),
@@ -278,6 +295,14 @@ fn announced_agent_identity_survives_child_completion() {
         now,
     );
     assert_eq!(tree.agent_for_key(SubagentKey(1)), Some("claude-code"));
+    assert_eq!(
+        find(&tree.entries(now).0, 1).agent.as_deref(),
+        Some("claude-code")
+    );
+    assert_eq!(
+        find(&tree.entries(now).0, 1).model.as_deref(),
+        Some("anthropic/claude-sonnet-4")
+    );
     end(
         &mut tree,
         1,
@@ -285,6 +310,30 @@ fn announced_agent_identity_survives_child_completion() {
         now,
     );
     assert_eq!(tree.agent_for_key(SubagentKey(1)), Some("claude-code"));
+    assert_eq!(
+        find(&tree.entries(now).0, 1).agent.as_deref(),
+        Some("claude-code")
+    );
+    assert_eq!(
+        find(&tree.entries(now).0, 1).model.as_deref(),
+        Some("anthropic/claude-sonnet-4")
+    );
+    tree.on_update(
+        SubagentUpdate {
+            parent_session_id: root,
+            session_id: session(1),
+            agent: Patch::Keep,
+            model: Patch::Set("deepseek/deepseek-chat".to_owned()),
+            title: Patch::Keep,
+            description: Patch::Keep,
+            state: Patch::Keep,
+        },
+        now,
+    );
+    assert_eq!(
+        find(&tree.entries(now).0, 1).model.as_deref(),
+        Some("deepseek/deepseek-chat")
+    );
 }
 
 #[test]

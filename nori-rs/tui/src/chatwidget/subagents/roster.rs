@@ -14,6 +14,7 @@ use crate::history_cell::AgentMarkdownCell;
 use crate::subagent_switcher::Body;
 use crate::subagent_switcher::BodyQuery;
 use crate::subagent_switcher::Entry;
+use crate::subagent_switcher::Parent;
 use crate::subagent_switcher::Roster;
 use crate::subagent_switcher::Status;
 use crate::subagent_switcher::SubagentKey;
@@ -93,30 +94,6 @@ impl SubagentTree {
         }
         Some(projection)
     }
-    pub(crate) fn tool_projection(
-        &self,
-        key: SubagentKey,
-        width: u16,
-        expanded: &std::collections::HashSet<String>,
-    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
-        let id = NodeId(key.0);
-        if let Some(node) = self.live.get(&id) {
-            return Some(node.tool_projection(&self.context.cwd, width, expanded));
-        }
-        let finished = &self.ended.get(&id)?.finished;
-        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
-        for cell in &finished.detail {
-            projection.push(cell.as_ref(), width, expanded);
-        }
-        if finished.detail.is_empty() && !finished.message.trim().is_empty() {
-            projection.push(
-                &AgentMarkdownCell::new(finished.message.clone(), &self.context.cwd),
-                width,
-                expanded,
-            );
-        }
-        Some(projection)
-    }
     pub(crate) fn parent_for_key(&self, key: SubagentKey) -> Option<SubagentKey> {
         let id = NodeId(key.0);
         self.live
@@ -156,22 +133,38 @@ impl SubagentTree {
     pub(crate) fn entries(&self, now: Instant) -> (Vec<Entry>, Vec<(SubagentKey, SubagentKey)>) {
         let mut entries = Vec::with_capacity(self.live.len() + self.ended.len());
         for (id, node) in &self.live {
-            let parent = node
+            let parent_label = node
                 .parent
                 .and_then(|parent| self.live.get(&parent))
-                .map(|parent| parent.label().to_owned());
+                .map(|parent| parent.label().to_owned())
+                .or_else(|| {
+                    node.history_parent
+                        .and_then(|parent| self.ended.get(&parent))
+                        .map(|record| record.finished.label.clone())
+                });
+            let parent = parent_label.map(|label| Parent {
+                label,
+                target: node
+                    .parent
+                    .or(node.history_parent)
+                    .map(|parent| Target::Subagent(key(parent))),
+            });
             entries.push(Entry {
                 target: Target::Subagent(key(*id)),
                 title: node.label().to_owned(),
                 parent,
-                agent: node.kind().map(str::to_owned),
-                model: None,
+                agent: node
+                    .agent
+                    .clone()
+                    .or_else(|| node.kind().map(str::to_owned)),
+                model: node.model.clone(),
                 status: if node.idle {
                     Status::Idle
                 } else {
                     Status::Running
                 },
                 detail: None,
+                transcript_text: node.searchable_text(),
                 elapsed: now.saturating_duration_since(node.started_at),
                 ended_ago: None,
                 tool_count: node.tool_count,
@@ -180,6 +173,12 @@ impl SubagentTree {
             });
         }
         for (id, record) in &self.ended {
+            if self.live.contains_key(id) {
+                // A completed native child can resume the same ACP session.
+                // Its live row owns the stable key while the ended record
+                // remains the archived transcript.
+                continue;
+            }
             let finished = &record.finished;
             let (status, detail) = match &finished.outcome {
                 SubagentOutcome::Completed { .. } => (Status::Completed, None),
@@ -189,11 +188,17 @@ impl SubagentTree {
             entries.push(Entry {
                 target: Target::Subagent(key(*id)),
                 title: finished.label.clone(),
-                parent: record.parent.clone(),
-                agent: finished.kind.clone(),
-                model: None,
+                parent: record.parent.clone().map(|label| Parent {
+                    label,
+                    target: record
+                        .history_parent
+                        .map(|parent| Target::Subagent(key(parent))),
+                }),
+                agent: record.agent.clone().or_else(|| finished.kind.clone()),
+                model: finished.model.clone(),
                 status,
                 detail,
+                transcript_text: finished.message.clone(),
                 elapsed: finished.elapsed,
                 ended_ago: Some(now.saturating_duration_since(record.ended_at)),
                 tool_count: finished.tool_count,
@@ -269,14 +274,6 @@ impl ChatWidget {
     ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
         self.subagents.project_cell(key, index, width, expanded)
     }
-    pub(crate) fn subagent_tool_projection(
-        &self,
-        key: SubagentKey,
-        width: u16,
-        expanded: &std::collections::HashSet<String>,
-    ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
-        self.subagents.tool_projection(key, width, expanded)
-    }
     pub(crate) fn replace_subagent_history(
         &mut self,
         key: SubagentKey,
@@ -284,6 +281,7 @@ impl ChatWidget {
     ) {
         let id = NodeId(key.0);
         let context = self.subagents.context.clone();
+        self.subagents.revision += 1;
         if let Some(node) = self.subagents.live.get_mut(&id) {
             node.replace_replay(events, &context.cwd, context.animations);
         } else if let Some(ended) = self.subagents.ended.get_mut(&id) {
@@ -320,6 +318,7 @@ impl ChatWidget {
                 Status::Idle
             },
             detail: None,
+            transcript_text: String::new(),
             elapsed: std::time::Duration::ZERO,
             ended_ago: None,
             tool_count: 0,
@@ -342,7 +341,7 @@ impl ChatWidget {
 
     /// The conversation tail of one subagent. The root session's is built by the app, which owns
     /// its transcript.
-    pub(crate) fn subagent_body(&self, query: BodyQuery, now: Instant) -> Option<Body> {
+    pub(crate) fn subagent_body(&self, query: BodyQuery) -> Option<Body> {
         let Target::Subagent(subagent) = query.target else {
             return None;
         };
@@ -351,7 +350,6 @@ impl ChatWidget {
             query,
             revision,
             lines,
-            built_at: now,
         })
     }
 

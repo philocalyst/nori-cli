@@ -1,71 +1,183 @@
+//! A finished subagent in the transcript: one header, the start of what it concluded, and (when
+//! it had helpers of its own) one row counting them. Its whole conversation is in the transcript
+//! overlay and the subagent picker, not here.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use nori_protocol::SubagentOutcome;
-use ratatui::style::Stylize;
+use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
 use super::FinishedSubagent;
+use super::lanes::Counts;
+use super::node::NodeId;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::chrome::Chrome;
+use crate::history_cell::chrome::Header;
+use crate::history_cell::chrome::Target;
+use crate::history_cell::chrome::format_duration;
 
 /// Rows of the child's final message shown in the scrollback summary.
-const SUMMARY_MESSAGE_ROWS: usize = 3;
+const SUMMARY_MESSAGE_ROWS: usize = 2;
 
 /// One finished subagent: a compact summary for the scrollback, the whole detail for the
 /// transcript overlay.
 #[derive(Debug)]
 pub(crate) struct SubagentSummaryCell {
     finished: FinishedSubagent,
+    /// Set by the tree when a child that failed runs again (its fallback route took over): the
+    /// card on screen says so instead of reporting a failure that did not end the work.
+    revived: Arc<AtomicBool>,
+    /// Whether the card has been drawn as revived, so it is redrawn until it has.
+    drawn_revived: AtomicBool,
+    created: Instant,
 }
 
 impl SubagentSummaryCell {
     pub(crate) fn new(finished: FinishedSubagent) -> Self {
-        Self { finished }
+        Self {
+            finished,
+            revived: Arc::default(),
+            drawn_revived: AtomicBool::new(false),
+            created: Instant::now(),
+        }
     }
 
-    fn headline(&self) -> Line<'static> {
+    /// The card's revival flag, for the tree to set if the child comes back.
+    pub(crate) fn revival(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.revived)
+    }
+
+    fn is_revived(&self) -> bool {
+        let revived = self.revived.load(Ordering::Relaxed);
+        if revived {
+            self.drawn_revived.store(true, Ordering::Relaxed);
+        }
+        revived
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collect_ids(&self, ids: &mut Vec<NodeId>) {
+        ids.push(self.finished.node_id);
+        for nested in &self.finished.nested {
+            nested.collect_ids(ids);
+        }
+    }
+
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.finished.node_id
+    }
+
+    /// Count this child and everything that finished under it, by how each ended.
+    pub(super) fn add_counts(&self, counts: &mut Counts) {
+        match &self.finished.outcome {
+            SubagentOutcome::Completed { .. } => counts.done += 1,
+            SubagentOutcome::Failed { .. } => counts.failed += 1,
+            SubagentOutcome::Cancelled | SubagentOutcome::Closed => counts.cancelled += 1,
+        }
+        for nested in &self.finished.nested {
+            nested.add_counts(counts);
+        }
+    }
+
+    /// `✓ auth-audit  claude/sonnet-4 · 1 tool · 34s`: the type shown only when it adds to the
+    /// task, the duration only when it took a second.
+    fn headline(&self, chrome: &Chrome, width: usize) -> Line<'static> {
         let finished = &self.finished;
-        let (mark, detail) = match &finished.outcome {
-            SubagentOutcome::Completed { .. } => ("✓".green(), None),
-            SubagentOutcome::Failed { reason } => ("✗".red(), reason.clone()),
-            SubagentOutcome::Cancelled | SubagentOutcome::Closed => {
-                ("⊘".dim(), Some("cancelled".to_owned()))
-            }
+        let revived = self.is_revived();
+        let (glyph, detail) = match &finished.outcome {
+            SubagentOutcome::Failed { .. } if revived => (
+                Span::styled("↻", chrome.amber()),
+                Some("continued on another route".to_owned()),
+            ),
+            SubagentOutcome::Completed { .. } => (Span::styled("✓", chrome.mint()), None),
+            SubagentOutcome::Failed { reason } => (
+                Span::styled("✗", chrome.coral().add_modifier(Modifier::BOLD)),
+                Some(reason.clone().unwrap_or_else(|| "failed".to_owned())),
+            ),
+            SubagentOutcome::Cancelled | SubagentOutcome::Closed => (
+                Span::styled("⊘", chrome.muted()),
+                Some("cancelled".to_owned()),
+            ),
         };
-        let mut spans: Vec<Span<'static>> = vec![
-            "  ".repeat(finished.depth).into(),
-            mark,
-            " ".into(),
-            finished.label.clone().bold(),
-        ];
-        if let Some(kind) = &finished.kind {
-            spans.push(format!("  {kind}").dim());
+        let indent = "  ".repeat(finished.depth);
+        let mut meta = Vec::new();
+        if finished.tool_count > 0 {
+            meta.push(chrome.fact(tool_count_text(finished.tool_count)));
         }
-        spans.push(
-            match finished.tool_count {
-                0 => format!(" · {}", format_elapsed(finished.elapsed)),
-                count => format!(
-                    " · {} · {}",
-                    tool_count_text(count),
-                    format_elapsed(finished.elapsed)
-                ),
-            }
-            .dim(),
-        );
+        if let Some(took) = format_duration(finished.elapsed) {
+            meta.push(chrome.fact(took));
+        }
         if let Some(detail) = detail {
-            spans.push(format!(" · {detail}").dim());
+            meta.push(Span::styled(
+                detail,
+                if revived {
+                    chrome.amber()
+                } else {
+                    chrome.coral()
+                },
+            ));
         }
-        Line::from(spans)
+        let mut who = chrome.identity(finished.agent.as_deref(), finished.model.as_deref());
+        if who.is_empty()
+            && let Some(kind) = finished
+                .kind
+                .as_ref()
+                .filter(|kind| **kind != finished.label)
+        {
+            who.push(Span::styled(kind.clone(), chrome.muted()));
+        }
+        let mut line = chrome.header(
+            Header {
+                glyph,
+                verb: finished.label.clone(),
+                target: if who.is_empty() {
+                    Target::None
+                } else {
+                    Target::Spans(who)
+                },
+                chip: Vec::new(),
+                meta,
+            },
+            width.saturating_sub(indent.len()),
+        );
+        line.spans.insert(0, Span::raw(indent));
+        line
+    }
+
+    /// `⋮ 3 nested · ✓2 ✗1`: what finished under this child, in one row.
+    fn nested_summary(&self, chrome: &Chrome) -> Option<Line<'static>> {
+        let mut counts = Counts::default();
+        for nested in &self.finished.nested {
+            nested.add_counts(&mut counts);
+        }
+        if counts.total() == 0 {
+            return None;
+        }
+        let mut spans = vec![
+            Span::raw("  ".repeat(self.finished.depth + 1)),
+            Span::styled("⋮ ", chrome.faint()),
+            Span::styled(format!("{} nested", counts.total()), chrome.muted()),
+            chrome.dot(),
+        ];
+        spans.extend(counts.spans(chrome));
+        Some(Line::from(spans))
     }
 }
 
 impl HistoryCell for SubagentSummaryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![self.headline()];
+        let chrome = Chrome::live();
+        let mut lines = vec![self.headline(&chrome, usize::from(width))];
         let indent = "  ".repeat(self.finished.depth + 1);
         let message = self.finished.message.trim();
         if !message.is_empty() {
-            // The child's answer is markdown; its first rendered rows stand for it, dimmed so the
+            // The child's answer is markdown; its first rendered rows stand for it, quiet so the
             // root conversation stays the brightest thing on screen.
             let rendered: Vec<Line<'static>> =
                 crate::markdown_render::render_markdown_text_with_width(
@@ -82,26 +194,30 @@ impl HistoryCell for SubagentSummaryCell {
                 .collect();
             let total = rendered.len();
             for line in rendered.into_iter().take(SUMMARY_MESSAGE_ROWS) {
-                let mut spans = vec![Span::from(indent.clone())];
-                spans.extend(line.spans.into_iter().map(ratatui::prelude::Stylize::dim));
+                let mut spans = vec![Span::raw(indent.clone())];
+                spans.extend(line.spans.into_iter().map(|mut span| {
+                    span.style = chrome.muted().patch(span.style);
+                    span
+                }));
                 lines.push(Line::from(spans));
             }
             if total > SUMMARY_MESSAGE_ROWS {
                 lines.push(Line::from(vec![
-                    indent.into(),
-                    format!(
-                        "… {} more lines (ctrl+t for the full transcript)",
-                        total - SUMMARY_MESSAGE_ROWS
-                    )
-                    .dim(),
+                    Span::raw(indent),
+                    Span::styled(
+                        format!("⋯ +{} more lines", total - SUMMARY_MESSAGE_ROWS),
+                        chrome.faint(),
+                    ),
                 ]));
             }
         }
+        lines.extend(self.nested_summary(&chrome));
         lines
     }
 
     fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![self.headline()];
+        let chrome = Chrome::live();
+        let mut lines = vec![self.headline(&chrome, usize::from(width))];
         for cell in &self.finished.detail {
             for mut line in cell.transcript_lines(width.saturating_sub(4).max(1)) {
                 line.spans.insert(0, "    ".into());
@@ -113,6 +229,14 @@ impl HistoryCell for SubagentSummaryCell {
 
     fn full_transcript(&self) -> bool {
         true
+    }
+
+    /// A failed child's card may flip to "continued" while it is on screen: it is redrawn each
+    /// frame until it has, for at most two minutes.
+    fn animated(&self) -> bool {
+        matches!(self.finished.outcome, SubagentOutcome::Failed { .. })
+            && !self.drawn_revived.load(Ordering::Relaxed)
+            && self.created.elapsed() < Duration::from_secs(120)
     }
 }
 
@@ -130,101 +254,5 @@ pub(crate) fn format_elapsed(elapsed: Duration) -> String {
         format!("{seconds}s")
     } else {
         format!("{}m {:02}s", seconds / 60, seconds % 60)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    fn plain(lines: &[Line<'static>]) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect()
-    }
-
-    fn finished(outcome: SubagentOutcome, message: &str) -> FinishedSubagent {
-        FinishedSubagent {
-            label: "Read a.txt contents".into(),
-            kind: Some("general-purpose".into()),
-            outcome,
-            tool_count: 1,
-            elapsed: Duration::from_secs(34),
-            message: message.into(),
-            detail: Vec::new(),
-            depth: 0,
-        }
-    }
-
-    #[test]
-    fn completed_child_summary() {
-        let cell = SubagentSummaryCell::new(finished(
-            SubagentOutcome::Completed {
-                stop_reason: Some("end_turn".into()),
-            },
-            "The file holds alpha.",
-        ));
-        assert_eq!(
-            plain(&cell.display_lines(80)),
-            vec![
-                "✓ Read a.txt contents  general-purpose · 1 tool · 34s".to_string(),
-                "  The file holds alpha.".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_and_cancelled_children() {
-        let failed = SubagentSummaryCell::new(finished(
-            SubagentOutcome::Failed {
-                reason: Some("usage limit".into()),
-            },
-            "",
-        ));
-        assert_eq!(
-            plain(&failed.display_lines(80)),
-            vec!["✗ Read a.txt contents  general-purpose · 1 tool · 34s · usage limit".to_string()]
-        );
-        let cancelled = SubagentSummaryCell::new(finished(SubagentOutcome::Cancelled, ""));
-        assert!(plain(&cancelled.display_lines(80))[0].contains("cancelled"));
-    }
-
-    #[test]
-    fn long_messages_are_collapsed() {
-        let message = (0..10)
-            .map(|n| format!("line {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let cell = SubagentSummaryCell::new(finished(
-            SubagentOutcome::Completed { stop_reason: None },
-            &message,
-        ));
-        let lines = plain(&cell.display_lines(80));
-        assert_eq!(lines.len(), 1 + SUMMARY_MESSAGE_ROWS + 1);
-        assert!(lines.last().is_some_and(|line| line.contains("more lines")));
-    }
-
-    #[test]
-    fn the_message_is_rendered_as_markdown() {
-        let cell = SubagentSummaryCell::new(finished(
-            SubagentOutcome::Completed { stop_reason: None },
-            "**Done.** The files:\n\n- `a.txt` holds alpha\n- `b.txt` holds beta",
-        ));
-        assert_eq!(
-            plain(&cell.display_lines(80))[1..],
-            [
-                "  Done. The files:".to_string(),
-                "  - a.txt holds alpha".to_string(),
-                "  - b.txt holds beta".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn elapsed_formats() {
-        assert_eq!(format_elapsed(Duration::from_secs(7)), "7s");
-        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 05s");
     }
 }

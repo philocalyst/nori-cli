@@ -52,6 +52,13 @@ impl Status {
     }
 }
 
+/// Who started a subagent: its name, and its row when that is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Parent {
+    pub(crate) label: String,
+    pub(crate) target: Option<Target>,
+}
+
 /// One row of the switcher.
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
@@ -59,12 +66,14 @@ pub(crate) struct Entry {
     /// The task, or the type of subagent when no task is known.
     pub(crate) title: String,
     /// The subagent that started this one, so a nested child reads `parent › child`.
-    pub(crate) parent: Option<String>,
+    pub(crate) parent: Option<Parent>,
     pub(crate) agent: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) status: Status,
     /// Why it failed, when it said.
     pub(crate) detail: Option<String>,
+    /// Flattened child transcript text for full-text search.
+    pub(crate) transcript_text: String,
     /// How long it has run, or ran.
     pub(crate) elapsed: Duration,
     /// How long ago it ended.
@@ -86,6 +95,7 @@ impl Entry {
             && self.parent == other.parent
             && self.agent == other.agent
             && self.model == other.model
+            && self.detail == other.detail
     }
 }
 
@@ -147,19 +157,4 @@ pub(crate) struct Body {
     /// The [`Entry::revision`] it was built from.
     pub(crate) revision: i64,
     pub(crate) lines: Vec<Line<'static>>,
-    pub(crate) built_at: Instant,
-}
-
-/// A running session's output changes without a new revision (a tool's spinner turns), so its
-/// body is rebuilt at least this often.
-pub(crate) const LIVE_REFRESH: Duration = Duration::from_millis(250);
-
-impl Body {
-    /// Whether this body still shows `entry` as asked: nothing changed, and nothing animates.
-    pub(crate) fn is_current(&self, entry: &Entry, query: BodyQuery, now: Instant) -> bool {
-        self.query == query
-            && self.revision == entry.revision
-            && (!entry.status.is_running()
-                || now.saturating_duration_since(self.built_at) < LIVE_REFRESH)
-    }
 }

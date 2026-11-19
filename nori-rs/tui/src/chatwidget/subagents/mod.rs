@@ -9,32 +9,27 @@
 //! explicitly. For agents that do not, a root tool call that launches a subagent (`Agent`/`Task`),
 //! and the root-session updates tagged with its id, stand in for the announcement.
 
-mod block;
 mod cell;
 mod events;
+mod lanes;
 mod node;
 mod projection;
 mod roster;
-mod strip;
 mod tree;
 
-pub(crate) use block::SPINNER_FRAMES;
-pub(crate) use block::SPINNER_PERIOD;
-#[cfg(test)]
-pub(crate) use block::SubagentBlock;
+pub(crate) use crate::history_cell::chrome::SPINNER_FRAMES;
+pub(crate) use crate::history_cell::chrome::SPINNER_PERIOD;
 pub(crate) use cell::SubagentSummaryCell;
 pub(crate) use cell::format_elapsed;
 pub(crate) use cell::tool_count_text;
+pub(crate) use lanes::InChatSubagents;
 pub(crate) use projection::project_child_history;
-pub(crate) use strip::StripAction;
-pub(crate) use strip::StripState;
-pub(crate) use strip::SubagentStrip;
 pub(crate) use tree::ChildTarget;
 pub(crate) use tree::FinishedSubagent;
 pub(crate) use tree::SubagentTree;
 
 #[cfg(test)]
-mod block_tests;
+mod completion_tests;
 #[cfg(test)]
 mod roster_tests;
 #[cfg(test)]

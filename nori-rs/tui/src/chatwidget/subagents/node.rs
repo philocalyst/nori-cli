@@ -1,6 +1,6 @@
 //! One running subagent: what the live block shows and the detail its summary will carry.
 
-use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,7 +13,7 @@ use nori_protocol::acp::v1::SessionId;
 
 use ratatui::text::Line;
 
-use super::block::RowCache;
+use super::SubagentSummaryCell;
 use crate::client_tool_cell::ClientToolCell;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::HistoryCell;
@@ -25,6 +25,8 @@ use crate::subagent_switcher::cell_lines;
 
 /// How much of a child's final message is kept for its summary.
 const MAX_FINAL_MESSAGE_BYTES: usize = 8 * 1024;
+/// How much of a conversation's words the picker can search.
+const MAX_SEARCH_BYTES: usize = 8 * 1024;
 /// The activity row shows at most this many characters of the latest line.
 const MAX_ACTIVITY_CHARS: usize = 240;
 /// The latest line is looked for in at most this many trailing bytes of streamed text, so a
@@ -34,7 +36,7 @@ const ACTIVITY_SCAN_BYTES: usize = MAX_ACTIVITY_CHARS * 4;
 /// Identity of a running subagent within its tree. Ids grow and are never reused, so ordering by
 /// id is the order in which subagents appeared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct NodeId(pub(super) i64);
+pub(crate) struct NodeId(pub(crate) i64);
 
 /// A part of a child's detail, in the order it happened.
 #[derive(Debug)]
@@ -65,6 +67,7 @@ pub(super) struct Node {
     /// Child session id, once known. A child known only through its launcher call has none.
     pub(super) session_id: Option<SessionId>,
     pub(super) agent: Option<String>,
+    pub(super) model: Option<String>,
     /// The root tool call that launched this child, once known.
     pub(super) launcher_call_id: Option<String>,
     /// The running subagent that announced this one.
@@ -89,30 +92,50 @@ pub(super) struct Node {
     pub(super) active_at: Instant,
     /// The most recent message or tool work, excluding status-only updates.
     pub(super) work_at: Instant,
-    /// Rows built for the live block, reused until the node changes or the width does.
-    pub(super) row_cache: RefCell<Option<RowCache>>,
     /// Summaries of this child's own finished children, for the detail view.
-    pub(super) nested: Vec<Arc<dyn HistoryCell>>,
+    pub(super) nested: Vec<Arc<SubagentSummaryCell>>,
+    pub(super) nested_by_id: BTreeMap<NodeId, Arc<SubagentSummaryCell>>,
+    /// Completed-turn cells retained while a reusable provider session runs again.
+    pub(super) archived: Vec<Arc<dyn HistoryCell>>,
     transcript: ChildTranscript,
     projection_epoch: i64,
+    /// The tail of the conversation as plain words, for search.
+    search: String,
 }
 
 impl Node {
     pub(super) fn projection_len(&self) -> usize {
-        self.transcript.parts.len() + self.nested.len()
+        self.archived.len() + self.transcript.parts.len() + self.nested.len()
     }
 
     pub(super) fn projection_continuation(&self, index: usize) -> Option<bool> {
-        if index < self.transcript.parts.len() {
+        if index < self.archived.len() {
+            self.archived
+                .get(index)
+                .map(|cell| cell.is_stream_continuation())
+        } else if index - self.archived.len() < self.transcript.parts.len() {
+            let _index = index - self.archived.len();
             Some(false)
         } else {
             self.nested
-                .get(index.checked_sub(self.transcript.parts.len())?)
+                .get(
+                    index
+                        .checked_sub(self.archived.len())?
+                        .checked_sub(self.transcript.parts.len())?,
+                )
                 .map(|cell| cell.is_stream_continuation())
         }
     }
 
     pub(super) fn projection_revision(&self, index: usize) -> Option<i64> {
+        if let Some(cell) = self.archived.get(index) {
+            return Some(
+                self.projection_epoch
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(cell.display_lines(1).len() as i64),
+            );
+        }
+        let index = index - self.archived.len();
         let revision = match self.transcript.parts.get(index) {
             Some(Detail::Tool { revision, .. }) => revision.wrapping_mul(3),
             Some(Detail::User(text)) => i64::try_from(text.len())
@@ -143,6 +166,11 @@ impl Node {
         expanded: &std::collections::HashSet<String>,
     ) -> Option<crate::chatwidget::tool_projection::ToolProjection> {
         let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
+        if let Some(cell) = self.archived.get(index) {
+            projection.push(cell.as_ref(), width, expanded);
+            return Some(projection);
+        }
+        let index = index - self.archived.len();
         match self.transcript.parts.get(index) {
             Some(Detail::Tool { cell, .. }) => projection.push(cell.as_ref(), width, expanded),
             Some(Detail::User(message)) => projection.push(
@@ -166,37 +194,32 @@ impl Node {
         Some(projection)
     }
 
-    pub(super) fn tool_projection(
-        &self,
-        cwd: &Path,
-        width: u16,
-        expanded: &std::collections::HashSet<String>,
-    ) -> crate::chatwidget::tool_projection::ToolProjection {
-        let mut projection = crate::chatwidget::tool_projection::ToolProjection::default();
-        for part in &self.transcript.parts {
-            match part {
-                Detail::Tool { cell, .. } => projection.push(cell.as_ref(), width, expanded),
-                Detail::User(message) => projection.push(
-                    &UserHistoryCell {
-                        message: message.clone(),
-                    },
-                    width,
-                    expanded,
-                ),
-                Detail::Text(text) => {
-                    projection.push(&AgentMarkdownCell::new(text.clone(), cwd), width, expanded)
-                }
-            }
-        }
-        for cell in &self.nested {
-            projection.push(cell.as_ref(), width, expanded);
-        }
-        projection
+    /// The words of the conversation, for the picker's full-text search: the tail of it, kept as
+    /// it happens so reading it costs a copy and not a walk through the transcript.
+    pub(super) fn searchable_text(&self) -> String {
+        self.search.clone()
     }
+
+    /// Add `text` to what the picker can search, dropping the oldest words past the cap.
+    fn remember(&mut self, text: &str) {
+        if !self.search.is_empty() {
+            self.search.push('\n');
+        }
+        self.search.push_str(text);
+        if self.search.len() > MAX_SEARCH_BYTES {
+            let mut cut = self.search.len() - MAX_SEARCH_BYTES;
+            while !self.search.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.search.drain(..cut);
+        }
+    }
+
     pub(super) fn new(now: Instant) -> Self {
         Self {
             session_id: None,
             agent: None,
+            model: None,
             launcher_call_id: None,
             parent: None,
             history_parent: None,
@@ -211,10 +234,12 @@ impl Node {
             revision: 0,
             active_at: now,
             work_at: now,
-            row_cache: RefCell::new(None),
             nested: Vec::new(),
+            nested_by_id: BTreeMap::new(),
+            archived: Vec::new(),
             transcript: ChildTranscript::default(),
             projection_epoch: 0,
+            search: String::new(),
         }
     }
 
@@ -226,10 +251,11 @@ impl Node {
             .unwrap_or("subagent")
     }
 
-    /// The type of the child, shown dim next to the task when both exist.
+    /// The type of the child, shown next to the task when it says something the task does not:
+    /// a title that only repeats the description is not a type.
     pub(super) fn kind(&self) -> Option<&str> {
         match (&self.description, &self.title) {
-            (Some(_), Some(title)) => Some(title),
+            (Some(description), Some(title)) if description != title => Some(title),
             _ => None,
         }
     }
@@ -256,6 +282,7 @@ impl Node {
     ) {
         self.projection_epoch = self.projection_epoch.wrapping_add(1);
         self.transcript = ChildTranscript::default();
+        self.search.clear();
         self.tool_count = 0;
         for event in events {
             match event {
@@ -282,6 +309,7 @@ impl Node {
                 if let acp::ContentBlock::Text(text) = &chunk.content {
                     self.transcript.text_open = false;
                     self.transcript.parts.push(Detail::User(text.text.clone()));
+                    self.remember(&text.text);
                     self.transcript.text_open = false;
                 }
             }
@@ -297,6 +325,7 @@ impl Node {
                         continue;
                     };
                     if !snapshot.title.is_empty() {
+                        self.remember(&snapshot.title);
                         self.activity.clear();
                         self.activity
                             .extend(snapshot.title.chars().take(MAX_ACTIVITY_CHARS));
@@ -335,6 +364,15 @@ impl Node {
     }
 
     fn push_text(&mut self, delta: &str) {
+        // Streamed words extend the line they continue.
+        self.search.push_str(delta);
+        if self.search.len() > MAX_SEARCH_BYTES * 2 {
+            let mut cut = self.search.len() - MAX_SEARCH_BYTES;
+            while !self.search.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.search.drain(..cut);
+        }
         match self.transcript.parts.last_mut() {
             Some(Detail::Text(text)) if self.transcript.text_open => text.push_str(delta),
             _ => self.transcript.parts.push(Detail::Text(delta.to_owned())),
@@ -365,6 +403,12 @@ impl Node {
     /// overlay would show them. Costs the rows asked for, not the length of the transcript.
     pub(super) fn detail_lines(&self, cwd: &Path, width: u16, rows: usize) -> Vec<Line<'static>> {
         let mut tail = Tail::new(rows);
+        for cell in self.archived.iter().rev() {
+            if tail.is_full() {
+                break;
+            }
+            tail.push_front(cell_lines(cell.as_ref(), width));
+        }
         for cell in self.nested.iter().rev() {
             if tail.is_full() {
                 break;
@@ -411,7 +455,11 @@ impl Node {
                 }
             })
             .collect();
-        detail.append(&mut self.nested);
+        detail.extend(
+            self.nested
+                .drain(..)
+                .map(|cell| cell as Arc<dyn HistoryCell>),
+        );
         (detail, final_message)
     }
 }

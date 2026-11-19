@@ -15,7 +15,6 @@ use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 
 use super::ChildTarget;
-use super::SubagentBlock;
 use super::SubagentTree;
 
 const SESSIONS: usize = 6;
@@ -29,6 +28,7 @@ fn update(parent: acp::SessionId, child: usize, state: SubagentState) -> Subagen
         parent_session_id: parent,
         session_id: session(child),
         agent: Patch::Keep,
+        model: Patch::Keep,
         title: Patch::Set("general-purpose".into()),
         description: Patch::Set(format!("task {child}")),
         state: Patch::Set(state),
@@ -89,7 +89,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// Whatever order announcements, output and endings arrive in: every running child is shown
-    /// exactly once, every child that ends is reported exactly once, and nothing ended runs again.
+    /// exactly once, subtree completion never duplicates a child, and ending the root loses no nodes.
     #[test]
     fn any_interleaving_keeps_the_tree_consistent(ops in proptest::collection::vec(op(), 1..80)) {
         let base = Instant::now();
@@ -97,13 +97,17 @@ proptest! {
         let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
         tree.set_root(root.clone());
         let mut ended: BTreeSet<usize> = BTreeSet::new();
-        let mut reported = 0;
         for (step, op) in ops.into_iter().enumerate() {
             let now = base + Duration::from_millis(u64::try_from(step).unwrap_or(0));
             match op {
                 Op::Announce { child, parent } => {
                     let parent = parent.filter(|parent| *parent != child).map_or(root.clone(), session);
                     tree.on_update(update(parent, child, SubagentState::Running), now);
+                    // Only an explicit Running update can begin another turn on
+                    // a completed session. Late output alone cannot revive it.
+                    if tree.live.values().any(|node| node.session_id.as_ref() == Some(&session(child))) {
+                        ended.remove(&child);
+                    }
                 }
                 Op::Text { child } => {
                     tree.on_child_update(ChildTarget::Session(&session(child)), &text("more\n"), now);
@@ -136,12 +140,33 @@ proptest! {
                             recipient_session_id: Some(session(child)),
                             text: "go".into(),
                             chunk: false,
+                            sender_label: None,
+                            recipient_label: None,
+                            delivery: None,
+                            failure: None,
                         },
                         now,
                     );
                 }
             }
-            reported += tree.take_finished().len();
+            let mut emitted = Vec::new();
+            for finished in tree.take_finished() {
+                emitted.push(finished.node_id);
+                for nested in finished.nested {
+                    nested.collect_ids(&mut emitted);
+                }
+            }
+            prop_assert_eq!(emitted.len(), emitted.iter().copied().collect::<BTreeSet<_>>().len(),
+                "a completed subtree emitted the same child twice");
+            for id in tree.live.keys() {
+                let mut ancestors = BTreeSet::new();
+                let mut current = Some(*id);
+                while let Some(ancestor) = current {
+                    prop_assert!(ancestors.insert(ancestor), "cyclic subagent ancestry");
+                    current = tree.live.get(&ancestor).and_then(|node| node.parent)
+                        .or_else(|| tree.ended.get(&ancestor).and_then(|record| record.parent_id));
+                }
+            }
             let shown = tree.display_order(usize::MAX);
             prop_assert_eq!(shown.len(), tree.running_count());
             let mut seen = BTreeSet::new();
@@ -153,12 +178,37 @@ proptest! {
                 }
             }
         }
-        // Each child that ended was reported exactly once.
-        prop_assert_eq!(reported, ended.len());
-        let running = tree.running_count();
+        // Cancelling the root must conserve every retained live or pending
+        // subtree, regardless of which parent finished or reactivated first.
+        let mut expected: Vec<_> = tree.live.keys().chain(tree.pending.keys()).copied().collect();
+        for node in tree.live.values() {
+            for nested in &node.nested {
+                nested.collect_ids(&mut expected);
+            }
+        }
+        for pending in tree.pending.values() {
+            for nested in &pending.nested {
+                nested.collect_ids(&mut expected);
+            }
+        }
+        for nested in tree.pending_nested.values().flat_map(|children| children.values()) {
+            nested.collect_ids(&mut expected);
+        }
+        let expected: BTreeSet<_> = expected.into_iter().collect();
         tree.on_root_turn_end(true, base + Duration::from_secs(60));
         prop_assert_eq!(tree.running_count(), 0);
-        prop_assert_eq!(tree.take_finished().len(), running);
+        let mut emitted = Vec::new();
+        for finished in tree.take_finished() {
+            emitted.push(finished.node_id);
+            for nested in finished.nested {
+                nested.collect_ids(&mut emitted);
+            }
+        }
+        let actual: BTreeSet<_> = emitted.iter().copied().collect();
+        prop_assert_eq!(emitted.len(), actual.len(), "a child was emitted twice when the root ended");
+        prop_assert_eq!(actual, expected, "a retained subtree was lost when the root ended");
+        prop_assert!(tree.pending.is_empty(), "root cancellation left a pending ancestor");
+        prop_assert!(tree.take_finished().is_empty());
     }
 }
 
@@ -180,13 +230,21 @@ fn a_finished_grandchild_is_nested_in_its_parent_and_reported_once() {
     let done = SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None });
     tree.on_update(update(session(1), 2, done.clone()), now);
     let finished = tree.take_finished();
-    assert_eq!(finished.len(), 1);
-    assert_eq!(finished[0].depth, 1);
+    assert!(finished.is_empty());
     // A late update for the finished grandchild changes nothing.
     tree.on_child_update(ChildTarget::Session(&session(2)), &text("late"), now);
     tree.on_update(update(session(1), 2, SubagentState::Running), now);
-    assert_eq!(tree.running_count(), 1);
+    assert_eq!(tree.running_count(), 2);
     tree.on_update(update(root, 1, done), now);
+    assert!(tree.take_finished().is_empty());
+    tree.on_update(
+        update(
+            session(1),
+            2,
+            SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None }),
+        ),
+        now,
+    );
     let parent = tree.take_finished();
     assert_eq!(parent.len(), 1);
     assert_eq!(
@@ -194,6 +252,94 @@ fn a_finished_grandchild_is_nested_in_its_parent_and_reported_once() {
         1,
         "the grandchild's summary is in its parent's detail"
     );
+}
+
+#[test]
+fn a_parent_summary_waits_for_a_grandchild_that_finishes_later() {
+    let now = Instant::now();
+    let root = acp::SessionId::new("root");
+    let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
+    tree.set_root(root.clone());
+    tree.on_update(update(root.clone(), 1, SubagentState::Running), now);
+    tree.on_update(update(session(1), 2, SubagentState::Running), now);
+    tree.on_update(update(session(2), 3, SubagentState::Running), now);
+    let done = SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None });
+
+    tree.on_update(update(root, 1, done.clone()), now);
+    assert!(tree.take_finished().is_empty());
+    tree.on_update(update(session(1), 2, done.clone()), now);
+    assert!(tree.take_finished().is_empty());
+    tree.on_update(update(session(2), 3, done), now);
+
+    let finished = tree.take_finished();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].label, "task 1");
+    assert_eq!(finished[0].nested.len(), 1);
+    assert_eq!(finished[0].detail.len(), 1);
+}
+
+#[test]
+fn reactivated_parent_keeps_a_live_child_visible() {
+    let now = Instant::now();
+    let root = acp::SessionId::new("root");
+    let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
+    tree.set_root(root.clone());
+    tree.on_child_update(ChildTarget::Session(&session(5)), &text("first"), now);
+    tree.on_update(update(session(5), 0, SubagentState::Running), now);
+    tree.on_update(
+        update(
+            session(5),
+            5,
+            SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None }),
+        ),
+        now,
+    );
+    tree.on_update(update(root, 5, SubagentState::Running), now);
+    let shown = tree.display_order(usize::MAX);
+    assert_eq!(shown.len(), 2);
+    assert!(
+        shown
+            .iter()
+            .any(|(_, node, _)| node.session_id == Some(session(0)))
+    );
+}
+
+#[test]
+fn a_completed_native_child_reactivates_with_the_same_key() {
+    let now = Instant::now();
+    let root = acp::SessionId::new("root");
+    let child = session(1);
+    let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
+    tree.set_root(root.clone());
+    tree.on_update(update(root.clone(), 1, SubagentState::Running), now);
+    tree.on_child_update(ChildTarget::Session(&child), &text("first turn"), now);
+    tree.on_update(
+        update(
+            root.clone(),
+            1,
+            SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None }),
+        ),
+        now,
+    );
+    let first = tree.take_finished();
+    assert_eq!(first.len(), 1);
+    let key = first[0].label.clone();
+
+    tree.on_update(update(root, 1, SubagentState::Running), now);
+    assert_eq!(tree.running_count(), 1);
+    tree.on_child_update(ChildTarget::Session(&child), &text("second turn"), now);
+    tree.on_update(
+        update(
+            acp::SessionId::new("root"),
+            1,
+            SubagentState::Ended(SubagentOutcome::Completed { stop_reason: None }),
+        ),
+        now,
+    );
+    let second = tree.take_finished();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].label, key);
+    assert!(second[0].detail.len() >= 2);
 }
 
 #[test]
@@ -220,39 +366,4 @@ fn the_final_message_is_what_the_child_said_after_its_last_tool() {
     assert_eq!(finished[0].message, "The file holds alpha.");
     assert_eq!(finished[0].tool_count, 1);
     assert_eq!(finished[0].detail.len(), 3);
-}
-
-/// Sixteen children streaming a thousand updates each cost a frame only the rows of the children
-/// that changed since the previous frame, never work proportional to the updates.
-#[test]
-fn a_frame_costs_the_rows_that_changed_not_the_updates_that_arrived() {
-    let base = Instant::now();
-    let root = acp::SessionId::new("root");
-    let mut tree = SubagentTree::new(PathBuf::from("/work"), false);
-    tree.set_root(root.clone());
-    for child in 0..16 {
-        tree.on_update(update(root.clone(), child, SubagentState::Running), base);
-    }
-    let frame = |tree: &SubagentTree| {
-        SubagentBlock {
-            tree,
-            now: base,
-            screen_rows: 0,
-        }
-        .lines(80)
-        .len()
-    };
-    assert_eq!(frame(&tree), 32);
-    let after_first_frame = tree.rows_built();
-    assert_eq!(after_first_frame, 16);
-    for round in 0..1000 {
-        for child in 0..16 {
-            let delta = if round % 10 == 0 { "line\n" } else { "word " };
-            tree.on_child_update(ChildTarget::Session(&session(child)), &text(delta), base);
-        }
-    }
-    let _ = frame(&tree);
-    assert_eq!(tree.rows_built(), after_first_frame + 16);
-    let _ = frame(&tree);
-    assert_eq!(tree.rows_built(), after_first_frame + 16);
 }

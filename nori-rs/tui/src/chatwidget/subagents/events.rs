@@ -10,6 +10,7 @@ use nori_protocol::acp::v1 as acp;
 use super::ChildTarget;
 use super::SubagentSummaryCell;
 use crate::chatwidget::ChatWidget;
+use crate::history_cell::PeerMessageCell;
 
 /// How often the live block is redrawn while a child runs, for its spinner and clock.
 const ANIMATION_FRAME: Duration = Duration::from_millis(80);
@@ -81,6 +82,7 @@ impl ChatWidget {
 
     /// The root turn ended; children that only a launcher call stood for end with it.
     pub(in crate::chatwidget) fn subagents_turn_ended(&mut self, cancelled: bool) {
+        self.subagents.close_peer_messages();
         self.subagents.on_root_turn_end(cancelled, Instant::now());
         self.after_subagent_change();
     }
@@ -98,19 +100,41 @@ impl ChatWidget {
 
     /// Commit children that finished, refresh the status line, and keep the clock moving.
     fn after_subagent_change(&mut self) {
-        for finished in self.subagents.take_finished() {
-            // Text the root is streaming is finalized first so the summary lands where the child
-            // finished, not in the middle of a message.
-            self.flush_answer_stream_with_separator();
-            self.add_to_history(SubagentSummaryCell::new(finished));
-        }
+        self.commit_finished_subagents();
         let running = self.subagents.running_count();
+        self.bottom_pane
+            .set_active_subagent_count(i64::try_from(running).unwrap_or(0));
         if running != self.subagents_running_shown {
             self.subagents_running_shown = running;
             let header = self.current_status_header.clone();
             self.set_status_header(header);
         }
         self.request_redraw();
+    }
+
+    /// Peer messages that became whole and children whose end can be believed, as cells. They
+    /// are side cells: while an answer streams they wait for it to be whole.
+    fn commit_finished_subagents(&mut self) {
+        for peer in self.subagents.take_peer_messages() {
+            self.add_side_cell(PeerMessageCell::new(
+                peer.from,
+                peer.to,
+                peer.delivery,
+                peer.text,
+            ));
+        }
+        for finished in self.subagents.take_finished() {
+            if finished.depth > 0 {
+                // Nested completions are rendered as compact lines inside their controlling
+                // parent's summary. Their full detail is retained by the parent transcript and
+                // the picker; adding them to root history would flatten the hierarchy.
+                continue;
+            }
+            let node_id = finished.node_id;
+            let card = SubagentSummaryCell::new(finished);
+            self.subagents.register_summary(node_id, card.revival());
+            self.add_side_cell(card);
+        }
     }
 
     /// Called before every draw: while a child runs, ask for the next animation frame.
@@ -125,6 +149,10 @@ impl ChatWidget {
         }
     }
 
+    pub(crate) fn running_subagents(&self) -> usize {
+        self.subagents.running_count()
+    }
+
     /// Whether Esc stops the running subagents: they run on while the agent that started them is
     /// idle, so there is no turn for Esc to interrupt instead.
     pub(crate) fn subagents_stoppable(&self) -> bool {
@@ -133,7 +161,7 @@ impl ChatWidget {
 
     /// Stop the subagents that run while the agent is idle, as stopping the agent would.
     pub(crate) fn stop_background_subagents(&mut self) {
-        self.submit_harness_action(crate::app_event::HarnessAction::Cancel);
+        self.submit_harness_action(crate::app_event::HarnessAction::StopSubagents);
         self.add_info_message("Stopping the subagents".to_owned(), None);
     }
 
