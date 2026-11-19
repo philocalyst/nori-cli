@@ -1,0 +1,2275 @@
+//! Pkl's value renderers (`JsonRenderer`, `YamlRenderer` and
+//! `PropertiesRenderer` from `pkl:base`) and the conversion of a module's
+//! value to JSON for [`crate::eval_to_json`].
+//!
+//! The renderers follow pkl-core's `AbstractRenderer`: a value is converted
+//! (by `converters` keyed by class or by path), then visited, and each member
+//! is converted before it is visited in turn.
+//!
+//! pklr's [`Value`] does not keep every distinction Pkl's renderers make
+//! (`List` vs `Listing`, `Map` vs `Mapping`, the elements of a `Dynamic` that
+//! also has properties), so [`kind_of`] recovers what it can from an
+//! object's [`ObjectSource`].
+
+use std::sync::Arc;
+
+use rustc_hash::FxHashSet as HashSet;
+
+use super::mapping::type_names_match;
+use crate::error::{Error, Result};
+use crate::parser::{Entry, Modifier};
+use crate::value::{ListValue, ObjectKind, ObjectMap, ObjectSource, Value};
+
+pub(crate) mod json;
+pub(crate) mod jsonnet;
+pub(crate) mod pcf;
+pub(crate) mod plist;
+pub(crate) mod properties;
+pub(crate) mod xml;
+mod xml_names;
+pub(crate) mod yaml;
+
+/// Prefix of a mapping key that stands for a class (`[String] = ...` in
+/// `converters`) rather than a string. pklr's object keys are strings, so a
+/// class key is a string no Pkl source can spell.
+const CLASS_KEY_PREFIX: &str = "\0class:";
+
+/// The mapping key for the class `name`.
+pub(crate) fn class_key(name: &str) -> Arc<str> {
+    format!("{CLASS_KEY_PREFIX}{name}").into()
+}
+
+/// Separates a class's name from its definition-site identity in a class key.
+const CLASS_IDENTITY_SEP: char = '\u{1}';
+
+/// The mapping key for the class `name` declared at `identity`: classes that
+/// share a name, such as `json.Property` and `yaml.Property`, stay apart.
+pub(crate) fn class_key_with_identity(name: &str, identity: Option<&str>) -> Arc<str> {
+    match identity {
+        Some(identity) => format!("{CLASS_KEY_PREFIX}{name}{CLASS_IDENTITY_SEP}{identity}").into(),
+        None => class_key(name),
+    }
+}
+
+/// The class a mapping key made by [`class_key`] stands for.
+pub(crate) fn class_key_name(key: &str) -> Option<&str> {
+    let key = key.strip_prefix(CLASS_KEY_PREFIX)?;
+    Some(key.split(CLASS_IDENTITY_SEP).next().unwrap_or(key))
+}
+
+/// The definition-site identity of the class a key stands for, if it has one.
+pub(crate) fn class_key_identity(key: &str) -> Option<&str> {
+    key.strip_prefix(CLASS_KEY_PREFIX)?
+        .split_once(CLASS_IDENTITY_SEP)
+        .map(|(_, identity)| identity)
+}
+
+/// Prefix of a mapping key that stands for a `RenderDirective`.
+const DIRECTIVE_KEY_PREFIX: &str = "\0directive:";
+/// Prefix of a mapping key that stands for another object or a list.
+const VALUE_KEY_PREFIX: &str = "\0value:";
+/// The member holding a `RenderDirective` key's text in [`key_value`].
+const DIRECTIVE_TEXT: &str = "\0directive";
+
+/// The mapping key for an object or list key: a `RenderDirective` keeps its
+/// text, and other values are keyed by their content.
+pub(crate) fn object_key(value: &Value) -> Arc<str> {
+    match kind_of(value) {
+        Kind::RenderDirective => match render_directive_text(value) {
+            Ok(text) => format!("{DIRECTIVE_KEY_PREFIX}{text}").into(),
+            Err(_) => format!("{VALUE_KEY_PREFIX}{}", value.identity_json()).into(),
+        },
+        _ => format!("{VALUE_KEY_PREFIX}{}", value.identity_json()).into(),
+    }
+}
+
+/// Whether `key` stands for something other than a string.
+fn is_non_string_key(key: &str) -> bool {
+    if let Some(stored) = key.strip_prefix(crate::value::MAPPING_KEY_PREFIX) {
+        // Object and list keys are stored by an identity string, which
+        // `mapping_storage_value` reads back as a string.
+        return !matches!(crate::value::mapping_storage_value(key), Value::String(_))
+            || !stored.starts_with("string:");
+    }
+    key.starts_with('\0')
+        && (key.starts_with(CLASS_KEY_PREFIX)
+            || key.starts_with(DIRECTIVE_KEY_PREFIX)
+            || key.starts_with(VALUE_KEY_PREFIX))
+}
+
+/// The value an entry key stands for, as renderers see it: a string, a
+/// `RenderDirective`, or an object standing for another non-string key.
+fn key_value(key: &Arc<str>) -> Value {
+    if key.starts_with(crate::value::MAPPING_KEY_PREFIX) {
+        return crate::value::mapping_storage_value(key);
+    }
+    if !is_non_string_key(key) {
+        return Value::String(key.clone());
+    }
+    let mut map = ObjectMap::default();
+    match key.strip_prefix(DIRECTIVE_KEY_PREFIX) {
+        Some(text) => map.insert(DIRECTIVE_TEXT.into(), Value::String(text.into())),
+        None => map.insert(key.clone(), Value::Null),
+    };
+    Value::Object(Arc::new(map), None)
+}
+
+/// Classes of `pkl:base` that a bare name in a mapping key (`[String]`)
+/// refers to.
+pub(crate) const BASE_CLASS_NAMES: &[&str] = &[
+    "Any",
+    "Boolean",
+    "Bytes",
+    "Class",
+    "Collection",
+    "DataSize",
+    "Duration",
+    "Dynamic",
+    "Float",
+    "Function",
+    "Function0",
+    "Function1",
+    "Function2",
+    "Function3",
+    "Function4",
+    "Function5",
+    "Int",
+    "IntSeq",
+    "List",
+    "Listing",
+    "Map",
+    "Mapping",
+    "Module",
+    "Null",
+    "Number",
+    "Object",
+    "Pair",
+    "Regex",
+    "Set",
+    "String",
+    "TypeAlias",
+    "Typed",
+];
+
+const DURATION_UNITS: &[&str] = &["ns", "us", "ms", "s", "min", "h", "d"];
+const DATA_SIZE_UNITS: &[&str] = &[
+    "b", "kb", "mb", "gb", "tb", "pb", "kib", "mib", "gib", "tib", "pib",
+];
+
+/// The renderer classes pklr implements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RendererKind {
+    Pcf,
+    Json,
+    Yaml,
+    Properties,
+    PList,
+    Jsonnet,
+    Xml,
+}
+
+impl RendererKind {
+    pub(crate) const ALL: &[RendererKind] = &[
+        RendererKind::Pcf,
+        RendererKind::Json,
+        RendererKind::Yaml,
+        RendererKind::Properties,
+        RendererKind::PList,
+        RendererKind::Jsonnet,
+        RendererKind::Xml,
+    ];
+
+    /// The module and name of the renderer's class.
+    fn class(self) -> (&'static str, &'static str) {
+        match self {
+            RendererKind::Pcf => ("pkl:base", "PcfRenderer"),
+            RendererKind::Json => ("pkl:base", "JsonRenderer"),
+            RendererKind::Yaml => ("pkl:base", "YamlRenderer"),
+            RendererKind::Properties => ("pkl:base", "PropertiesRenderer"),
+            RendererKind::PList => ("pkl:base", "PListRenderer"),
+            RendererKind::Jsonnet => ("pkl:jsonnet", "Renderer"),
+            RendererKind::Xml => ("pkl:xml", "Renderer"),
+        }
+    }
+
+    /// The unqualified class name used by the existing output setup path.
+    pub(crate) fn class_name(self) -> &'static str {
+        self.class().1
+    }
+
+    /// The type identity instances of this renderer carry (see
+    /// `Scope::runtime_type_identity`).
+    fn identity(self) -> String {
+        let (module, class) = self.class();
+        format!("{module}.{class}")
+    }
+}
+
+/// The renderer kind of a renderer object, including instances of a
+/// subclass of a renderer class.
+pub(crate) fn renderer_kind(value: &Value) -> Option<RendererKind> {
+    let Value::Object(_, Some(source)) = value else {
+        return None;
+    };
+    let by_identity = source
+        .type_identity
+        .iter()
+        .chain(source.parent_type_identities.iter())
+        .find_map(|identity| {
+            RendererKind::ALL
+                .iter()
+                .copied()
+                .find(|kind| kind.identity() == *identity)
+        });
+    by_identity.or_else(|| {
+        // `pkl:base` renderers are known by name too. Imported renderers must
+        // retain their module identity so an unrelated user `Renderer` class
+        // cannot be mistaken for a standard-library renderer.
+        source
+            .type_name
+            .iter()
+            .chain(source.parent_type_names.iter())
+            .find_map(|name| {
+                RendererKind::ALL
+                    .iter()
+                    .copied()
+                    .find(|kind| kind.class() == ("pkl:base", name.as_str()))
+            })
+    })
+}
+
+/// Whether `value` is an instance of the class `class` of the standard
+/// library module `module` (such as `pkl:xml`'s `Comment`).
+pub(crate) fn typed_class_is(value: &Value, module: &str, class: &str) -> bool {
+    matches!(
+        value,
+        Value::Object(_, Some(source))
+            if source.type_identity.as_deref().is_some_and(|identity| {
+                identity.strip_prefix(module).and_then(|rest| rest.strip_prefix('.')) == Some(class)
+            })
+    )
+}
+
+use crate::value::ListKind;
+
+/// What a pklr [`Value`] is to a renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Null,
+    Boolean,
+    Int,
+    Float,
+    String,
+    Duration,
+    DataSize,
+    Regex,
+    Function,
+    RenderDirective,
+    /// An `IntSeq`.
+    IntSeq,
+    /// A `Bytes`.
+    Bytes,
+    /// A `Pair`.
+    Pair,
+    /// A `Class`.
+    Class,
+    /// A `TypeAlias`.
+    TypeAlias,
+    /// A `Listing` or `List`; pklr does not tell them apart.
+    Listing,
+    /// An object whose members are all entries: a `Mapping` or `Map`.
+    Mapping,
+    /// An object with properties and entries.
+    Dynamic,
+    /// An instance of a class (or a module); all members are properties.
+    Typed,
+}
+
+impl Kind {
+    /// The Pkl class name used in error messages.
+    pub(super) fn pkl_class(self, value: &Value) -> String {
+        match self {
+            Kind::Null => "Null".into(),
+            Kind::Boolean => "Boolean".into(),
+            Kind::Int => "Int".into(),
+            Kind::Float => "Float".into(),
+            Kind::String => "String".into(),
+            Kind::Duration => "Duration".into(),
+            Kind::DataSize => "DataSize".into(),
+            Kind::Regex => "Regex".into(),
+            Kind::Function => match value {
+                Value::Lambda(params, ..) => format!("Function{}", params.len()),
+                _ => "Function".into(),
+            },
+            Kind::RenderDirective => "RenderDirective".into(),
+            Kind::IntSeq => "IntSeq".into(),
+            Kind::Bytes => "Bytes".into(),
+            Kind::Pair => "Pair".into(),
+            Kind::Class => "Class".into(),
+            Kind::TypeAlias => "TypeAlias".into(),
+            Kind::Listing => match value {
+                Value::List(items) => match items.kind() {
+                    ListKind::Dynamic => "Dynamic".into(),
+                    ListKind::List => "List".into(),
+                    ListKind::Set => "Set".into(),
+                    ListKind::Listing => "Listing".into(),
+                },
+                _ => "Listing".into(),
+            },
+            Kind::Mapping => match value {
+                Value::Object(_, None) => "Map".into(),
+                _ => "Mapping".into(),
+            },
+            Kind::Dynamic => "Dynamic".into(),
+            Kind::Typed => match value {
+                Value::Object(_, Some(source)) => match source.type_identity.as_deref() {
+                    _ if source.kind == ObjectKind::Reference => "pkl.ref#Reference".into(),
+                    Some(identity) if !identity.starts_with("pkl:") => class_display_name(
+                        identity,
+                        source.type_name.as_deref(),
+                        source.display_module.as_deref(),
+                    ),
+                    _ => source.type_name.clone().unwrap_or_else(|| "Typed".into()),
+                },
+                _ => "Typed".into(),
+            },
+        }
+    }
+
+    pub(crate) fn is_object(self) -> bool {
+        matches!(self, Kind::Mapping | Kind::Dynamic | Kind::Typed)
+    }
+}
+
+/// Classify `value` for rendering.
+pub(crate) fn kind_of(value: &Value) -> Kind {
+    match value {
+        Value::Null | Value::NullDefault(_) => Kind::Null,
+        Value::Bool(_) => Kind::Boolean,
+        Value::Int(_) => Kind::Int,
+        Value::Float(_) => Kind::Float,
+        Value::String(_) => Kind::String,
+        Value::Duration(_) => Kind::Duration,
+        Value::DataSize(_) => Kind::DataSize,
+        Value::Regex(_) => Kind::Regex,
+        Value::Lambda(..) | Value::Failed(_) => Kind::Function,
+        Value::List(items) if items.kind() == ListKind::List && items.is_int_seq() => Kind::IntSeq,
+        Value::List(items) if items.kind() == ListKind::List && items.is_bytes() => Kind::Bytes,
+        Value::List(_) => Kind::Listing,
+        Value::Object(map, None) => {
+            if let Some(kind) = builtin_object_kind(map) {
+                kind
+            } else {
+                Kind::Mapping
+            }
+        }
+        Value::Object(_, Some(source))
+            if source.kind == ObjectKind::Class && source.declared_as.is_none() =>
+        {
+            Kind::Class
+        }
+        Value::Object(_, Some(source)) => match source.type_name.as_deref() {
+            Some("RenderDirective") => Kind::RenderDirective,
+            Some("Pair") if source.type_identity.as_deref() == Some("pkl:base#Pair") => Kind::Pair,
+            Some("TypeAlias") if source.type_identity.as_deref() == Some("pkl:base#TypeAlias") => {
+                Kind::TypeAlias
+            }
+            Some("Dynamic") => Kind::Dynamic,
+            Some("Mapping" | "Map") => Kind::Mapping,
+            Some(_) => Kind::Typed,
+            None if source.kind == ObjectKind::Mapping => Kind::Mapping,
+            None if source.is_metadata_only() => Kind::Typed,
+            None if source.is_parsed_json || source.kind == ObjectKind::Object => Kind::Dynamic,
+            None => Kind::Dynamic,
+        },
+    }
+}
+
+/// Recognize legacy built-in objects without a source.
+fn builtin_object_kind(map: &ObjectMap) -> Option<Kind> {
+    if map.len() == 1 && map.contains_key(DIRECTIVE_TEXT) {
+        return Some(Kind::RenderDirective);
+    }
+    if map.len() != 2 {
+        return None;
+    }
+    if let (Some(Value::Int(_) | Value::Float(_)), Some(Value::String(unit))) =
+        (map.get("value"), map.get("unit"))
+    {
+        if DURATION_UNITS.contains(&&**unit) {
+            return Some(Kind::Duration);
+        }
+        if DATA_SIZE_UNITS.contains(&&**unit) {
+            return Some(Kind::DataSize);
+        }
+    }
+    if let (Some(Value::String(ty)), Some(Value::String(_))) =
+        (map.get("_type"), map.get("pattern"))
+        && &**ty == "regex"
+    {
+        return Some(Kind::Regex);
+    }
+    None
+}
+
+/// Whether a member of an object is a property or an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberKind {
+    Property,
+    Entry,
+}
+
+/// Tells the properties of an object from its entries. A `Dynamic`'s
+/// properties are the names its definition declares as properties; every
+/// other member came from an entry (`["key"] = ...`) or a spread map.
+pub(crate) struct Members<'a> {
+    kind: Kind,
+    properties: Option<HashSet<&'a str>>,
+}
+
+impl<'a> Members<'a> {
+    pub(crate) fn new(kind: Kind, source: Option<&'a ObjectSource>) -> Self {
+        let properties = (kind == Kind::Dynamic).then(|| {
+            source
+                .map(|source| {
+                    source
+                        .entries()
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            Entry::Property(prop) if !prop.modifiers.contains(&Modifier::Local) => {
+                                Some(prop.name.as_ref())
+                            }
+                            _ => None,
+                        })
+                        .chain(
+                            source
+                                .is_parsed_json
+                                .then_some(&source.body_members)
+                                .into_iter()
+                                .flatten()
+                                .map(AsRef::as_ref),
+                        )
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        Self { kind, properties }
+    }
+
+    pub(crate) fn kind_of(&self, key: &str) -> MemberKind {
+        match self.kind {
+            Kind::Mapping => MemberKind::Entry,
+            Kind::Dynamic
+                if !self
+                    .properties
+                    .as_ref()
+                    .is_some_and(|names| names.contains(key)) =>
+            {
+                MemberKind::Entry
+            }
+            _ => MemberKind::Property,
+        }
+    }
+}
+
+/// A segment of the path from the rendered value to the one being visited.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PathPart {
+    TopLevel,
+    Property(Arc<str>),
+    /// An entry with a string key.
+    Entry(Arc<str>),
+    /// An entry whose (converted) key is not a string.
+    Key(Value),
+    Element(usize),
+}
+
+/// A segment of a converter path such as `foo.bar[*]`.
+#[derive(Clone, Debug, PartialEq)]
+enum PathSpec {
+    TopLevel,
+    Property(String),
+    Entry(String),
+    AnyProperty,
+    AnyElement,
+}
+
+impl PathSpec {
+    fn matches(&self, part: &PathPart) -> bool {
+        match (self, part) {
+            (PathSpec::TopLevel, PathPart::TopLevel) => true,
+            (PathSpec::Property(name), PathPart::Property(actual)) => name == &**actual,
+            (PathSpec::Entry(key), PathPart::Entry(actual)) => key == &**actual,
+            (PathSpec::AnyProperty, PathPart::Property(_)) => true,
+            (
+                PathSpec::AnyElement,
+                PathPart::Element(_) | PathPart::Entry(_) | PathPart::Key(_),
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Parse a converter path, innermost segment first, as pkl-core's
+/// `PathSpecParser` does.
+fn parse_path_spec(spec: &str) -> Result<Vec<PathSpec>> {
+    let invalid = || Error::Eval(format!("Converter path `{spec}` has invalid syntax."));
+    let chars: Vec<char> = spec.chars().collect();
+    let mut result = Vec::new();
+    // 0: start or after leading `^`, 1: in property, 2: in element,
+    // 3: after `]`, 4: after `.*`, 5: after `[*`
+    let mut state = 0;
+    let mut start = 0;
+    let part = |from: usize, to: usize| chars[from..to].iter().collect::<String>();
+    for (idx, &ch) in chars.iter().enumerate() {
+        match ch {
+            '^' => {
+                if idx != 0 {
+                    return Err(invalid());
+                }
+                result.push(PathSpec::TopLevel);
+                start = 1;
+            }
+            '.' => {
+                match state {
+                    1 => {
+                        if idx == start {
+                            return Err(invalid());
+                        }
+                        result.push(PathSpec::Property(part(start, idx)));
+                    }
+                    3 | 4 => {}
+                    _ => return Err(invalid()),
+                }
+                start = idx + 1;
+                state = 1;
+            }
+            '[' => {
+                match state {
+                    1 => {
+                        if idx == start {
+                            return Err(invalid());
+                        }
+                        result.push(PathSpec::Property(part(start, idx)));
+                    }
+                    0 | 3 | 4 => {}
+                    _ => return Err(invalid()),
+                }
+                start = idx + 1;
+                state = 2;
+            }
+            ']' => {
+                match state {
+                    2 => {
+                        if idx == start {
+                            return Err(invalid());
+                        }
+                        result.push(PathSpec::Entry(part(start, idx)));
+                    }
+                    5 => {}
+                    _ => return Err(invalid()),
+                }
+                state = 3;
+            }
+            '*' => {
+                state = match state {
+                    0 | 1 => {
+                        if start != idx {
+                            return Err(invalid());
+                        }
+                        result.push(PathSpec::AnyProperty);
+                        4
+                    }
+                    2 => {
+                        if start != idx {
+                            return Err(invalid());
+                        }
+                        result.push(PathSpec::AnyElement);
+                        5
+                    }
+                    _ => return Err(invalid()),
+                };
+            }
+            _ => {
+                if state > 2 {
+                    return Err(invalid());
+                }
+                if state == 0 {
+                    state = 1;
+                }
+            }
+        }
+    }
+    match state {
+        0 => {
+            if result.is_empty() {
+                // "" matches the top-level value (deprecated in favor of "^")
+                result.push(PathSpec::TopLevel);
+            }
+        }
+        1 => {
+            if start == chars.len() {
+                return Err(invalid());
+            }
+            result.push(PathSpec::Property(part(start, chars.len())));
+        }
+        3 | 4 => {}
+        _ => return Err(invalid()),
+    }
+    result.reverse();
+    Ok(result)
+}
+
+/// A renderer's `converters`: functions applied to values before they are
+/// rendered, keyed by class or by path.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Converters {
+    /// Each converter's class name, its definition-site identity if known,
+    /// and the function.
+    by_class: Vec<(String, Option<String>, Value)>,
+    by_path: Vec<(Vec<PathSpec>, Value)>,
+}
+
+impl Converters {
+    /// Read a `converters` mapping. Keys made by [`class_key`] are class
+    /// converters; any other key is a path.
+    pub(crate) fn from_mapping(converters: Option<&Value>) -> Result<Self> {
+        let mut result = Converters::default();
+        let Some(Value::Object(map, _)) = converters else {
+            return Ok(result);
+        };
+        for (key, function) in map.iter() {
+            if !matches!(function, Value::Lambda(..)) {
+                continue;
+            }
+            match class_key_name(key) {
+                Some(class) => result.by_class.push((
+                    class.to_string(),
+                    class_key_identity(key).map(str::to_string),
+                    function.clone(),
+                )),
+                None => result
+                    .by_path
+                    .push((parse_path_spec(key)?, function.clone())),
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_class.is_empty() && self.by_path.is_empty()
+    }
+
+    pub(crate) fn has_paths(&self) -> bool {
+        !self.by_path.is_empty()
+    }
+
+    pub(crate) fn class(&self, name: &str) -> Option<&Value> {
+        self.by_class
+            .iter()
+            // A builtin kind is named by a builtin class: a user class that
+            // shares the name (`[mod.Int]`) is a different class.
+            .find(|(class, declared, _)| {
+                class == name && declared.as_deref().is_none_or(|id| id.starts_with("pkl:"))
+            })
+            .map(|(.., function)| function)
+    }
+
+    /// The converter for `value` at `path` (innermost segment last): a
+    /// matching path converter wins over a class converter.
+    pub(crate) fn find(&self, value: &Value, kind: Kind, path: &[PathPart]) -> Option<&Value> {
+        for (spec, function) in &self.by_path {
+            if spec.len() <= path.len()
+                && spec
+                    .iter()
+                    .zip(path.iter().rev())
+                    .all(|(spec, part)| spec.matches(part))
+            {
+                return Some(function);
+            }
+        }
+        if self.by_class.is_empty() {
+            return None;
+        }
+        match kind {
+            Kind::Null => self.class("Null"),
+            Kind::Boolean => self.class("Boolean"),
+            Kind::Int => self.class("Int"),
+            Kind::Float => self.class("Float"),
+            Kind::String => self.class("String"),
+            Kind::Duration => self.class("Duration"),
+            Kind::DataSize => self.class("DataSize"),
+            Kind::Regex => self.class("Regex"),
+            Kind::Function => match value {
+                Value::Lambda(params, ..) => self.class(&format!("Function{}", params.len())),
+                _ => None,
+            },
+            Kind::Listing => match value {
+                Value::List(items) => match items.kind() {
+                    ListKind::List => self.class("List"),
+                    ListKind::Listing => self.class("Listing"),
+                    ListKind::Set => self.class("Set"),
+                    ListKind::Dynamic => self.class("Dynamic"),
+                },
+                _ => None,
+            },
+            // A `Map` has no source; a `Mapping` does.
+            Kind::Mapping => match value {
+                Value::Object(_, None) => self.class("Map"),
+                _ => self.class("Mapping"),
+            },
+            Kind::Dynamic => self.class("Dynamic"),
+            Kind::IntSeq => self.class("IntSeq"),
+            Kind::Bytes => self.class("Bytes"),
+            Kind::Pair => self.class("Pair"),
+            Kind::Class => self.class("Class"),
+            Kind::TypeAlias => self.class("TypeAlias"),
+            Kind::Typed | Kind::RenderDirective => {
+                // Class converters are covariant: the nearest class with a
+                // converter wins.
+                let source = match value {
+                    Value::Object(_, Some(source)) => Some(&**source),
+                    _ => None,
+                };
+                source
+                    .into_iter()
+                    .flat_map(|source| {
+                        // Each class in the chain, nearest first, with the
+                        // identity of its declaration where one is known.
+                        source
+                            .type_name
+                            .iter()
+                            .map(|name| (name, source.type_identity.as_deref()))
+                            .chain(source.parent_type_names.iter().enumerate().map(
+                                |(index, name)| {
+                                    (
+                                        name,
+                                        source
+                                            .parent_type_identities
+                                            .get(index)
+                                            .map(String::as_str),
+                                    )
+                                },
+                            ))
+                    })
+                    .find_map(|(name, identity)| {
+                        self.by_class
+                            .iter()
+                            .find(|(class, declared, _)| match (declared, identity) {
+                                (Some(declared), Some(identity)) => declared == identity,
+                                _ => type_names_match(class, name),
+                            })
+                            .map(|(.., function)| function)
+                    })
+                    .or_else(|| {
+                        ["Typed", "Object", "Any"]
+                            .iter()
+                            .find_map(|c| self.class(c))
+                    })
+            }
+        }
+    }
+}
+
+/// Calls Pkl functions on behalf of the renderers.
+pub(crate) trait Invoke {
+    fn invoke(&mut self, function: &Value, arg: Value) -> Result<Value>;
+
+    /// Call `function` with several arguments.
+    fn invoke_all(&mut self, function: &Value, args: &[Value]) -> Result<Value>;
+
+    /// The annotations of the property `name` of an instance of the class
+    /// `source` describes, evaluated.
+    fn property_annotations(&mut self, source: &ObjectSource, name: &str) -> Result<Vec<Value>>;
+}
+
+/// A renderer's settings, read from a renderer object.
+pub(crate) struct Settings {
+    pub kind: RendererKind,
+    pub converters: Converters,
+    pub indent: String,
+    pub omit_null_properties: bool,
+    pub yaml_mode: String,
+    pub yaml_indent_width: usize,
+    pub yaml_is_stream: bool,
+    pub restrict_charset: bool,
+    pub use_custom_string_delimiters: bool,
+    pub xml_version: String,
+    pub xml_root_name: String,
+    pub xml_root_attributes: Option<ObjectMap>,
+    /// The renderer object, which `ConvertProperty` annotations receive.
+    pub renderer: Value,
+    /// `convertPropertyTransformers`, keyed by annotation class.
+    pub property_transformers: Converters,
+}
+
+impl Settings {
+    /// Read the settings of `renderer`. Members missing from it (such as an
+    /// untyped `renderer { ... }` amendment) take `kind`'s defaults.
+    pub(crate) fn read(kind: RendererKind, renderer: &Value) -> Result<Self> {
+        let members = match renderer {
+            Value::Object(map, _) => Some(&**map),
+            _ => None,
+        };
+        let get = |name: &str| members.and_then(|map| map.get(name));
+        let string = |name: &str, default: &str| -> Result<String> {
+            match get(name) {
+                None => Ok(default.to_string()),
+                Some(Value::String(s)) => Ok(s.to_string()),
+                Some(other) => Err(type_mismatch(name, "String", other)),
+            }
+        };
+        let boolean = |name: &str, default: bool| -> Result<bool> {
+            match get(name) {
+                None => Ok(default),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(other) => Err(type_mismatch(name, "Boolean", other)),
+            }
+        };
+        let yaml_indent_width = match get("indentWidth") {
+            None => 2,
+            Some(Value::Int(n)) if *n > 1 => *n as usize,
+            Some(Value::Int(_)) => {
+                return Err(Error::Eval("Type constraint `this > 1` violated.".into()));
+            }
+            Some(other) => return Err(type_mismatch("indentWidth", "Int", other)),
+        };
+        let yaml_mode = string("mode", "compat")?;
+        if !matches!(yaml_mode.as_str(), "compat" | "1.1" | "1.2") {
+            return Err(Error::Eval(format!(
+                "Expected value of type `\"compat\"|\"1.1\"|\"1.2\"`, but got \"{yaml_mode}\"."
+            )));
+        }
+        let xml_version = string("xmlVersion", "1.0")?;
+        if !matches!(xml_version.as_str(), "1.0" | "1.1") {
+            return Err(Error::Eval(format!(
+                "Expected value of type `\"1.0\"|\"1.1\"`, but got \"{xml_version}\"."
+            )));
+        }
+        Ok(Settings {
+            kind,
+            converters: Converters::from_mapping(get("converters"))?,
+            // Only `jsonnet.Renderer.indent` may be null, meaning no indent.
+            indent: match get("indent") {
+                Some(Value::Null | Value::NullDefault(_)) if kind == RendererKind::Jsonnet => {
+                    String::new()
+                }
+                _ => string("indent", "  ")?,
+            },
+            omit_null_properties: boolean("omitNullProperties", kind != RendererKind::Pcf)?,
+            yaml_mode,
+            yaml_indent_width,
+            yaml_is_stream: boolean("isStream", false)?,
+            restrict_charset: boolean("restrictCharset", false)?,
+            use_custom_string_delimiters: boolean("useCustomStringDelimiters", false)?,
+            xml_version,
+            xml_root_name: string("rootElementName", "root")?,
+            xml_root_attributes: match get("rootElementAttributes") {
+                Some(Value::Object(map, _)) => Some((**map).clone()),
+                _ => None,
+            },
+            // Without an `output.renderer`, annotations see the renderer the
+            // format selects, as `pkl eval` renders with one.
+            renderer: match renderer_kind(renderer) {
+                Some(_) => renderer.clone(),
+                None => super::stdlib::typed_object(kind.class_name(), ObjectMap::default()),
+            },
+            property_transformers: Converters::from_mapping(get("convertPropertyTransformers"))?,
+        })
+    }
+
+    /// Render `value` as a document (`renderDocument`) or as a value
+    /// (`renderValue`). `top_kind` overrides how the top-level value is
+    /// classified, for a module's own value.
+    pub(crate) fn render(
+        &self,
+        value: &Value,
+        document: bool,
+        top_kind: Option<Kind>,
+        invoke: &mut dyn Invoke,
+    ) -> Result<String> {
+        let walk = Walk::new(self, invoke, top_kind);
+        match self.kind {
+            RendererKind::Pcf => {
+                pcf::Pcf::new(walk, &self.indent, self.use_custom_string_delimiters)
+                    .render(value, document)
+            }
+            RendererKind::Json => json::Json::new(walk, &self.indent).render(value, document),
+            RendererKind::Yaml => yaml::Yaml::new(walk, self).render(value, document),
+            RendererKind::Properties => {
+                properties::Properties::new(walk, self.restrict_charset).render(value, document)
+            }
+            RendererKind::PList => plist::PList::new(walk, &self.indent).render(value, document),
+            RendererKind::Jsonnet => {
+                jsonnet::Jsonnet::new(walk, &self.indent).render(value, document)
+            }
+            RendererKind::Xml => xml::Xml::new(
+                walk,
+                &self.indent,
+                &self.xml_version,
+                &self.xml_root_name,
+                self.xml_root_attributes.clone(),
+            )
+            .render(value, document),
+        }
+    }
+}
+
+fn type_mismatch(property: &str, expected: &str, got: &Value) -> Error {
+    Error::Eval(format!(
+        "Expected value of type `{expected}` for `{property}`, but got type `{}`.",
+        kind_of(got).pkl_class(got)
+    ))
+}
+
+/// The state pkl-core's `AbstractRenderer` keeps while visiting a value.
+pub(crate) struct Walk<'a> {
+    converters: &'a Converters,
+    invoke: &'a mut dyn Invoke,
+    pub(crate) path: Vec<PathPart>,
+    skip_null_properties: bool,
+    skip_null_entries: bool,
+    /// The kind of the value directly enclosing the one being visited.
+    pub(crate) enclosing: Option<Kind>,
+    top_kind: Option<Kind>,
+    renderer: &'a Value,
+    property_transformers: &'a Converters,
+}
+
+impl<'a> Walk<'a> {
+    fn new(settings: &'a Settings, invoke: &'a mut dyn Invoke, top_kind: Option<Kind>) -> Self {
+        let skip_nulls = settings.omit_null_properties;
+        Walk {
+            converters: &settings.converters,
+            invoke,
+            path: Vec::new(),
+            skip_null_properties: skip_nulls,
+            // Pcf renders null entries even when it omits null properties.
+            skip_null_entries: skip_nulls && settings.kind != RendererKind::Pcf,
+            enclosing: None,
+            top_kind,
+            renderer: &settings.renderer,
+            property_transformers: &settings.property_transformers,
+        }
+    }
+
+    /// Apply the `ConvertProperty` annotations of the property `name` of an
+    /// instance of the class `source` describes. `None` if it has none.
+    fn annotated_property(
+        &mut self,
+        source: &ObjectSource,
+        name: &Arc<str>,
+        value: &Value,
+    ) -> Result<Option<(Arc<str>, Value)>> {
+        apply_property_annotations(
+            &mut *self.invoke,
+            self.property_transformers,
+            self.renderer,
+            source,
+            name,
+            value,
+        )
+    }
+
+    /// The kind of `value`, honoring the top-level override once.
+    fn kind(&mut self, value: &Value) -> Kind {
+        let kind = self.top_kind.take().unwrap_or_else(|| kind_of(value));
+        // Only a class given to the renderer itself is an error. A nested one
+        // is, as before, rendered as the typed object it holds: pklr cannot
+        // always tell a class a member names from one the module declares.
+        if kind == Kind::Class && self.path.len() > 1 {
+            return Kind::Typed;
+        }
+        kind
+    }
+
+    /// Apply the converter for `value` at the current path, if any.
+    fn convert(&mut self, value: &Value) -> Result<Value> {
+        match self.converters.find(value, kind_of(value), &self.path) {
+            Some(function) => {
+                let function = function.clone();
+                self.invoke.invoke(&function, value.clone())
+            }
+            None => Ok(value.clone()),
+        }
+    }
+
+    /// Convert an entry key, which only class converters apply to.
+    fn convert_key(&mut self, key: &Value) -> Result<Value> {
+        match self.converters.find(key, kind_of(key), &[]) {
+            Some(function) => {
+                let function = function.clone();
+                self.invoke.invoke(&function, key.clone())
+            }
+            None => Ok(key.clone()),
+        }
+    }
+}
+
+/// The hooks of pkl-core's `AbstractRenderer`, with its traversal as
+/// provided methods.
+pub(crate) trait StringRenderer<'a> {
+    fn walk(&mut self) -> &mut Walk<'a>;
+    /// The renderer's name in error messages, such as `JSON`.
+    fn name(&self) -> &'static str;
+
+    fn visit_null(&mut self) -> Result<()>;
+    fn visit_bool(&mut self, value: bool) -> Result<()>;
+    fn visit_int(&mut self, value: i64) -> Result<()>;
+    fn visit_float(&mut self, value: f64) -> Result<()>;
+    fn visit_string(&mut self, value: &str) -> Result<()>;
+    fn visit_render_directive(&mut self, text: &str) -> Result<()>;
+    /// Render a typed object the format treats specially (such as
+    /// `xml.Comment`), returning whether it did.
+    fn visit_typed(&mut self, _value: &Value) -> Result<bool> {
+        Ok(false)
+    }
+    /// Durations, data sizes, regexes and functions, which these renderers
+    /// cannot render.
+    fn visit_other(&mut self, value: &Value, kind: Kind) -> Result<()> {
+        Err(cannot_render_type(value, kind, self.name()))
+    }
+    /// Render a `List`, `Set`, `Map`, `Pair` or `IntSeq` the format writes as a
+    /// call, returning whether it did.
+    fn visit_collection(&mut self, _value: &Value, _kind: Kind) -> Result<bool> {
+        Ok(false)
+    }
+    /// Whether an object can have both elements and members in this format.
+    fn supports_mixed_objects(&self) -> bool {
+        false
+    }
+    fn start_object(&mut self, kind: Kind) -> Result<()>;
+    fn end_object(&mut self, kind: Kind, is_empty: bool) -> Result<()>;
+    fn start_listing(&mut self) -> Result<()>;
+    fn end_listing(&mut self, is_empty: bool) -> Result<()>;
+    fn visit_element(&mut self, index: usize, value: &Value, is_first: bool) -> Result<()>;
+    fn visit_entry_key(&mut self, key: &Value, is_first: bool) -> Result<()>;
+    /// Whether an object or list mapping key is an error here, as in JSON.
+    fn rejects_compound_keys(&self) -> bool {
+        false
+    }
+    fn visit_entry_value(&mut self, value: &Value) -> Result<()> {
+        self.visit(value)
+    }
+    fn visit_property(&mut self, name: &str, value: &Value, is_first: bool) -> Result<()>;
+
+    /// Start rendering: convert the top-level value.
+    fn convert_top_level(&mut self, value: &Value) -> Result<Value> {
+        let walk = self.walk();
+        walk.path.clear();
+        walk.path.push(PathPart::TopLevel);
+        let kind = walk.top_kind.unwrap_or_else(|| kind_of(value));
+        match walk.converters.find(value, kind, &walk.path) {
+            Some(function) => {
+                let function = function.clone();
+                // The converted value is classified on its own.
+                walk.top_kind = None;
+                walk.invoke.invoke(&function, value.clone())
+            }
+            None => Ok(value.clone()),
+        }
+    }
+
+    fn visit(&mut self, value: &Value) -> Result<()> {
+        crate::stack::check_depth()?;
+        let kind = self.walk().kind(value);
+        if kind == Kind::Typed
+            && typed_class_is(value, "pkl:xml", "CommentClass")
+            && matches!(value, Value::Object(map, _) if map.get("text").and_then(Value::as_str).is_some_and(|text| text.contains("--") || text.ends_with('-')))
+        {
+            return Err(Error::Eval(
+                "XML comments must not contain `--` or end with `-`.".into(),
+            ));
+        }
+        if self.visit_collection(value, kind)? {
+            return Ok(());
+        }
+        // A reference holds internal members; it has no document form.
+        if kind == Kind::Typed
+            && matches!(value, Value::Object(_, Some(source)) if source.kind == ObjectKind::Reference)
+        {
+            return Err(cannot_render_type(value, kind, self.name()));
+        }
+        match (kind, value) {
+            (Kind::Null, _) => self.visit_null(),
+            (Kind::Boolean, Value::Bool(b)) => self.visit_bool(*b),
+            (Kind::Int, Value::Int(n)) => self.visit_int(*n),
+            (Kind::Float, Value::Float(f)) => self.visit_float(*f),
+            (Kind::String, Value::String(s)) => self.visit_string(s),
+            (Kind::RenderDirective, _) => {
+                self.visit_render_directive(&render_directive_text(value)?)
+            }
+            (Kind::Listing, Value::List(items)) => self.visit_listing(items),
+            (Kind::Typed, _) if self.visit_typed(value)? => Ok(()),
+            (kind, Value::Object(map, source)) if kind.is_object() => {
+                self.visit_object(kind, map, source.as_deref())
+            }
+            (kind, _) => self.visit_other(value, kind),
+        }
+    }
+
+    fn visit_listing(&mut self, items: &[Value]) -> Result<()> {
+        self.start_listing()?;
+        let previous = self.walk().enclosing.replace(Kind::Listing);
+        for (index, item) in items.iter().enumerate() {
+            self.walk().path.push(PathPart::Element(index));
+            let converted = self.walk().convert(item)?;
+            self.visit_element(index, &converted, index == 0)?;
+            self.walk().path.pop();
+        }
+        self.walk().enclosing = previous;
+        self.end_listing(items.is_empty())
+    }
+
+    fn visit_object(
+        &mut self,
+        kind: Kind,
+        map: &ObjectMap,
+        source: Option<&ObjectSource>,
+    ) -> Result<()> {
+        // A failed member of an object that is rendered, a converter's
+        // result included, fails here, as in the JSON conversion walk.
+        if let Some(member) = source
+            .and_then(|source| source.poisoned_members.as_ref())
+            .and_then(|members| members.values().find(|member| member.rendered))
+        {
+            return Err(Error::Eval(member.message.clone()));
+        }
+        self.start_object(kind)?;
+        let previous = self.walk().enclosing.replace(kind);
+        let members = Members::new(kind, source);
+        // Pkl keeps an object body's properties ahead of its entries.
+        let mut ordered: Vec<(MemberKind, &Arc<str>, &Value)> = map
+            .iter()
+            // Methods are stored as function-valued members.
+            .filter(|(key, value)| !value.is_unrendered_member(key, source))
+            .map(|(key, value)| (members.kind_of(key), key, value))
+            .collect();
+        ordered.sort_by_key(|(member, ..)| *member == MemberKind::Entry);
+        // A `Dynamic` with both members and elements renders its elements
+        // after its members, in the formats that have a place for both.
+        let elements = match source {
+            Some(source) if kind == Kind::Dynamic => &source.elements[..],
+            _ => &[],
+        };
+        if !elements.is_empty() && !ordered.is_empty() && !self.supports_mixed_objects() {
+            self.walk().enclosing = previous;
+            let shown = ordered
+                .iter()
+                .map(|(member, key, value)| match member {
+                    MemberKind::Property => format!("{key} = {}", display_value(value)),
+                    MemberKind::Entry => {
+                        format!(
+                            "[{}] = {}",
+                            display_value(&key_value(key)),
+                            display_value(value)
+                        )
+                    }
+                })
+                .chain(elements.iter().map(display_value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Eval(format!(
+                "Cannot render object with both elements and properties/entries as {}.\nObject: new Dynamic {{ {shown} }}",
+                self.name()
+            )));
+        }
+        // Only an instance of a class can have annotated properties.
+        let annotated_source = source.filter(|source| has_annotated_properties(source));
+        let mut is_first = true;
+        for (member, key, value) in ordered {
+            match member {
+                MemberKind::Property => {
+                    let renamed = match annotated_source {
+                        Some(source) => self.walk().annotated_property(source, key, value)?,
+                        None => None,
+                    };
+                    let (key, value) = match &renamed {
+                        Some((key, value)) => (key, value),
+                        None => (key, value),
+                    };
+                    self.walk().path.push(PathPart::Property(key.clone()));
+                    let converted = self.walk().convert(value)?;
+                    if !(self.walk().skip_null_properties && crate::eval::is_null_value(&converted))
+                    {
+                        self.visit_property(key, &converted, is_first)?;
+                        is_first = false;
+                    }
+                    self.walk().path.pop();
+                }
+                MemberKind::Entry => {
+                    let raw_key = key;
+                    let key = self.walk().convert_key(&key_value(key))?;
+                    self.walk().path.push(match &key {
+                        Value::String(s) => PathPart::Entry(s.clone()),
+                        other => PathPart::Key(other.clone()),
+                    });
+                    let converted = self.walk().convert(value)?;
+                    if !(self.walk().skip_null_entries && crate::eval::is_null_value(&converted)) {
+                        if self.rejects_compound_keys()
+                            && raw_key.starts_with(crate::value::MAPPING_KEY_PREFIX)
+                            && is_non_string_key(raw_key)
+                            && match key_value(raw_key) {
+                                Value::String(_) => true,
+                                // A converter may have turned the key into a
+                                // string, which JSON accepts.
+                                Value::Object(..) | Value::List(_) | Value::Regex(_) => {
+                                    !matches!(key, Value::String(_))
+                                }
+                                _ => false,
+                            }
+                        {
+                            return Err(cannot_render_non_string_key(&key_value(raw_key), "JSON"));
+                        }
+                        let value_path = std::mem::take(&mut self.walk().path);
+                        let result = self.visit_entry_key(&key, is_first);
+                        self.walk().path = value_path;
+                        result?;
+                        is_first = false;
+                        self.visit_entry_value(&converted)?;
+                    }
+                    self.walk().path.pop();
+                }
+            }
+        }
+        for (index, element) in elements.iter().enumerate() {
+            self.walk().path.push(PathPart::Element(index));
+            let converted = self.walk().convert(element)?;
+            self.visit_element(index, &converted, is_first)?;
+            is_first = false;
+            self.walk().path.pop();
+        }
+        self.walk().enclosing = previous;
+        self.end_object(kind, is_first)
+    }
+}
+
+/// The `text` of a `RenderDirective`.
+fn render_directive_text(value: &Value) -> Result<Arc<str>> {
+    match value {
+        Value::Object(map, _) => match map.get("text").or_else(|| map.get(DIRECTIVE_TEXT)) {
+            Some(Value::String(text)) => Ok(text.clone()),
+            _ => Err(Error::Eval(
+                "Expected value of type `String` for `RenderDirective.text`.".into(),
+            )),
+        },
+        _ => Err(Error::Eval("expected a RenderDirective".into())),
+    }
+}
+
+/// `Cannot render value of type ...`, for a value the renderer has no
+/// representation for.
+pub(crate) fn cannot_render_type(value: &Value, kind: Kind, name: &str) -> Error {
+    Error::Eval(format!(
+        "Cannot render value of type `{}` as {name}.\nValue: {}\n\nConsider adding a converter to `output.converters`.",
+        kind.pkl_class(value),
+        reference_display(value)
+            .or_else(|| unforced_object_display(value, kind))
+            .unwrap_or_else(|| match value {
+                // Here pkl shows a `Listing`'s elements, unlike the top-level
+                // type errors, which show `?` for each.
+                Value::List(items)
+                    if kind == Kind::Listing
+                        && !items.is_empty()
+                        && matches!(items.kind(), ListKind::Listing) =>
+                {
+                    let shown = items
+                        .iter()
+                        .map(|item| display_value_at(item, 1, DISPLAY_DEPTH))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!("new Listing {{ {shown} }}")
+                }
+                _ => display_value(value),
+            }),
+    ))
+}
+
+/// A `Dynamic` or typed object as Pkl shows one whose members are not yet
+/// evaluated: `new Person { name = ?; age = ? }`.
+fn unforced_object_display(value: &Value, kind: Kind) -> Option<String> {
+    let Value::Object(map, source) = value else {
+        return None;
+    };
+    if !matches!(kind, Kind::Dynamic | Kind::Typed)
+        || map.is_empty()
+        || map.keys().any(|key| class_key_name(key).is_some())
+    {
+        return None;
+    }
+    let source = source.as_deref();
+    let members = Members::new(kind, source);
+    let mut shown: Vec<(MemberKind, String)> = map
+        .iter()
+        .filter(|(key, value)| !value.is_unrendered_member(key, source))
+        .map(|(key, _)| match members.kind_of(key) {
+            MemberKind::Property => (MemberKind::Property, format!("{key} = ?")),
+            MemberKind::Entry => (
+                MemberKind::Entry,
+                format!("[{}] = ?", map_key_display(key, 0, DISPLAY_DEPTH)),
+            ),
+        })
+        .collect();
+    shown.sort_by_key(|(member, _)| *member == MemberKind::Entry);
+    let shown = shown
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let name = kind.pkl_class(value);
+    Some(format!("new {name} {{ {shown} }}"))
+}
+
+/// `Cannot render object with non-string key as ...`.
+pub(crate) fn cannot_render_non_string_key(key: &Value, name: &str) -> Error {
+    Error::Eval(format!(
+        "Cannot render object with non-string key as {name}.\nKey   : {}",
+        display_value(key)
+    ))
+}
+
+/// Check that `text` can be emitted in the selected XML version. XML 1.1's
+/// restricted controls are allowed only where the renderer can write them as
+/// character references.
+pub(crate) fn validate_xml_characters(
+    text: &str,
+    version: &str,
+    context: &str,
+    allow_xml11_restricted: bool,
+) -> Result<()> {
+    for ch in text.chars() {
+        let code = ch as u32;
+        let valid = if version == "1.1" {
+            (1..=0xD7FF).contains(&code)
+                || (0xE000..=0xFFFD).contains(&code)
+                || (0x10000..=0x10FFFF).contains(&code)
+        } else {
+            matches!(code, 0x9 | 0xA | 0xD)
+                || (0x20..=0xD7FF).contains(&code)
+                || (0xE000..=0xFFFD).contains(&code)
+                || (0x10000..=0x10FFFF).contains(&code)
+        };
+        if !valid {
+            return Err(Error::Eval(format!(
+                "Invalid XML {version} character U+{code:04X} in {context}."
+            )));
+        }
+        let restricted_xml11 =
+            matches!(code, 0x1..=0x8 | 0xB | 0xC | 0xE..=0x1F | 0x7F..=0x84 | 0x86..=0x9F);
+        if version == "1.1" && restricted_xml11 && !allow_xml11_restricted {
+            return Err(Error::Eval(format!(
+                "XML 1.1 restricted character U+{code:04X} cannot be written in {context}."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A short Pkl rendering of `value` for error messages.
+/// A `Map` or `Mapping` key as it reads in an error: a class key by its name.
+fn map_key_display(key: &Arc<str>, depth: usize, max: usize) -> String {
+    if let Some(class) = key
+        .strip_prefix(crate::value::MAPPING_KEY_PREFIX)
+        .filter(|rest| rest.starts_with("object:object:class:"))
+    {
+        // A class key ends with `::` and the class's own name.
+        return class
+            .rsplit_once("::")
+            .map_or(class, |(_, name)| name)
+            .to_string();
+    }
+    match class_key_name(key) {
+        Some(name) => name.rsplit(['#', ':']).next().unwrap_or(name).to_string(),
+        None => match key_value(key) {
+            // A key is a value in its own right, so its members are shown.
+            Value::Object(map, source)
+                if matches!(
+                    kind_of(&Value::Object(map.clone(), source.clone())),
+                    Kind::Dynamic | Kind::Typed
+                ) && !map.is_empty()
+                    && map.keys().all(|name| !name.starts_with('\0')) =>
+            {
+                let name = source
+                    .as_deref()
+                    .and_then(ObjectSource::type_name)
+                    .unwrap_or("Dynamic");
+                let members = map
+                    .iter()
+                    .filter(|(_, member)| !matches!(member, Value::Lambda(..)))
+                    .map(|(name, member)| {
+                        format!("{name} = {}", display_value_at(member, depth + 2, max))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("new {name} {{ {members} }}")
+            }
+            key => display_value_at(&key, depth + 1, max),
+        },
+    }
+}
+
+/// The module and declared name of an alias identity. The name may hold dots
+/// (a quoted name), so it is taken from the value and not by splitting.
+fn alias_split<'a>(identity: &'a str, members: &ObjectMap) -> Option<(&'a str, &'a str)> {
+    let Some(Value::String(name)) = members.get(crate::eval::stdlib::TYPE_ALIAS_NAME_KEY) else {
+        return None;
+    };
+    let module = identity.strip_suffix(&**name)?.strip_suffix('.')?;
+    Some((module, &identity[module.len() + 1..]))
+}
+
+/// A class as Pkl names it in messages: `module#Name`.
+fn class_display_name(
+    identity: &str,
+    type_name: Option<&str>,
+    display_module: Option<&str>,
+) -> String {
+    // A class name may itself contain dots, so peel the declared name off the
+    // end of the identity rather than splitting at the last dot.
+    let split = type_name
+        .and_then(|name| Some((identity.strip_suffix(name)?.strip_suffix('.')?, name)))
+        .or_else(|| identity.rsplit_once('.'));
+    match split {
+        Some((module, name)) => {
+            let module = display_module.map_or_else(
+                || crate::eval::stdlib::render::module_display_name(module),
+                str::to_string,
+            );
+            format!("{module}#{name}")
+        }
+        None => identity.to_string(),
+    }
+}
+
+/// The deepest nesting `display_value` expands: shared contents can make an
+/// expanded value exponentially larger than the value itself.
+const DISPLAY_DEPTH: usize = 6;
+
+pub(crate) fn display_value(value: &Value) -> String {
+    display_value_at(value, 0, DISPLAY_DEPTH)
+}
+
+/// `display_value` without the depth cap, for text that is part of rendered
+/// output, where cutting a value short could make distinct values alike.
+pub(crate) fn display_value_full(value: &Value) -> String {
+    display_value_at(value, 0, usize::MAX)
+}
+
+fn display_value_at(value: &Value, depth: usize, max: usize) -> String {
+    if depth > max && matches!(value, Value::List(_) | Value::Object(..)) {
+        return "...".into();
+    }
+    match (kind_of(value), value) {
+        (Kind::Null, _) => "null".into(),
+        (_, Value::Bool(b)) => b.to_string(),
+        (_, Value::Int(n)) => n.to_string(),
+        (_, Value::Float(f)) => java_double_to_string(*f),
+        (_, Value::String(s)) => format!("{s:?}"),
+        (Kind::Duration | Kind::DataSize, Value::Duration(_) | Value::DataSize(_)) => {
+            crate::eval::stdlib::render_value(value)
+        }
+        (Kind::Duration | Kind::DataSize, Value::Object(map, _)) => {
+            let number = match map.get("value") {
+                Some(Value::Int(n)) => n.to_string(),
+                Some(Value::Float(f)) => java_double_to_string(*f),
+                _ => String::new(),
+            };
+            let unit = map.get("unit").and_then(Value::as_str).unwrap_or_default();
+            format!("{number}.{unit}")
+        }
+        (Kind::Regex, Value::Regex(regex)) => format!("Regex({:?})", regex.pattern()),
+        (kind @ Kind::Function, _) => format!("new {} {{}}", kind.pkl_class(value)),
+        (Kind::Bytes, Value::List(items)) => {
+            let bytes: Vec<String> = items.iter().map(display_value).collect();
+            format!("Bytes({})", bytes.join(", "))
+        }
+        (Kind::IntSeq, Value::List(items)) if items.int_seq_bounds().is_some() => {
+            let (start, end, step) = items.int_seq_bounds().unwrap_or_default();
+            if step == 1 {
+                format!("IntSeq({start}, {end})")
+            } else {
+                format!("IntSeq({start}, {end}).step({step})")
+            }
+        }
+        (Kind::IntSeq, Value::List(items)) => {
+            let int = |item: Option<&Value>| match item {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            };
+            match (int(items.first()), int(items.last())) {
+                (Some(start), Some(end)) if items.len() > 1 => {
+                    let step = int(items.get(1)).map_or(1, |second| second.wrapping_sub(start));
+                    if step == 1 {
+                        format!("IntSeq({start}, {end})")
+                    } else {
+                        format!("IntSeq({start}, {end}).step({step})")
+                    }
+                }
+                (Some(start), _) => format!("IntSeq({start}, {start})"),
+                _ => "IntSeq(1, 0)".into(),
+            }
+        }
+        (Kind::Pair, Value::Object(map, _)) => format!(
+            "Pair({}, {})",
+            map.get("first")
+                .map(|item| display_value_at(item, depth + 1, max))
+                .unwrap_or_default(),
+            map.get("second")
+                .map(|item| display_value_at(item, depth + 1, max))
+                .unwrap_or_default()
+        ),
+        (Kind::Class | Kind::TypeAlias, Value::Object(members, Some(source))) => {
+            (if kind_of(value) == Kind::TypeAlias {
+                match members.get(crate::eval::stdlib::TYPE_ALIAS_IDENTITY_KEY) {
+                    Some(Value::String(identity)) => Some(&**identity),
+                    _ => None,
+                }
+            } else {
+                source.type_identity.as_deref()
+            })
+            .map(|identity| {
+                if let Some(module) = source.display_module.as_deref()
+                    && let Some(name) = source.type_name.as_deref()
+                    && kind_of(value) == Kind::Class
+                {
+                    return format!("{module}#{name}");
+                }
+                match alias_split(identity, members).or_else(|| identity.rsplit_once('.')) {
+                    _ if crate::eval::stdlib::module_class_name(identity).is_some() => {
+                        crate::eval::stdlib::module_class_name(identity)
+                            .unwrap_or_default()
+                            .to_string()
+                    }
+                    _ if identity.starts_with("pkl:") => identity
+                        .rsplit_once('#')
+                        .map_or(identity, |(_, name)| name)
+                        .to_string(),
+                    Some((module, name)) => {
+                        let module = module.rsplit(['/', '\\']).next().unwrap_or(module);
+                        let module = module.strip_suffix(".pkl").unwrap_or(module);
+                        if crate::eval::stdlib::render::is_regular_identifier(name) {
+                            format!("{module}#{name}")
+                        } else {
+                            format!("{module}#`{name}`")
+                        }
+                    }
+                    None => identity.to_string(),
+                }
+            })
+            .or_else(|| source.type_name.clone())
+            .unwrap_or_default()
+        }
+        (Kind::Mapping, Value::Object(map, source)) if !map.is_empty() => {
+            if source.is_none() {
+                // A `Map`, which keeps its entries in view.
+                let shown = map
+                    .iter()
+                    .map(|(key, value)| {
+                        format!(
+                            "{}, {}",
+                            map_key_display(key, depth, max),
+                            display_value_at(value, depth + 1, max)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Map({shown})")
+            } else {
+                let shown = map
+                    .keys()
+                    .map(|key| format!("[{}] = ?", map_key_display(key, depth, max)))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("new Mapping {{ {shown} }}")
+            }
+        }
+        (Kind::Mapping, Value::Object(map, source)) if map.is_empty() => {
+            if source.is_none() {
+                "Map()".into()
+            } else {
+                "new Mapping {}".into()
+            }
+        }
+        (_, Value::Object(map, _)) => {
+            let class = kind_of(value).pkl_class(value);
+            match map.keys().next() {
+                Some(key) => match class_key_name(key) {
+                    Some(name) => name.to_string(),
+                    // `violating_value_display` expands this by its prefix.
+                    None => "new Dynamic { ... }".into(),
+                },
+                None => format!("new {class} {{}}"),
+            }
+        }
+        (_, Value::List(items)) => {
+            let shown = |items: &ListValue| {
+                items
+                    .iter()
+                    .map(|item| display_value_at(item, depth + 1, max))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            match items.kind() {
+                ListKind::List => format!("List({})", shown(items)),
+                ListKind::Set => format!("Set({})", shown(items)),
+                ListKind::Listing | ListKind::Dynamic => {
+                    let name = if items.kind() == ListKind::Listing {
+                        "Listing"
+                    } else {
+                        "Dynamic"
+                    };
+                    if items.is_empty() {
+                        format!("new {name} {{}}")
+                    } else {
+                        format!("new {name} {{ {} }}", vec!["?"; items.len()].join("; "))
+                    }
+                }
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format a float as Java's `Double.toString` does, which is how Pkl
+/// renders floats: `1.0`, `1.23456789123E8`, `1.0E-5`.
+pub(crate) fn java_double_to_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0"
+        } else {
+            "0.0"
+        }
+        .into();
+    }
+    // Shortest round-tripping digits and the decimal exponent.
+    let mut scientific = format!("{:e}", value.abs());
+    // Java writes at least two digits, the closest two-digit decimal that
+    // still reads back as the same double: `4.9E-324`, not `5.0E-324`.
+    if !scientific.contains('.') {
+        let two = format!("{:.1e}", value.abs());
+        if !two.contains(".0e") && two.parse::<f64>() == Ok(value.abs()) {
+            scientific = two;
+        }
+    }
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let sign = if value < 0.0 { "-" } else { "" };
+    if (-3..7).contains(&exponent) {
+        let point = exponent + 1;
+        let (int_part, frac_part) = if point <= 0 {
+            (
+                "0".to_string(),
+                format!("{}{digits}", "0".repeat((-point) as usize)),
+            )
+        } else if point as usize >= digits.len() {
+            (
+                format!("{digits}{}", "0".repeat(point as usize - digits.len())),
+                String::new(),
+            )
+        } else {
+            (
+                digits[..point as usize].to_string(),
+                digits[point as usize..].to_string(),
+            )
+        };
+        let frac_part = if frac_part.is_empty() {
+            "0".to_string()
+        } else {
+            frac_part
+        };
+        format!("{sign}{int_part}.{frac_part}")
+    } else {
+        let frac = if digits.len() > 1 { &digits[1..] } else { "0" };
+        format!("{sign}{}.{frac}E{exponent}", &digits[..1])
+    }
+}
+
+/// Whether the properties of `source` can carry `ConvertProperty`
+/// annotations: only an instance of a class, or a module, can.
+fn has_annotated_properties(source: &ObjectSource) -> bool {
+    // An amended instance replaces properties without their annotations, which
+    // the object it amends still has.
+    let mut next = Some(source);
+    while let Some(source) = next {
+        if source.module_annotations.is_some()
+            || (source.type_identity.is_some()
+                && source.entries.iter().any(
+                    |entry| matches!(entry, Entry::Property(prop) if !prop.annotations.is_empty()),
+                ))
+        {
+            return true;
+        }
+        next = match &source.prototype {
+            Some(Value::Object(_, Some(prototype))) => Some(prototype),
+            _ => None,
+        };
+    }
+    false
+}
+
+/// Apply the `ConvertProperty` annotations of the property `name` of an
+/// instance of the class `source` describes, as `renderer` renders it, to
+/// `value`. `None` if it has none.
+fn apply_property_annotations(
+    invoke: &mut dyn Invoke,
+    transformers: &Converters,
+    renderer: &Value,
+    source: &ObjectSource,
+    name: &Arc<str>,
+    value: &Value,
+) -> Result<Option<(Arc<str>, Value)>> {
+    let annotations = invoke.property_annotations(source, name)?;
+    let mut converted: Option<(Arc<str>, Value)> = None;
+    for annotation in annotations {
+        let annotation = match transformers.find(&annotation, Kind::Typed, &[]) {
+            Some(transformer) => {
+                let transformer = transformer.clone();
+                invoke.invoke(&transformer, annotation)?
+            }
+            None => annotation,
+        };
+        let Value::Object(members, source) = &annotation else {
+            continue;
+        };
+        // Only a `ConvertProperty` converts a property; another annotation
+        // may have a `render` member of its own.
+        let Some(source) = source else {
+            continue;
+        };
+        if source.type_name.as_deref() != Some("ConvertProperty")
+            && !source
+                .parent_type_names
+                .iter()
+                .any(|parent| parent == "ConvertProperty")
+        {
+            continue;
+        }
+        let Some(render @ Value::Lambda(..)) = members.get("render") else {
+            continue;
+        };
+        let (key, value) = match &converted {
+            Some((key, value)) => (key.clone(), value.clone()),
+            None => (name.clone(), value.clone()),
+        };
+        let mut pair = ObjectMap::default();
+        pair.insert("first".into(), Value::String(key));
+        pair.insert("second".into(), value);
+        let pair = super::stdlib::typed_object("Pair", pair);
+        let result = invoke.invoke_all(render, &[pair, renderer.clone()])?;
+        let rendered = match &result {
+            Value::Object(pair, _) => pair.get("first").zip(pair.get("second")),
+            _ => None,
+        };
+        match rendered {
+            Some((Value::String(key), value)) => converted = Some((key.clone(), value.clone())),
+            _ => {
+                return Err(Error::Eval(format!(
+                    "Expected value of type `Pair<String, Any>`, but got `{}`.",
+                    display_value(&result)
+                )));
+            }
+        }
+    }
+    Ok(converted)
+}
+
+/// Convert a module's output value to JSON for [`crate::eval_to_json`],
+/// applying `converters` and refusing what Pkl's `JsonRenderer` refuses.
+/// Null properties and entries are dropped when `omit_nulls` (the renderer
+/// sets `omitNullProperties`). `top_kind` overrides how the value itself is
+/// classified (a module is typed).
+#[cfg(feature = "native-io")]
+pub(crate) fn to_json(
+    value: &Value,
+    top_kind: Option<Kind>,
+    converters: &Converters,
+    omit_nulls: bool,
+    annotations: Option<(&Value, &Converters)>,
+    invoke: &mut dyn Invoke,
+) -> Result<serde_json::Value> {
+    let mut state = JsonValue {
+        converters,
+        invoke,
+        path: Vec::new(),
+        track_path: converters.has_paths(),
+        omit_nulls,
+        annotations,
+        memo: Default::default(),
+    };
+    state.push(PathPart::TopLevel);
+    let kind = top_kind.unwrap_or_else(|| kind_of(value));
+    let (value, kind) = match converters.find(value, kind, &[PathPart::TopLevel]) {
+        Some(function) => {
+            let converted = state.invoke.invoke(function, value.clone())?;
+            let kind = kind_of(&converted);
+            (converted, kind)
+        }
+        None => (value.clone(), kind),
+    };
+    // Convert first, sharing what no converter changed, then render the
+    // converted tree.
+    let converted = state.convert_members(&value, kind)?.unwrap_or(value);
+    let no_converters = Converters::default();
+    let mut render = JsonValue {
+        converters: &no_converters,
+        invoke: state.invoke,
+        path: Vec::new(),
+        track_path: false,
+        omit_nulls,
+        annotations: None,
+        memo: Default::default(),
+    };
+    render.value(&converted, kind)
+}
+
+/// Apply `converters` to `value` and everything under it, as a renderer
+/// would before rendering it.
+pub(crate) fn convert_value(
+    value: &Value,
+    top_kind: Option<Kind>,
+    converters: &Converters,
+    invoke: &mut dyn Invoke,
+) -> Result<Value> {
+    let mut state = JsonValue {
+        converters,
+        invoke,
+        path: Vec::new(),
+        track_path: converters.has_paths(),
+        omit_nulls: false,
+        annotations: None,
+        memo: Default::default(),
+    };
+    state.push(PathPart::TopLevel);
+    let kind = top_kind.unwrap_or_else(|| kind_of(value));
+    let (value, kind) = match converters.find(value, kind, &[PathPart::TopLevel]) {
+        Some(function) => {
+            let converted = state.invoke.invoke(function, value.clone())?;
+            let kind = kind_of(&converted);
+            (converted, kind)
+        }
+        None => (value.clone(), kind),
+    };
+    Ok(state.convert_members(&value, kind)?.unwrap_or(value))
+}
+
+struct JsonValue<'a> {
+    converters: &'a Converters,
+    invoke: &'a mut dyn Invoke,
+    path: Vec<PathPart>,
+    track_path: bool,
+    /// Whether null members are left out (`to_json` only).
+    #[cfg_attr(not(feature = "native-io"), allow(dead_code))]
+    omit_nulls: bool,
+    /// The renderer and its `convertPropertyTransformers`, to apply the
+    /// `ConvertProperty` annotations of properties (`to_json` only).
+    annotations: Option<(&'a Value, &'a Converters)>,
+    /// Converted objects and lists by address (see
+    /// [`JsonValue::convert_member`]), each kept with its original so the
+    /// address is not reused while the memo is alive.
+    memo: rustc_hash::FxHashMap<(usize, usize), (Value, Option<Value>)>,
+}
+
+impl JsonValue<'_> {
+    fn push(&mut self, part: PathPart) {
+        if self.track_path {
+            self.path.push(part);
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.track_path {
+            self.path.pop();
+        }
+    }
+
+    /// The converted value, or `None` when no converter applies.
+    fn convert_if_needed(&mut self, value: &Value) -> Result<(Option<Value>, Kind)> {
+        let kind = kind_of(value);
+        if self.converters.is_empty() {
+            return Ok((None, kind));
+        }
+        match self.converters.find(value, kind, &self.path) {
+            Some(function) => {
+                let converted = self.invoke.invoke(function, value.clone())?;
+                let kind = kind_of(&converted);
+                Ok((Some(converted), kind))
+            }
+            None => Ok((None, kind)),
+        }
+    }
+
+    /// The storage representation of a converted entry key.
+    fn entry_storage_key(value: &Value) -> Arc<str> {
+        match value {
+            Value::String(value) => value.clone(),
+            Value::Object(_, _) | Value::List(_) => object_key(value),
+            value => crate::value::mapping_storage_key(value)
+                .unwrap_or_else(|| display_value(value).into()),
+        }
+    }
+
+    /// The key an entry key converts to, or `None` if it is unchanged.
+    fn convert_entry_key(&mut self, key: &Arc<str>) -> Result<Option<Arc<str>>> {
+        let value = key_value(key);
+        let kind = kind_of(&value);
+        let Some(function) = self.converters.find(&value, kind, &[]) else {
+            return Ok(None);
+        };
+        let converted = self.invoke.invoke(function, value)?;
+        let converted = Self::entry_storage_key(&converted);
+        Ok((converted != *key).then_some(converted))
+    }
+
+    /// Convert `member` and everything under it, or `None` if nothing
+    /// changed. A shared object or list (like the same steps under every
+    /// hook) converts the same way each time unless converters depend on the
+    /// path, so it is converted once.
+    fn convert_member(&mut self, member: &Value) -> Result<Option<Value>> {
+        let key = match member {
+            _ if self.track_path => None,
+            Value::Object(map, source) => Some((
+                Arc::as_ptr(map) as usize,
+                source.as_ref().map_or(0, |s| Arc::as_ptr(s) as usize),
+            )),
+            Value::List(items) => Some((items.items_ptr() as usize, 0)),
+            _ => None,
+        };
+        if let Some(key) = key
+            && let Some((_, converted)) = self.memo.get(&key)
+        {
+            return Ok(converted.clone());
+        }
+        let (converted, kind) = self.convert_if_needed(member)?;
+        let inner = self.convert_members(converted.as_ref().unwrap_or(member), kind)?;
+        let converted = inner.or(converted);
+        if let Some(key) = key {
+            self.memo.insert(key, (member.clone(), converted.clone()));
+        }
+        Ok(converted)
+    }
+
+    /// Convert the members of `value`. `None` means nothing under it
+    /// changed, so the caller can keep sharing `value`.
+    fn convert_members(&mut self, value: &Value, kind: Kind) -> Result<Option<Value>> {
+        match (kind, value) {
+            (Kind::Listing, Value::List(items)) => {
+                let mut changed: Option<Vec<Value>> = None;
+                for (index, item) in items.iter().enumerate() {
+                    self.push(PathPart::Element(index));
+                    let converted = self.convert_member(item)?;
+                    self.pop();
+                    match (&mut changed, converted) {
+                        (Some(changed), converted) => {
+                            changed.push(converted.unwrap_or_else(|| item.clone()))
+                        }
+                        (None, Some(converted)) => {
+                            let mut list = items[..index].to_vec();
+                            list.push(converted);
+                            changed = Some(list);
+                        }
+                        (None, None) => {}
+                    }
+                }
+                Ok(changed.map(|changed| Value::List(ListValue::new(items.kind(), changed))))
+            }
+            (kind, Value::Object(map, source)) if kind.is_object() => {
+                // Entry keys are converted with an empty path before their
+                // values. This includes typed keys stored with an internal
+                // mapping-key prefix.
+                let converts_keys = !self.converters.is_empty();
+                // The module-wide check skips what a converter replaces and
+                // cannot match a path converter, so it is made here: on every
+                // object this walk reaches, which includes a converter's
+                // result.
+                if let Some(member) = source
+                    .as_ref()
+                    .and_then(|source| source.poisoned_members.as_ref())
+                    .and_then(|members| members.values().find(|member| member.rendered))
+                {
+                    return Err(Error::Eval(member.message.clone()));
+                }
+                let annotated_source = match (self.annotations, source.as_deref()) {
+                    (Some(_), Some(source)) if has_annotated_properties(source) => Some(source),
+                    _ => None,
+                };
+                let members = (self.track_path || converts_keys || annotated_source.is_some())
+                    .then(|| Members::new(kind, source.as_deref()));
+                let mut changed: Option<ObjectMap> = None;
+                for (index, (key, member)) in map.iter().enumerate() {
+                    let member_kind = members.as_ref().map(|members| members.kind_of(key));
+                    let new_key = if converts_keys && member_kind == Some(MemberKind::Entry) {
+                        self.convert_entry_key(key)?
+                    } else {
+                        None
+                    };
+                    // A property annotation renames and converts the member
+                    // before the converters see it.
+                    let mut annotated_member = None;
+                    if let (
+                        Some(source),
+                        Some((renderer, transformers)),
+                        Some(MemberKind::Property),
+                    ) = (annotated_source, self.annotations, member_kind)
+                        && !member.is_unrendered_member(key, Some(source))
+                        && let Some((renamed, value)) = apply_property_annotations(
+                            &mut *self.invoke,
+                            transformers,
+                            renderer,
+                            source,
+                            key,
+                            member,
+                        )?
+                    {
+                        annotated_member = Some((renamed, value));
+                    }
+                    let new_key = match &annotated_member {
+                        Some((renamed, _)) if renamed != key => Some(renamed.clone()),
+                        _ => new_key,
+                    };
+                    let member = match &annotated_member {
+                        Some((_, value)) => value,
+                        None => member,
+                    };
+                    if self.track_path {
+                        let key = new_key.clone().unwrap_or_else(|| key.clone());
+                        let key_value = key_value(&key);
+                        self.path.push(match member_kind {
+                            Some(MemberKind::Entry) => match key_value {
+                                Value::String(key) => PathPart::Entry(key),
+                                key => PathPart::Key(key),
+                            },
+                            _ => PathPart::Property(key),
+                        });
+                    }
+                    let converted = if member.is_unrendered_member(key, source.as_deref()) {
+                        None
+                    } else {
+                        self.convert_member(member)?
+                    };
+                    self.pop();
+                    if changed.is_none()
+                        && (converted.is_some() || new_key.is_some() || annotated_member.is_some())
+                    {
+                        let mut new_map =
+                            ObjectMap::with_capacity_and_hasher(map.len(), Default::default());
+                        new_map.extend(map.iter().take(index).map(|(k, v)| (k.clone(), v.clone())));
+                        changed = Some(new_map);
+                    }
+                    if let Some(changed) = &mut changed {
+                        changed.insert(
+                            new_key.unwrap_or_else(|| key.clone()),
+                            converted.unwrap_or_else(|| member.clone()),
+                        );
+                    }
+                }
+                Ok(changed.map(|map| Value::Object(Arc::new(map), source.clone())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Render a member of an already converted value.
+    #[cfg(feature = "native-io")]
+    fn member(&mut self, value: &Value) -> Result<(serde_json::Value, Kind)> {
+        let kind = match kind_of(value) {
+            // As in `Walk::kind`, a nested class renders as a typed object.
+            Kind::Class => Kind::Typed,
+            kind => kind,
+        };
+        Ok((self.value(value, kind)?, kind))
+    }
+
+    #[cfg(feature = "native-io")]
+    fn value(&mut self, value: &Value, kind: Kind) -> Result<serde_json::Value> {
+        crate::stack::check_depth()?;
+        if kind == Kind::Typed
+            && typed_class_is(value, "pkl:xml", "CommentClass")
+            && matches!(value, Value::Object(map, _) if map.get("text").and_then(Value::as_str).is_some_and(|text| text.contains("--") || text.ends_with('-')))
+        {
+            return Err(Error::Eval(
+                "XML comments must not contain `--` or end with `-`.".into(),
+            ));
+        }
+        if kind == Kind::Typed
+            && matches!(value, Value::Object(_, Some(source)) if source.kind == ObjectKind::Reference)
+        {
+            return Err(cannot_render_type(value, kind, "JSON"));
+        }
+        Ok(match (kind, value) {
+            (Kind::Null, _) => serde_json::Value::Null,
+            (_, Value::Bool(b)) => serde_json::Value::Bool(*b),
+            (_, Value::Int(n)) => serde_json::Value::from(*n),
+            (_, Value::Float(f)) => {
+                if !f.is_finite() {
+                    return Err(Error::Eval(format!(
+                        "Cannot render value `{}` as JSON.",
+                        java_double_to_string(*f)
+                    )));
+                }
+                serde_json::Value::from(*f)
+            }
+            (_, Value::String(s)) => serde_json::Value::String(s.to_string()),
+            (Kind::RenderDirective, _) => {
+                return Err(Error::Eval(
+                    "Cannot render a `RenderDirective` as a JSON value.".into(),
+                ));
+            }
+            (Kind::Listing, Value::List(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    self.push(PathPart::Element(index));
+                    out.push(self.member(item)?.0);
+                    self.pop();
+                }
+                serde_json::Value::Array(out)
+            }
+            (kind, Value::Object(map, source)) if kind.is_object() => {
+                if kind == Kind::Dynamic
+                    && source
+                        .as_deref()
+                        .is_some_and(|source| !source.elements.is_empty())
+                    && map
+                        .values()
+                        .any(|member| !matches!(member, Value::Lambda(..)))
+                {
+                    return Err(Error::Eval(format!(
+                        "Cannot render object with both elements and properties/entries as JSON.\nObject: {}",
+                        display_value(value)
+                    )));
+                }
+                let members = self
+                    .track_path
+                    .then(|| Members::new(kind, source.as_deref()));
+                let mut out = serde_json::Map::new();
+                for (key, member) in map.iter() {
+                    if is_non_string_key(key) {
+                        // As pkl: an entry dropped for its null value is
+                        // never rendered, so its key is not checked.
+                        if self.omit_nulls && kind_of(member) == Kind::Null {
+                            continue;
+                        }
+                        return Err(cannot_render_non_string_key(&key_value(key), "JSON"));
+                    }
+                    // Methods are stored as function-valued members, and an
+                    // object without a source cannot tell them from data.
+                    if member.is_unrendered_member(key, source.as_deref()) {
+                        continue;
+                    }
+                    if let Some(members) = &members {
+                        self.path.push(match members.kind_of(key) {
+                            MemberKind::Property => PathPart::Property(key.clone()),
+                            MemberKind::Entry => PathPart::Entry(key.clone()),
+                        });
+                    }
+                    let (json, kind) = self.member(member)?;
+                    if !(self.omit_nulls && kind == Kind::Null) {
+                        out.insert(key.to_string(), json);
+                    }
+                    self.pop();
+                }
+                serde_json::Value::Object(out)
+            }
+            (kind, _) => return Err(cannot_render_type(value, kind, "JSON")),
+        })
+    }
+}
+
+/// A reference as an error message shows it.
+fn reference_display(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(_, Some(source)) if source.kind == ObjectKind::Reference => {
+            Some(crate::eval::stdlib::render_value(value))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn java_doubles() {
+        for (value, expected) in [
+            (1.0, "1.0"),
+            (1.23, "1.23"),
+            (-1.5, "-1.5"),
+            (1e10, "1.0E10"),
+            (1e7, "1.0E7"),
+            (9999999.0, "9999999.0"),
+            (0.001, "0.001"),
+            (0.0001, "1.0E-4"),
+            (1e-5, "1.0E-5"),
+            (123456789.123, "1.23456789123E8"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (4.9e-324, "4.9E-324"),
+            (2e-323, "2.0E-323"),
+            (1e23, "1.0E23"),
+            (100.0, "100.0"),
+            (-0.0, "-0.0"),
+            (f64::NAN, "NaN"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            assert_eq!(java_double_to_string(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn path_specs() {
+        use PathSpec::*;
+        assert_eq!(
+            parse_path_spec("^apple").unwrap(),
+            vec![Property("apple".into()), TopLevel]
+        );
+        assert_eq!(
+            parse_path_spec("hobbies[*]").unwrap(),
+            vec![AnyElement, Property("hobbies".into())]
+        );
+        assert_eq!(
+            parse_path_spec("address.*").unwrap(),
+            vec![AnyProperty, Property("address".into())]
+        );
+        assert_eq!(
+            parse_path_spec("^[apple]").unwrap(),
+            vec![Entry("apple".into()), TopLevel]
+        );
+        assert_eq!(parse_path_spec("").unwrap(), vec![TopLevel]);
+        assert!(parse_path_spec("a..b").is_err());
+        assert!(parse_path_spec("a^").is_err());
+    }
+
+    /// Converters can turn two keys into modules that differ only in the
+    /// classes they declare. Pkl keeps both entries (it renders them as
+    /// `[new { p = 1 }] = 1` and `[new { p = 1 }] = 2`), so the keys' identity
+    /// must keep the classes that rendering leaves out.
+    #[cfg(feature = "native-io")]
+    #[test]
+    fn converted_keys_differing_only_in_classes_stay_distinct() {
+        let dir = std::env::temp_dir().join(format!("pklr-class-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("l1.pkl"), "class X { a: Int = 1 }\np = 1\n").unwrap();
+        std::fs::write(dir.join("l2.pkl"), "class Y { a: Int = 1 }\np = 1\n").unwrap();
+        std::fs::write(
+            dir.join("main.pkl"),
+            "import \"l1.pkl\" as l1\nimport \"l2.pkl\" as l2\nk1 = l1\nk2 = l2\n",
+        )
+        .unwrap();
+        let value = crate::Evaluator::new()
+            .eval_file(&dir.join("main.pkl"))
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let Value::Object(map, _) = value else {
+            panic!("module value");
+        };
+        let (k1, k2) = (&map["k1"], &map["k2"]);
+        assert_eq!(k1.to_json(), k2.to_json());
+        assert_ne!(object_key(k1), object_key(k2));
+    }
+}

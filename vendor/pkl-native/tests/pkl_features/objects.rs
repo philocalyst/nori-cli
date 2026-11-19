@@ -1,0 +1,8430 @@
+use super::*;
+
+// ============================================================
+// Class instantiation (future)
+// ============================================================
+
+#[test]
+fn class_new_with_defaults() {
+    let json = eval(
+        r#"
+class Person {
+    name: String
+    age: Int = 0
+}
+x = new Person {
+    name = "Alice"
+}
+"#,
+    );
+    assert_eq!(json["x"]["name"], "Alice");
+    assert_eq!(json["x"]["age"], 0);
+}
+
+// ============================================================
+// Object amendment (future)
+// ============================================================
+
+#[test]
+fn object_amendment() {
+    let json = eval(
+        r#"
+local base = new Mapping {
+    ["check"] = "echo hello"
+    ["fix"] = "echo fix"
+}
+x = (base) {
+    ["check"] = "echo override"
+}
+"#,
+    );
+    assert_eq!(json["x"]["check"], "echo override");
+    assert_eq!(json["x"]["fix"], "echo fix");
+}
+
+// ============================================================
+// Throw and trace
+// ============================================================
+
+#[test]
+fn throw_produces_error() {
+    let msg = eval_fails(r#"x = throw("boom")"#);
+    assert!(msg.contains("boom"));
+}
+
+#[test]
+fn invalid_module_body_reports_a_parse_error() {
+    let msg = eval_fails("this is not valid pkl");
+    assert!(msg.contains("Keyword `this` is not allowed here"), "{msg}");
+    assert!(!msg.contains("Invalid property definition"), "{msg}");
+}
+
+// ============================================================
+// pkl:test
+// ============================================================
+
+#[test]
+fn test_catch_returns_error_message() {
+    let json = eval(
+        r#"
+import "pkl:test"
+class Bird { name = "Pigeon" }
+local bird = new Bird {}
+thrown = test.catch(() -> throw("boom"))
+dynamic = test.catch(() -> new Dynamic { x = 1 }.y)
+typed = test.catch(() -> bird.age)
+caught = test.catchOrNull(() -> throw("boom"))
+notThrown = test.catchOrNull(() -> 1) == null
+"#,
+    );
+    assert_eq!(json["thrown"], "boom");
+    assert_eq!(
+        json["dynamic"],
+        "Cannot find property `y` in object of type `Dynamic`."
+    );
+    assert_eq!(
+        json["typed"],
+        "Cannot find property `age` in object of type `test#Bird`."
+    );
+    assert_eq!(json["caught"], "boom");
+    assert_eq!(json["notThrown"], true);
+}
+
+#[test]
+fn test_catch_fails_without_an_error() {
+    let msg = eval_fails(
+        r#"
+import "pkl:test"
+x = test.catch(() -> 1)
+"#,
+    );
+    assert!(msg.contains("Expected an exception, but none was thrown."));
+}
+
+#[test]
+fn modules_extending_pkl_test_inherit_catch() {
+    let json = eval(
+        r#"
+extends "pkl:test"
+x = module.catch(() -> throw("boom"))
+"#,
+    );
+    assert_eq!(json, serde_json::json!({ "x": "boom" }));
+}
+
+#[test]
+fn modules_amending_pkl_test_inherit_catch() {
+    let json = eval(
+        r#"
+amends "pkl:test"
+local x = module.catch(() -> throw("boom"))
+local y = catch(() -> throw("bare"))
+examples { [x] = new Listing {}; [y] = new Listing {} }
+"#,
+    );
+    assert_eq!(
+        json,
+        serde_json::json!({ "examples": { "boom": [], "bare": [] } })
+    );
+}
+
+#[test]
+fn modules_amending_a_pkl_test_module_inherit_catch() {
+    let temp = TestTempDir::new("pklr_test_amend_pkl_test_base");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("base.pkl"),
+        "open module base\nextends \"pkl:test\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        r#"
+amends "base.pkl"
+local x = module.catch(() -> throw("boom"))
+local y = catch(() -> throw("bare"))
+examples { [x] = new Listing {}; [y] = new Listing {} }
+"#,
+    )
+    .unwrap();
+    let val = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(
+        val,
+        serde_json::json!({ "examples": { "boom": [], "bare": [] } })
+    );
+}
+
+#[test]
+fn generated_mapping_keys_cannot_repeat_in_one_body() {
+    let json = eval(
+        r#"
+import "pkl:test"
+local m = new Mapping { ["a"] = 0 }
+forLoop = test.catch(() -> new Mapping { for (i in List(1, 2)) { ["a"] = i } })
+direct = test.catch(() -> new Mapping { ["a"] = 1; when (true) { ["a"] = 2 } })
+generatorAfterDirect = test.catch(() -> new Dynamic { ["a"] = 1; for (i in List(1)) { ["a"] = i } })
+twoLoops = test.catch(() -> new Mapping { for (i in List(1)) { ["a"] = i } for (i in List(1)) { ["a"] = i } })
+amendedTwice = test.catch(() -> (m) { for (i in List(1, 2)) { ["a"] = i } })
+amendsParent = (m) { for (i in List(1)) { ["a"] = i } }
+nextLayer = new Mapping { ["a"] = 1 } { ["a"] = 2 }
+differentTypes = test.catchOrNull(() -> new Mapping<Any, Int> { [1] = 10; ["1"] = 20 })
+local differentTypeKeys = new Mapping<Any, Int> { [1] = 10; ["1"] = 20 }
+numberKey = differentTypeKeys[1]
+stringKey = differentTypeKeys["1"]
+differentTypeKeyCount = differentTypeKeys.length
+typedKeys = differentTypeKeys.keys
+"#,
+    );
+    let duplicate = "Duplicate definition of member `\"a\"`.";
+    for key in [
+        "forLoop",
+        "direct",
+        "generatorAfterDirect",
+        "twoLoops",
+        "amendedTwice",
+    ] {
+        assert_eq!(json[key], duplicate, "{key}");
+    }
+    assert_eq!(json["amendsParent"]["a"], 1);
+    assert_eq!(json["nextLayer"]["a"], 2);
+    assert!(json["differentTypes"].is_null());
+    assert_eq!(json["numberKey"], 10);
+    assert_eq!(json["stringKey"], 20);
+    assert_eq!(json["differentTypeKeyCount"], 2);
+    assert_eq!(json["typedKeys"], serde_json::json!([1, "1"]));
+}
+
+#[test]
+fn amended_mapping_cannot_define_a_key_twice() {
+    let json = eval(
+        r#"
+import "pkl:test"
+local m = new Mapping { ["z"] = 0 }
+direct = test.catch(() -> (m) { ["k"] = 1; ["" + "k"] = 2 }.length)
+intAndFloat = test.catchOrNull(() -> new Mapping<Any, Int> { [1] = 10; [1.0] = 20 })
+"#,
+    );
+    assert_eq!(json["direct"], "Duplicate definition of member `\"k\"`.");
+    assert!(json["intAndFloat"].is_null());
+}
+
+#[test]
+fn amended_mapping_cannot_amend_a_key_twice_in_one_body() {
+    let msg = eval_fails(
+        r#"
+local m = new Mapping { ["nested"] = new Dynamic {} }
+x = (m) { ["nested"] { a = 1 }; ["nested"] { b = 2 } }
+"#,
+    );
+    assert!(
+        msg.contains("Duplicate definition of member `\"nested\"`."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn declared_module_names_do_not_outlive_an_evaluation() {
+    let temp = TestTempDir::new("pklr_test_module_names_reset");
+    let dir = temp.path();
+    let settings = dir.join("settings.pkl");
+    let main = dir.join("main.pkl");
+    std::fs::write(&main, "import \"settings.pkl\"\nx = settings.nope\n").unwrap();
+    let mut ev = Evaluator::new();
+    std::fs::write(&settings, "module company.Settings\na = 1\n").unwrap();
+    let first = ev.eval_file(&main).unwrap_err().to_string();
+    assert!(first.contains("in module `company.Settings`"), "{first}");
+    std::fs::write(&settings, "a = 1\n").unwrap();
+    let second = ev.eval_file(&main).unwrap_err().to_string();
+    assert!(second.contains("in module `settings`"), "{second}");
+}
+
+#[test]
+fn missing_property_messages_use_declared_module_names() {
+    let temp = TestTempDir::new("pklr_test_declared_module_name");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("settings.pkl"),
+        "module company.Settings\nclass Bird { name = \"x\" }\nbird = new Bird {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        r#"
+import "pkl:test"
+import "settings.pkl"
+typed = test.catch(() -> settings.bird.age)
+"#,
+    )
+    .unwrap();
+    let val = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(
+        val["typed"],
+        "Cannot find property `age` in object of type `company.Settings#Bird`."
+    );
+    std::fs::write(
+        dir.join("main.pkl"),
+        "import \"settings.pkl\"\nx = settings.nope\n",
+    )
+    .unwrap();
+    let err = pklr::eval_to_json(&dir.join("main.pkl"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Cannot find property `nope` in module `company.Settings`."));
+}
+
+#[test]
+fn listing_index_amendments_must_name_a_parent_element() {
+    let json = eval(
+        r#"
+import "pkl:test"
+local x = new Listing { "one" }
+amended = (x) { [0] = "uno" }
+past = test.catch(() -> (x) { [1] = "two" })
+added = test.catch(() -> (x) { "two"; [1] = "dos" })
+negative = test.catch(() -> (x) { [-1] = "two" })
+wrongType = test.catch(() -> (x) { ["0"] = "two" })
+"#,
+    );
+    assert_eq!(json["amended"], serde_json::json!(["uno"]));
+    assert_eq!(json["past"], "Element index `1` is out of range `0`..`0`.");
+    assert_eq!(json["added"], "Element index `1` is out of range `0`..`0`.");
+    assert_eq!(
+        json["negative"],
+        "Element index `-1` is out of range `0`..`0`."
+    );
+    assert_eq!(
+        json["wrongType"],
+        "Expected key of type `Int`, but got type `String`."
+    );
+}
+
+#[test]
+fn mapping_body_cannot_define_a_key_twice() {
+    let json = eval(
+        r#"
+import "pkl:test"
+local m = new Mapping { ["a"] = 1 }
+amended = (m) { ["a"] = 2 }
+duplicate = test.catch(() -> new Mapping { ["a"] = 1; ["" + "a"] = 2 })
+"#,
+    );
+    assert_eq!(json["amended"]["a"], 2);
+    assert_eq!(json["duplicate"], "Duplicate definition of member `\"a\"`.");
+}
+
+#[test]
+fn mapping_entry_this_reads_prior_entries() {
+    let json = eval(
+        r#"
+res = new Mapping {
+    ["one"] = 1
+    ["two"] = this["one"] + 1
+}
+"#,
+    );
+    assert_eq!(json["res"], serde_json::json!({ "one": 1, "two": 2 }));
+}
+
+#[test]
+fn mapping_entry_this_is_lexical_for_lambdas() {
+    let json = eval(
+        r#"
+local mapping = new Mapping {
+    ["one"] = 1
+    ["f"] = () -> this["one"]
+}
+result = mapping["f"].apply()
+"#,
+    );
+    assert_eq!(json["result"], 1);
+}
+
+// ============================================================
+// Null-safe access (future)
+// ============================================================
+
+#[test]
+fn null_safe_access() {
+    let json = eval(
+        r#"
+local x = null
+result = x?.name ?? "default"
+"#,
+    );
+    assert_eq!(json["result"], "default");
+}
+
+// ============================================================
+// Module header
+// ============================================================
+
+#[test]
+fn module_header_skipped() {
+    let json = eval(
+        r#"
+module my.Config
+x = 42
+"#,
+    );
+    assert_eq!(json["x"], 42);
+}
+
+// ============================================================
+// Higher-order methods (map, filter, fold)
+// ============================================================
+
+#[test]
+fn list_map() {
+    let json = eval(
+        r#"
+local items = List(1, 2, 3)
+x = items.map((n) -> n * 2)
+"#,
+    );
+    assert_eq!(json["x"], serde_json::json!([2, 4, 6]));
+}
+
+#[test]
+fn list_filter() {
+    let json = eval(
+        r#"
+local items = List(1, 2, 3, 4, 5)
+x = items.filter((n) -> n > 2)
+"#,
+    );
+    assert_eq!(json["x"], serde_json::json!([3, 4, 5]));
+}
+
+#[test]
+fn list_fold() {
+    let json = eval(
+        r#"
+local items = List(1, 2, 3, 4)
+x = items.fold(0, (acc, n) -> acc + n)
+"#,
+    );
+    assert_eq!(json["x"], 10);
+}
+
+#[test]
+fn list_any_every() {
+    let json = eval(
+        r#"
+local items = List(1, 2, 3)
+has_even = items.any((n) -> n % 2 == 0)
+all_positive = items.every((n) -> n > 0)
+"#,
+    );
+    assert_eq!(json["has_even"], true);
+    assert_eq!(json["all_positive"], true);
+}
+
+// ============================================================
+// Higher-order methods on Map / Mapping
+// ============================================================
+
+#[test]
+fn map_filter() {
+    let json = eval(
+        r#"
+local items = new Mapping<String, Int> {
+    ["a"] = 1
+    ["b"] = 2
+    ["c"] = 3
+}
+x = items.toMap().filter((k, v) -> v > 1).toMapping()
+"#,
+    );
+    assert_eq!(json["x"]["b"], 2);
+    assert_eq!(json["x"]["c"], 3);
+    assert!(json["x"].get("a").is_none());
+}
+
+#[test]
+fn map_filter_then_map_values_chain() {
+    // toMap().filter().mapValues().toMapping() is a common transformation chain.
+    let json = eval(
+        r#"
+local items = new Mapping<String, Int> {
+    ["a"] = 1
+    ["b"] = 2
+    ["c"] = 3
+}
+x =
+    items
+        .toMap()
+        .filter((k, v) -> v > 1)
+        .mapValues((k, v) -> v * 10)
+        .toMapping()
+"#,
+    );
+    assert_eq!(json["x"]["b"], 20);
+    assert_eq!(json["x"]["c"], 30);
+    assert!(json["x"].get("a").is_none());
+}
+
+#[test]
+fn object_amendment_with_named_property() {
+    let json = eval(
+        r#"
+local base = new Mapping {
+    ["a"] {
+        value = 1
+    }
+}
+x = (base) {
+    ["a"] {
+        value = 2
+    }
+    ["b"] {
+        value = 3
+    }
+}
+"#,
+    );
+    assert_eq!(json["x"]["a"]["value"], 2);
+    assert_eq!(json["x"]["b"]["value"], 3);
+}
+
+// ============================================================
+// Late binding
+// ============================================================
+
+#[test]
+fn late_binding_basic() {
+    // Overriding x should cause y to re-evaluate
+    let json = eval(
+        r#"
+local base = new {
+    x = 1
+    y = x + 1
+}
+result = (base) {
+    x = 10
+}
+"#,
+    );
+    assert_eq!(json["result"]["x"], 10);
+    assert_eq!(json["result"]["y"], 11);
+}
+
+#[test]
+fn late_binding_chained() {
+    // Chained dependency: x -> y -> z
+    let json = eval(
+        r#"
+local base = new {
+    x = 1
+    y = x + 1
+    z = y + 1
+}
+result = (base) {
+    x = 10
+}
+"#,
+    );
+    assert_eq!(json["result"]["x"], 10);
+    assert_eq!(json["result"]["y"], 11);
+    assert_eq!(json["result"]["z"], 12);
+}
+
+#[test]
+fn late_binding_unrelated_preserved() {
+    // Properties not depending on overridden ones stay the same
+    let json = eval(
+        r#"
+local base = new {
+    x = 1
+    y = x + 1
+    name = "hello"
+}
+result = (base) {
+    x = 10
+}
+"#,
+    );
+    assert_eq!(json["result"]["x"], 10);
+    assert_eq!(json["result"]["y"], 11);
+    assert_eq!(json["result"]["name"], "hello");
+}
+
+#[test]
+fn late_binding_class_new() {
+    // Late binding with class defaults
+    let json = eval(
+        r#"
+class Config {
+    port: Int = 8080
+    url: String = "http://localhost:\(port)"
+}
+result = new Config {
+    port = 3000
+}
+"#,
+    );
+    assert_eq!(json["result"]["port"], 3000);
+    assert_eq!(json["result"]["url"], "http://localhost:3000");
+}
+
+#[test]
+fn late_binding_string_interpolation() {
+    // Late binding with string interpolation
+    let json = eval(
+        r#"
+local base = new {
+    name = "world"
+    greeting = "Hello, \(name)!"
+}
+result = (base) {
+    name = "Pkl"
+}
+"#,
+    );
+    assert_eq!(json["result"]["name"], "Pkl");
+    assert_eq!(json["result"]["greeting"], "Hello, Pkl!");
+}
+
+// ============================================================
+// this / outer keywords
+// ============================================================
+
+#[test]
+fn outer_keyword() {
+    let json = eval(
+        r#"
+local prefix = "test"
+data {
+    local before = "\(prefix)-data"
+    inner {
+        name = outer.before
+    }
+}
+"#,
+    );
+    assert_eq!(json["data"]["inner"]["name"], "test-data");
+}
+
+#[test]
+fn this_alias_reachable_from_nested_objects() {
+    // Nested objects leave out `this` aliases they never name; every way of
+    // still reaching the alias (directly, from a deeper body, from a lambda,
+    // through `outer`, or through a property holding `this`) must keep it.
+    let json = eval(
+        r#"
+obj {
+  local self = this
+  a = 1
+  me = this
+  plain { x = 0 }
+  direct { y = self.a }
+  deep { inner { z = self.a } }
+  viaOuter { w = outer.a }
+  viaMember { w = outer.me.a }
+  fn { local f = (n) -> n + self.a; r = f.apply(1) }
+  b = 2
+}
+amended = (obj.plain) { q = obj.b }
+reamended = (obj.deep) { extra = 3 }
+"#,
+    );
+    assert_eq!(json["obj"]["direct"]["y"], 1);
+    assert_eq!(json["obj"]["deep"]["inner"]["z"], 1);
+    assert_eq!(json["obj"]["viaOuter"]["w"], 1);
+    assert_eq!(json["obj"]["viaMember"]["w"], 1);
+    assert_eq!(json["obj"]["fn"]["r"], 2);
+    assert_eq!(json["amended"], serde_json::json!({"x": 0, "q": 2}));
+    assert_eq!(
+        json["reamended"],
+        serde_json::json!({"inner": {"z": 1}, "extra": 3})
+    );
+}
+
+#[test]
+fn this_snapshot_unaffected_by_later_entries() {
+    let json = eval(
+        r#"
+obj {
+  local self = this
+  a = 1
+  early = self.a
+  inner { y = outer.a }
+  snap = this
+  b = 2
+  late = self.b
+}
+m {
+  ["one"] = 1
+  ["nested"] { v = 5 }
+  held = this
+  ["two"] = this["one"] + 1
+}
+"#,
+    );
+    assert_eq!(json["obj"]["early"], 1);
+    assert_eq!(json["obj"]["inner"]["y"], 1);
+    assert_eq!(json["obj"]["late"], 2);
+    assert_eq!(
+        json["obj"]["snap"],
+        serde_json::json!({"a": 1, "early": 1, "inner": {"y": 1}})
+    );
+    assert_eq!(json["m"]["two"], 2);
+    assert_eq!(
+        json["m"]["held"],
+        serde_json::json!({"one": 1, "nested": {"v": 5}})
+    );
+}
+
+#[test]
+fn this_keyword_basic() {
+    // `this` refers to the current object
+    let json = eval(
+        r#"
+data {
+    x = 1
+    y = this.x + 1
+}
+"#,
+    );
+    assert_eq!(json["data"]["x"], 1);
+    assert_eq!(json["data"]["y"], 2);
+}
+
+#[test]
+fn this_keyword_nested() {
+    // `this` in a nested object refers to the inner object, not the outer
+    let json = eval(
+        r#"
+data {
+    x = 10
+    inner {
+        x = 20
+        y = this.x + 1
+    }
+}
+"#,
+    );
+    assert_eq!(json["data"]["x"], 10);
+    assert_eq!(json["data"]["inner"]["x"], 20);
+    assert_eq!(json["data"]["inner"]["y"], 21);
+}
+
+#[test]
+fn this_keyword_module_level() {
+    // `this` at module level refers to the module object
+    let json = eval(
+        r#"
+x = 42
+y = this.x + 1
+"#,
+    );
+    assert_eq!(json["x"], 42);
+    assert_eq!(json["y"], 43);
+}
+
+#[test]
+fn this_keyword_in_string_interpolation() {
+    let json = eval(
+        r#"
+data {
+    name = "world"
+    greeting = "Hello, \(this.name)!"
+}
+"#,
+    );
+    assert_eq!(json["data"]["greeting"], "Hello, world!");
+}
+
+#[test]
+fn this_keyword_with_hidden_property() {
+    let json = eval(
+        r#"
+class Data {
+    hidden base = "https://example.com"
+    url = this.base + "/api"
+}
+data = new Data {}
+"#,
+    );
+    // base must not appear in output (hidden)
+    assert!(json["data"].get("base").is_none());
+    // but url must resolve via this.base
+    assert_eq!(json["data"]["url"], "https://example.com/api");
+}
+
+#[test]
+fn this_keyword_hidden_at_module_level() {
+    let json = eval(
+        r#"
+hidden secret = "abc123"
+derived = this.secret + "-derived"
+"#,
+    );
+    assert!(json.get("secret").is_none());
+    assert_eq!(json["derived"], "abc123-derived");
+}
+
+#[test]
+fn module_keyword_at_top_level() {
+    // `module` refers to the top-level module object
+    let json = eval(
+        r#"
+x = 1
+y = module.x + 10
+"#,
+    );
+    assert_eq!(json["x"], 1);
+    assert_eq!(json["y"], 11);
+}
+
+// ============================================================
+// Class definitions
+// ============================================================
+
+#[test]
+fn class_multiple_defaults() {
+    let json = eval(
+        r#"
+class Config {
+    debug: Boolean = false
+    port: Int = 8080
+    host: String = "localhost"
+}
+x = new Config {
+    debug = true
+}
+"#,
+    );
+    assert_eq!(json["x"]["debug"], true);
+    assert_eq!(json["x"]["port"], 8080);
+    assert_eq!(json["x"]["host"], "localhost");
+}
+
+#[test]
+fn class_defaults_reference_locals() {
+    let json = eval(
+        r#"
+const local DEFAULT_PORT = 8080
+
+class Config {
+    port: Int = DEFAULT_PORT
+}
+x = new Config {}
+"#,
+    );
+    assert_eq!(json["x"]["port"], 8080);
+}
+
+#[test]
+fn class_local_this_alias_tracks_amended_inputs() {
+    let json = eval(
+        r#"
+class Factory {
+    local factory = this
+    staged: Boolean = false
+    fixed step = (new Dynamic { staged = false }) {
+        staged = factory.staged
+    }
+}
+x = new Factory {
+    staged = true
+}
+"#,
+    );
+    assert_eq!(json["x"]["step"]["staged"], true);
+    assert!(json["x"].get("factory").is_none());
+}
+
+#[test]
+fn class_local_this_alias_is_complete_for_deferred_methods() {
+    let json = eval(
+        r#"
+class Factory {
+    local factory = this
+    local secondAlias = factory
+    first: String = "first"
+    last: String = "last"
+    function lastValue(): String = secondAlias.last
+}
+
+local factory = new Factory {}
+result = factory.lastValue()
+"#,
+    );
+    assert_eq!(json["result"], "last");
+}
+
+#[test]
+fn class_with_type_params_is_rejected() {
+    let err = eval_fails(
+        r#"
+class Container<T> {
+    value: T = "default"
+}
+"#,
+    );
+    assert!(
+        err.contains("Only standard library members can have type parameters"),
+        "{err}"
+    );
+}
+
+#[test]
+fn new_with_dotted_type_name() {
+    // Dotted type names in new: an imported module, then a class of it.
+    let json = eval(
+        r#"
+import "pkl:base"
+x = new base.Dynamic {
+    check = "custom"
+}
+"#,
+    );
+    assert_eq!(json["x"]["check"], "custom");
+
+    // The qualifier must be an import, not a property.
+    let err = eval_fails(
+        r#"
+local base = import("pkl:base")
+x = new base.Dynamic {}
+"#,
+    );
+    assert!(
+        err.contains("Expected `base` to be a module import, but it is not."),
+        "{err}"
+    );
+}
+
+// ============================================================
+// Class inheritance (extends) and super keyword
+// ============================================================
+
+#[test]
+fn class_extends_basic() {
+    let json = eval(
+        r#"
+open class Animal {
+    name: String = "unknown"
+    legs: Int = 4
+}
+class Dog extends Animal {
+    breed: String = "mixed"
+}
+x = new Dog {
+    name = "Rex"
+}
+"#,
+    );
+    assert_eq!(json["x"]["name"], "Rex");
+    assert_eq!(json["x"]["legs"], 4);
+    assert_eq!(json["x"]["breed"], "mixed");
+}
+
+#[test]
+fn class_extends_override_parent_default() {
+    let json = eval(
+        r#"
+open class Base {
+    port: Int = 8080
+    host: String = "localhost"
+}
+class Production extends Base {
+    port: Int = 443
+    tls: Boolean = true
+}
+x = new Production {}
+"#,
+    );
+    assert_eq!(json["x"]["port"], 443);
+    assert_eq!(json["x"]["host"], "localhost");
+    assert_eq!(json["x"]["tls"], true);
+}
+
+#[test]
+fn class_extends_instance_override() {
+    // Instance overrides both parent and child defaults
+    let json = eval(
+        r#"
+open class Base {
+    x: Int = 1
+    y: Int = 2
+}
+class Child extends Base {
+    z: Int = 3
+}
+result = new Child {
+    x = 10
+    z = 30
+}
+"#,
+    );
+    assert_eq!(json["result"]["x"], 10);
+    assert_eq!(json["result"]["y"], 2);
+    assert_eq!(json["result"]["z"], 30);
+}
+
+#[test]
+fn super_keyword_basic() {
+    let json = eval(
+        r#"
+open class Base {
+    greeting: String = "hello"
+}
+class Child extends Base {
+    greeting: String = super.greeting + " world"
+}
+x = new Child {}
+"#,
+    );
+    assert_eq!(json["x"]["greeting"], "hello world");
+}
+
+#[test]
+fn super_keyword_field_access() {
+    let json = eval(
+        r#"
+open class Config {
+    port: Int = 8080
+    url: String = "http://localhost"
+}
+class AppConfig extends Config {
+    port: Int = 3000
+    url: String = super.url + ":\(port)"
+}
+x = new AppConfig {}
+"#,
+    );
+    assert_eq!(json["x"]["port"], 3000);
+    assert_eq!(json["x"]["url"], "http://localhost:3000");
+}
+
+#[test]
+fn class_extends_chain() {
+    // Three-level inheritance chain
+    let json = eval(
+        r#"
+open class A {
+    x: Int = 1
+}
+open class B extends A {
+    y: Int = 2
+}
+class C extends B {
+    z: Int = 3
+}
+result = new C {}
+"#,
+    );
+    assert_eq!(json["result"]["x"], 1);
+    assert_eq!(json["result"]["y"], 2);
+    assert_eq!(json["result"]["z"], 3);
+}
+
+// ============================================================
+// Durations
+// ============================================================
+
+#[test]
+fn duration_minutes() {
+    let json = eval("local d = 5.min\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 5);
+    assert_eq!(json["x"]["unit"], "min");
+}
+
+#[test]
+fn duration_seconds() {
+    let json = eval("local d = 3.s\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 3);
+    assert_eq!(json["x"]["unit"], "s");
+}
+
+#[test]
+fn duration_hours() {
+    let json = eval("local d = 2.h\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 2);
+    assert_eq!(json["x"]["unit"], "h");
+}
+
+#[test]
+fn duration_days() {
+    let json = eval("local d = 7.d\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 7);
+    assert_eq!(json["x"]["unit"], "d");
+}
+
+#[test]
+fn duration_milliseconds() {
+    let json = eval("local d = 100.ms\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 100);
+    assert_eq!(json["x"]["unit"], "ms");
+}
+
+#[test]
+fn duration_nanoseconds() {
+    let json = eval("local d = 50.ns\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 50);
+    assert_eq!(json["x"]["unit"], "ns");
+}
+
+#[test]
+fn duration_microseconds() {
+    let json = eval("local d = 10.us\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 10);
+    assert_eq!(json["x"]["unit"], "us");
+}
+
+#[test]
+fn duration_float_value() {
+    let json = eval("local d = 5.5.min\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 5.5);
+    assert_eq!(json["x"]["unit"], "min");
+}
+
+// ============================================================
+// Data sizes
+// ============================================================
+
+#[test]
+fn datasize_bytes() {
+    let json = eval("local d = 512.b\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 512);
+    assert_eq!(json["x"]["unit"], "b");
+}
+
+#[test]
+fn datasize_kilobytes() {
+    let json = eval("local d = 10.kb\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 10);
+    assert_eq!(json["x"]["unit"], "kb");
+}
+
+#[test]
+fn datasize_megabytes() {
+    let json = eval("local d = 256.mb\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 256);
+    assert_eq!(json["x"]["unit"], "mb");
+}
+
+#[test]
+fn datasize_gigabytes() {
+    let json = eval("local d = 4.gb\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 4);
+    assert_eq!(json["x"]["unit"], "gb");
+}
+
+#[test]
+fn datasize_terabytes() {
+    let json = eval("local d = 1.tb\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 1);
+    assert_eq!(json["x"]["unit"], "tb");
+}
+
+#[test]
+fn datasize_petabytes() {
+    let json = eval("local d = 2.pb\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 2);
+    assert_eq!(json["x"]["unit"], "pb");
+}
+
+#[test]
+fn datasize_gibibytes() {
+    let json = eval("local d = 8.gib\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 8);
+    assert_eq!(json["x"]["unit"], "gib");
+}
+
+#[test]
+fn datasize_mebibytes() {
+    let json = eval("local d = 16.mib\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 16);
+    assert_eq!(json["x"]["unit"], "mib");
+}
+
+#[test]
+fn datasize_tebibytes() {
+    let json = eval("local d = 1.tib\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 1);
+    assert_eq!(json["x"]["unit"], "tib");
+}
+
+#[test]
+fn datasize_pebibytes() {
+    let json = eval("local d = 1.pib\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 1);
+    assert_eq!(json["x"]["unit"], "pib");
+}
+
+#[test]
+fn datasize_kibibytes() {
+    let json = eval("local d = 64.kib\nx { value = d.value; unit = d.unit }");
+    assert_eq!(json["x"]["value"], 64);
+    assert_eq!(json["x"]["unit"], "kib");
+}
+
+#[test]
+fn unicode_escape_without_braces_errors() {
+    let msg = eval_fails(r#"x = "\u0041""#);
+    assert!(msg.contains("Did you mean `{`?"));
+}
+
+#[test]
+fn unicode_escape_empty_braces_errors() {
+    let msg = eval_fails(r#"x = "\u{}""#);
+    assert!(msg.contains("Invalid Unicode escape sequence"));
+}
+
+// ============================================================
+// Property modifiers
+// ============================================================
+
+#[test]
+fn hidden_not_in_output() {
+    let json = eval(
+        r#"
+hidden secret = "s3cr3t"
+visible = "hello"
+"#,
+    );
+    assert!(json.get("secret").is_none());
+    assert_eq!(json["visible"], "hello");
+}
+
+#[test]
+fn hidden_accessible_by_other_properties() {
+    let json = eval(
+        r#"
+hidden base_url = "https://example.com"
+api_url = base_url + "/api"
+"#,
+    );
+    assert!(json.get("base_url").is_none());
+    assert_eq!(json["api_url"], "https://example.com/api");
+}
+
+#[test]
+fn const_property() {
+    // const properties work normally when not overridden
+    let json = eval(
+        r#"
+const name = "fixed"
+x = name
+"#,
+    );
+    assert_eq!(json["x"], "fixed");
+}
+
+#[test]
+fn abstract_property_with_value() {
+    // abstract property with a value is fine
+    let json = eval(
+        r#"
+class Base {
+    abstract name: String = "default"
+}
+x = new Base {}
+"#,
+    );
+    assert_eq!(json["x"]["name"], "default");
+}
+
+#[test]
+fn fixed_property() {
+    let json = eval(
+        r#"
+fixed version = 1
+x = version
+"#,
+    );
+    assert_eq!(json["x"], 1);
+}
+
+#[test]
+fn hidden_in_nested_object_is_rejected() {
+    let err = eval_fails(
+        r#"
+config {
+    hidden internal = "private"
+    public = "visible"
+}
+"#,
+    );
+    assert!(
+        err.contains("Modifier `hidden` is not applicable to object members"),
+        "{err}"
+    );
+}
+
+#[test]
+fn fixed_cannot_override() {
+    let json = eval(
+        r#"
+fixed version = 1
+x = version
+"#,
+    );
+    // fixed works fine when not overridden
+    assert_eq!(json["x"], 1);
+}
+
+#[test]
+fn external_requires_value() {
+    let msg = eval_fails(
+        r#"
+external name: String
+x = name
+"#,
+    );
+    assert!(
+        msg.contains("External members can only be defined by standard library modules"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn const_cannot_override_in_amends() {
+    let mut ev = pklr::eval::Evaluator::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    ev.set_base_path(&base);
+    // Create a base file with const property
+    let base_src = r#"const version = 1"#;
+    std::fs::write(base.join("const_base.pkl"), base_src).unwrap();
+    let src = r#"
+amends "const_base.pkl"
+const version = 2
+"#;
+    let path = base.join("test_const_override.pkl");
+    let result = ev.eval_source(src, &path);
+    std::fs::remove_file(base.join("const_base.pkl")).ok();
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("const"));
+}
+
+// ============================================================
+// Default elements/values
+// ============================================================
+
+#[test]
+fn default_value_in_object() {
+    let json = eval(
+        r#"
+config {
+    default {
+        enabled = true
+        port = 8080
+    }
+    ["api"] {
+        port = 9090
+    }
+    ["web"] {
+        port = 3000
+    }
+}
+"#,
+    );
+    // api: port overridden, enabled inherited from default
+    assert_eq!(json["config"]["api"]["port"], 9090);
+    assert_eq!(json["config"]["api"]["enabled"], true);
+    // web: port overridden, enabled inherited from default
+    assert_eq!(json["config"]["web"]["port"], 3000);
+    assert_eq!(json["config"]["web"]["enabled"], true);
+}
+
+#[test]
+fn default_not_in_output() {
+    let json = eval(
+        r#"
+services {
+    default {
+        replicas = 1
+    }
+    ["app"] {
+        replicas = 3
+    }
+}
+"#,
+    );
+    // default itself should not appear in output
+    assert!(json["services"].get("default").is_none());
+    assert_eq!(json["services"]["app"]["replicas"], 3);
+}
+
+#[test]
+fn default_in_mapping() {
+    let json = eval(
+        r#"
+x = new Mapping {
+    default {
+        active = true
+    }
+    ["a"] {
+        name = "alpha"
+    }
+    ["b"] {
+        name = "beta"
+        active = false
+    }
+}
+"#,
+    );
+    assert_eq!(json["x"]["a"]["name"], "alpha");
+    assert_eq!(json["x"]["a"]["active"], true);
+    assert_eq!(json["x"]["b"]["name"], "beta");
+    assert_eq!(json["x"]["b"]["active"], false);
+}
+
+#[test]
+fn no_default_no_merge() {
+    // Without a default, dynamic entries should not be merged
+    let json = eval(
+        r#"
+x {
+    ["a"] {
+        name = "alpha"
+    }
+}
+"#,
+    );
+    assert_eq!(json["x"]["a"]["name"], "alpha");
+    assert!(json["x"]["a"].get("enabled").is_none());
+}
+
+#[test]
+fn default_nested_merge() {
+    let json = eval(
+        r#"
+services {
+    default {
+        config {
+            timeout = 30
+            retries = 3
+        }
+    }
+    ["api"] {
+        config {
+            timeout = 60
+        }
+    }
+}
+"#,
+    );
+    // timeout overridden, retries inherited from default
+    assert_eq!(json["services"]["api"]["config"]["timeout"], 60);
+    assert_eq!(json["services"]["api"]["config"]["retries"], 3);
+}
+
+// ============================================================
+// Type aliases
+// ============================================================
+
+#[test]
+fn typealias_to_class() {
+    // typealias acts as an alternative constructor for a class
+    let json = eval(
+        r#"
+class Server {
+    host: String = "localhost"
+    port: Int = 8080
+}
+typealias Srv = Server
+x = new Srv {
+    port = 3000
+}
+"#,
+    );
+    assert_eq!(json["x"]["host"], "localhost");
+    assert_eq!(json["x"]["port"], 3000);
+}
+
+#[test]
+fn typealias_chain() {
+    // Alias of an alias
+    let json = eval(
+        r#"
+class Base {
+    value: Int = 1
+}
+typealias A = Base
+typealias B = A
+x = new B {}
+"#,
+    );
+    assert_eq!(json["x"]["value"], 1);
+}
+
+#[test]
+fn typealias_simple_type_ignored() {
+    // typealias to a simple type (not a class) is a no-op, shouldn't error
+    let json = eval(
+        r#"
+typealias Name = String
+x = "hello"
+"#,
+    );
+    assert_eq!(json["x"], "hello");
+}
+
+#[test]
+fn typealias_with_constraint() {
+    // typealias with type constraint -- constraint is skipped but should parse
+    let json = eval(
+        r#"
+typealias Port = Int(isBetween(1, 65535))
+x = 8080
+"#,
+    );
+    assert_eq!(json["x"], 8080);
+}
+
+#[test]
+fn type_defaults_cover_literals_unions_and_collections() {
+    let json = eval(
+        r#"
+literal: "only"
+selected: "first" | *"second"
+items: Listing<String>
+mapping: Mapping<String, Int>
+"#,
+    );
+    assert_eq!(json["literal"], "only");
+    assert_eq!(json["selected"], "second");
+    assert_eq!(json["items"], serde_json::json!([]));
+    assert_eq!(json["mapping"], serde_json::json!({}));
+}
+
+#[test]
+fn selected_structured_union_defaults_retain_semantics() {
+    let json = eval(
+        r#"
+nullable: String | *Null
+listing: String | *Listing<String>
+nullableResult = nullable == null
+stringMatches = "ok" is Int | *String
+"#,
+    );
+    assert_eq!(json["nullableResult"], true);
+    assert_eq!(json["listing"], serde_json::json!([]));
+    assert_eq!(json["stringMatches"], true);
+    assert!(json.get("nullable").is_none());
+}
+
+#[test]
+fn union_without_selected_default_fails() {
+    let message = eval_fails(r#"value: "first" | "second""#);
+    assert!(message.contains("no selected default"));
+}
+
+#[test]
+fn selected_union_member_without_implicit_value_stays_undefined() {
+    let json = eval(
+        r#"
+optional: *String | Int
+provided: *String | Int = "value"
+"#,
+    );
+    assert!(json.get("optional").is_none());
+    assert_eq!(json["provided"], "value");
+}
+
+#[test]
+fn multiple_type_constraints_are_conjunctive() {
+    let json = eval(
+        r#"
+local small = 5
+local large = 20
+smallMatches = small is Int(this > 0, this < 10)
+largeMatches = large is Int(this > 0, this < 10)
+"#,
+    );
+    assert_eq!(json["smallMatches"], true);
+    assert_eq!(json["largeMatches"], false);
+}
+
+#[test]
+fn failing_constraint_in_list_rejects_cast() {
+    let message = eval_fails("result = 20 as Int(this > 0, this < 10)");
+    assert!(
+        message.contains("Type constraint `this < 10` violated."),
+        "{message}"
+    );
+}
+
+#[test]
+fn typed_lambda_parameters_evaluate() {
+    let json = eval(
+        r#"
+local choose = (value: String) -> value
+result = choose.apply("ok")
+"#,
+    );
+    assert_eq!(json["result"], "ok");
+}
+
+#[test]
+fn nullable_class_default_can_be_amended() {
+    let json = eval(
+        r#"
+class Options { enabled: Boolean = false }
+class Base { options: Options? }
+base = new Base {}
+result = (base) { options { enabled = true } }
+"#,
+    );
+    assert_eq!(json["result"]["options"]["enabled"], true);
+}
+
+#[test]
+fn nullable_amendment_prefers_existing_non_null_value() {
+    let json = eval(
+        r#"
+class Options { enabled: Boolean = false; label: String = "default" }
+class Base { options: Options? = new Options { enabled = true } }
+base = new Base {}
+result = (base) { options { label = "changed" } }
+"#,
+    );
+    assert_eq!(json["result"]["options"]["enabled"], true);
+    assert_eq!(json["result"]["options"]["label"], "changed");
+}
+
+#[test]
+fn listing_body_amendment_appends_elements() {
+    let json = eval(
+        r#"
+class Base { items: Listing<String> }
+base = new Base {}
+result = (base) {
+  items {
+    local prefix = ""
+    "first"
+    for (item in List("second")) { prefix + item }
+    when (true) { "third" } else { "wrong" }
+  }
+}
+"#,
+    );
+    assert_eq!(
+        json["result"]["items"],
+        serde_json::json!(["first", "second", "third"])
+    );
+}
+
+#[test]
+fn list_body_amendment_rejects_external_list() {
+    let error = eval_fails(
+        r#"
+base { items = List("old", "stay") }
+result = (base) {
+  items {
+    [0] = "new"
+    "appended"
+  }
+}
+"#,
+    );
+    assert!(error.contains("Cannot instantiate, or amend an instance of, external class `List`."));
+}
+
+#[test]
+fn list_index_body_amendment_rejects_external_list() {
+    let error = eval_fails(
+        r#"
+base {
+  items = List(new Dynamic {
+    kept = 1
+    changed = 1
+  })
+}
+result = (base) {
+  items {
+    [0] {
+      changed = 2
+      added = 3
+    }
+  }
+}
+"#,
+    );
+    assert!(error.contains("Cannot instantiate, or amend an instance of, external class `List`."));
+}
+
+#[test]
+fn listing_named_members_are_not_elements() {
+    let json = eval(
+        r#"
+items = new Listing {
+  default = "template"
+  "value"
+}
+"#,
+    );
+    assert_eq!(json["items"], serde_json::json!(["value"]));
+}
+
+#[test]
+fn listing_shaped_body_preserves_existing_object_kind() {
+    let json = eval(
+        r#"
+base {
+  value = new Dynamic {
+    kept = 1
+  }
+}
+result = (base) {
+  value {
+    "element"
+    added = 2
+  }
+}
+"#,
+    );
+    // `pkl eval -f json` rejects a `Dynamic` with elements and members;
+    // the lenient conversion tags it instead of dropping the element.
+    assert_eq!(
+        json["result"]["value"],
+        serde_json::json!({
+            "_type": "dynamic",
+            "elements": ["element"],
+            "members": {"kept": 1, "added": 2}
+        })
+    );
+}
+
+#[test]
+fn poisoned_local_shadows_parent_binding() {
+    let message = eval_fails(
+        r#"
+name = "outer"
+result {
+  local name = throw("local failed")
+  value = name
+}
+"#,
+    );
+    assert!(message.contains("local failed"), "{message}");
+}
+
+#[test]
+fn poisoned_local_is_preserved_in_closure_capture() {
+    let message = eval_fails(
+        r#"
+name = "outer"
+result {
+  local name = throw("local failed")
+  local getName = () -> name
+  value = getName()
+}
+"#,
+    );
+    assert!(message.contains("local failed"), "{message}");
+}
+
+#[test]
+fn current_binding_shadows_outer_poison_in_closure_capture() {
+    let json = eval(
+        r#"
+local name = throw("outer failed")
+result {
+  local name = 1
+  local getName = () -> name
+  value = getName()
+}
+"#,
+    );
+    assert_eq!(json["result"]["value"], 1);
+}
+
+#[test]
+fn inherited_late_binding_recomputes_dependency_chains() {
+    let temp = TestTempDir::new("pklr_inherited_chain");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\na = this.b\nm = module.b\nb = c\nd = b + 1\nc = 1\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "extends \"Base.pkl\"\nc = 2\ne = d + 1\n").unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["a"], 2);
+    assert_eq!(json["m"], 2);
+    assert_eq!(json["b"], 2);
+    assert_eq!(json["d"], 3);
+    assert_eq!(json["e"], 4);
+}
+
+#[test]
+fn child_locals_recompute_after_inherited_properties_are_overridden() {
+    let temp = TestTempDir::new("pklr_child_local_late_binding");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nsource = 1\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"Base.pkl\"\nlocal derived = source + 1\nresult = derived\nsource = 2\n",
+    )
+    .unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["source"], 2);
+    assert_eq!(json["result"], 3);
+    assert!(json.get("derived").is_none());
+}
+
+#[test]
+fn inherited_late_binding_preserves_parent_locals() {
+    let temp = TestTempDir::new("pklr_parent_local_late_binding");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nlocal offset = 1\nsource = 1\nderived = source + offset\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "extends \"Base.pkl\"\nsource = 2\n").unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["source"], 2);
+    assert_eq!(json["derived"], 3);
+    assert!(json.get("offset").is_none());
+}
+
+#[test]
+fn inherited_late_binding_reaches_grandparent_declarations() {
+    let temp = TestTempDir::new("pklr_grandparent_late_binding");
+    std::fs::write(
+        temp.path().join("Grand.pkl"),
+        "abstract module Grand\nsource = 1\nderived = source + 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("Parent.pkl"),
+        "abstract module Parent\nextends \"Grand.pkl\"\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"Parent.pkl\"\nsource = 2\nresult = derived\n",
+    )
+    .unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["source"], 2);
+    assert_eq!(json["derived"], 3);
+    assert_eq!(json["result"], 3);
+}
+
+#[test]
+fn computed_sibling_access_recomputes_after_child_override() {
+    let temp = TestTempDir::new("pklr_computed_late_binding");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nsource = 1\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"Base.pkl\"\nlocal keyName = \"source\"\nresult = this[keyName]\nsource = 2\n",
+    )
+    .unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["result"], 2);
+}
+
+#[test]
+fn aliased_module_snapshot_recomputes_after_child_override() {
+    let temp = TestTempDir::new("pklr_aliased_snapshot_late_binding");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nsource = 1\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"Base.pkl\"\nlocal snapshot = this\nresult = snapshot.source\nsource = 2\n",
+    )
+    .unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["result"], 2);
+}
+
+#[test]
+fn amended_typed_defaults_render_as_in_pkl() {
+    let temp = TestTempDir::new("pklr_amended_scope_default");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "implicit: Mapping<String, String>\nvisible = implicit.length\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "amends \"Base.pkl\"\n").unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["implicit"], serde_json::json!({}));
+    assert_eq!(json["visible"], 0);
+}
+
+#[test]
+fn inherited_late_binding_propagates_errors() {
+    let temp = TestTempDir::new("pklr_inherited_error");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nderived = 1 ~/ denominator\ndenominator = 1\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "extends \"Base.pkl\"\ndenominator = 0\n").unwrap();
+    let error = pklr::EvaluatorBuilder::new()
+        .eval_to_json(&child)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Division by zero."), "{error}");
+}
+
+#[test]
+fn constrained_nullable_mapping_preserves_value_defaults() {
+    let json = eval(
+        r#"
+class Item { enabled: Boolean = false }
+class Base { items: Mapping<String, Item>(length >= 0)? }
+base = new Base {}
+result = (base) { items { ["example"] { enabled = true } } }
+"#,
+    );
+    assert_eq!(json["result"]["items"]["example"]["enabled"], true);
+}
+
+#[test]
+fn used_unresolved_abstract_member_still_errors() {
+    let temp = TestTempDir::new("pklr_abstract_member");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nabstract missing: String\ndependent = missing\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "extends \"Base.pkl\"\nresult = dependent\n").unwrap();
+    let error = pklr::EvaluatorBuilder::new()
+        .eval_to_json(&child)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("abstract property") || error.contains("undefined variable"));
+}
+
+#[test]
+fn concrete_module_must_implement_inherited_abstract_property() {
+    let temp = TestTempDir::new("pklr_required_abstract_member");
+    std::fs::write(
+        temp.path().join("Base.pkl"),
+        "abstract module Base\nabstract required: Listing<String>\n",
+    )
+    .unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "extends \"Base.pkl\"\n").unwrap();
+    let error = pklr::EvaluatorBuilder::new()
+        .eval_to_json(&child)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("abstract property 'required'"));
+
+    std::fs::write(
+        &child,
+        "extends \"Base.pkl\"\nrequired { \"implemented\" }\n",
+    )
+    .unwrap();
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["required"], serde_json::json!(["implemented"]));
+}
+
+#[test]
+fn typealias_union_parses() {
+    // Union type alias should parse without error
+    let json = eval(
+        r#"
+typealias StringOrInt = String|Int
+x = 42
+"#,
+    );
+    assert_eq!(json["x"], 42);
+}
+
+#[test]
+fn typealias_nullable_class() {
+    // typealias Foo = Bar? should still work as constructor
+    let json = eval(
+        r#"
+class Config {
+    debug: Boolean = false
+}
+typealias MaybeConfig = Config?
+x = new MaybeConfig {
+    debug = true
+}
+"#,
+    );
+    assert_eq!(json["x"]["debug"], true);
+}
+
+#[test]
+fn typealias_generic_parses() {
+    // Generic type alias should parse without error
+    let json = eval(
+        r#"
+typealias StringMap = Mapping<String, String>
+x = new Mapping {
+    ["a"] = "b"
+}
+"#,
+    );
+    assert_eq!(json["x"]["a"], "b");
+}
+
+// ============================================================
+// is / as type operators
+// ============================================================
+
+#[test]
+fn is_operator_string() {
+    let json = eval(
+        r#"
+local x = "hello"
+a = x is String
+b = x is Int
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], false);
+}
+
+#[test]
+fn is_operator_int() {
+    let json = eval(
+        r#"
+local x = 42
+a = x is Int
+b = x is Number
+c = x is String
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["c"], false);
+}
+
+#[test]
+fn is_operator_null() {
+    let json = eval(
+        r#"
+local x = null
+a = x is Null
+b = x is String?
+c = x is String
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["c"], false);
+}
+
+#[test]
+fn is_operator_nullable() {
+    let json = eval(
+        r#"
+local x = "hello"
+a = x is String?
+b = x is Int?
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], false);
+}
+
+#[test]
+fn is_operator_union() {
+    let json = eval(
+        r#"
+local x = 42
+local y = "hello"
+a = x is String|Int
+b = y is String|Int
+c = x is String|Boolean
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["c"], false);
+}
+
+#[test]
+fn is_operator_object_and_list() {
+    let json = eval(
+        r#"
+local obj = new { x = 1 }
+local lst = List(1, 2, 3)
+a = obj is Object
+b = lst is List
+c = obj is List
+d = lst is Object
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["c"], false);
+    assert_eq!(json["d"], false);
+}
+
+#[test]
+fn is_operator_user_defined_classes() {
+    let json = eval(
+        r#"
+local class Step { check: String = "true" }
+local class Ext { off: Boolean = false }
+local plain = new Step {}
+local ext = new Ext {}
+plainIsStep = plain is Step
+plainIsExt = plain is Ext
+extIsStep = ext is Step
+extIsExt = ext is Ext
+"#,
+    );
+    assert_eq!(json["plainIsStep"], true);
+    assert_eq!(json["plainIsExt"], false);
+    assert_eq!(json["extIsStep"], false);
+    assert_eq!(json["extIsExt"], true);
+}
+
+#[test]
+fn is_operator_user_defined_class_inheritance_and_aliases() {
+    let json = eval(
+        r#"
+open class Base { enabled: Boolean = true }
+class Derived extends Base { name: String = "derived" }
+class Other { name: String = "other" }
+typealias BaseAlias = Base
+local base = new Base {}
+local derived = new Derived {}
+local aliased = new BaseAlias {}
+baseIsDerived = base is Derived
+derivedIsBase = derived is Base
+derivedIsAlias = derived is BaseAlias
+derivedIsOther = derived is Other
+aliasedIsBase = aliased is Base
+constrainedBase = derived is Base(this.enabled)
+"#,
+    );
+    assert_eq!(json["baseIsDerived"], false);
+    assert_eq!(json["derivedIsBase"], true);
+    assert_eq!(json["derivedIsAlias"], true);
+    assert_eq!(json["derivedIsOther"], false);
+    assert_eq!(json["aliasedIsBase"], true);
+    assert_eq!(json["constrainedBase"], true);
+}
+
+#[test]
+fn constrained_type_checks_preserve_nullable_and_generic_bases() {
+    let json = eval(
+        r#"
+local items = List("one")
+local empty = null
+typealias WholeNumber = Int
+genericMatches = items is List<String>(this.length > 0)
+nullableMatches = empty is String?(this == null)
+innerNullableRejectsNull = empty is List<String?>(this == null)
+aliasMatches = 42 is WholeNumber(this > 0)
+"#,
+    );
+    assert_eq!(json["genericMatches"], true);
+    assert_eq!(json["nullableMatches"], true);
+    assert_eq!(json["innerNullableRejectsNull"], false);
+    assert_eq!(json["aliasMatches"], true);
+}
+
+#[test]
+fn as_operator_rejects_unrelated_user_defined_class() {
+    let msg = eval_fails(
+        r#"
+class Left {}
+class Right {}
+result = new Left {} as Right
+"#,
+    );
+    assert!(
+        msg.contains("Expected value of type `test#Right`, but got type `test#Left`."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn is_operator_distinguishes_qualified_classes_with_the_same_name() {
+    let dir = TestTempDir::new("pklr_is_qualified_classes");
+    std::fs::write(
+        dir.path.join("left.pkl"),
+        "class Item { side = \"left\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("right.pkl"),
+        "class Item { side = \"right\" }\n",
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "left.pkl"
+import "right.pkl"
+local item = new left.Item {}
+same = item is left.Item
+different = item is right.Item
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["same"], true);
+    assert_eq!(json["different"], false);
+}
+
+#[test]
+fn is_operator_distinguishes_local_and_imported_classes_with_the_same_name() {
+    let dir = TestTempDir::new("pklr_is_local_and_imported_classes");
+    std::fs::write(
+        dir.path.join("imported.pkl"),
+        r#"
+open class Item {}
+class Derived extends Item {}
+instance = new Item {}
+derived = new Derived {}
+function make(): Item = new Item {}
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "imported.pkl"
+class Item {}
+local localItem = new Item {}
+local importedDirect = new imported.Item {}
+local importedValue = imported.instance
+local importedDerived = imported.derived
+local importedFromFunction = imported.make()
+localIsImported = localItem is imported.Item
+directIsImported = importedDirect is imported.Item
+valueIsImported = importedValue is imported.Item
+derivedIsImportedBase = importedDerived is imported.Item
+functionValueIsImported = importedFromFunction is imported.Item
+valueIsLocal = importedValue is Item
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["localIsImported"], false);
+    assert_eq!(json["directIsImported"], true);
+    assert_eq!(json["valueIsImported"], true);
+    assert_eq!(json["derivedIsImportedBase"], true);
+    assert_eq!(json["functionValueIsImported"], true);
+    assert_eq!(json["valueIsLocal"], false);
+}
+
+#[test]
+fn imported_class_identity_survives_reexports_and_captured_imports() {
+    let dir = TestTempDir::new("pklr_imported_class_identity");
+    std::fs::write(
+        dir.path.join("types.pkl"),
+        r#"
+class Item {}
+instance = new Item {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("wrapper.pkl"),
+        r#"
+import "types.pkl"
+reexported = types.instance
+amended = (types.instance) {}
+function make(): types.Item = new types.Item {}
+function accepts(value): Boolean = value is types.Item
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "types.pkl"
+import "wrapper.pkl"
+reexportedMatches = wrapper.reexported is types.Item
+amendedMatches = wrapper.amended is types.Item
+functionResultMatches = wrapper.make() is types.Item
+capturedImportMatches = wrapper.accepts(types.instance)
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["reexportedMatches"], true);
+    assert_eq!(json["amendedMatches"], true);
+    assert_eq!(json["functionResultMatches"], true);
+    assert_eq!(json["capturedImportMatches"], true);
+}
+
+#[test]
+fn imported_helper_preserves_nested_class_identity_in_returned_instance() {
+    let dir = TestTempDir::new("pklr_imported_helper_nested_class_identity");
+    std::fs::write(
+        dir.path.join("Config.pkl"),
+        r#"
+class Expect {
+    code: Int = 0
+}
+class Test {
+    expect: Expect = new Expect {}
+}
+function marker(): Int = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("helpers.pkl"),
+        r#"
+import "Config.pkl"
+class TestMaker {
+    local function makeTest(expectedCode: Int): Config.Test = new Config.Test {
+        expect = new Config.Expect { code = expectedCode }
+    }
+    function make(code: Int): Config.Test = makeTest(code)
+}
+class Container {
+    test: Config.Test
+}
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "Config.pkl"
+import "helpers.pkl"
+local maker = new helpers.TestMaker {}
+marker = Config.marker()
+result = new helpers.Container {
+    test = maker.make(1)
+}
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["marker"], 1);
+    assert_eq!(json["result"]["test"]["expect"]["code"], 1);
+}
+
+#[test]
+fn ordinary_scope_objects_are_not_merged_as_partial_modules() {
+    let dir = TestTempDir::new("pklr_ordinary_scope_objects");
+    std::fs::write(dir.path.join("types.pkl"), "class Item {}\n").unwrap();
+    std::fs::write(
+        dir.path.join("base.pkl"),
+        r#"
+import "types.pkl"
+const local Config = new {
+    ["Item"] = new types.Item {}
+    selected = "base"
+    stale = true
+}
+open class Holder {
+    selected = Config.selected
+    hasStale = Config.containsKey("stale")
+}
+holder = new Holder {}
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "types.pkl"
+import "base.pkl"
+local Config = new {
+    ["Item"] = new types.Item {}
+    selected = "current"
+}
+result = (base.holder) {}
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["result"]["selected"], "base");
+    assert_eq!(json["result"]["hasStale"], true);
+}
+
+#[test]
+fn partial_views_of_wrapper_with_distinct_reexports_are_merged() {
+    let dir = TestTempDir::new("pklr_partial_wrapper_reexports");
+    std::fs::write(
+        dir.path.join("left.pkl"),
+        "class Left { name = \"left\" }\ninstance = new Left {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("right.pkl"),
+        "class Right { name = \"right\" }\ninstance = new Right {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("wrapper.pkl"),
+        r#"
+import "left.pkl"
+import "right.pkl"
+Left = left.instance
+Right = right.instance
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("helper.pkl"),
+        r#"
+import "wrapper.pkl" as Wrapper
+open class Holder {
+    left = Wrapper.Left.name
+}
+holder = new Holder {}
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "wrapper.pkl" as Wrapper
+import "helper.pkl"
+result = (helper.holder) {
+    right = Wrapper.Right.name
+}
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["result"]["left"], "left");
+    assert_eq!(json["result"]["right"], "right");
+}
+
+#[test]
+fn partial_views_of_distinct_wrappers_are_not_merged() {
+    let dir = TestTempDir::new("pklr_distinct_partial_wrappers");
+    std::fs::write(
+        dir.path.join("types.pkl"),
+        "class Item {}\ninstance = new Item {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("wrapper_a.pkl"),
+        r#"
+import "types.pkl"
+Item = types.instance
+baseOnly = true
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("wrapper_b.pkl"),
+        r#"
+import "types.pkl"
+Item = types.instance
+currentOnly = true
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("helper.pkl"),
+        r#"
+import "wrapper_a.pkl" as Wrapper
+open class Holder {
+    hasBase = Wrapper.containsKey("baseOnly")
+    hasCurrent = Wrapper.containsKey("currentOnly")
+}
+holder = new Holder {}
+"#,
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "wrapper_b.pkl" as Wrapper
+import "helper.pkl"
+selected = Wrapper.currentOnly
+result = (helper.holder) {}
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["selected"], true);
+    assert_eq!(json["result"]["hasBase"], true);
+    assert_eq!(json["result"]["hasCurrent"], false);
+}
+
+#[test]
+fn is_operator_any() {
+    let json = eval(
+        r#"
+a = 42 is Any
+b = "hello" is Any
+c = null is Any
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["c"], true);
+}
+
+#[test]
+fn as_operator_success() {
+    let json = eval(
+        r#"
+local x = 42
+result = x as Int
+"#,
+    );
+    assert_eq!(json["result"], 42);
+}
+
+#[test]
+fn as_operator_failure() {
+    let msg = eval_fails(
+        r#"
+local x = "hello"
+result = x as Int
+"#,
+    );
+    assert!(
+        msg.contains("Expected value of type `Int`, but got type `String`."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn as_operator_nullable() {
+    let json = eval(
+        r#"
+local x = null
+result = x as String?
+"#,
+    );
+    assert_eq!(json["result"], serde_json::Value::Null);
+}
+
+#[test]
+fn is_in_conditional() {
+    let json = eval(
+        r#"
+local x = 42
+result = if (x is Int) "integer" else "other"
+"#,
+    );
+    assert_eq!(json["result"], "integer");
+}
+
+// ============================================================
+// Type constraints
+// ============================================================
+
+#[test]
+fn constraint_is_check_pass() {
+    let json = eval(
+        r#"
+local x = 42
+result = x is Int(this >= 0)
+"#,
+    );
+    assert_eq!(json["result"], true);
+}
+
+#[test]
+fn constraint_is_check_fail() {
+    let json = eval(
+        r#"
+local x = -1
+result = x is Int(this >= 0)
+"#,
+    );
+    assert_eq!(json["result"], false);
+}
+
+#[test]
+fn constraint_is_wrong_base_type() {
+    let json = eval(
+        r#"
+local x = "hello"
+result = x is Int(this >= 0)
+"#,
+    );
+    assert_eq!(json["result"], false);
+}
+
+#[test]
+fn constraint_as_pass() {
+    let json = eval(
+        r#"
+local x = 42
+result = x as Int(this > 0)
+"#,
+    );
+    assert_eq!(json["result"], 42);
+}
+
+#[test]
+fn constraint_as_fail() {
+    let msg = eval_fails(
+        r#"
+local x = -1
+result = x as Int(this > 0)
+"#,
+    );
+    assert!(
+        msg.contains("Type constraint `this > 0` violated."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn constraint_string_not_empty() {
+    let json = eval(
+        r#"
+local a = "hello"
+local b = ""
+x = a is String(!isEmpty)
+y = b is String(!isEmpty)
+"#,
+    );
+    assert_eq!(json["x"], true);
+    assert_eq!(json["y"], false);
+}
+
+#[test]
+fn constraint_string_length() {
+    let json = eval(
+        r#"
+local x = "hi"
+a = x is String(length <= 5)
+b = x is String(length > 10)
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], false);
+}
+
+#[test]
+fn constraint_comparison() {
+    let json = eval(
+        r#"
+local x = 8080
+a = x is Int(this >= 1 && this <= 65535)
+b = x is Int(this < 0)
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], false);
+}
+
+#[test]
+fn typealias_with_constraint_enforced() {
+    // typealias with constraint, checked via is
+    let json = eval(
+        r#"
+typealias PositiveInt = Int(this > 0)
+local x = 42
+local y = -1
+a = x is PositiveInt
+b = y is PositiveInt
+"#,
+    );
+    assert_eq!(json["a"], true);
+    assert_eq!(json["b"], false);
+}
+
+#[test]
+fn typealias_constraint_works_inside_amended_object() {
+    // type aliases must be available inside amended/extended objects
+    // (regression: flatten() used to drop type_aliases)
+    let json = eval(
+        r#"
+typealias PositiveInt = Int(this > 0)
+base {
+    port = 8080
+}
+result = (base) {
+    check = 42 is PositiveInt
+}
+"#,
+    );
+    assert_eq!(json["result"]["check"], true);
+}
+
+#[test]
+fn typealias_constraint_inside_amended_object_rejects_invalid() {
+    let json = eval(
+        r#"
+typealias PositiveInt = Int(this > 0)
+local neg = 0 - 5
+base {
+    port = 8080
+}
+result = (base) {
+    check = neg is PositiveInt
+}
+"#,
+    );
+    assert_eq!(json["result"]["check"], false);
+}
+
+// ============================================================
+// Annotations
+// ============================================================
+
+#[test]
+fn annotation_module_info_parsed() {
+    // @ModuleInfo should be parsed without error
+    let json = eval(
+        r#"
+@ModuleInfo { minPklVersion = "0.25.0" }
+module my.Config
+x = 42
+"#,
+    );
+    assert_eq!(json["x"], 42);
+}
+
+#[test]
+fn annotation_deprecated_property() {
+    // @Deprecated annotation should not prevent evaluation
+    let json = eval(
+        r#"
+@Deprecated { message = "use newName instead" }
+oldName = "value"
+result = oldName
+"#,
+    );
+    assert_eq!(json["oldName"], "value");
+    assert_eq!(json["result"], "value");
+}
+
+#[test]
+fn annotation_multiple() {
+    let json = eval(
+        r#"
+@Since { version = "1.0" }
+@Deprecated { message = "removed in 2.0" }
+legacy = true
+current = false
+"#,
+    );
+    assert_eq!(json["legacy"], true);
+    assert_eq!(json["current"], false);
+}
+
+#[test]
+fn annotation_on_class() {
+    let json = eval(
+        r#"
+@Deprecated { message = "use NewConfig" }
+class OldConfig {
+    name: String = "old"
+}
+x = new OldConfig {}
+"#,
+    );
+    assert_eq!(json["x"]["name"], "old");
+}
+
+#[test]
+fn annotation_empty() {
+    // @Foo with no body
+    let json = eval(
+        r#"
+@Experimental
+feature = true
+"#,
+    );
+    assert_eq!(json["feature"], true);
+}
+
+// ============================================================
+// Class extends
+// ============================================================
+
+#[test]
+fn class_extends_inherits_defaults() {
+    let json = eval(
+        r#"
+open class Animal {
+    name: String = "unknown"
+    legs: Int = 4
+}
+class Dog extends Animal {
+    breed: String = "mixed"
+}
+x = new Dog {
+    name = "Rex"
+}
+"#,
+    );
+    assert_eq!(json["x"]["name"], "Rex");
+    assert_eq!(json["x"]["legs"], 4);
+    assert_eq!(json["x"]["breed"], "mixed");
+}
+
+#[test]
+fn class_extends_override_parent() {
+    let json = eval(
+        r#"
+open class Base {
+    value: Int = 1
+}
+class Child extends Base {
+    value: Int = 2
+    extra: String = "new"
+}
+x = new Child {}
+"#,
+    );
+    assert_eq!(json["x"]["value"], 2);
+    assert_eq!(json["x"]["extra"], "new");
+}
+
+// ============================================================
+// Module extends
+// ============================================================
+
+#[test]
+fn module_extends_inherits_properties() {
+    let mut ev = pklr::eval::Evaluator::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    ev.set_base_path(&base);
+    let src = r#"
+extends "base_module.pkl"
+default_name = "extended"
+extra = "new property"
+"#;
+    let path = base.join("test_extends.pkl");
+    let val = ev.eval_source(src, &path).unwrap();
+    let json = val.to_json();
+    // default_name overridden
+    assert_eq!(json["default_name"], "extended");
+    // version inherited from base
+    assert_eq!(json["version"], 1);
+    // new property added
+    assert_eq!(json["extra"], "new property");
+}
+
+#[test]
+fn module_extends_inherits_classes() {
+    let mut ev = pklr::eval::Evaluator::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    ev.set_base_path(&base);
+    let src = r#"
+extends "base_module.pkl"
+x = new Config {
+    debug = true
+}
+"#;
+    let path = base.join("test_extends_classes.pkl");
+    let val = ev.eval_source(src, &path).unwrap();
+    let json = val.to_json();
+    assert_eq!(json["x"]["debug"], true);
+    assert_eq!(json["x"]["port"], 8080);
+}
+
+#[test]
+fn inherited_class_identity_uses_canonical_module_path() {
+    let dir = TestTempDir::new("pklr_canonical_class_identity");
+    std::fs::write(
+        dir.path.join("base.pkl"),
+        "open module base\nclass Item {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("wrapper.pkl"),
+        "extends \"./base.pkl\"\ninstance = new Item {}\n",
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "base.pkl"
+import "wrapper.pkl"
+same = wrapper.instance is base.Item
+"#,
+    )
+    .unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["same"], true);
+}
+
+// ============================================================
+// read() and read?()
+// ============================================================
+
+#[test]
+fn read_env_variable() {
+    unsafe { std::env::set_var("PKLR_TEST_VAR", "hello_pklr") };
+    let json = eval(
+        r#"
+x = read("env:PKLR_TEST_VAR")
+"#,
+    );
+    assert_eq!(json["x"], "hello_pklr");
+    unsafe { std::env::remove_var("PKLR_TEST_VAR") };
+}
+
+#[test]
+fn read_or_null_missing_env() {
+    let json = eval(
+        r#"
+x = read?("env:DEFINITELY_NOT_SET_12345")
+"#,
+    );
+    assert!(json["x"].is_null());
+}
+
+#[test]
+fn read_local_file() {
+    let mut ev = pklr::eval::Evaluator::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    ev.set_base_path(&base);
+    let src = r#"
+x = read("readme.txt")
+"#;
+    let path = base.join("test_read.pkl");
+    let val = ev.eval_source(src, &path).unwrap();
+    let json = val.to_json();
+    assert_eq!(json["x"]["text"], "Hello from pklr!\n");
+}
+
+#[test]
+fn read_file_uri() {
+    let mut ev = pklr::eval::Evaluator::new();
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    ev.set_base_path(&base);
+    let file_path = base.join("readme.txt");
+    let src = format!(
+        r#"
+x = read("file://{}")
+"#,
+        file_path.display()
+    );
+    let path = base.join("test_read_file.pkl");
+    let val = ev.eval_source(&src, &path).unwrap();
+    let json = val.to_json();
+    assert_eq!(json["x"]["text"], "Hello from pklr!\n");
+}
+
+#[test]
+fn read_or_null_missing_file() {
+    let json = eval(
+        r#"
+x = read?("file:///nonexistent/path/to/file.txt")
+"#,
+    );
+    assert!(json["x"].is_null());
+}
+
+#[test]
+fn read_env_in_interpolation() {
+    unsafe { std::env::set_var("PKLR_NAME", "world") };
+    let json = eval(
+        r#"
+x = "hello \(read("env:PKLR_NAME"))"
+"#,
+    );
+    assert_eq!(json["x"], "hello world");
+    unsafe { std::env::remove_var("PKLR_NAME") };
+}
+
+// ============================================================
+// Set() deduplication
+// ============================================================
+
+// ============================================================
+// Resources
+// ============================================================
+
+#[test]
+fn resources_are_module_relative_and_preserve_bytes() {
+    let temp = TestTempDir::new("pklr_test_resources_relative");
+    let dir = temp.path();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested/data.bin"), [0, 255, b'x']).unwrap();
+    std::fs::write(dir.join("nested/main.pkl"), "value = read(\"data.bin\")\n").unwrap();
+    let value = pklr::eval_to_json(&dir.join("nested/main.pkl")).unwrap();
+    assert_eq!(value["value"]["base64"], "AP94");
+    assert!(
+        value["value"]["uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("nested/data.bin")
+    );
+}
+
+#[test]
+fn resource_read_question_only_suppresses_missing_resources() {
+    let temp = TestTempDir::new("pklr_test_resources_denied");
+    let path = temp.path().join("main.pkl");
+    std::fs::write(
+        &path,
+        "missing = read?(\"missing.txt\")\ndenied = read?(\"env:HOME\")\n",
+    )
+    .unwrap();
+    let error = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec!["file:".to_string()])
+        .eval_to_json(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Refusing to read resource `env:HOME`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resource_allowlist_normalizes_paths_before_io() {
+    let temp = TestTempDir::new("pklr_test_resources_allowlist");
+    let dir = temp.path();
+    std::fs::create_dir_all(dir.join("allowed")).unwrap();
+    std::fs::write(dir.join("secret.txt"), "nope").unwrap();
+    let path = dir.join("allowed/main.pkl");
+    std::fs::write(&path, "x = read(\"../secret.txt\")\n").unwrap();
+    let allowed = format!("file://{}/allowed/", dir.display());
+    let error = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec![allowed])
+        .eval_to_json(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Refusing to read resource"), "{error}");
+
+    // A non-directory URI prefix remains a prefix, as documented by the
+    // builder, while a trailing slash above keeps directory boundaries.
+    std::fs::write(dir.join("allowed/config-current.txt"), "prefix").unwrap();
+    let path = dir.join("allowed/main.pkl");
+    std::fs::write(&path, "value = read(\"config-current.txt\")\n").unwrap();
+    let allowed = format!("file:{}/allowed/config-", dir.display());
+    let value = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec![allowed])
+        .eval_to_json(&path)
+        .unwrap();
+    assert_eq!(value["value"]["text"], "prefix");
+
+    let value = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec!["file:///".to_string()])
+        .eval_to_json(&path)
+        .unwrap();
+    assert_eq!(value["value"]["text"], "prefix");
+}
+
+#[test]
+fn resource_env_prop_and_file_globs() {
+    let temp = TestTempDir::new("pklr_test_resources_glob");
+    let dir = temp.path();
+    std::fs::write(dir.join("a.txt"), "a").unwrap();
+    std::fs::write(dir.join("b.txt"), "b").unwrap();
+    let path = dir.join("main.pkl");
+    std::fs::write(
+        &path,
+        "envs = read*(\"env:APP_*\")\nprops = read*(\"prop:app*\")\nfiles = read*(\"*.txt\")\n",
+    )
+    .unwrap();
+    let value = pklr::EvaluatorBuilder::new()
+        .environment_variables(vec![("APP_MODE".to_string(), "test".to_string())])
+        .external_properties(vec![("apple".to_string(), "pie".to_string())])
+        .eval_to_json(&path)
+        .unwrap();
+    assert_eq!(value["envs"]["env:APP_MODE"], "test");
+    assert_eq!(value["props"]["prop:apple"], "pie");
+    assert_eq!(value["files"]["a.txt"]["text"], "a");
+    assert_eq!(value["files"]["b.txt"]["text"], "b");
+}
+
+#[test]
+fn resource_glob_keys_stay_module_relative_and_braces_do_not_expand() {
+    let temp = TestTempDir::new("pklr_test_resources_glob_keys");
+    let dir = temp.path();
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::create_dir_all(dir.join("literal")).unwrap();
+    std::fs::write(dir.join("literal/value.txt"), "value").unwrap();
+    std::fs::write(
+        dir.join("nested/main.pkl"),
+        "values = read*(\"../literal/*.txt\")\n",
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("nested/main.pkl")).unwrap();
+    assert_eq!(value["values"]["../literal/value.txt"]["text"], "value");
+
+    // This is deliberately invoked through read* so the production resolver,
+    // not a test-only matcher, compiles the adjacent groups.
+    let pattern = std::iter::repeat_n("{a,b}", 30).collect::<String>();
+    let name = "a".repeat(30);
+    std::fs::write(dir.join(&name), "safe").unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        format!("values = read*(\"{pattern}\")\n"),
+    )
+    .unwrap();
+    let value = pklr::eval_to_json(&dir.join("main.pkl")).unwrap();
+    assert_eq!(value["values"][name]["text"], "safe");
+}
+
+#[test]
+fn resource_file_allowlist_accepts_equivalent_uri_spellings() {
+    let temp = TestTempDir::new("pklr_test_resources_uri_spellings");
+    let dir = temp.path();
+    std::fs::write(dir.join("data.txt"), "allowed").unwrap();
+    let path = dir.join("main.pkl");
+    std::fs::write(&path, "value = read(\"data.txt\")\n").unwrap();
+    let allowed = format!("file:{}", dir.display());
+    let value = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec![allowed])
+        .eval_to_json(&path)
+        .unwrap();
+    assert_eq!(value["value"]["text"], "allowed");
+
+    std::fs::create_dir_all(dir.join("allowed")).unwrap();
+    std::fs::create_dir_all(dir.join("allowed-sibling")).unwrap();
+    std::fs::write(dir.join("allowed-sibling/secret.txt"), "secret").unwrap();
+    let path = dir.join("allowed/main.pkl");
+    std::fs::write(&path, "value = read(\"../allowed-sibling/secret.txt\")\n").unwrap();
+    let allowed = format!("file:{}/allowed/", dir.display());
+    let error = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec![allowed])
+        .eval_to_json(&path)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Refusing to read resource"), "{error}");
+}
+
+#[test]
+fn narrow_native_allowlist_keeps_missing_relative_resources_nullable() {
+    let temp = TestTempDir::new("pklr_test_resources_missing_narrow");
+    let dir = temp.path().join("safe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("main.pkl");
+    std::fs::write(&path, "value = read?(\"missing.txt\")\n").unwrap();
+    let allowed = format!("file:{}/", dir.display());
+    let value = pklr::EvaluatorBuilder::new()
+        .allowed_resources(vec![allowed])
+        .eval_to_json(&path)
+        .unwrap();
+    assert!(value["value"].is_null());
+
+    // The module itself need not exist for eval_source. Its existing relative
+    // parent still establishes the native allowlist base.
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let allowed = format!("file:{}/", fixture.display());
+    let mut evaluator = pklr::eval::Evaluator::new();
+    evaluator.set_allowed_resources(vec![allowed]);
+    let value = evaluator
+        .eval_source(
+            "value = read?(\"missing-from-unsaved.txt\")\n",
+            std::path::Path::new("tests/fixtures/unsaved-resource-module.pkl"),
+        )
+        .unwrap()
+        .to_json();
+    assert!(value["value"].is_null());
+
+    let cwd = std::env::current_dir().unwrap();
+    let allowed = format!("file:{}/", cwd.display());
+    let mut evaluator = pklr::eval::Evaluator::new();
+    evaluator.set_allowed_resources(vec![allowed]);
+    let value = evaluator
+        .eval_source(
+            "value = read?(\"missing-from-bare-unsaved.txt\")\n",
+            std::path::Path::new("unsaved-resource-module.pkl"),
+        )
+        .unwrap()
+        .to_json();
+    assert!(value["value"].is_null());
+}
+
+#[test]
+fn resource_glob_rejects_triple_dot_before_traversal() {
+    let error = eval_fails(r#"x = read*(".../secret/*.txt")"#);
+    assert!(
+        error.contains("Cannot combine resource globs with triple-dot"),
+        "{error}"
+    );
+}
+
+#[test]
+fn set_deduplicates() {
+    let json = eval(r#"x = Set(1, 2, 3, 2, 1)"#);
+    assert_eq!(json["x"], serde_json::json!([1, 2, 3]));
+}
+
+#[test]
+fn set_preserves_order() {
+    let json = eval(r#"x = Set("b", "a", "c", "a")"#);
+    assert_eq!(json["x"], serde_json::json!(["b", "a", "c"]));
+}
+
+#[test]
+fn set_empty() {
+    let json = eval(r#"x = Set()"#);
+    assert_eq!(json["x"], serde_json::json!([]));
+}
+
+#[test]
+fn sets_cannot_be_indexed() {
+    let error = eval_fails(r#"x = Set(1, 2)[0]"#);
+    assert!(
+        error.contains("Operator `[]` is not defined for operand types `Set` and `Int`."),
+        "{error}"
+    );
+}
+
+// ============================================================
+// open modifier
+// ============================================================
+
+#[test]
+fn open_class_allows_new_properties() {
+    let json = eval(
+        r#"
+open class Config {
+    port: Int = 8080
+}
+x = new Config {
+    port = 9090
+    host = "localhost"
+}
+"#,
+    );
+    assert_eq!(json["x"]["port"], 9090);
+    assert_eq!(json["x"]["host"], "localhost");
+}
+
+#[test]
+fn non_open_class_rejects_new_properties() {
+    let msg = eval_fails(
+        r#"
+class Config {
+    port: Int = 8080
+}
+x = new Config {
+    port = 9090
+    host = "localhost"
+}
+"#,
+    );
+    assert!(msg.contains("non-open"));
+    assert!(msg.contains("host"));
+}
+
+#[test]
+fn class_instance_rejects_entries() {
+    let msg = eval_fails(
+        r#"
+class Config {
+    port: Int = 8080
+}
+x = new Config {
+    ["host"] = "localhost"
+}
+"#,
+    );
+    assert!(
+        msg.contains("Object of type `test#Config` cannot have an entry."),
+        "{msg}"
+    );
+}
+
+#[test]
+fn non_open_class_preserves_constraint_on_re_instantiation() {
+    // After instantiating a non-open class, the is_open=false flag must be
+    // preserved so that re-using the result as a base still enforces the constraint.
+    let msg = eval_fails(
+        r#"
+class Config {
+    port: Int = 8080
+}
+base = new Config { port = 9090 }
+x = new Config {
+    port = base.port
+    host = "bad"
+}
+"#,
+    );
+    assert!(msg.contains("non-open"));
+    assert!(msg.contains("host"));
+}
+
+#[test]
+fn non_open_class_allows_overrides() {
+    let json = eval(
+        r#"
+class Config {
+    port: Int = 8080
+    debug: Boolean = false
+}
+x = new Config {
+    port = 9090
+    debug = true
+}
+"#,
+    );
+    assert_eq!(json["x"]["port"], 9090);
+    assert_eq!(json["x"]["debug"], true);
+}
+
+// ============================================================
+// Output block handling
+// ============================================================
+
+#[test]
+fn output_block_is_skipped() {
+    let json = eval(
+        r#"
+x = 1
+output {
+    renderer {
+        converters {
+            ["test"] = "hello"
+        }
+    }
+}
+"#,
+    );
+    assert_eq!(json["x"], 1);
+    assert!(
+        json.get("output").is_none(),
+        "output should be skipped, got: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
+}
+
+// ============================================================
+// new Dynamic
+// ============================================================
+
+#[test]
+fn new_dynamic_creates_object() {
+    let json = eval(
+        r#"
+x = new Dynamic {
+    _type = "step"
+    name = "test"
+}
+"#,
+    );
+    assert_eq!(json["x"]["_type"], "step");
+    assert_eq!(json["x"]["name"], "test");
+}
+
+#[test]
+fn new_dynamic_with_spread() {
+    let json = eval(
+        r#"
+base {
+    port = 8080
+}
+x = new Dynamic {
+    _type = "config"
+    ...base
+}
+"#,
+    );
+    assert_eq!(json["x"]["_type"], "config");
+    assert_eq!(json["x"]["port"], 8080);
+}
+
+// ============================================================
+// Class functions
+// ============================================================
+
+#[test]
+fn class_function_basic() {
+    let json = eval(
+        r#"
+class Greeter {
+    name: String = "World"
+    function greet(prefix: String): String = prefix + " " + name
+}
+g = new Greeter {}
+result = g.greet("Hello")
+"#,
+    );
+    assert_eq!(json["result"], "Hello World");
+}
+
+#[test]
+fn null_safe_class_function_call() {
+    let json = eval(
+        r#"
+class Greeter {
+    name: String = "World"
+    function greet(prefix: String): String = prefix + " " + name
+}
+g = new Greeter {}
+a = g?.greet("Hello")
+b = null?.greet("Hello")
+"#,
+    );
+    assert_eq!(json["a"], "Hello World");
+    assert_eq!(json["b"], serde_json::Value::Null);
+}
+
+#[test]
+fn null_safe_unknown_method_errors_without_falling_through() {
+    let error = eval_fails(
+        r#"
+class Greeter {
+    name: String = "World"
+}
+g = new Greeter {}
+result = g?.missing("Hello")
+"#,
+    );
+    assert!(error.contains("unknown method 'missing' on Object"));
+}
+
+#[test]
+fn null_safe_regex_constructor_emits_type_tag() {
+    let json = eval(
+        r##"
+import "pkl:base" as base
+glob = base?.Regex(#"^.*\.json$"#)
+"##,
+    );
+    assert_eq!(json["glob"]["_type"], "regex");
+    assert_eq!(json["glob"]["pattern"], r"^.*\.json$");
+}
+
+#[test]
+fn null_safe_non_function_field_errors_like_regular_call() {
+    let error = eval_fails(
+        r#"
+class Greeter {
+    name: String = "World"
+}
+g = new Greeter {}
+result = g?.name("Hello")
+"#,
+    );
+    assert!(error.contains("cannot call non-function"));
+}
+
+#[test]
+fn zero_arg_field_call_returns_field_value() {
+    let json = eval(
+        r#"
+class Greeter {
+    name: String = "World"
+}
+g = new Greeter {}
+a = g.name()
+b = g?.name()
+"#,
+    );
+    assert_eq!(json["a"], "World");
+    assert_eq!(json["b"], "World");
+}
+
+#[test]
+fn regular_unknown_method_errors_without_falling_through() {
+    let error = eval_fails(
+        r#"
+class Greeter {
+    name: String = "World"
+}
+g = new Greeter {}
+result = g.missing("Hello")
+"#,
+    );
+    assert!(error.contains("unknown method 'missing' on Object"));
+}
+
+#[test]
+fn class_lambda_valued_property_is_preserved() {
+    let json = eval(
+        r#"
+class Transformer {
+    transform = (x) -> x + 1
+}
+t = new Transformer {}
+result = t.transform.apply(2)
+"#,
+    );
+    assert_eq!(json["result"], 3);
+    assert_eq!(json["t"]["transform"], "<lambda>");
+}
+
+#[test]
+fn class_same_named_typed_property_is_preserved() {
+    let json = eval(
+        r#"
+class Script {
+    linux: String = "echo ok"
+}
+
+class Holder {
+    Script = new Script {}
+}
+
+h = new Holder {}
+"#,
+    );
+    assert_eq!(json["h"]["Script"]["linux"], "echo ok");
+}
+
+#[test]
+fn class_function_testmaker_pattern() {
+    // First check: does the class itself have checkFail?
+    let json1 = eval(
+        r#"
+class TestMaker {
+    filename: String = "file.txt"
+    function checkFail(contents: String, code: Int): String = "check:" + filename
+}
+local testMaker = new TestMaker {}
+result = testMaker.checkFail("bad", 1)
+"#,
+    );
+    assert_eq!(json1["result"], "check:file.txt");
+
+    // Second check: does it survive property override?
+    let json2 = eval(
+        r#"
+class TestMaker {
+    filename: String = "file.txt"
+    function checkFail(contents: String, code: Int): String = "check:" + filename
+}
+local testMaker = new TestMaker { filename = "main.rs" }
+result = testMaker.checkFail("bad", 1)
+"#,
+    );
+    assert_eq!(json2["result"], "check:main.rs");
+}
+
+#[test]
+fn class_function_with_local() {
+    let json = eval(
+        r#"
+class Calc {
+    base: Int = 10
+    local function helper(x: Int): Int = x + base
+    function compute(x: Int): Int = helper(x)
+}
+c = new Calc {}
+result = c.compute(5)
+"#,
+    );
+    assert_eq!(json["result"], 15);
+}
+
+// ============================================================
+// hk.pkl compatibility
+// ============================================================
+
+#[test]
+fn regex_constructor_emits_type_tag() {
+    let json = eval(
+        r##"
+glob = Regex(#"^.*\.json$"#)
+"##,
+    );
+    assert_eq!(json["glob"]["_type"], "regex");
+    assert_eq!(json["glob"]["pattern"], r"^.*\.json$");
+}
+
+#[test]
+fn imported_regex_constructor_emits_type_tag() {
+    let temp = TestTempDir::new("pklr_test_imported_regex_type_tag");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("Types.pkl"),
+        r#"
+import "pkl:base"
+function Regex(pattern: String) = base.Regex(pattern)
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("test.pkl"),
+        r##"
+import "Types.pkl"
+glob = Types.Regex(#"^.*\.yaml$"#)
+"##,
+    )
+    .unwrap();
+
+    let mut ev = Evaluator::new();
+    let path = dir.join("test.pkl");
+    let val = ev
+        .eval_source(&std::fs::read_to_string(&path).unwrap(), &path)
+        .unwrap();
+    let json = val.to_json();
+    assert_eq!(json["glob"]["_type"], "regex");
+    assert_eq!(json["glob"]["pattern"], r"^.*\.yaml$");
+}
+
+#[test]
+fn hk_step_regex_glob_emits_type_tag() {
+    let temp = TestTempDir::new("pklr_test_hk_step_regex_glob");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("Config.pkl"),
+        r#"
+import "pkl:base" as base
+function Regex(pattern: String) = base.Regex(pattern)
+class Step {
+    glob: (String | List<String> | Regex)?
+    check: String?
+}
+class Hook {
+    steps: Mapping<String, Step> = new Mapping<String, Step> {}
+}
+hooks: Mapping<String, Hook> = new Mapping<String, Hook> {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("hk.pkl"),
+        r##"
+amends "Config.pkl"
+hooks {
+    ["check"] {
+        steps {
+            ["regex-test"] {
+                glob = Regex(#"^.*\.json$"#)
+                check = "echo {{files}}"
+            }
+        }
+    }
+}
+"##,
+    )
+    .unwrap();
+
+    let mut ev = Evaluator::new();
+    let path = dir.join("hk.pkl");
+    let val = ev
+        .eval_source(&std::fs::read_to_string(&path).unwrap(), &path)
+        .unwrap();
+    let json = val.to_json();
+    let glob = &json["hooks"]["check"]["steps"]["regex-test"]["glob"];
+    assert_eq!(glob["_type"], "regex");
+    assert_eq!(glob["pattern"], r"^.*\.json$");
+}
+
+#[test]
+fn hk_multiline_regex_pattern_is_normalized() {
+    let json = eval(
+        r####"
+glob = Regex(#"""
+    (?x)
+    ^.*airflow\.template\.yaml$|
+    ^chart/(?:templates|files)/.*\.yaml$
+    """#)
+"####,
+    );
+    assert_eq!(json["glob"]["_type"], "regex");
+    assert_eq!(
+        json["glob"]["pattern"],
+        "(?x)\n^.*airflow\\.template\\.yaml$|\n^chart/(?:templates|files)/.*\\.yaml$"
+    );
+}
+
+#[test]
+fn eval_amends_perf() {
+    // Minimal amends test to check performance
+    let temp = TestTempDir::new("pklr_test_perf");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("Base.pkl"),
+        r#"
+class Step {
+    glob: (String | List<String>)?
+    check: String?
+    fix: String?
+    check_first: Boolean = true
+    batch: Boolean = false
+}
+class Hook {
+    fix: Boolean?
+    steps: Mapping<String, Step> = new Mapping<String, Step> {}
+}
+hooks: Mapping<String, Hook> = new Mapping<String, Hook> {}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("test.pkl"),
+        r#"
+amends "Base.pkl"
+hooks = new {
+    ["pre-commit"] {
+        fix = true
+        steps = new {
+            ["lint"] { check = "lint" }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let path = dir.join("test.pkl");
+    let start = std::time::Instant::now();
+    let val = pklr::eval_to_json(&path).unwrap();
+    let elapsed = start.elapsed();
+    eprintln!("eval_amends_perf: {elapsed:?}");
+    assert!(
+        elapsed.as_secs() < 5,
+        "amends eval took too long: {elapsed:?}"
+    );
+    assert!(val["hooks"]["pre-commit"]["fix"] == true);
+}
+
+#[test]
+fn class_function_nested_in_new() {
+    // Matches the hk builtin pattern: testMaker.checkFail() inside new Config.Step { tests { ... } }
+    let temp = TestTempDir::new("pklr_test_nested");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("helpers.pkl"),
+        r#"
+class TestMaker {
+    filename: String = "file.txt"
+    local function makeTest(runType: String, code: Int): String = runType + ":" + filename
+    function checkFail(contents: String, code: Int): String = makeTest("check", code)
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        r#"
+import "helpers.pkl"
+local const testMaker = new helpers.TestMaker { filename = "src/main.rs" }
+x {
+    tests {
+        ["check bad file"] = testMaker.checkFail("bad", 1)
+    }
+}
+"#,
+    )
+    .unwrap();
+    let path = dir.join("main.pkl");
+    let val = pklr::eval_to_json(&path).unwrap();
+    assert_eq!(val["x"]["tests"]["check bad file"], "check:src/main.rs");
+}
+
+#[test]
+fn class_function_cross_module() {
+    let temp = TestTempDir::new("pklr_test_cross_module");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("helpers.pkl"),
+        r#"
+class TestMaker {
+    filename: String = "file.txt"
+    local function makeTest(runType: String, code: Int): String = runType + ":" + filename
+    function checkFail(contents: String, code: Int): String = makeTest("check", code)
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.pkl"),
+        r#"
+import "helpers.pkl"
+local const testMaker = new helpers.TestMaker { filename = "main.rs" }
+result = testMaker.checkFail("bad", 1)
+"#,
+    )
+    .unwrap();
+    let path = dir.join("main.pkl");
+    let val = pklr::eval_to_json(&path).unwrap();
+    assert_eq!(val["result"], "check:main.rs");
+}
+
+#[test]
+fn body_amendment_ignores_same_named_property_of_enclosing_object() {
+    let val = eval(
+        r#"
+x {
+  files = List("a")
+  expect { files { ["a"] = "b" } }
+}
+"#,
+    );
+    assert_eq!(val["x"]["files"], serde_json::json!(["a"]));
+    assert_eq!(val["x"]["expect"]["files"], serde_json::json!({"a": "b"}));
+}
+
+#[test]
+fn body_amendment_ignores_inherited_property_of_enclosing_object() {
+    let val = eval(
+        r#"
+class Test { files: List<String> = List("a"); expect: Dynamic = new Dynamic {} }
+x = new Test {
+  expect { files { ["a"] = "b" } }
+}
+"#,
+    );
+    assert_eq!(val["x"]["files"], serde_json::json!(["a"]));
+    assert_eq!(val["x"]["expect"]["files"], serde_json::json!({"a": "b"}));
+}
+
+// ============================================================
+// `module` inside class bodies
+// ============================================================
+
+#[test]
+fn module_in_class_body_reads_module_property() {
+    let val = eval(
+        r#"
+const expected = "b"
+class C { v = module.expected }
+result = new C {}
+"#,
+    );
+    assert_eq!(val["result"]["v"], "b");
+}
+
+#[test]
+fn module_in_class_body_reads_property_declared_after_class() {
+    let val = eval(
+        r#"
+class C { v = module.expected; w = "w" }
+const expected = "b"
+result = new C {}
+amended = new C { w = "x" }
+overridden = new C { v = "o" }
+"#,
+    );
+    assert_eq!(val["result"]["v"], "b");
+    assert_eq!(val["amended"], serde_json::json!({"v": "b", "w": "x"}));
+    assert_eq!(val["overridden"]["v"], "o");
+    assert!(val.get("C").is_none());
+}
+
+#[test]
+fn module_qualified_class_read_is_not_shadowed_by_class_member() {
+    let val = eval(
+        r#"
+class C { expected = "class"; v = module.expected }
+const expected = "module"
+result = new C {}
+"#,
+    );
+    assert_eq!(val["result"]["v"], "module");
+}
+
+#[test]
+fn module_in_class_body_reaches_subclasses_and_local_functions() {
+    let val = eval(
+        r#"
+open class C { v = module.expected; w = "w" }
+class D extends C { u = module.other }
+local function make(s) = new D { w = s }
+local mk = (s) -> new C { w = s }
+const expected = "b"
+const other = "o"
+d = new D {}
+made = make("z")
+lambda = mk.apply("y")
+"#,
+    );
+    assert_eq!(val["d"], serde_json::json!({"v": "b", "w": "w", "u": "o"}));
+    assert_eq!(
+        val["made"],
+        serde_json::json!({"v": "b", "w": "z", "u": "o"})
+    );
+    assert_eq!(val["lambda"], serde_json::json!({"v": "b", "w": "y"}));
+}
+
+#[test]
+fn module_in_class_body_reads_property_declared_after_use() {
+    let val = eval(
+        r#"
+class C { v = module.expected }
+result = new C {}
+const expected = "b"
+"#,
+    );
+    assert_eq!(val["result"], serde_json::json!({"v": "b"}));
+}
+
+#[test]
+fn unused_class_reading_missing_module_property_is_not_an_error() {
+    let val = eval("class C { v = module.missing }\nresult = 1\n");
+    assert_eq!(val, serde_json::json!({"result": 1}));
+}
+
+#[test]
+fn subclass_of_class_reading_missing_module_property_reports_error() {
+    let err = eval_fails(
+        r#"
+class C { v = module.missing }
+class D extends C { w = 1 }
+result = new D {}
+"#,
+    );
+    assert!(err.contains("missing"), "{err}");
+}
+
+#[test]
+fn subclass_recovers_once_module_property_is_evaluated() {
+    let val = eval(
+        r#"
+open class C { v = module.expected }
+class D extends C { w = 1 }
+const expected = "b"
+result = new D {}
+"#,
+    );
+    assert_eq!(val["result"], serde_json::json!({"v": "b", "w": 1}));
+}
+
+#[test]
+fn type_alias_of_class_reading_module_is_refreshed() {
+    let val = eval(
+        r#"
+class C { v = module.expected }
+typealias A = C
+const expected = "b"
+result = new A {}
+"#,
+    );
+    assert_eq!(val["result"], serde_json::json!({"v": "b"}));
+}
+
+#[test]
+fn recovered_class_is_visible_through_module_and_this() {
+    let val = eval(
+        r#"
+class C { v = module.expected }
+const expected = "b"
+result = new module.C {}
+"#,
+    );
+    assert_eq!(val["result"], serde_json::json!({"v": "b"}));
+    let val = eval(
+        r#"
+class C { v = module.expected }
+function make() = new C {}
+const expected = "b"
+viaModule = module.make()
+viaThis = this.make()
+"#,
+    );
+    assert_eq!(val["viaModule"], serde_json::json!({"v": "b"}));
+    assert_eq!(val["viaThis"], serde_json::json!({"v": "b"}));
+}
+
+#[test]
+fn class_reading_module_is_refreshed_only_where_used() {
+    // Classes are refreshed lazily, before a property that can reach them:
+    // by bare name, through a nested body, via a function, or `module.C`.
+    let val = eval(
+        r#"
+open class C { v = module.expected }
+function make() = new C {}
+const expected = "b"
+unrelated = expected + "!"
+holder { c = new C {} }
+viaFunction = module.make()
+later = "c"
+direct = new C { w = module.later }
+"#,
+    );
+    assert_eq!(val["unrelated"], "b!");
+    assert_eq!(val["holder"]["c"], serde_json::json!({"v": "b"}));
+    assert_eq!(val["viaFunction"], serde_json::json!({"v": "b"}));
+    assert_eq!(val["direct"], serde_json::json!({"v": "b", "w": "c"}));
+}
+
+#[test]
+fn class_read_in_type_constraint_is_refreshed() {
+    let val = eval(
+        r#"
+class C { v = module.expected }
+const expected = "b"
+result = 1 is Int(new C {}.v == "b")
+"#,
+    );
+    assert_eq!(val["result"], true);
+    let val = eval(
+        r#"
+class C { v = module.expected }
+typealias Ok = Int(new C {}.v == "b")
+const expected = "b"
+result = 1 is Ok
+"#,
+    );
+    assert_eq!(val["result"], true);
+}
+
+#[test]
+fn functions_reading_module_dynamically_are_refreshed() {
+    for src in [
+        "local key = \"C\"\nclass C { v = module.expected }\nlocal function make() = new C {}.v\nconst expected = \"b\"\nresult = make()\n",
+        "local key = \"C\"\nclass C { v = module.expected }\nfunction make() = new C {}.v\nconst expected = \"b\"\nresult = make()\n",
+    ] {
+        assert_eq!(eval(src)["result"], "b", "{src}");
+    }
+}
+
+#[test]
+fn failed_class_reports_error_through_every_member_read() {
+    for read in ["module[\"C\"]", "this[\"C\"]", "module?.C", "this?.C"] {
+        let src = format!("class C {{ v = module.missing }}\nresult = {read}\n");
+        let err = eval_fails(&src);
+        assert!(err.contains("missing"), "{read}: {err}");
+    }
+}
+
+#[test]
+fn failed_module_local_is_not_a_member_of_module() {
+    // Locals are not members of `module`/`this`, whether or not they failed,
+    // even in a module whose classes are refreshed.
+    let src =
+        "class C { v = module.expected }\nlocal x = throw(\"boom\")\nconst expected = \"b\"\n";
+    let val = eval(&format!("{src}result = module?.x\nself = this?.x\n"));
+    assert_eq!(val["result"], serde_json::Value::Null);
+    assert_eq!(val["self"], serde_json::Value::Null);
+    for read in ["module[\"x\"]", "this[\"x\"]"] {
+        let err = eval_fails(&format!("{src}result = {read}\n"));
+        assert!(err.contains("Cannot find key `\"x\"`"), "{read}: {err}");
+    }
+}
+
+#[test]
+fn members_declared_before_the_class_they_use_are_refreshed() {
+    for (src, expected) in [
+        (
+            "function make() = new C {}\nclass C { v = module.expected }\nconst expected = \"b\"\nresult = make()\n",
+            serde_json::json!({"v": "b"}),
+        ),
+        (
+            "local function make() = new C {}\nclass C { v = module.expected }\nconst expected = \"b\"\nresult = make()\n",
+            serde_json::json!({"v": "b"}),
+        ),
+        (
+            "class D { c = new C {} }\nclass C { v = module.expected }\nconst expected = \"b\"\nresult = new D {}\n",
+            serde_json::json!({"c": {"v": "b"}}),
+        ),
+    ] {
+        assert_eq!(eval(src)["result"], expected, "{src}");
+    }
+}
+
+#[test]
+fn failed_class_reports_error_through_module_and_this() {
+    for src in [
+        "class C { v = module.missing }\nresult = new module.C {}\n",
+        "class C { v = module.missing }\nresult = new this.C {}\n",
+        "class C { v = module.missing }\nclass D extends module.C { w = 1 }\nresult = new D {}\n",
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains("missing"), "{src}: {err}");
+    }
+}
+
+#[test]
+fn qualified_class_refs_are_refreshed_when_class_recovers() {
+    for src in [
+        "class C { v = module.expected }\nfunction make() = new module.C {}\nconst expected = \"b\"\nresult = make()\n",
+        "class C { v = module.expected }\nfunction make() = new this.C {}\nconst expected = \"b\"\nresult = make()\n",
+    ] {
+        let val = eval(src);
+        assert_eq!(val["result"], serde_json::json!({"v": "b"}), "{src}");
+    }
+    // A local holding a class is a value, not a type.
+    for src in [
+        "class C { v = module.expected }\nlocal x = module.C\nconst expected = \"b\"\nresult = new x {}\n",
+        "class C { v = module.expected }\nlocal x = this.C\nconst expected = \"b\"\nresult = new x {}\n",
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Expected `x` to be a type, but it is not."),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn module_function_building_class_reading_module_is_refreshed() {
+    let val = eval(
+        r#"
+class C { v = module.expected }
+function make() = new C {}
+const expected = "b"
+result = make()
+"#,
+    );
+    assert_eq!(val["result"], serde_json::json!({"v": "b"}));
+}
+
+#[test]
+fn outer_in_type_position_is_bound() {
+    let json = eval(
+        r#"
+class Step { v = 1 }
+obj {
+  inner { s = new outer.Step {} }
+  local x: outer.Step = new Step {}
+  ok = x is outer.Step
+}
+"#,
+    );
+    assert_eq!(json["obj"]["inner"]["s"]["v"], 1);
+    assert_eq!(json["obj"]["ok"], true);
+}
+
+#[test]
+fn outer_is_bound_for_type_alias_constraints_checked_in_body() {
+    let json = eval(
+        r#"
+limit = 5
+typealias Checked = Int(this < outer.limit)
+obj {
+  ok = 3 is Checked
+}
+"#,
+    );
+    assert_eq!(json["obj"]["ok"], true);
+}
+
+// ============================================================
+// Class extension and instantiation rules
+// ============================================================
+
+#[test]
+fn class_without_body_is_an_empty_class() {
+    let json = eval("open class Base\nclass Derived extends Base\nx = new Derived {}\n");
+    assert_eq!(json["x"], serde_json::json!({}));
+}
+
+#[test]
+fn invalid_supertypes_are_rejected() {
+    for (src, message) in [
+        (
+            "class Base\nclass Derived extends Base\n",
+            "Cannot extend non-open class `test#Base`.",
+        ),
+        (
+            "open class Recurring extends Recurring {}\n",
+            "Class `test#Recurring` cannot extend itself.",
+        ),
+        (
+            "class Person extends Any\n",
+            "Cannot extend external class `Any`.",
+        ),
+        (
+            "class Person extends Dynamic\n",
+            "Cannot extend non-open class `Dynamic`.",
+        ),
+        (
+            "open class Foo\ntypealias Bar = Foo(true)\nclass Baz extends Bar\n",
+            "`Bar` is not a valid supertype.",
+        ),
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains(message), "{src}: {err}");
+    }
+    // An alias that only names a class stands for it.
+    let json = eval(
+        "open class Foo { value = 42 }\ntypealias Bar = Foo\nclass Baz extends Bar {}\nx = new Baz {}.value\n",
+    );
+    assert_eq!(json["x"], 42);
+    // Open and abstract classes can be extended.
+    let json = eval(
+        "open class A { a = 1 }\nabstract class B extends A { b = 2 }\nclass C extends B\nx = new C {}\n",
+    );
+    assert_eq!(json["x"], serde_json::json!({"a": 1, "b": 2}));
+}
+
+#[test]
+fn abstract_and_external_classes_cannot_be_instantiated() {
+    for (src, message) in [
+        (
+            "abstract class Base\nres = new Base {}\n",
+            "Cannot instantiate abstract class `test#Base`.",
+        ),
+        (
+            "res = new String {}\n",
+            "Cannot instantiate, or amend an instance of, external class `String`.",
+        ),
+        (
+            "res = new Map {}\n",
+            "Cannot instantiate, or amend an instance of, external class `Map`.",
+        ),
+        (
+            "class Foo\nlocal Foo2 = Foo\nres = new Foo2 {}\n",
+            "Expected `Foo2` to be a type, but it is not.",
+        ),
+        (
+            "local Foo = new Dynamic {\n  @Deprecated { message = \"old\" }\n  value = 1\n}\nres = new Foo {}\n",
+            "Expected `Foo` to be a type, but it is not.",
+        ),
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains(message), "{src}: {err}");
+    }
+}
+
+#[test]
+fn instantiation_checks_follow_type_aliases() {
+    let err = eval_fails("typealias R = Regex\nres = new R {}\n");
+    assert!(
+        err.contains("Cannot instantiate, or amend an instance of, external class `Regex`."),
+        "{err}"
+    );
+    let json =
+        eval("class Foo { x = 1 }\ntypealias A = Foo\nlocal f = () -> new A {}\nr = f.apply()\n");
+    assert_eq!(json["r"], serde_json::json!({"x": 1}));
+    // A parameter named like the class doesn't change what the alias names.
+    let json = eval(
+        "class Foo { x = 1 }\ntypealias A = Foo\nlocal f = (Foo) -> new A {}\nr = f.apply(5)\n",
+    );
+    assert_eq!(json["r"], serde_json::json!({"x": 1}));
+    let err = eval_fails(
+        "typealias A1 = A2\ntypealias A2 = A3\ntypealias A3 = A4\ntypealias A4 = A5\ntypealias A5 = A6\ntypealias A6 = A7\ntypealias A7 = A8\ntypealias A8 = A9\ntypealias A9 = Regex\nres = new A1 {}\n",
+    );
+    assert!(
+        err.contains("Cannot instantiate, or amend an instance of, external class `Regex`."),
+        "{err}"
+    );
+}
+
+#[test]
+fn min_pkl_version_folds_constant_strings() {
+    let err =
+        eval_fails("@ModuleInfo { minPklVersion = \"99.\" + \"9.9\" }\nmodule future\nx = 1\n");
+    assert!(
+        err.contains("Module `future` requires Pkl version 99.9.9 or higher"),
+        "{err}"
+    );
+}
+
+// ============================================================
+// Iteration and element rules
+// ============================================================
+
+#[test]
+fn generators_and_spreads_reject_non_iterable_values() {
+    for (src, message) in [
+        (
+            "foo {\n  for (n in 5) { n }\n}\n",
+            "Cannot iterate over value of type `Int`.",
+        ),
+        (
+            "foo = new Listing {\n  for (c in \"abc\") { c }\n}\n",
+            "Cannot iterate over value of type `String`.",
+        ),
+        (
+            "class Person\nfoo {\n  for (_ in new Person {}) { 42 }\n}\n",
+            "Cannot iterate over value of type `test#Person`.",
+        ),
+        (
+            "source = null\nres { ...source }\n",
+            "Cannot iterate over value of type `Null`.",
+        ),
+        (
+            "res = new Listing { ...1 }\n",
+            "Cannot iterate over value of type `Int`.",
+        ),
+        (
+            "class Person { name = \"Bob\" }\nres { ...new Person {} }\n",
+            "Cannot iterate over value of type `test#Person`.",
+        ),
+        (
+            "res = new Mapping { ...List(1, 2) }\n",
+            "Cannot spread value of type `List` into object of type `Mapping`.",
+        ),
+        (
+            "local d = new Dynamic { b = 2 }\nres = new Listing { ...d }\n",
+            "Cannot spread object containing properties into object of type `Listing`.",
+        ),
+        (
+            "local m = new Mapping { [\"a\"] = 1 }\nres = new Listing { ...m }\n",
+            "Cannot spread object containing entries into object of type `Listing`.",
+        ),
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains(message), "{src}: {err}");
+    }
+    // Collections, Listings, Mappings and Dynamic objects can be iterated.
+    let json = eval(
+        r#"
+local m = new Mapping { ["a"] = 1 }
+res = new Listing {
+  for (x in List(1)) { x }
+  for (x in new Listing { 2 }) { x }
+  for (_, v in m) { v }
+  ...List(2)
+}
+"#,
+    );
+    assert_eq!(json["res"], serde_json::json!([1, 2, 1, 2]));
+}
+
+#[test]
+fn typed_objects_cannot_have_elements() {
+    for src in [
+        "class Foo { names: Listing<String> }\nfoo = new Foo {\n  (names) { \"x\" }\n}\n",
+        "class Foo { names: Listing<String> }\nfoo = new Foo {}\nbar = (foo) {\n  when (true) { \"x\" }\n}\n",
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Object of type `test#Foo` cannot have an element."),
+            "{src}: {err}"
+        );
+    }
+    // Amending a property that is a Listing can add elements.
+    let json =
+        eval("class Foo { names: Listing<String> }\nfoo = new Foo {\n  names { \"x\" }\n}\n");
+    assert_eq!(json["foo"]["names"], serde_json::json!(["x"]));
+}
+
+#[test]
+fn body_amendment_merges_member_from_when_generator() {
+    let json = eval(
+        r#"
+base { when (true) { o { v = 1 } } }
+x = (base) { o { w = 2 } }
+y = (x) { o { z = 3 } }
+"#,
+    );
+    assert_eq!(json["x"], serde_json::json!({"o": {"v": 1, "w": 2}}));
+    assert_eq!(
+        json["y"],
+        serde_json::json!({"o": {"v": 1, "w": 2, "z": 3}})
+    );
+}
+
+#[test]
+fn body_amendment_merges_member_from_when_else_generator() {
+    let json = eval(
+        r#"
+base { when (false) { o { v = 1 } } else { o { v = 2 } } }
+x = (base) { o { w = 3 } }
+"#,
+    );
+    assert_eq!(json["x"], serde_json::json!({"o": {"v": 2, "w": 3}}));
+}
+
+#[test]
+fn class_instance_amendment_merges_member_from_generator() {
+    let json = eval(
+        r#"
+class C { p: Dynamic = new { when (true) { o { v = 1 } } } }
+c = new C { p { o { w = 2 } } }
+nested = (c) { p { o { x = 3 } } }
+class E { p: Dynamic = new { when (false) { o { v = 1 } } else { o { v = 2 } } } }
+e = new E { p { o { w = 3 } } }
+"#,
+    );
+    assert_eq!(json["c"], serde_json::json!({"p": {"o": {"v": 1, "w": 2}}}));
+    assert_eq!(
+        json["nested"],
+        serde_json::json!({"p": {"o": {"v": 1, "w": 2, "x": 3}}})
+    );
+    assert_eq!(json["e"], serde_json::json!({"p": {"o": {"v": 2, "w": 3}}}));
+}
+
+#[test]
+fn entry_amendment_merges_entry_from_for_generator() {
+    let json = eval(
+        r#"
+base { for (k in List("a", "b")) { [k] { v = k } } }
+x = (base) { ["a"] { w = 1 } }
+class F { p: Dynamic = new { for (k in List("a", "b")) { [k] { v = k } } } }
+f = new F { p { ["a"] { w = 1 } } }
+"#,
+    );
+    let expected = serde_json::json!({"a": {"v": "a", "w": 1}, "b": {"v": "b"}});
+    assert_eq!(json["x"], expected);
+    assert_eq!(json["f"]["p"], expected);
+}
+
+#[test]
+fn amending_the_wrong_kind_of_parent_is_rejected() {
+    for (src, message) in [
+        (
+            "res = (5) { \"pigeon\" }\n",
+            "Cannot instantiate, or amend an instance of, external class `Int`.",
+        ),
+        (
+            "res = (\"s\") { [\"pigeon\"] = true }\n",
+            "Cannot instantiate, or amend an instance of, external class `String`.",
+        ),
+        (
+            "class Person {}\nres = new Person { \"pigeon\" }\n",
+            "Object of type `test#Person` cannot have an element.",
+        ),
+        (
+            "class Person {}\nres = new Person { [\"pigeon\"] = true }\n",
+            "Object of type `test#Person` cannot have an entry.",
+        ),
+        (
+            "res = new ValueRenderer { \"pigeon\" }\n",
+            "Cannot instantiate abstract class `ValueRenderer`.",
+        ),
+        (
+            "typealias R = ValueRenderer\nres = new R {}\n",
+            "Cannot instantiate abstract class `ValueRenderer`.",
+        ),
+        (
+            "res = new Mapping { \"pigeon\" }\n",
+            "Object of type `Mapping` cannot have an element.",
+        ),
+        (
+            "res = (new Mapping {}) { \"pigeon\" }\n",
+            "Object of type `Mapping` cannot have an element.",
+        ),
+        (
+            "res = (new Mapping {}) { ...List(1, 2) }\n",
+            "Cannot spread value of type `List` into object of type `Mapping`.",
+        ),
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains(message), "{src}: {err}");
+    }
+}
+
+#[test]
+fn bare_mapping_amendment_preserves_default_for_later_amendments() {
+    let json = eval(
+        r#"
+local base = (new Mapping {}) { default { enabled = true } }
+result = (base) { ["example"] {} }
+"#,
+    );
+    assert_eq!(
+        json["result"],
+        serde_json::json!({"example": {"enabled": true}})
+    );
+}
+#[test]
+fn nested_amendments_of_class_instances_reject_elements() {
+    for src in [
+        "class Foo { a = 1 }\nm = new Mapping<String, Foo> { [\"a\"] { \"ignored\" } }\n",
+        "class Foo { a = 1 }\nclass Bar { f: Foo }\nb = new Bar { f { \"x\" } }\n",
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Object of type `test#Foo` cannot have an element."),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn declared_property_types_check_aliases_constraints_and_late_members() {
+    let alias = eval_fails(
+        r#"
+typealias IsB = String(this == "b")
+checked: IsB = "x"
+"#,
+    );
+    assert!(alias.contains("property 'checked'"), "{alias}");
+
+    let later = eval_fails(
+        r#"
+checked: Int(this < limit) = 1
+limit = 0
+"#,
+    );
+    assert!(later.contains("property 'checked'"), "{later}");
+}
+
+#[test]
+fn declared_property_type_checks_wait_for_instances_and_cover_body_forms() {
+    let json = eval(
+        r#"
+class C { value: Int = "bad" }
+instance = new C { value = 1 }
+fn: Function1<Int, Int> = (x) -> x
+"#,
+    );
+    assert_eq!(json["instance"]["value"], 1);
+
+    let class_default = eval_fails("class C { value: Int = \"bad\" }\ninstance = new C {}\n");
+    assert!(
+        class_default.contains("property 'value'"),
+        "{class_default}"
+    );
+
+    let body = eval_fails("items: Listing(this.length == 1) = new Listing { 1; 2 }\n");
+    assert!(body.contains("property 'items'"), "{body}");
+}
+
+#[test]
+fn amended_module_checks_the_final_declared_property_value() {
+    let temp = TestTempDir::new("pklr_amended_declared_property_type");
+    std::fs::write(temp.path().join("Base.pkl"), "foo: Int(this > 0) = -1\n").unwrap();
+    let child = temp.path().join("Child.pkl");
+    std::fs::write(&child, "amends \"Base.pkl\"\nfoo = 5\n").unwrap();
+
+    let json = pklr::EvaluatorBuilder::new().eval_to_json(&child).unwrap();
+    assert_eq!(json["foo"], 5);
+}
+
+#[test]
+fn generator_body_amends_the_receiver_member() {
+    let json = eval(
+        r#"
+base { o { v = 1 } }
+property = (base) { when (true) { o { w = 2 } } }
+entryBase { ["k"] { v = 1 } }
+entry = (entryBase) { for (_ in List(1)) { ["k"] { w = 2 } } }
+"#,
+    );
+    assert_eq!(json["property"], serde_json::json!({"o": {"v": 1, "w": 2}}));
+    assert_eq!(json["entry"], serde_json::json!({"k": {"v": 1, "w": 2}}));
+}
+
+#[test]
+fn inherited_body_listings_are_not_applied_twice_when_amended() {
+    let result = eval(
+        r#"
+b { l { 1 } }
+b2 = (b) { l { 2 } }
+b3 = (b2) { l { 3 } }
+class D { l: Listing<Int> }
+d = new D { l { 1 } }
+d2 = (d) { l { 2 } }
+"#,
+    );
+    assert_eq!(result["b2"]["l"], serde_json::json!([1, 2]));
+    assert_eq!(result["b3"]["l"], serde_json::json!([1, 2, 3]));
+    assert_eq!(result["d2"]["l"], serde_json::json!([1, 2]));
+}
+
+#[test]
+fn untyped_new_uses_declared_and_inherited_property_types() {
+    let json = eval(
+        r#"
+class P { a = 1; b = 2 }
+open class C { l: Listing<Int> = new { 1 }; p: P = new { a = 5 } }
+open class D extends C { l = new { 2 }; p = new { b = 3 } }
+class E extends D { p = new { b = 9 } }
+typed: Mapping<String, Int> = new { ["k"] = 1 }
+d = new D { l = new { 3 } }
+e = new E {}
+"#,
+    );
+    assert_eq!(json["typed"], serde_json::json!({"k": 1}));
+    assert_eq!(json["d"]["l"], serde_json::json!([2, 3]));
+    assert_eq!(json["d"]["p"], serde_json::json!({"a": 1, "b": 3}));
+    assert_eq!(json["e"]["p"], serde_json::json!({"a": 1, "b": 9}));
+}
+
+#[test]
+fn dynamic_generator_kind_follows_taken_branch() {
+    let json = eval(
+        r#"
+a = new { when (true) { 1 } else { p = 2 } }
+b = new { when (false) { 1 } else { p = 2 } }
+"#,
+    );
+    assert_eq!(json["a"], serde_json::json!([1]));
+    assert_eq!(json["b"], serde_json::json!({"p": 2}));
+}
+
+#[test]
+fn typed_untyped_new_covers_alias_nullable_and_mapping_values() {
+    let json = eval(
+        r#"
+class F { a = 1; b = 3 }
+x: F = new { a = 2 }
+v: F? = new { a = 7 }
+typealias L = Listing<String>
+u: L = new { "s" }
+m: Mapping<String, F> = new { ["k"] { a = 0 } }
+"#,
+    );
+    assert_eq!(json["x"], serde_json::json!({"a": 2, "b": 3}));
+    assert_eq!(json["v"], serde_json::json!({"a": 7, "b": 3}));
+    assert_eq!(json["u"], serde_json::json!(["s"]));
+    assert_eq!(json["m"], serde_json::json!({"k": {"a": 0, "b": 3}}));
+}
+
+#[test]
+fn untyped_new_amendment_uses_declared_type_default() {
+    let json = eval(
+        r#"
+class F { a = 1; b = 3 }
+class H { f: F = new { a = 5 } }
+class H2 { f: F }
+h = new H { f = new { b = 10 } }
+h2 = new H2 { f = new { b = 10 } }
+h3 = (h) { f = new { a = 7 } }
+"#,
+    );
+    assert_eq!(json["h"]["f"], serde_json::json!({"a": 5, "b": 10}));
+    assert_eq!(json["h2"]["f"], serde_json::json!({"a": 1, "b": 10}));
+    assert_eq!(json["h3"]["f"], serde_json::json!({"a": 7, "b": 3}));
+}
+
+#[test]
+fn object_locals_retry_after_body_members_bind() {
+    let json = eval("bar = 5\nfoo { bar = 1; local loc = bar; qux = loc }");
+    assert_eq!(json["foo"], serde_json::json!({"bar": 1, "qux": 1}));
+
+    // Both locals recover once `b` binds, then the earlier property that
+    // depended on them is retried.
+    let json = eval("foo { local a = b; local c = a + 1; d = c; b = 2 }");
+    assert_eq!(json["foo"], serde_json::json!({"d": 3, "b": 2}));
+
+    // Retry until the chain reaches a fixed point, not just once after `c`
+    // binds. The property that depended on the chain is then retried too.
+    let json = eval("foo { local a = b; local b = c; d = a; c = 2 }");
+    assert_eq!(json["foo"], serde_json::json!({"d": 2, "c": 2}));
+
+    // A deferred property shadows an outer binding while it waits for its
+    // local. Its dependent must retry rather than capture that outer value.
+    let json = eval("d = 1\nfoo { local a = c; d = a; e = d; c = 2 }");
+    assert_eq!(json["foo"], serde_json::json!({"d": 2, "e": 2, "c": 2}));
+
+    // The same deferred dependency can appear in a generated body. Once the
+    // local resolves, the generated member must retry rather than surfacing
+    // the temporary poison from the earlier property.
+    let json = eval("foo { local a = c; d = a; when (true) { e = d }; c = 2 }");
+    assert_eq!(json["foo"], serde_json::json!({"d": 2, "e": 2, "c": 2}));
+
+    // Dynamic entries also bind their keys into `this`, so a local can retry
+    // after a later key becomes available.
+    let json = eval(r#"foo { local a = this["c"]; ["d"] = a; ["c"] = 2 }"#);
+    assert_eq!(json["foo"], serde_json::json!({"d": 2, "c": 2}));
+
+    // When the deferred property recovers, it returns to source order rather
+    // than remaining appended after members that bound while it was pending.
+    let json = eval(
+        "foo { local a = c; first = a; second = 2; c = 1 }\nrendered = new PcfRenderer {}.renderDocument(foo)",
+    );
+    let rendered = json["rendered"].as_str().unwrap();
+    let first = rendered.find("first = 1").unwrap();
+    let second = rendered.find("second = 2").unwrap();
+    let c = rendered.find("c = 1").unwrap();
+    assert!(first < second && second < c, "{rendered}");
+
+    // A child entry may overwrite an inherited member without moving that
+    // member's existing slot. A recovered property belongs after that slot,
+    // even though the overwrite itself appears later in the child body.
+    let json = eval(
+        "base = new { old = 1 }\nfoo = (base) { local a = c; deferred = a; old = 2; c = 3 }\nrendered = new PcfRenderer {}.renderDocument(foo)",
+    );
+    let rendered = json["rendered"].as_str().unwrap();
+    let old = rendered.find("old = 2").unwrap();
+    let deferred = rendered.find("deferred = 3").unwrap();
+    let c = rendered.find("c = 3").unwrap();
+    assert!(old < deferred && deferred < c, "{rendered}");
+
+    // A local that never resolves remains lazy and fails only when read.
+    let err = eval_fails("foo { local a = missing; b = a }");
+    assert!(err.contains("missing"), "{err}");
+}
+
+#[test]
+fn const_locals_reject_non_const_members_that_are_actually_bound() {
+    for src in [
+        r#"
+foo {
+  res1 = 15
+  const local qux = this.res1
+  res2 = qux
+}
+"#,
+        r#"
+foo {
+  when (true) {
+    res1 = 15
+  }
+  const local qux = res1
+  res2 = qux
+}
+"#,
+        r#"
+open class Parent { res1 = 15 }
+class Child extends Parent {
+  const local qux = res1
+  res2 = qux
+}
+foo = new Child {}
+"#,
+        r#"
+open class Parent { res1 = 15 }
+class Child extends Parent {
+  const local qux = super.res1
+  res2 = qux
+}
+foo = new Child {}
+"#,
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Cannot reference property `res1` from here because it is not `const`"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn const_local_lambdas_stay_lazy_but_reject_non_const_members_when_called() {
+    let json = eval(
+        r#"
+foo {
+  res1 = 15
+  const local f = () -> res1
+}
+"#,
+    );
+    assert_eq!(json["foo"], serde_json::json!({"res1": 15}));
+
+    let err = eval_fails(
+        r#"
+foo {
+  res1 = 15
+  const local f = () -> res1
+  res2 = f.apply()
+}
+"#,
+    );
+    assert!(
+        err.contains("Cannot reference property `res1` from here because it is not `const`"),
+        "{err}"
+    );
+
+    let err = eval_fails(
+        r#"
+foo {
+  const local f = () -> res1
+  when (true) {
+    res1 = 15
+  }
+  res2 = f.apply()
+}
+"#,
+    );
+    assert!(
+        err.contains("Cannot reference property `res1` from here because it is not `const`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn class_const_local_lambdas_defer_inherited_non_const_validation() {
+    let json = eval(
+        r#"
+open class Parent { res1 = 15 }
+class Child extends Parent {
+  const local f = () -> res1
+}
+result = 1
+"#,
+    );
+    assert_eq!(json, serde_json::json!({"result": 1}));
+
+    let json = eval(
+        r#"
+open class Parent { res1 = 15 }
+class Child extends Parent {
+  const local f = () -> res1
+}
+result = new Child {}
+"#,
+    );
+    assert_eq!(json, serde_json::json!({"result": {"res1": 15}}));
+
+    let err = eval_fails(
+        r#"
+open class Parent { res1 = 15 }
+class Child extends Parent {
+  const local f = () -> res1
+  result = f.apply()
+}
+instance = new Child {}
+"#,
+    );
+    assert!(
+        err.contains("Cannot reference property `res1` from here because it is not `const`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn const_locals_are_lazy_and_validate_on_access_across_receivers_and_bodies() {
+    for receiver in ["res1", "this.res1", "super.res1"] {
+        for is_lambda in [false, true] {
+            let value = if is_lambda {
+                format!("() -> {receiver}")
+            } else {
+                receiver.to_string()
+            };
+            let use_value = if is_lambda { "qux.apply()" } else { "qux" };
+            let object_source = |used: bool| {
+                let use_line = if used {
+                    format!("result = {use_value}")
+                } else {
+                    String::new()
+                };
+                if receiver == "super.res1" {
+                    format!(
+                        "base = new {{ res1 = 15 }}\nfoo = (base) {{\n  const local qux = {value}\n  {use_line}\n}}"
+                    )
+                } else {
+                    format!("foo {{\n  res1 = 15\n  const local qux = {value}\n  {use_line}\n}}")
+                }
+            };
+            let class_source = |used: bool| {
+                let use_line = if used {
+                    format!("result = {use_value}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "open class Parent {{ res1 = 15 }}\nclass Child extends Parent {{\n  const local qux = {value}\n  {use_line}\n}}\ninstance = new Child {{}}"
+                )
+            };
+
+            eval(&object_source(false));
+            eval(&class_source(false));
+            for src in [object_source(true), class_source(true)] {
+                let err = eval_fails(&src);
+                assert!(
+                    err.contains(
+                        "Cannot reference property `res1` from here because it is not `const`"
+                    ),
+                    "{src}: {err}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn const_local_lambda_copies_keep_late_member_validation() {
+    for src in [
+        r#"
+foo {
+  const local f = () -> res1
+  result = f.apply()
+  res1 = 15
+}
+"#,
+        r#"
+res1 = 5
+foo {
+  const local f = () -> res1
+  local g = f
+  res1 = 15
+  result = g.apply()
+}
+"#,
+        r#"
+res1 = 5
+foo {
+  const local f = () -> res1
+  local g = f
+  when (true) {
+    res1 = 15
+  }
+  result = g.apply()
+}
+"#,
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Cannot reference property `res1` from here because it is not `const`"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn const_local_lambda_ignores_untaken_generator_members() {
+    let err = eval_fails(
+        r#"
+foo {
+  const local f = () -> res1
+  when (false) {
+    res1 = 15
+  }
+  result = f.apply()
+}
+"#,
+    );
+    assert!(err.contains("res1"), "{err}");
+    assert!(
+        !err.contains("Cannot reference property `res1` from here because it is not `const`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn const_local_lambda_guard_is_not_exposed_through_outer() {
+    let json = eval(
+        r#"
+foo {
+  const local f = () -> new Dynamic {
+    copied = outer
+  }
+  result = f.apply()
+}
+"#,
+    );
+    assert!(
+        !json.to_string().contains("pklr:lambda-guard"),
+        "internal lambda guard leaked through outer: {json}"
+    );
+}
+
+#[test]
+fn super_in_an_extending_module_reads_the_base_module() {
+    let temp = TestTempDir::new("pklr_module_super");
+    std::fs::write(
+        temp.path().join("base.pkl"),
+        "open module base\nhidden secret = 42\nfunction say(msg) = \"Hi \" + msg\nsameProp = \"a\"\npigeon { name = \"Pigeon\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("mid.pkl"),
+        "open module mid\nextends \"base.pkl\"\nsameProp = super.sameProp + \"b\"\nhello = super.say(\"there\")\nsecretCopy = super.secret\npigeon = (super.pigeon) { name = \"PIGEON\" }\n",
+    )
+    .unwrap();
+    let child = temp.path().join("child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"mid.pkl\"\nsameProp = super.sameProp + \"c\"\n",
+    )
+    .unwrap();
+    let json = pklr::eval_to_json(&temp.path().join("mid.pkl")).unwrap();
+    assert_eq!(json["sameProp"], "ab");
+    assert_eq!(json["hello"], "Hi there");
+    assert_eq!(json["secretCopy"], 42);
+    assert_eq!(json["pigeon"]["name"], "PIGEON");
+    // A base module's property reading `super` keeps reading its own base.
+    let json = pklr::eval_to_json(&child).unwrap();
+    assert_eq!(json["sameProp"], "abc");
+}
+
+#[test]
+fn nested_object_super_does_not_freeze_inherited_module_properties() {
+    let temp = TestTempDir::new("pklr_nested_super");
+    std::fs::write(
+        temp.path().join("base.pkl"),
+        "open module base\np = 1\ntemplate { x = 10 }\nobj = (template) { x = super.x + p }\n",
+    )
+    .unwrap();
+    let child = temp.path().join("child.pkl");
+    std::fs::write(&child, "extends \"base.pkl\"\np = 2\n").unwrap();
+
+    let json = pklr::eval_to_json(&child).unwrap();
+    assert_eq!(json["obj"]["x"], 12);
+}
+
+#[test]
+fn inherited_method_keeps_its_defining_module_super() {
+    let temp = TestTempDir::new("pklr_method_module_super");
+    std::fs::write(temp.path().join("root.pkl"), "open module root\np = 1\n").unwrap();
+    std::fs::write(
+        temp.path().join("base.pkl"),
+        "open module base\nextends \"root.pkl\"\nfunction baseP() = super.p\n",
+    )
+    .unwrap();
+    let child = temp.path().join("child.pkl");
+    std::fs::write(
+        &child,
+        "extends \"base.pkl\"\np = 2\nresult = super.baseP()\n",
+    )
+    .unwrap();
+
+    assert_eq!(pklr::eval_to_json(&child).unwrap()["result"], 1);
+}
+
+#[test]
+fn amending_module_super_reads_hidden_properties_but_not_methods() {
+    let temp = TestTempDir::new("pklr_amending_module_super");
+    std::fs::write(
+        temp.path().join("base.pkl"),
+        "hidden secret = 42\ncopy = 0\nresult = 0\nfunction say(msg) = \"Hi \" + msg\n",
+    )
+    .unwrap();
+    let child = temp.path().join("child.pkl");
+    std::fs::write(&child, "amends \"base.pkl\"\ncopy = super.secret\n").unwrap();
+    assert_eq!(pklr::eval_to_json(&child).unwrap()["copy"], 42);
+
+    std::fs::write(
+        &child,
+        "amends \"base.pkl\"\nresult = super.say(\"there\")\n",
+    )
+    .unwrap();
+    assert!(pklr::eval_to_json(&child).is_err());
+}
+
+#[test]
+fn only_open_or_abstract_modules_can_be_extended() {
+    let temp = TestTempDir::new("pklr_extend_non_open");
+    std::fs::write(temp.path().join("closed.pkl"), "a = 1\n").unwrap();
+    let child = temp.path().join("child.pkl");
+    std::fs::write(&child, "extends \"closed.pkl\"\nb = 2\n").unwrap();
+    let err = pklr::eval_to_json(&child).unwrap_err().to_string();
+    assert!(
+        err.contains("Cannot extend non-open module `closed`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn constraint_reads_unbound_names_from_the_checked_value() {
+    let source = "class Address { street: String }\nclass Person { address: Address(street.endsWith(\"St.\")) }\n";
+    let json = eval(&format!(
+        "{source}result = new Person {{ address {{ street = \"Hampton St.\" }} }}"
+    ));
+    assert_eq!(json["result"]["address"]["street"], "Hampton St.");
+
+    let error = eval_fails(&format!(
+        "{source}result = new Person {{ address {{ street = \"Garlic Blvd.\" }} }}"
+    ));
+    assert!(error.contains("property 'address'"), "{error}");
+
+    // A bare call in a constraint is a call on the checked value. Lambda
+    // parameters still resolve lexically instead of becoming `this.it`.
+    let json = eval("values: List(every((it) -> it < 0)) = List(-1, -2)");
+    assert_eq!(json["values"], serde_json::json!([-1, -2]));
+    let error = eval_fails("values: List(every((it) -> it < 0)) = List(1)");
+    assert!(error.contains("property 'values'"), "{error}");
+
+    // `read?` also receives a rewritten URI expression; the missing resource
+    // is deliberately nullable.
+    let json = eval(
+        "class Resource { path: String }\nresult: Resource(read?(path) == null) = new Resource { path = \"missing-resource.txt\" }",
+    );
+    assert_eq!(json["result"]["path"], "missing-resource.txt");
+}
+
+#[test]
+fn constraint_reads_the_instance_members_around_it() {
+    let source = "class Gauge { min: Int; max: Int(this >= min) }\n";
+    let json = eval(&format!(
+        "{source}result = new Gauge {{ min = 4; max = 6 }}"
+    ));
+    assert_eq!(json["result"], serde_json::json!({"min": 4, "max": 6}));
+
+    let error = eval_fails(&format!(
+        "{source}result = new Gauge {{ min = 4; max = 3 }}"
+    ));
+    assert!(error.contains("property 'max'"), "{error}");
+
+    // A finished object's saved scope also retains hidden members, which are
+    // not present in its rendered map but remain visible to the constraint.
+    let json = eval(
+        "class HiddenGauge { hidden min: Int; max: Int(this >= min) }\nresult = new HiddenGauge { min = 4; max = 6 }",
+    );
+    assert_eq!(json["result"], serde_json::json!({"max": 6}));
+}
+
+#[test]
+fn typed_defaults_render_and_constraints_apply_predicates() {
+    let json = eval(
+        r#"
+class Person
+person: Person
+mapping: Mapping<String, Person>
+choice: *Person | String
+items: Listing(isShort) = new Listing { 1 }
+hidden isShort = (it) -> it.length < 2
+listItem = List(1, 2)[1]
+listingItem = (new Listing { 3; 4 })[0]
+"#,
+    );
+    assert_eq!(json["person"], serde_json::json!({}));
+    assert_eq!(json["mapping"], serde_json::json!({}));
+    assert_eq!(json["choice"], serde_json::json!({}));
+    assert_eq!(json["items"], serde_json::json!([1]));
+    assert_eq!(json["listItem"], 2);
+    assert_eq!(json["listingItem"], 3);
+}
+
+#[test]
+fn inherited_fixed_members_reject_direct_and_generated_overrides() {
+    let error = eval_fails(
+        "class Bird { fixed name: String = \"Hawk\" }\nvalue = new Bird { name = \"Eagle\" }",
+    );
+    assert!(
+        error.contains("Cannot assign to fixed property `name`."),
+        "{error}"
+    );
+
+    let error = eval_fails(
+        "class Bird { fixed name: String = \"Hawk\" }\nvalue = new Bird { when (true) { name = \"Eagle\" } }",
+    );
+    assert!(
+        error.contains("Cannot assign to fixed property `name`."),
+        "{error}"
+    );
+
+    let error = eval_fails(
+        "class Bird { fixed name: String = \"Hawk\" }\nvalue = new Bird { ...new Dynamic { name = \"Eagle\" } }",
+    );
+    assert!(
+        error.contains("Cannot assign to fixed property `name`."),
+        "{error}"
+    );
+
+    let json = eval(
+        "class Bird { fixed name: String = \"Hawk\" }\nvalue = new Bird { when (false) { name = \"Eagle\" } }",
+    );
+    assert_eq!(json["value"]["name"], "Hawk");
+}
+
+#[test]
+fn typed_class_defaults_preserve_lazy_errors_until_requested() {
+    let json = eval(
+        r#"
+class C { value = throw("boom") }
+answer = 1
+"#,
+    );
+    assert_eq!(json["answer"], 1);
+
+    for src in [
+        "class C { value = throw(\"boom\") }\nc: C",
+        "class C { value = throw(\"boom\") }\ntypealias Alias = C\nc: Alias",
+        "class C { value = throw(\"boom\") }\nc: *C|String",
+    ] {
+        let error = eval_fails(src);
+        assert!(error.contains("boom"), "{error}");
+    }
+    let error = eval_fails("class C { value: Int = \"wrong\" }\nc: C");
+    assert!(
+        error.contains("property 'value'") && error.contains("Expected value of type `Int`"),
+        "{error}"
+    );
+
+    let json = eval("class Int { value = 1 }\nc: Int");
+    assert_eq!(json["c"], serde_json::json!({ "value": 1 }));
+    let error = eval_fails("class Int { value = throw(\"boom\") }\nc: Int");
+    assert!(error.contains("boom"), "{error}");
+
+    let json = eval(
+        r#"
+class C { value = throw("boom") }
+nullable: C?
+items: Listing<Int>
+mapping: Mapping<String, C>
+"#,
+    );
+    assert!(json.get("nullable").is_none());
+    assert_eq!(json["items"], serde_json::json!([]));
+    assert_eq!(json["mapping"], serde_json::json!({}));
+}
+
+#[test]
+fn qualified_imported_typed_defaults_materialize_deferred_class_errors() {
+    let dir = TestTempDir::new("pklr_qualified_typed_default");
+    std::fs::write(
+        dir.path().join("lib.pkl"),
+        "class C { value = throw(\"boom\") }\n",
+    )
+    .unwrap();
+    let main = dir.path().join("main.pkl");
+
+    for source in [
+        "import \"lib.pkl\" as lib\nresult: lib.C\n",
+        "import \"lib.pkl\" as lib\ntypealias Imported = lib.C\nresult: Imported\n",
+    ] {
+        std::fs::write(&main, source).unwrap();
+        let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    std::fs::write(&main, "import \"lib.pkl\" as lib\nanswer = 1\n").unwrap();
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["answer"], 1);
+}
+
+#[test]
+fn recursive_typed_defaults_fail_cleanly() {
+    let error = eval_fails(
+        r#"
+class Node {
+  child: Node
+}
+x: Node
+"#,
+    );
+    assert!(error.contains("recursive typed default"), "{error}");
+}
+
+#[test]
+fn typed_instance_member_errors_remain_lazy() {
+    let json = eval("class C { bad: Int = \"wrong\"; ok = 1 }\nlocal c = new C {}\nres = c.ok");
+    assert_eq!(json["res"], 1);
+
+    for src in [
+        "class C { bad: Int = \"wrong\"; ok = 1 }\nlocal c = new C {}\nres = c.bad",
+        "class C { bad: Int = \"wrong\"; ok = 1 }\nc = new C {}",
+    ] {
+        let error = eval_fails(src);
+        assert!(
+            error.contains("property 'bad'") && error.contains("Expected value of type `Int`"),
+            "{error}"
+        );
+    }
+
+    let json = eval("class C { hidden bad: Int = \"wrong\"; ok = 1 }\nc: C");
+    assert_eq!(json["c"], serde_json::json!({ "ok": 1 }));
+}
+
+#[test]
+fn imported_amending_module_exports_inherited_classes() {
+    let dir = TestTempDir::new("pklr_import_inherited_class");
+    std::fs::write(
+        dir.path.join("base.pkl"),
+        "open module base\nclass Person\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path.join("child.pkl"),
+        "extends \"base.pkl\"\nchildValue = 1\n",
+    )
+    .unwrap();
+    let main = dir.path.join("main.pkl");
+    std::fs::write(&main, "import \"child.pkl\"\nres = new child.Person {}\n").unwrap();
+
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["res"], serde_json::json!({}));
+}
+
+#[test]
+fn amending_module_rejects_invalid_fixed_and_const_before_member_evaluation() {
+    let dir = TestTempDir::new("pklr_amending_modifier_timing");
+    std::fs::write(dir.path.join("base.pkl"), "name = \"base\"\n").unwrap();
+    let main = dir.path.join("main.pkl");
+
+    for (member, expected) in [
+        (
+            "fixed unused = throw(\"boom\")",
+            "Modifier `fixed` is not applicable to object members.",
+        ),
+        (
+            "const unused = throw(\"boom\")",
+            "Modifier `const` can only be applied to object members that are also `local`.",
+        ),
+    ] {
+        std::fs::write(&main, format!("amends \"base.pkl\"\n{member}\n")).unwrap();
+        let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn typed_mapping_new_entry_takes_the_value_type() {
+    let result = eval(
+        r#"
+class R { m: Mapping<String, Int> = new {} }
+scopes: Mapping<String, R> = new {
+  ["x"] = new { m { ["k"] = 1 } }
+}
+picked: R = scopes["x"]
+"#,
+    );
+    assert_eq!(result["picked"]["m"]["k"], 1);
+    assert_eq!(result["scopes"]["x"]["m"]["k"], 1);
+}
+
+#[test]
+fn typed_mapping_new_entry_recomputes_class_properties() {
+    let result = eval(
+        r#"
+class R { x: Int = 1; y: Int = x + 1 }
+m: Mapping<String, R> = new {
+  ["a"] = new { x = 5 }
+}
+"#,
+    );
+    assert_eq!(result["m"]["a"]["x"], 5);
+    assert_eq!(result["m"]["a"]["y"], 6);
+}
+
+#[test]
+fn typed_mapping_new_entry_amends_the_mapping_default() {
+    let result = eval(
+        r#"
+class R { x: Int = 1 }
+m: Mapping<String, R> = new {
+  default { x = 9 }
+  ["bare"] {}
+  ["fresh"] = new {}
+}
+"#,
+    );
+    assert_eq!(result["m"]["bare"]["x"], 9);
+    assert_eq!(result["m"]["fresh"]["x"], 9);
+}
+
+#[test]
+fn typed_mapping_new_entry_with_builtin_value_type_stays_untyped() {
+    let result = eval(
+        r#"
+m: Mapping<String, Dynamic> = new {
+  ["x"] = new { 1; 2 }
+  ["y"] = new { k = 1 }
+}
+"#,
+    );
+    assert_eq!(result["m"]["x"], serde_json::json!([1, 2]));
+    assert_eq!(result["m"]["y"]["k"], 1);
+}
+
+#[test]
+fn class_union_property_without_default_can_be_assigned() {
+    let json = eval(
+        r#"
+class C {
+  e: "a" | "b"
+}
+c: C = new C { e = "a" }
+"#,
+    );
+    assert_eq!(json["c"]["e"], "a");
+}
+
+#[test]
+fn inherited_module_union_property_without_default_fails() {
+    let dir = TestTempDir::new("pklr_inherited_union_default");
+    std::fs::write(
+        dir.path().join("base.pkl"),
+        "open module base\nvalue: \"a\" | \"b\"\n",
+    )
+    .unwrap();
+    for header in ["amends", "extends"] {
+        let main = dir.path().join("main.pkl");
+        std::fs::write(&main, format!("{header} \"base.pkl\"\n")).unwrap();
+        let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+        assert!(error.contains("no selected default"), "{header}: {error}");
+    }
+}
+
+// pkl cannot pick a parent for `new { ... }` here ("Tried to read property
+// `default` but its value is undefined"). The untyped body is a `Dynamic`,
+// which neither `R` nor `Listing<Int>` accepts.
+#[test]
+fn typed_mapping_new_entry_with_mixed_union_value_type_is_rejected() {
+    let error = eval_fails(
+        r#"
+class R { x: Int = 1 }
+m: Mapping<String, R | Listing<Int>> = new {
+  ["l"] = new { 1; 2 }
+}
+"#,
+    );
+    assert!(
+        error.contains("Expected value of type `R|Listing<Int>`"),
+        "{error}"
+    );
+}
+
+// ============================================================
+// Amending a union-typed property: only a `*` alternative gives a default
+// ============================================================
+
+const UNDEFINED: &str = "Tried to read property `argv` but its value is undefined.";
+
+#[test]
+fn amending_union_property_without_default_is_undefined() {
+    let src = r#"
+class Ref { path: String }
+class C { argv: Listing<String>|Ref }
+c = new C { argv { "a" } }
+"#;
+    assert!(eval_fails(src).contains(UNDEFINED));
+}
+
+#[test]
+fn amending_union_property_with_default_marker_still_works() {
+    let json = eval(
+        r#"
+class Ref { path: String }
+class C {
+    argv: *Listing<String>|Ref
+    ref: Listing<String>|*Ref
+}
+c = new C { argv { "a" } ref { path = "p" } }
+"#,
+    );
+    assert_eq!(json["c"]["argv"], serde_json::json!(["a"]));
+    assert_eq!(json["c"]["ref"], serde_json::json!({ "path": "p" }));
+}
+
+#[test]
+fn amending_union_property_covers_each_alternative_shape() {
+    for ty in [
+        "Listing<String>|Int",
+        "Listing<String>|Int|Null",
+        "Listing<String>|Int?",
+        "Listing<String>?|Int",
+        "Listing<String>|Dynamic",
+        "Listing<String>(length > 0)|Int",
+        "Mapping<String, String>|Int",
+        "Listing<String>|Listing<Int>",
+        "Listing<String>|*Int",
+    ] {
+        let src = format!("class C {{ argv: {ty} }}\nc = new C {{ argv {{ \"a\" }} }}\n");
+        assert!(eval_fails(&src).contains(UNDEFINED), "{ty}");
+    }
+    let src = r#"
+class R { path: String }
+class S { x: Int }
+class C { argv: R|S }
+c = new C { argv { path = "a" } }
+"#;
+    assert!(eval_fails(src).contains(UNDEFINED));
+    let src = "class C { argv: Int|String }\nc = new C { argv { \"a\" } }\n";
+    assert!(eval_fails(src).contains(UNDEFINED));
+}
+
+#[test]
+fn amending_union_property_through_aliases() {
+    let plain = r#"
+typealias A = Listing<String>|Int
+typealias B = A
+class C { argv: B }
+c = new C { argv { "a" } }
+"#;
+    assert!(eval_fails(plain).contains(UNDEFINED));
+    // An alias used as one alternative contributes no default of its own.
+    let nested = r#"
+typealias A = *Listing<String>|Int
+class C { argv: A|String }
+c = new C { argv { "a" } }
+"#;
+    assert!(eval_fails(nested).contains(UNDEFINED));
+    let marked = r#"
+typealias A = *Listing<String>|Int
+typealias B = A
+class C { argv: B }
+c = new C { argv { "a" } }
+"#;
+    assert_eq!(eval(marked)["c"]["argv"], serde_json::json!(["a"]));
+}
+
+#[test]
+fn amending_nullable_union_property_builds_a_dynamic() {
+    let src = r#"
+class Ref { path: String }
+class C { argv: (Listing<String>|Ref)? }
+c = new C { argv { "a" } }
+"#;
+    let error = eval_fails(src);
+    assert!(
+        error.contains("Expected value of type `Listing<String>|Ref`, but got type `Dynamic`."),
+        "{error}"
+    );
+    let alias = r#"
+typealias A = (Listing<String>|Int)?
+class C { argv: A }
+c = new C { argv { "a" } }
+"#;
+    assert!(eval_fails(alias).contains("but got type `Dynamic`"));
+    let marked = r#"
+class C { argv: (*Listing<String>|Int)?; dyn: (Dynamic|Int)? }
+c = new C { argv { "a" } dyn { x = 1 } }
+"#;
+    let json = eval(marked);
+    assert_eq!(json["c"]["argv"], serde_json::json!(["a"]));
+    assert_eq!(json["c"]["dyn"], serde_json::json!({ "x": 1 }));
+}
+
+#[test]
+fn union_property_assignments_and_existing_values_can_still_be_amended() {
+    let json = eval(
+        r#"
+open class C { argv: Listing<String>|Int; other: Listing<String>|Int = new Listing { "z" } }
+class D extends C { other { "y" } }
+e = new D {}
+a = new C { argv = new Listing { "a" } }
+b = (a) { argv { "b" } }
+c = new C { argv = 3 }
+d = new C { argv = new Listing { "q" } other { "w" } }
+local unused = new C { argv { "x" } }
+"#,
+    );
+    assert_eq!(json["b"]["argv"], serde_json::json!(["a", "b"]));
+    assert_eq!(json["c"]["argv"], 3);
+    assert_eq!(json["d"]["other"], serde_json::json!(["z", "w"]));
+}
+
+#[test]
+fn amending_union_property_of_amended_module_without_default_is_undefined() {
+    let temp = TestTempDir::new("pklr_test_union_amend_module");
+    let dir = temp.path();
+    std::fs::write(dir.join("base.pkl"), "argv: Listing<String>|Int\n").unwrap();
+    std::fs::write(dir.join("marked.pkl"), "argv: *Listing<String>|Int\n").unwrap();
+    std::fs::write(
+        dir.join("child.pkl"),
+        "amends \"base.pkl\"\nargv { \"a\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("assign.pkl"),
+        "amends \"base.pkl\"\nargv = new Listing { \"a\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("marked_child.pkl"),
+        "amends \"marked.pkl\"\nargv { \"a\" }\n",
+    )
+    .unwrap();
+    let error = pklr::eval_to_json(&dir.join("child.pkl")).unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+    let json = pklr::eval_to_json(&dir.join("assign.pkl")).unwrap();
+    assert_eq!(json["argv"], serde_json::json!(["a"]));
+    let json = pklr::eval_to_json(&dir.join("marked_child.pkl")).unwrap();
+    assert_eq!(json["argv"], serde_json::json!(["a"]));
+}
+
+#[test]
+fn amending_union_property_with_alias_from_imported_module() {
+    let temp = TestTempDir::new("pklr_test_union_amend_import");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "typealias A = Listing<String>|Int\ntypealias D = *Listing<String>|Int\ntypealias N = (Listing<String>|Int)?\n",
+    )
+    .unwrap();
+    let main = |ty: &str| {
+        std::fs::write(
+            dir.join("main.pkl"),
+            format!(
+                "import \"lib.pkl\"\nclass C {{ argv: {ty} }}\nc = new C {{ argv {{ \"a\" }} }}\n"
+            ),
+        )
+        .unwrap();
+        pklr::eval_to_json(&dir.join("main.pkl"))
+    };
+    assert!(main("lib.A").unwrap_err().to_string().contains(UNDEFINED));
+    assert!(
+        main("lib.A|String")
+            .unwrap_err()
+            .to_string()
+            .contains(UNDEFINED)
+    );
+    assert!(
+        main("lib.N")
+            .unwrap_err()
+            .to_string()
+            .contains("Expected value of type `Listing<String>|Int`, but got type `Dynamic`.")
+    );
+    assert_eq!(
+        main("lib.D").unwrap()["c"]["argv"],
+        serde_json::json!(["a"])
+    );
+}
+
+/// Evaluate `main.pkl` of a temporary directory holding `files`.
+fn eval_union_files(tag: &str, files: &[(&str, &str)]) -> Result<serde_json::Value, pklr::Error> {
+    let temp = TestTempDir::new(&format!("pklr_test_union_amend_{tag}"));
+    for (name, source) in files {
+        std::fs::write(temp.path().join(name), source).unwrap();
+    }
+    pklr::eval_to_json(&temp.path().join("main.pkl"))
+}
+
+const UNION_MAIN: &str = "import \"lib.pkl\" as L\nx = new L.C { argv { \"a\" } }\n";
+
+#[test]
+fn amending_union_property_resolves_alias_in_declaring_module() {
+    // `Args` is visible only in lib.pkl, where the class was declared.
+    let lib = "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args }\n";
+    let error =
+        eval_union_files("decl", &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)]).unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+
+    // The same with a nullable property or a nullable alias.
+    for lib in [
+        "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args? }\n",
+        "typealias Args = (Listing<String>|Ref)?\nclass Ref { path: String }\nclass C { argv: Args }\n",
+    ] {
+        let error = eval_union_files("decl_null", &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected value of type `Listing<String>|Ref`"),
+            "{error}"
+        );
+    }
+
+    // A `*` default alternative keeps the amendment valid.
+    for lib in [
+        "typealias Args = *Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args }\n",
+        "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: *Args|Int }\n",
+    ] {
+        let json = eval_union_files(
+            "decl_default",
+            &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+        );
+        // pkl rejects the second form: an alias alternative gives no default.
+        if lib.contains("*Args") {
+            assert!(json.is_err());
+        } else {
+            assert_eq!(json.unwrap()["x"]["argv"], serde_json::json!(["a"]));
+        }
+    }
+}
+
+#[test]
+fn amending_union_property_ignores_importer_alias_of_the_same_name() {
+    // The importer's `Args` has a default; the declaring module's does not.
+    let lib = "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args }\n";
+    let main = "import \"lib.pkl\" as L\ntypealias Args = *Listing<String>|L.Ref\nx = new L.C { argv { \"a\" } }\n";
+    let error = eval_union_files("shadow", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+
+    // And the other way round: the declaring module's `*` default wins.
+    let lib = "typealias Args = *Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args }\n";
+    let main = "import \"lib.pkl\" as L\ntypealias Args = Listing<String>|L.Ref\nx = new L.C { argv { \"a\" } }\n";
+    let json = eval_union_files("shadow_default", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(json["x"]["argv"], serde_json::json!(["a"]));
+}
+
+#[test]
+fn amending_nullable_union_with_dynamic_alternative_checks_the_built_value() {
+    // `D` resolves to Dynamic, so the Dynamic the body builds satisfies it.
+    let main = "import \"lib.pkl\" as L\nx = new L.C { argv { y = 1 } }\n";
+    for lib in [
+        "typealias D = Dynamic\nclass C { argv: (D|Int)? }\n",
+        "class C { argv: (Dynamic(y == 1)|Int)? }\n",
+    ] {
+        let json = eval_union_files("dynamic", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+        assert_eq!(json["x"]["argv"], serde_json::json!({"y": 1}));
+    }
+    // A constraint the built value fails is still reported.
+    let lib = "class C { argv: (Dynamic(y == 1)|Int)? }\n";
+    let main = "import \"lib.pkl\" as L\nx = new L.C { argv { y = 2 } }\n";
+    assert!(eval_union_files("dynamic_fail", &[("lib.pkl", lib), ("main.pkl", main)]).is_err());
+}
+
+#[test]
+fn amending_union_with_marked_type_that_has_no_default() {
+    // `Duration` supplies no default, directly or behind an alias.
+    for lib in [
+        "class C { argv: Listing<String>|*Duration }\n",
+        "typealias T = Duration\nclass C { argv: Listing<String>|*T }\n",
+    ] {
+        let error = eval_union_files("no_default", &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)])
+            .unwrap_err();
+        assert!(error.to_string().contains(UNDEFINED), "{error}");
+    }
+}
+
+#[test]
+fn amending_union_property_follows_aliases_across_several_modules() {
+    // lib.pkl's alias names an alias of another module it imports.
+    let types = "typealias U = Listing<String>|Int\n";
+    let lib = "import \"types.pkl\"\ntypealias A = types.U\nclass C { argv: A }\n";
+    let error = eval_union_files(
+        "chain",
+        &[
+            ("types.pkl", types),
+            ("lib.pkl", lib),
+            ("main.pkl", UNION_MAIN),
+        ],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+
+    // Declared in the importer as `L.A`, whose own import `types` it cannot see.
+    let main = "import \"lib.pkl\" as L\nclass E { argv: L.A }\nx = new E { argv { \"a\" } }\n";
+    let error = eval_union_files(
+        "chain_imported",
+        &[("types.pkl", types), ("lib.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+}
+
+#[test]
+fn amending_nullable_union_marking_a_type_with_no_default_builds_a_dynamic() {
+    // The marked `Int` supplies no value, so the nullable property is null and
+    // the body builds a Dynamic that neither alternative accepts.
+    for lib in [
+        "class C { argv: (*Int|Listing<String>)? }\n",
+        "class C { argv: (*Duration|Listing<String>)? }\n",
+    ] {
+        let error = eval_union_files("marked_null", &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("but got type `Dynamic`"),
+            "{error}"
+        );
+    }
+    // A Dynamic alternative still takes it.
+    let lib = "class C { argv: (*Int|Dynamic)? }\n";
+    let main = "import \"lib.pkl\" as L\nx = new L.C { argv { y = 1 } }\n";
+    let json = eval_union_files(
+        "marked_null_dynamic",
+        &[("lib.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(json["x"]["argv"], serde_json::json!({"y": 1}));
+}
+
+#[test]
+fn amending_union_marking_a_standard_library_type_without_default_is_undefined() {
+    for ty in [
+        "*Duration",
+        "*DataSize",
+        "*Regex",
+        "*Pair<Int, Int>",
+        "*Map<String, Int>",
+        "*Boolean",
+        "*Any",
+    ] {
+        let lib = format!("class C {{ argv: Listing<String>|{ty} }}\n");
+        let error = eval_union_files("marked_std", &[("lib.pkl", &lib), ("main.pkl", UNION_MAIN)])
+            .unwrap_err();
+        assert!(error.to_string().contains(UNDEFINED), "{ty}: {error}");
+    }
+}
+
+#[test]
+fn amending_nullable_union_with_aliased_dynamic_alternative_is_accepted() {
+    // `D` is Dynamic behind an alias, so the Dynamic the body builds fits.
+    let lib = "typealias D = Dynamic\nclass Ref { path: String }\nclass C { argv: (Ref|D)? }\n";
+    let main = "import \"lib.pkl\" as L\nx = new L.C { argv { y = 1 } }\n";
+    let json =
+        eval_union_files("aliased_dynamic", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(json["x"]["argv"], serde_json::json!({"y": 1}));
+    // Accepted with a Listing alternative too.
+    let lib = "typealias D = Dynamic\nclass C { argv: (Listing<String>|D)? }\n";
+    assert!(
+        eval_union_files(
+            "aliased_dynamic_listing",
+            &[("lib.pkl", lib), ("main.pkl", main)]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn marked_cyclic_local_alias_is_an_error_not_a_crash() {
+    // A recursion here would overflow the stack and abort the test binary.
+    for src in [
+        "local typealias A = *A|Int\nclass C { x: A }\nc = new C {}\n",
+        "local typealias A = *B|Int\nlocal typealias B = *A|String\nclass C { x: A }\nc = new C {}\n",
+        "local typealias A = *A|Int\nx: A\n",
+    ] {
+        let error = eval_fails(src);
+        assert!(error.contains("cyclic"), "{src}: {error}");
+    }
+}
+
+#[test]
+fn marked_user_class_named_like_a_builtin_keeps_its_default() {
+    // A class declaration shadows `Map` and `IntSeq`, so `*Map` takes the
+    // class's default as pkl does.
+    for name in [
+        "Map", "IntSeq", "Duration", "DataSize", "Regex", "Pair", "Any",
+    ] {
+        let src = format!(
+            "class {name} {{ n: Int = 1 }}\nclass C {{ value: *{name}|String }}\nc = new C {{}}\n"
+        );
+        assert_eq!(
+            eval(&src)["c"],
+            serde_json::json!({"value": {"n": 1}}),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn marked_builtin_map_and_intseq_have_no_default() {
+    let json = eval("class C { value: *Map<String, Int>|String }\nc = new C {}\n");
+    assert_eq!(json["c"], serde_json::json!({}));
+    let json = eval("class C { value: *IntSeq|String }\nc = new C {}\n");
+    assert_eq!(json["c"], serde_json::json!({}));
+}
+
+#[test]
+fn amending_marked_alias_of_unmarked_union_is_undefined() {
+    // An alias alternative supplies the default its own union marks, and the
+    // alias here marks none.
+    let lib = "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: *Args|Int }\n";
+    let error = eval_union_files(
+        "marked_alias",
+        &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+}
+
+#[test]
+fn amending_inherited_union_property_uses_the_declaring_modules_aliases() {
+    // `Args` is private to lib.pkl; `D` is declared where it is not visible.
+    let main = "import \"lib.pkl\" as L\nclass D extends L.C {}\nx = new D { argv { \"a\" } }\n";
+    let lib = "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nopen class C { argv: Args }\n";
+    let error = eval_union_files("inherited", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+
+    // A `*` default alternative on the declaring alias keeps it valid.
+    let lib = "typealias Args = *Listing<String>|Ref\nclass Ref { path: String }\nopen class C { argv: Args }\n";
+    let json =
+        eval_union_files("inherited_default", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(json["x"]["argv"], serde_json::json!(["a"]));
+}
+
+#[test]
+fn amending_constrained_union_alias_follows_the_alias_for_a_default() {
+    // A constraint is checked on the value and supplies no default, so the
+    // alias's own `*` marker decides.
+    for (tag, lib) in [
+        (
+            "constrained",
+            "typealias U = Listing<String>|Int\nclass C { argv: U(true) }\n",
+        ),
+        (
+            "constrained_marked_use",
+            "typealias U = Listing<String>|Int\nclass C { argv: *U(true)|String }\n",
+        ),
+    ] {
+        let error =
+            eval_union_files(tag, &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)]).unwrap_err();
+        assert!(error.to_string().contains(UNDEFINED), "{tag}: {error}");
+    }
+    // Nullable, through the property or the alias.
+    for lib in [
+        "typealias U = Listing<String>|Int\nclass C { argv: U(true)? }\n",
+        "typealias U = (Listing<String>|Int)?\nclass C { argv: U(true) }\n",
+    ] {
+        let error = eval_union_files(
+            "constrained_null",
+            &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Expected value of type `Listing<String>|Int`"),
+            "{error}"
+        );
+    }
+    // A marked alias or a non-union alias keeps the amendment valid.
+    for lib in [
+        "typealias U = *Listing<String>|Int\nclass C { argv: U(true) }\n",
+        "typealias U = Listing<String>\nclass C { argv: U(true) }\n",
+    ] {
+        let json = eval_union_files(
+            "constrained_ok",
+            &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+        )
+        .unwrap();
+        assert_eq!(json["x"]["argv"], serde_json::json!(["a"]));
+    }
+}
+
+#[test]
+fn amending_an_instance_with_undefined_union_property_uses_the_declaring_aliases() {
+    let lib = "typealias Args = Listing<String>|Ref\nclass Ref { path: String }\nclass C { argv: Args }\n";
+    for main in [
+        "import \"lib.pkl\" as L\nx = (new L.C {}) { argv { \"a\" } }\n",
+        "import \"lib.pkl\" as L\nlocal c = new L.C {}\nx = (c) { argv { \"a\" } }\n",
+    ] {
+        let error =
+            eval_union_files("instance", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap_err();
+        assert!(error.to_string().contains(UNDEFINED), "{error}");
+    }
+    // Assigning the value instead of amending it is fine, and so is amending
+    // a value the instance already holds.
+    let main = "import \"lib.pkl\" as L\nlocal c = new L.C { argv = new Listing { \"a\" } }\nx = (c) { argv { \"b\" } }\n";
+    let json = eval_union_files("instance_set", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(json["x"]["argv"], serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn amending_marked_nullable_alternative_starts_from_its_default_or_null() {
+    // A nullable alternative takes the default of the type it wraps.
+    for lib in [
+        "typealias A = Listing<String>?\nclass C { argv: *A|Int }\n",
+        "class C { argv: *Listing<String>?|Int }\n",
+        "typealias A = Listing<String>?\nclass C { argv: (*A|Int)? }\n",
+        "typealias B = Listing<String>?\ntypealias A = B\nclass C { argv: *A|Int }\n",
+    ] {
+        let json = eval_union_files(
+            "marked_nullable",
+            &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+        )
+        .unwrap();
+        assert_eq!(json["x"]["argv"], serde_json::json!(["a"]), "{lib}");
+    }
+    // One without a default starts from null, which the built Dynamic fails.
+    let lib = "class C { argv: *Int?|Listing<String> }\n";
+    let error = eval_union_files(
+        "marked_nullable_none",
+        &[("lib.pkl", lib), ("main.pkl", UNION_MAIN)],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Expected value of type `*Int?|Listing<String>`"),
+        "{error}"
+    );
+}
+
+// ============================================================
+// Constrained default union alternatives (`*T(constraint)|U`)
+// ============================================================
+
+const CONSTRAINED_DEFAULT_CLASS: &str = "class C { argv: *Listing<String>(!this.isEmpty)|Int }\n";
+
+#[test]
+fn constrained_default_alternative_rejects_implicit_default() {
+    let err = eval_fails(&format!("{CONSTRAINED_DEFAULT_CLASS}c = new C {{}}"));
+    assert!(err.contains("argv"), "{err}");
+    assert!(err.contains("!this.isEmpty"), "{err}");
+}
+
+#[test]
+fn constrained_default_alternative_rejects_explicit_and_amended_empty() {
+    eval_fails(&format!(
+        "{CONSTRAINED_DEFAULT_CLASS}c = new C {{ argv = new Listing {{}} }}"
+    ));
+    eval_fails(&format!(
+        "{CONSTRAINED_DEFAULT_CLASS}c = new C {{ argv {{}} }}"
+    ));
+    eval_fails("x: *Listing<String>(!this.isEmpty)|Int = new Listing {}");
+}
+
+#[test]
+fn constrained_default_alternative_accepts_valid_values() {
+    let v = eval(&format!(
+        "{CONSTRAINED_DEFAULT_CLASS}c = new C {{ argv {{ \"x\" }} }}\nd = new C {{ argv = 3 }}"
+    ));
+    assert_eq!(v["c"]["argv"], serde_json::json!(["x"]));
+    assert_eq!(v["d"]["argv"], serde_json::json!(3));
+}
+
+#[test]
+fn constrained_default_primitive_alternative_checks_constraint() {
+    let class = "class C { n: *String(length > 2)|Int }\n";
+    let v = eval(&format!(
+        "{class}a = new C {{ n = \"abcd\" }}\nb = new C {{ n = 5 }}"
+    ));
+    assert_eq!(v["a"]["n"], "abcd");
+    assert_eq!(v["b"]["n"], 5);
+    eval_fails(&format!("{class}a = new C {{ n = \"ab\" }}"));
+}
+
+#[test]
+fn constrained_default_alternative_through_alias_checks_constraint() {
+    let alias = "typealias T = *Listing<String>(!this.isEmpty)|Int\nclass C { argv: T }\n";
+    eval_fails(&format!("{alias}c = new C {{}}"));
+    let v = eval(&format!("{alias}c = new C {{ argv {{ \"x\" }} }}"));
+    assert_eq!(v["c"]["argv"], serde_json::json!(["x"]));
+}
+
+#[test]
+fn constrained_default_alternative_through_imported_alias_checks_constraint() {
+    let temp = TestTempDir::new("pklr_test_constrained_default_alias");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("mod.pkl"),
+        "typealias T = *Listing<String>(!this.isEmpty)|Int\nclass C { argv: T }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bad.pkl"),
+        "import \"mod.pkl\"\nc = new mod.C {}\n",
+    )
+    .unwrap();
+    let mut ev = Evaluator::new();
+    let err = ev.eval_file(&dir.join("bad.pkl")).unwrap_err().to_string();
+    assert!(err.contains("argv"), "{err}");
+}
+
+#[test]
+fn nullable_constrained_default_alternative_keeps_constraint() {
+    let class = "class C { n: *Int(this > 1)?|String }\n";
+    let v = eval(&format!("{class}a = new C {{}}\nb = new C {{ n = 5 }}"));
+    assert_eq!(v["b"]["n"], 5);
+    assert!(v["a"].get("n").is_none());
+    eval_fails(&format!("{class}a = new C {{ n = 1 }}"));
+}
+
+#[test]
+fn nullable_constrained_default_alternative_amends_its_own_default() {
+    // The property stays unset without an assignment, but a body amendment
+    // starts from the default alternative's value, as in pkl.
+    let class = "class C { xs: *Listing<String>(true)?|Int }\n";
+    let v = eval(&format!(
+        "{class}a = new C {{ xs {{}} }}\nb = new C {{ xs {{ \"x\" }} }}"
+    ));
+    assert_eq!(v["a"]["xs"], serde_json::json!([]));
+    assert_eq!(v["b"]["xs"], serde_json::json!(["x"]));
+    let v = eval(&format!("{class}c = new C {{ xs = 3 }}"));
+    assert_eq!(v["c"]["xs"], serde_json::json!(3));
+}
+
+#[test]
+fn default_constrained_generic_alternative_with_nullable_argument_keeps_constraint() {
+    // The `?` belongs to the generic argument, not to the alternative, so the
+    // default still applies and its constraint is checked on the implicit value.
+    let msg = eval_fails("class C { xs: *Listing<String?>(!isEmpty)|Int }\nc = new C {}");
+    assert!(msg.contains("xs"), "{msg}");
+    let class = "class C { xs: *Listing<String?>(true)|Int }\n";
+    let v = eval(&format!(
+        "{class}a = new C {{}}\nb = new C {{ xs {{ \"x\" null }} }}\nc = new C {{ xs = 3 }}"
+    ));
+    assert_eq!(v["a"]["xs"], serde_json::json!([]));
+    assert_eq!(v["b"]["xs"], serde_json::json!(["x", null]));
+    assert_eq!(v["c"]["xs"], serde_json::json!(3));
+    let v = eval("class C { m: *Mapping<String, Int?>(true)|Int }\na = new C {}");
+    assert_eq!(v["a"]["m"], serde_json::json!({}));
+}
+
+#[test]
+fn default_constrained_listing_alternative_amends_as_listing() {
+    // A body amendment of a `*Listing<...>(...)` default builds a listing,
+    // also when the property is read from an amended module.
+    let v = eval(
+        "class C { xs: *Listing<String>(true)|Int }\n\
+         a = new C {}\nb = new C { xs {} }\nc = new C { xs { \"x\" } }\n\
+         d: *Listing<String>(true)|Int = new {}",
+    );
+    assert_eq!(v["a"]["xs"], serde_json::json!([]));
+    assert_eq!(v["b"]["xs"], serde_json::json!([]));
+    assert_eq!(v["c"]["xs"], serde_json::json!(["x"]));
+    assert_eq!(v["d"], serde_json::json!([]));
+}
+
+// Amending a property whose default is an explicit `null` amends the `null`,
+// which makes a `Dynamic` that the declared type then checks (jdx/pklr#386).
+#[test]
+fn amend_explicit_null_default_rejects_listing_type() {
+    for ty in [
+        "Listing<String>?",
+        "(Listing<String>|Int)?",
+        "Listing<String>|Null",
+        "List<String>?",
+    ] {
+        let err = eval_fails(&format!(
+            "class U {{ g: {ty} = null }}\na = new U {{ g {{ \"adm\" }} }}\n"
+        ));
+        assert!(
+            (err.contains("Expected value") || err.contains("violated")) && err.contains("Dynamic"),
+            "{ty}: {err}"
+        );
+    }
+}
+
+#[test]
+fn amend_explicit_null_default_rejects_mapping_and_class_types() {
+    for ty in ["Mapping<String, Int>?", "Foo?"] {
+        let err = eval_fails(&format!(
+            "class Foo {{ a: Int }}\nclass U {{ g: {ty} = null }}\na = new U {{ g {{ [\"a\"] = 1 }} }}\n"
+        ));
+        assert!(err.contains("Dynamic"), "{ty}: {err}");
+    }
+    let err =
+        eval_fails("class Foo { a: Int }\nclass U { f: Foo? = null }\nx = new U { f { a = 1 } }\n");
+    assert!(err.contains("Dynamic"), "{err}");
+}
+
+#[test]
+fn amend_explicit_null_default_accepts_dynamic_types() {
+    let json = eval(
+        r#"
+typealias D = Dynamic
+class U {
+  a: Dynamic? = null
+  b: (Listing<String>|Dynamic)? = null
+  c: D? = null
+  d: Any = null
+  e = null
+}
+x = new U { a { "p" }; b { "q" }; c { k = 1 }; d { "r" }; e { "s" } }
+"#,
+    );
+    assert_eq!(
+        json["x"],
+        serde_json::json!({"a": ["p"], "b": ["q"], "c": {"k": 1}, "d": ["r"], "e": ["s"]})
+    );
+}
+
+#[test]
+fn amend_nullable_without_default_still_amends_type_default() {
+    let json = eval(
+        r#"
+class Foo { a: Int = 0 }
+class U { g: Listing<String>?; m: Mapping<String, Int>?; f: Foo?; u: (*Listing<String>|Int)? }
+x = new U { g { "adm" }; m { ["a"] = 1 }; f { a = 2 }; u { "z" } }
+"#,
+    );
+    assert_eq!(
+        json["x"],
+        serde_json::json!({"g": ["adm"], "m": {"a": 1}, "f": {"a": 2}, "u": ["z"]})
+    );
+}
+
+#[test]
+fn typed_listing_new_element_class_only_visible_in_the_declaring_module() {
+    let dir = TestTempDir::new("pklr_typed_listing_import");
+    std::fs::write(
+        dir.path().join("lib.pkl"),
+        "class Task { name: String; loopVar: String = \"item\" }\nclass Play { tasks: Listing<Task> }\n",
+    )
+    .unwrap();
+    let main = dir.path().join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\" as L\np = new L.Play { tasks { new { name = \"t\" } } }\n",
+    )
+    .unwrap();
+    let result = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(
+        result["p"]["tasks"],
+        serde_json::json!([{"name": "t", "loopVar": "item"}])
+    );
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\" as L\np = new L.Play { tasks { new { nme = \"t\" } } }\n",
+    )
+    .unwrap();
+    let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+    assert!(error.contains("nme"), "{error}");
+}
+
+#[test]
+fn typed_listing_new_element_with_union_or_builtin_element_type_stays_untyped() {
+    let result = eval(
+        r#"
+class A { a: Int = 1 }
+class B { b: Int = 2 }
+u: Listing<A | B> = new { new { a = 3 } }
+d: Listing<Dynamic> = new { new { k = 1 } }
+"#,
+    );
+    assert_eq!(result["u"], serde_json::json!([{"a": 3}]));
+    assert_eq!(result["d"], serde_json::json!([{"k": 1}]));
+}
+
+#[test]
+fn typed_listing_direct_amendment_keeps_the_element_class() {
+    let result = eval(
+        r#"
+class T { x: Int = 1 }
+a = new Listing<T> {}
+b = (a) { new {} }
+"#,
+    );
+    assert_eq!(result["a"], serde_json::json!([]));
+    assert_eq!(result["b"], serde_json::json!([{"x": 1}]));
+    let error = eval_fails(
+        r#"
+class T { x: Int = 1 }
+a = new Listing<T> {}
+b = (a) { new { x = "s" } }
+"#,
+    );
+    assert!(error.contains("Expected value of type `Int`"), "{error}");
+}
+
+#[test]
+fn typed_listing_super_reads_see_typed_elements() {
+    let result = eval(
+        r#"
+class T { x: Int = 1 }
+a = new Listing<T> { new {}; super.first }
+b = new Listing<T> { new {}; super.last; new {} }
+"#,
+    );
+    assert_eq!(result["a"], serde_json::json!([{"x": 1}, {"x": 1}]));
+    assert_eq!(
+        result["b"],
+        serde_json::json!([{"x": 1}, {"x": 1}, {"x": 1}])
+    );
+}
+
+#[test]
+fn typed_listing_abstract_element_class_error_names_the_class() {
+    let error = eval_fails(
+        r#"
+abstract class Task {}
+a = new Listing<Task> { new {} }
+"#,
+    );
+    assert!(error.contains("abstract class `"), "{error}");
+    assert!(error.contains("Task"), "{error}");
+    assert!(!error.contains("listing_elem_class"), "{error}");
+}
+
+#[test]
+fn typed_nullable_listing_amendment_uses_the_declaring_scope_class() {
+    let dir = TestTempDir::new("pklr_typed_nullable_listing_import");
+    std::fs::write(
+        dir.path().join("lib.pkl"),
+        "class T { x: Int = 1 }\nclass P { nested: Listing<T>? }\n",
+    )
+    .unwrap();
+    let main = dir.path().join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\" as L\np = new L.P { nested { new {} } }\n",
+    )
+    .unwrap();
+    let result = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(result["p"]["nested"], serde_json::json!([{"x": 1}]));
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\" as L\np = new L.P { nested { new { x = \"s\" } } }\n",
+    )
+    .unwrap();
+    let error = pklr::eval_to_json(&main).unwrap_err().to_string();
+    assert!(error.contains("Expected value of type `Int`"), "{error}");
+}
+
+#[test]
+fn typed_listing_of_listings_builds_inner_elements_as_the_class() {
+    let result = eval(
+        r#"
+class T { name: String; d: Int = 1 }
+class P { ll: Listing<Listing<T>> }
+p = new P { ll { new { new { name = "t" } } } }
+x: Listing<Listing<T>> = new { new { new { name = "u" } } }
+y = new Listing<Listing<T>> { new { new { name = "v" } } }
+"#,
+    );
+    assert_eq!(
+        result["p"]["ll"],
+        serde_json::json!([[{"name": "t", "d": 1}]])
+    );
+    assert_eq!(result["x"], serde_json::json!([[{"name": "u", "d": 1}]]));
+    assert_eq!(result["y"], serde_json::json!([[{"name": "v", "d": 1}]]));
+    let error = eval_fails(
+        r#"
+class T { name: String }
+x: Listing<Listing<T>> = new { new { new { name = 5 } } }
+"#,
+    );
+    assert!(error.contains("Expected value of type `String`"), "{error}");
+}
+
+#[test]
+fn typed_listing_class_declared_after_its_use_in_a_recursive_class() {
+    let result = eval(
+        r#"
+class Task { name: String; loopVar: String = "item"; steps: Listing<Step>? }
+class Step { id: String = "s"; sub: Listing<Task>? }
+p = new Task { name = "t"; steps { new { sub { new { name = "z" } } } } }
+"#,
+    );
+    assert_eq!(result["p"]["steps"][0]["id"], "s");
+    assert_eq!(result["p"]["steps"][0]["sub"][0]["loopVar"], "item");
+}
+
+#[test]
+fn typed_listing_of_nullable_or_aliased_listings_builds_inner_elements_as_the_class() {
+    let result = eval(
+        r#"
+class T { n: String; d: Int = 1 }
+typealias L = Listing<T>
+class H { x: Listing<Listing<T>?>; y: Listing<L> }
+h = new H { x { new { new { n = "p" } } }; y { new { new { n = "q" } } } }
+a = new Listing<Listing<T>?> { new { new { n = "a" } } }
+b = new Listing<L> { new { new { n = "b" } } }
+c: Listing<Listing<T>?> = new { new { new { n = "c" } } }
+d: Listing<L> = new { new { new { n = "d" } } }
+"#,
+    );
+    assert_eq!(result["h"]["x"], serde_json::json!([[{"n": "p", "d": 1}]]));
+    assert_eq!(result["h"]["y"], serde_json::json!([[{"n": "q", "d": 1}]]));
+    assert_eq!(result["a"], serde_json::json!([[{"n": "a", "d": 1}]]));
+    assert_eq!(result["b"], serde_json::json!([[{"n": "b", "d": 1}]]));
+    assert_eq!(result["c"], serde_json::json!([[{"n": "c", "d": 1}]]));
+    assert_eq!(result["d"], serde_json::json!([[{"n": "d", "d": 1}]]));
+}
+
+#[test]
+fn typed_listing_elements_through_if_let_and_trace_get_the_class() {
+    let result = eval(
+        r#"
+class T { x: Int = 1 }
+a = new Listing<T> { if (true) new {} else new {} }
+b = new Listing<T> { let (q = 1) new {} }
+c = new Listing<T> { trace(new {}) }
+class H { l: Listing<T>; m: Listing<T> = new { if (true) new {} else new {} } }
+h = new H { l { let (q = 1) new {} } }
+"#,
+    );
+    assert_eq!(result["a"], serde_json::json!([{"x": 1}]));
+    assert_eq!(result["b"], serde_json::json!([{"x": 1}]));
+    assert_eq!(result["c"], serde_json::json!([{"x": 1}]));
+    assert_eq!(result["h"]["l"], serde_json::json!([{"x": 1}]));
+    assert_eq!(result["h"]["m"], serde_json::json!([{"x": 1}]));
+}
+
+#[test]
+fn amend_non_null_default_still_amends_it() {
+    let json = eval(
+        "class U { g: Listing<String> = new Listing { \"z\" } }\nx = new U { g { \"adm\" } }\n",
+    );
+    assert_eq!(json["x"]["g"], serde_json::json!(["z", "adm"]));
+}
+
+#[test]
+fn explicit_new_dynamic_is_rejected_by_listing_typed_property() {
+    let err =
+        eval_fails("class U { g: Listing<String>? }\na = new U { g = new Dynamic { \"adm\" } }\n");
+    assert!(err.contains("Dynamic"), "{err}");
+    let err = eval_fails("x: Listing<String> = new Dynamic { \"a\" }\n");
+    assert!(err.contains("Dynamic"), "{err}");
+}
+
+// An element-only `new Dynamic` still satisfies the constraints on a declared
+// type that accepts a `Dynamic`, and is rejected when they fail, as in pkl.
+#[test]
+fn element_only_dynamic_evaluates_declared_type_constraints() {
+    for decl in [
+        "x: Any(false)",
+        "x: Dynamic(false)",
+        "x: Object(false)",
+        "x: Dynamic(toList().length == 2)",
+        "x: Dynamic(false)?",
+        "x: (Listing<String>|Dynamic(false))",
+        "typealias A = Any(false)\nx: A",
+    ] {
+        let err = eval_fails(&format!("{decl} = new Dynamic {{ \"a\" }}\n"));
+        assert!(
+            err.contains("expected") || err.contains("constraint"),
+            "{decl}: {err}"
+        );
+    }
+    let json = eval(
+        r#"
+typealias D = Dynamic(toList().length == 1)
+a: Any(true) = new Dynamic { "a" }
+b: Dynamic(toList().length == 1) = new Dynamic { "a" }
+c: (Listing<String>|Dynamic(toList().length == 1)) = new Dynamic { "a" }
+d: D? = new Dynamic { "a" }
+"#,
+    );
+    for key in ["a", "b", "c", "d"] {
+        assert_eq!(json[key], serde_json::json!(["a"]), "{key}");
+    }
+}
+
+// The constraint of a type that accepts a `Dynamic` runs against the
+// `Dynamic`, so type tests on `this` see one and not the list that stores its
+// elements.
+#[test]
+fn element_only_dynamic_constraints_see_a_dynamic() {
+    for decl in [
+        "x: Dynamic(this is Dynamic)",
+        "x: Dynamic(this is Object)",
+        "x: Dynamic(this is Any)",
+        "x: Dynamic(this is Dynamic?)",
+        "x: Dynamic(this is Dynamic(toList().length == 1))",
+        "x: Dynamic(toList().length == 1 && this is Dynamic)",
+        "x: Dynamic(this.toList().length == 1)",
+        "x: Dynamic(this.toList() is List)",
+        "x: Dynamic(this is Dynamic|Int)",
+    ] {
+        let json = eval(&format!("{decl} = new Dynamic {{ \"a\" }}\n"));
+        assert_eq!(json["x"], serde_json::json!(["a"]), "{decl}");
+    }
+    for decl in [
+        "x: Dynamic(this is Listing)",
+        "x: Dynamic(this is Listing<String>)",
+        "x: Dynamic(this is Listing|List)",
+        "x: Dynamic(this is Mapping)",
+        "x: Dynamic(this is List)",
+        "x: Dynamic(this is Dynamic(false))",
+        "x: Dynamic(this is Dynamic(this is Listing))",
+        "x: Dynamic(this.toList() is Dynamic)",
+    ] {
+        let err = eval_fails(&format!("{decl} = new Dynamic {{ \"a\" }}\n"));
+        assert!(
+            err.contains("expected") || err.contains("constraint"),
+            "{decl}: {err}"
+        );
+    }
+    // A listing that merely has the same elements is still a listing.
+    let json = eval("x: Dynamic(!(new Listing { \"a\" } is Dynamic)) = new Dynamic { \"a\" }\n");
+    assert_eq!(json["x"], serde_json::json!(["a"]));
+    // The same holds for the amended default of a property.
+    let json =
+        eval("class U { g: Dynamic(this is Dynamic)? = null }\na = new U { g { \"adm\" } }\n");
+    assert_eq!(json["a"]["g"], serde_json::json!(["adm"]));
+    let err = eval_fails(
+        "class U { g: Dynamic(this is Listing)? = null }\na = new U { g { \"adm\" } }\n",
+    );
+    assert!(err.contains("Dynamic"), "{err}");
+}
+
+// Every path that rejects an explicit `new Dynamic` names it a `Dynamic`.
+#[test]
+fn explicit_dynamic_constraint_failures_name_a_dynamic() {
+    for src in [
+        "x: Dynamic(false) = new Dynamic { \"a\" }\n",
+        "x: Dynamic(false) = new Dynamic { a = 1 }\n",
+        "x: Int = new Dynamic { \"a\" }\n",
+        "class U { g: Dynamic(false)? = null }\na = new U { g { \"adm\" } }\n",
+        "class U { g: Dynamic(false)? = null }\na = new U { g = new Dynamic { \"adm\" } }\n",
+    ] {
+        let err = eval_fails(src);
+        assert!(err.contains("Dynamic"), "{src}: {err}");
+        assert!(!err.contains("got List"), "{src}: {err}");
+    }
+}
+
+// A recursive alias whose constraint tests itself fails cleanly.
+#[test]
+fn element_only_dynamic_constraint_recursion_is_bounded() {
+    let err = eval_fails("typealias N = Dynamic(this is N)\nx: N = new Dynamic { \"a\" }\n");
+    assert!(err.contains("recursion"), "{err}");
+}
+
+// A class that shadows `Any` or `Dynamic` does not change how a constraint
+// runs: it only decides what a type annotation names.
+#[test]
+fn element_only_dynamic_constraint_ignores_unrelated_classes() {
+    for decl in [
+        "x: Dynamic(true)",
+        "x: Dynamic(toList().length == 1)",
+        "x: Dynamic(this is Dynamic)",
+    ] {
+        let json = eval(&format!(
+            "class Any {{}}\n{decl} = new Dynamic {{ \"a\" }}\n"
+        ));
+        assert_eq!(json["x"], serde_json::json!(["a"]), "{decl}");
+    }
+    let err = eval_fails("class Any {}\nx: Dynamic(false) = new Dynamic { \"a\" }\n");
+    assert!(err.contains("violated"), "{err}");
+}
+
+// A long chain of aliases ending in `Dynamic` is walked without deep
+// recursion.
+#[test]
+fn element_only_dynamic_follows_long_alias_chains() {
+    for (end, ok) in [
+        ("Dynamic", true),
+        ("Dynamic(toList().length == 1)", true),
+        ("Int", false),
+    ] {
+        let mut src = String::new();
+        for i in 0..5000 {
+            src.push_str(&format!("typealias A{i} = A{}\n", i + 1));
+        }
+        src.push_str(&format!(
+            "typealias A5000 = {end}\nx: A0 = new Dynamic {{ \"a\" }}\n"
+        ));
+        if ok {
+            assert_eq!(eval(&src)["x"], serde_json::json!(["a"]), "{end}");
+        } else {
+            let err = eval_fails(&src);
+            assert!(err.contains("Expected value of type"), "{end}: {err}");
+        }
+    }
+}
+
+#[test]
+fn amended_explicit_null_default_evaluates_declared_type_constraints() {
+    for ty in [
+        "Any(false)?",
+        "Dynamic(false)?",
+        "Dynamic(toList().length == 2)?",
+        "(Listing<String>|Any(false))?",
+    ] {
+        let err = eval_fails(&format!(
+            "class U {{ g: {ty} = null }}\na = new U {{ g {{ \"adm\" }} }}\n"
+        ));
+        assert!(err.contains("Dynamic"), "{ty}: {err}");
+    }
+    let err = eval_fails(
+        "class U { g: Any(false)? = null }\na = new U { g = new Dynamic { \"adm\" } }\n",
+    );
+    assert!(err.contains("violated"), "{err}");
+    let json =
+        eval("class U { g: Dynamic(toList().length == 1)? = null }\na = new U { g { \"adm\" } }\n");
+    assert_eq!(json["a"]["g"], serde_json::json!(["adm"]));
+}
+
+#[test]
+fn element_only_dynamic_is_not_a_class_named_like_a_builtin() {
+    for name in ["Object", "Any"] {
+        let err = eval_fails(&format!(
+            "class {name} {{}}\nx: {name} = new Dynamic {{ \"a\" }}\n"
+        ));
+        assert!(
+            err.contains("expected") || err.contains("Dynamic"),
+            "{name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn element_only_dynamic_is_rejected_by_function_types() {
+    for ty in [
+        "(Int) -> Int",
+        "() -> Int",
+        "Function0<Int>",
+        "Function1<Int, Int>",
+        "Function2<Int, Int, Int>",
+    ] {
+        let err = eval_fails(&format!("x: {ty} = new Dynamic {{ \"a\" }}\n"));
+        assert!(err.contains("Dynamic"), "{ty}: {err}");
+    }
+}
+
+#[test]
+fn amending_a_property_whose_alias_has_a_nullable_default_starts_from_it() {
+    // Verified against pkl 0.32.2: the nullable `*` alternative leaves the
+    // property unset, but a body amendment still starts from its default,
+    // however many aliases lead to it.
+    let json = eval(
+        "class Item { n = 1; m = 5 }\n\
+         typealias A = *Item(true)?|Int\n\
+         typealias B = A\n\
+         typealias C = Item?\n\
+         typealias D = *Item?|Int\n\
+         typealias E = D\n\
+         typealias Star = *C|Int\n\
+         class U {\n  a: A\n  b: B\n  c: C\n  d: D\n  e: E\n  f: *Item(true)?|Int\n  g: Star\n  h: D?\n}\n\
+         x = new U { a { n = 2 } b { n = 2 } c { n = 2 } d { n = 2 } e { n = 2 } f { n = 2 } g { n = 2 } h { n = 2 } }\n\
+         y = new U {}\n",
+    );
+    for key in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        assert_eq!(json["x"][key], serde_json::json!({"n": 2, "m": 5}), "{key}");
+    }
+    // Nothing is amended, so every nullable default stays unset.
+    for key in ["a", "b", "d", "e", "f", "g"] {
+        assert!(json["y"].get(key).is_none(), "{key}: {}", json["y"]);
+    }
+    let listing = eval(
+        "typealias L = *Listing<String>(true)?|Int\nclass U { l: L }\nx = new U { l { \"1\" } }\n",
+    );
+    assert_eq!(listing["x"]["l"], serde_json::json!(["1"]));
+}
+
+#[test]
+fn amending_through_a_cyclic_alias_does_not_loop() {
+    let err = eval_fails(
+        "typealias A = B?\ntypealias B = A?\nclass U { a: A }\nx = new U { a { \"1\" } }\n",
+    );
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn alias_nullable_default_resolves_in_the_declaring_module() {
+    // Verified against pkl 0.32.2.
+    let temp = TestTempDir::new("pklr_test_alias_nullable_default");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "class Item { n = 1 }\ntypealias MaybeItem = *Item(true)?|Int\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\"\nclass U { m: lib.MaybeItem }\nx = new U { m { n = 2 } }\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    assert_eq!(json["x"]["m"], serde_json::json!({"n": 2}));
+}
+
+#[test]
+fn amending_a_property_typed_by_a_nullable_alias_starts_from_the_class() {
+    // Verified against pkl 0.32.2: looking through the alias's nullable
+    // wrapper, a constrained or parenthesized nullable alias still amends an
+    // `Item` instance rather than null.
+    let json = eval(
+        "class Item { n = 1; m = 5 }\n\
+         typealias A = Item?\n\
+         typealias B = A\n\
+         class U {\n  a: A?(true)\n  b: A\n  c: (A)?\n  d: B?(true)\n  e: A(true)\n  f: B\n}\n\
+         x = new U { a { n = 2 } b { n = 3 } c { n = 4 } d { n = 5 } e { n = 6 } f { n = 7 } }\n",
+    );
+    for (key, n) in [("a", 2), ("b", 3), ("c", 4), ("d", 5), ("e", 6), ("f", 7)] {
+        assert_eq!(json["x"][key], serde_json::json!({"n": n, "m": 5}), "{key}");
+    }
+}
+
+#[test]
+fn amending_through_a_qualified_imported_alias_starts_from_its_default() {
+    // Verified against pkl 0.32.2: `lib.MaybeItem` and an alias chain to it
+    // amend an `Item` instance, so `m` keeps its default.
+    let temp = TestTempDir::new("pklr_test_qualified_alias_default");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "class Item { n = 1; m = 5 }\n\
+         typealias MaybeItem = *Item?|Int\n\
+         typealias Chain = MaybeItem\n\
+         typealias Strs = Listing<String>\n\
+         typealias MaybeStrs = *Strs?|Int\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\"\n\
+         class U { a: lib.MaybeItem; b: lib.Chain; c: lib.MaybeStrs; d: lib.Strs? }\n\
+         x = new U { a { n = 2 } b { n = 3 } c {} d { \"1\" } }\n\
+         y = new U {}\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    assert_eq!(json["x"]["a"], serde_json::json!({"n": 2, "m": 5}));
+    assert_eq!(json["x"]["b"], serde_json::json!({"n": 3, "m": 5}));
+    assert_eq!(json["x"]["c"], serde_json::json!([]));
+    assert_eq!(json["x"]["d"], serde_json::json!(["1"]));
+    assert!(json["y"].get("a").is_none(), "{}", json["y"]);
+}
+
+#[test]
+fn imported_alias_constraint_may_use_declaring_module_names() {
+    // Verified against pkl 0.32.2: a constraint naming a `const` function of
+    // the declaring module is valid, so importing the alias must not fail.
+    let temp = TestTempDir::new("pklr_test_qualified_alias_constraint");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "const function ok(n: Int): Boolean = n > 0\ntypealias Pos = Int(ok(this))\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\"\nclass U { a: lib.Pos }\nx = new U { a = 5 }\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    assert_eq!(json["x"]["a"], 5);
+}
+
+#[test]
+fn amending_a_nullable_default_alias_of_a_generic_type_starts_from_it() {
+    // Verified against pkl 0.32.2: an alias to `Listing<String>` or
+    // `Mapping<String, Int>` amends from an empty collection, not an object.
+    let json = eval(
+        "typealias Strs = Listing<String>\n\
+         typealias M = Mapping<String, Int>\n\
+         typealias S1 = *Strs?|Int\n\
+         typealias S2 = *Listing<String>?|Int\n\
+         typealias S3 = *M?|Int\n\
+         class U { a: S1; b: S2; d: S3; e: Strs?; f: M? }\n\
+         x = new U { a {} b {} d {} e {} f {} }\n",
+    );
+    for key in ["a", "b", "e"] {
+        assert_eq!(json["x"][key], serde_json::json!([]), "{key}");
+    }
+    for key in ["d", "f"] {
+        assert_eq!(json["x"][key], serde_json::json!({}), "{key}");
+    }
+}
+
+#[test]
+fn imported_alias_keeps_its_constraint() {
+    // Verified against pkl 0.32.2: `-1 is lib.Pos` is false, and a value that
+    // breaks the constraint of an imported alias is rejected, whether it is
+    // cast, assigned to a typed property, or the object of a constrained
+    // default union alternative.
+    let temp = TestTempDir::new("pklr_test_imported_alias_constraint");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "class Item { n: Int = 1 }\n\
+         typealias P = *Item(n > 0) | String\n\
+         typealias Pos = Int(this > 0)\n",
+    )
+    .unwrap();
+    let eval_main = |body: &str| {
+        let main = dir.join("main.pkl");
+        std::fs::write(&main, format!("import \"lib.pkl\"\n{body}")).unwrap();
+        Evaluator::new().eval_file(&main)
+    };
+    let json = eval_main(
+        "class U { x: lib.P; y: lib.Pos = 3 }\n\
+         u = new U {}\n\
+         v = new U { x { n = 4 } }\n\
+         a = -1 is lib.Pos\n\
+         b = 5 is lib.Pos\n",
+    )
+    .unwrap()
+    .to_json();
+    assert_eq!(json["a"], false);
+    assert_eq!(json["b"], true);
+    assert_eq!(json["u"]["x"], serde_json::json!({"n": 1}));
+    assert_eq!(json["v"]["x"], serde_json::json!({"n": 4}));
+    assert!(eval_main("c = (-1 as lib.Pos)\n").is_err());
+    assert!(eval_main("class U { y: lib.Pos }\nv = new U { y = -4 }\n").is_err());
+    assert!(eval_main("class U { x: lib.P }\nv = new U { x { n = -4 } }\n").is_err());
+}
+
+#[test]
+fn imported_alias_of_a_class_the_declaring_module_imports_keeps_its_default() {
+    // Verified against pkl 0.32.2: `lib.T` names `dep.Item`, which only `lib`
+    // imports, and a property of that type still defaults to an `Item`.
+    let temp = TestTempDir::new("pklr_test_imported_alias_of_dep_class");
+    let dir = temp.path();
+    std::fs::write(dir.join("dep.pkl"), "class Item { n: Int = 1 }\n").unwrap();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "import \"dep.pkl\"\ntypealias T = dep.Item\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\"\nclass U { x: lib.T }\nu = new U {}\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    assert_eq!(json["u"]["x"], serde_json::json!({"n": 1}));
+}
+
+#[test]
+fn re_exported_imported_alias_keeps_its_class_default() {
+    // Verified against pkl 0.32.2: `a.M` names `b.Q`, which only `a` imports,
+    // through any number of re-exports and a nullable wrapper.
+    let temp = TestTempDir::new("pklr_test_re_exported_alias_default");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("c.pkl"),
+        "class Item { n = 1 }\ntypealias R = Item\ntypealias Q = R\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("b.pkl"), "import \"c.pkl\"\ntypealias P = c.Q\n").unwrap();
+    std::fs::write(dir.join("a.pkl"), "import \"b.pkl\"\ntypealias M = b.P?\n").unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"a.pkl\"\n\
+         class U { x: a.M; y: a.M? }\n\
+         u = new U { x {} }\n\
+         w = new U {}\n\
+         z = new U { x { n = 5 } }\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    assert_eq!(json["u"]["x"], serde_json::json!({"n": 1}));
+    assert!(
+        json["w"]["x"].is_null() && json["w"]["y"].is_null(),
+        "{}",
+        json["w"]
+    );
+    assert_eq!(json["z"]["x"], serde_json::json!({"n": 5}));
+}
+
+#[test]
+fn cyclic_local_aliases_are_an_error_not_a_crash() {
+    // pkl 0.32.2 rejects these with "Type alias definitions must not be
+    // cyclic."; amending through them must fail rather than overflow the stack.
+    eval_fails(
+        "local typealias A = B\n\
+         local typealias B = A\n\
+         class U { a: A?(true) }\n\
+         x = new U { a {} }\n",
+    );
+}
+
+#[test]
+fn union_amend_follows_a_long_alias_chain_to_dynamic() {
+    // A chain longer than any fixed step limit still ends at `Dynamic`, which
+    // the null default of `argv` satisfies once the body has run.
+    let mut src = String::new();
+    for i in 0..39 {
+        src.push_str(&format!("typealias A{i} = A{}\n", i + 1));
+    }
+    src.push_str("typealias A39 = Dynamic\nclass C { argv: (A0|Int)? }\n");
+    src.push_str("c = new C { argv { x = 1 } }\n");
+    assert_eq!(eval(&src)["c"]["argv"]["x"], serde_json::json!(1));
+}
+
+#[test]
+fn union_amend_state_is_not_shared_with_same_named_properties_of_nested_objects() {
+    // The outer amendment of `lib.Outer.argv` (which takes a Dynamic) must not
+    // decide the same-named, same-printing `Args?` property of a nested `C`.
+    let temp = TestTempDir::new("pklr_test_union_amend_nested");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "typealias Args = Dynamic|Int\nclass Outer { argv: Args?; inner: Any? }\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        r#"
+import "lib.pkl"
+typealias Args = Int|String
+class C { argv: Args? }
+o = (new lib.Outer {}) {
+  argv { x = 1 }
+  inner = new C { argv { x = 1 } }
+}
+"#,
+    )
+    .unwrap();
+    let err = Evaluator::new().eval_file(&main).unwrap_err().to_string();
+    assert!(
+        err.contains("Int|String") && err.contains("Dynamic"),
+        "{err}"
+    );
+}
+
+/// Modules `m1`..`m3` each import their successor as `m` and declare
+/// `typealias A = m.A`, so the lookups print identically yet are distinct
+/// aliases; `m4` ends the chain in `end`.
+fn eval_import_chain(end: &str, property_type: &str) -> Result<serde_json::Value, pklr::Error> {
+    let end_src = format!("typealias A = {end}\n");
+    let main = format!(
+        "import \"m1.pkl\" as m\nclass C {{ argv: {property_type} }}\nc = new C {{ argv {{ x = 1 }} }}\n"
+    );
+    eval_union_files(
+        "import_chain",
+        &[
+            ("m4.pkl", &end_src),
+            ("m3.pkl", "import \"m4.pkl\" as m\ntypealias A = m.A\n"),
+            ("m2.pkl", "import \"m3.pkl\" as m\ntypealias A = m.A\n"),
+            ("m1.pkl", "import \"m2.pkl\" as m\ntypealias A = m.A\n"),
+            ("main.pkl", &main),
+        ],
+    )
+}
+
+#[test]
+fn union_amend_accepts_a_dynamic_behind_modules_that_each_import_the_next_as_m() {
+    let value = eval_import_chain("Dynamic", "(m.A|Int)?").unwrap();
+    assert_eq!(value["c"]["argv"]["x"], serde_json::json!(1));
+}
+
+#[test]
+fn union_amend_rejects_an_unmarked_union_behind_modules_that_each_import_the_next_as_m() {
+    let error = eval_import_chain("Int|String", "m.A").unwrap_err();
+    assert!(error.to_string().contains(UNDEFINED), "{error}");
+}
+
+#[test]
+fn union_amend_follows_a_very_long_alias_chain_without_overflowing_the_stack() {
+    let mut src = String::new();
+    for i in 0..5000 {
+        src.push_str(&format!("typealias A{i} = A{}\n", i + 1));
+    }
+    src.push_str("typealias A5000 = Dynamic\nclass C { argv: (A0|Int)? }\n");
+    src.push_str("c = new C { argv { x = 1 } }\n");
+    assert_eq!(eval(&src)["c"]["argv"]["x"], serde_json::json!(1));
+}
+
+/// A type alias or class named `Dynamic`, `Any` or `Object` shadows the
+/// standard library type of that name (stock pkl accepts the declaration), so
+/// a nullable union naming it does not take the `Dynamic` a body builds.
+#[test]
+fn union_amend_does_not_treat_an_alias_named_like_a_builtin_as_taking_a_dynamic() {
+    for name in ["Dynamic", "Any", "Object"] {
+        for property_type in [
+            format!("({name}|Int)?"),
+            "(B|Int)?".to_string(),
+            "(B|Int|Null)".to_string(),
+        ] {
+            for body in ["argv { \"a\" }", "argv { x = 1 }"] {
+                let src = format!(
+                    "typealias {name} = Listing<String>\ntypealias B = {name}\n\
+                     class C {{ argv: {property_type} }}\nc = new C {{ {body} }}\n"
+                );
+                let error = Evaluator::new()
+                    .eval_source(&src, std::path::Path::new("test.pkl"))
+                    .unwrap_err()
+                    .to_string();
+                let expected = if property_type.ends_with("Null)") {
+                    UNDEFINED
+                } else {
+                    "Expected value of type"
+                };
+                assert!(
+                    error.contains(expected),
+                    "{name} {property_type} {body}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn union_amend_rejects_an_unmarked_nullable_union_of_an_alias_named_like_a_builtin() {
+    for name in ["Dynamic", "Any", "Object"] {
+        let src = format!(
+            "typealias {name} = Listing<String>\nclass C {{ argv: {name}|Int|Null }}\n\
+             c = new C {{ argv {{ \"a\" }} }}\n"
+        );
+        let error = Evaluator::new()
+            .eval_source(&src, std::path::Path::new("test.pkl"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(UNDEFINED), "{name}: {error}");
+    }
+}
+
+#[test]
+fn union_amend_does_not_treat_a_class_named_like_a_builtin_as_taking_a_dynamic() {
+    for name in ["Dynamic", "Any", "Object"] {
+        let src = format!(
+            "class {name} {{ a: Int = 1 }}\nclass C {{ argv: ({name}|Int)? }}\n\
+             c = new C {{ argv {{ \"a\" }} }}\n"
+        );
+        let error = Evaluator::new()
+            .eval_source(&src, std::path::Path::new("test.pkl"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Dynamic"), "{name}: {error}");
+    }
+}
+
+#[test]
+fn union_amend_does_not_treat_an_imported_alias_or_class_named_like_a_builtin_as_taking_a_dynamic()
+{
+    for name in ["Dynamic", "Any", "Object"] {
+        for lib in [
+            format!("typealias {name} = Listing<String>\n"),
+            format!("class {name} {{ a: Int = 1 }}\n"),
+        ] {
+            let main = format!(
+                "import \"lib.pkl\" as m\nclass C {{ argv: (m.{name}|Int)? }}\n\
+                 c = new C {{ argv {{ \"a\" }} }}\n"
+            );
+            let error =
+                eval_union_files("shadow_import", &[("lib.pkl", &lib), ("main.pkl", &main)])
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains("Expected value of type") && error.contains("Dynamic"),
+                "{name} {lib}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn union_amend_still_accepts_a_dynamic_for_the_builtin_names_unshadowed() {
+    for name in ["Dynamic", "Any", "Object"] {
+        let src = format!("class C {{ argv: ({name}|Int)? }}\nc = new C {{ argv {{ x = 1 }} }}\n");
+        assert_eq!(eval(&src)["c"]["argv"]["x"], serde_json::json!(1));
+    }
+}
+#[test]
+fn typed_listing_new_element_takes_the_element_class() {
+    let result = eval(
+        r#"
+class Task { name: String; loopVar: String = "item" }
+class Play { tasks: Listing<Task> }
+p = new Play { tasks { new { name = "t" } } }
+n = p.tasks[0] is Task
+"#,
+    );
+    assert_eq!(
+        result["p"]["tasks"],
+        serde_json::json!([{"name": "t", "loopVar": "item"}])
+    );
+    assert_eq!(result["n"], true);
+}
+
+#[test]
+fn typed_listing_new_element_runs_the_class_type_checks() {
+    let error = eval_fails(
+        r#"
+class Task { name: String }
+class Play { tasks: Listing<Task> }
+p = new Play { tasks { new { name = 5 } } }
+"#,
+    );
+    assert!(error.contains("String"), "{error}");
+    let error = eval_fails(
+        r#"
+class Task { name: String }
+class Play { tasks: Listing<Task> }
+p = new Play { tasks { new { nme = "t" } } }
+"#,
+    );
+    assert!(error.contains("nme"), "{error}");
+}
+
+#[test]
+fn typed_listing_new_element_recomputes_class_properties() {
+    let result = eval(
+        r#"
+class Task { x: Int = 1; y: Int = x + 1 }
+class Play { tasks: Listing<Task> }
+local base = 10
+p = new Play {
+  tasks {
+    new { x = 5 }
+    for (i in List(1, 2)) { new { x = base + i } }
+    when (true) { new {} }
+    ...List(new Task { x = 20 })
+  }
+}
+"#,
+    );
+    let ys: Vec<_> = result["p"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|task| task["y"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ys, [6, 12, 13, 2, 21]);
+}
+
+#[test]
+fn typed_listing_new_element_in_declared_listing_forms() {
+    let result = eval(
+        r#"
+class Task { name: String; loopVar: String = "item" }
+typealias T = Task
+class Play {
+  tasks: Listing<Task> = new { new { name = "d" } }
+  opt: Listing<T?>
+  nested: Listing<Task>?
+}
+a: Listing<Task> = new { new { name = "a" } }
+b = new Listing<T> { new { name = "b" } }
+p = new Play { opt { new { name = "o" } null } }
+q = (p) { tasks { new { name = "e" } } }
+r = new Play { nested { new { name = "n" } } }
+"#,
+    );
+    let item = |name: &str| serde_json::json!({"name": name, "loopVar": "item"});
+    assert_eq!(result["a"], serde_json::json!([item("a")]));
+    assert_eq!(result["b"], serde_json::json!([item("b")]));
+    assert_eq!(
+        result["p"]["opt"],
+        serde_json::json!([item("o"), serde_json::Value::Null])
+    );
+    assert_eq!(
+        result["q"]["tasks"],
+        serde_json::json!([item("d"), item("e")])
+    );
+    assert_eq!(result["r"]["nested"], serde_json::json!([item("n")]));
+}
+
+#[test]
+fn typed_listing_new_element_of_a_self_referential_class() {
+    let result = eval(
+        r#"
+class Task { name: String; loopVar: String = "item"; block: Listing<Task>? }
+class Play { tasks: Listing<Task> }
+p = new Play { tasks { new { name = "t"; block { new { name = "inner" } } } } }
+"#,
+    );
+    assert_eq!(
+        result["p"]["tasks"][0]["block"],
+        serde_json::json!([{"name": "inner", "loopVar": "item", "block": null}])
+    );
+}
+
+#[test]
+fn constrained_default_of_a_type_with_no_default_leaves_the_property_unset() {
+    // Verified against pkl 0.32.2: `*IntSeq(c)|String` has no default, as bare
+    // `IntSeq` has none, while `*Map<K, V>(c)|String` defaults to an empty
+    // map and a class named `IntSeq` keeps its own default.
+    let json = eval("class C { x: *Map<String, Int>(true)|String }\nc = new C {}\n");
+    assert_eq!(json["c"]["x"], serde_json::json!({}));
+    let json = eval("class IntSeq { n = 1 }\nclass C { x: *IntSeq(true)|String }\nc = new C {}\n");
+    assert_eq!(json["c"]["x"], serde_json::json!({"n": 1}));
+    let error = eval_fails("class C { x: *IntSeq(true)|String }\nc = new C {}\nd = c.x\n");
+    assert!(error.contains("x"), "{error}");
+}
+
+#[test]
+fn amending_through_a_long_alias_chain_to_a_nullable_class_starts_from_it() {
+    // Verified against pkl 0.32.2: any number of aliases (`A0 = A1`, ...) may
+    // lead to `Item?`, and the property amends from an `Item`.
+    let mut src = String::from("class Item { n = 1 }\n");
+    for i in 0..40 {
+        src.push_str(&format!("typealias A{i} = A{}\n", i + 1));
+    }
+    src.push_str("typealias A40 = Item?\nclass C { x: A0 }\nc = new C { x { n = 2 } }\n");
+    let json = eval(&src);
+    assert_eq!(json["c"]["x"], serde_json::json!({"n": 2}));
+}
+
+#[test]
+fn imported_nullable_default_alias_leaves_the_property_unset() {
+    // Verified against pkl 0.32.2: `lib.A` is `B?(true)` with `B = Item`, so
+    // its `*` alternative is nullable and the property stays unset, whether
+    // the alias is named plainly, nullable, or through another module.
+    let temp = TestTempDir::new("pklr_test_imported_nullable_default_alias");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("lib.pkl"),
+        "class Item { n = 1 }\n\
+         typealias B = Item\n\
+         typealias A = B?(true)\n\
+         typealias N = B?\n\
+         typealias X = A\n\
+         typealias Y = N\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.pkl"),
+        "import \"lib.pkl\"\ntypealias M = lib.A\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "import \"lib.pkl\"\nimport \"mid.pkl\"\n\
+         class C { x: *lib.A|Int; y: *lib.N|Int; z: *mid.M|Int; w: *lib.A?|Int; v: *lib.X|Int; u: *lib.Y|Int }\n\
+         c = new C {}\n\
+         b = new lib.B {}\n\
+         whole = lib\n",
+    )
+    .unwrap();
+    let json = Evaluator::new().eval_file(&main).unwrap().to_json();
+    for key in ["x", "y", "z", "w", "v", "u"] {
+        assert!(json["c"][key].is_null(), "{key}: {}", json["c"]);
+    }
+    assert_eq!(json["b"], serde_json::json!({"n": 1}));
+}
+
+#[test]
+fn a_type_parameter_is_not_a_use_of_a_local_alias_of_the_same_name() {
+    // Verified against pkl 0.32.2: the `T` in `Items<T>` is the alias's own
+    // parameter, so the unused cyclic local alias `T` stays unresolved.
+    let json = eval(
+        "local typealias T = List<T>\ntypealias Items<T> = List<T>\nx: Items<Int> = List(1)\n",
+    );
+    assert_eq!(json["x"], serde_json::json!([1]));
+}
+
+#[test]
+fn untyped_new_in_a_nested_listing_of_a_non_class_type_is_a_listing() {
+    // Verified against pkl 0.32.2: the inner `new {}` is an empty `Listing`
+    // (`[]`) even when its element type is not a class.
+    let json = eval(
+        "class C { l: Listing<Listing<String>> }\n\
+         a = new C { l { new { \"x\" } new {} } }\n\
+         class D { m: Listing<Listing<Int>> }\n\
+         b = new D { m { new {} } }\n\
+         typealias S = Listing<String>(true)\n\
+         class E { n: Listing<S> }\n\
+         c = new E { n { new { \"q\" } new {} } }\n",
+    );
+    assert_eq!(json["a"]["l"], serde_json::json!([["x"], []]));
+    assert_eq!(json["b"]["m"], serde_json::json!([[]]));
+    assert_eq!(json["c"]["n"], serde_json::json!([["q"], []]));
+}
+
+#[test]
+fn index_replacement_of_a_typed_listing_element_is_an_instance_of_its_class() {
+    // Verified against pkl 0.32.2: `[0] = new { ... }` builds a `T`, with its
+    // defaults, and rejects a property `T` lacks.
+    let src = "class T { x: Int = 1; y: String = \"d\" }\n\
+         class H { xs: Listing<T> }\n\
+         h = new H { xs { new { x = 2 }; new { x = 3 } } }\n";
+    let json = eval(&format!(
+        "{src}h2 = (h) {{ xs {{ [0] = new {{ x = 9 }} }} }}\n"
+    ));
+    assert_eq!(
+        json["h2"]["xs"],
+        serde_json::json!([{"x": 9, "y": "d"}, {"x": 3, "y": "d"}])
+    );
+    let error = eval_fails(&format!(
+        "{src}h3 = (h) {{ xs {{ [0] = new {{ z = 9 }} }} }}\n"
+    ));
+    assert!(error.contains('z'), "{error}");
+}
+
+#[test]
+fn a_type_alias_named_like_a_builtin_shadows_it_for_listing_elements() {
+    // Verified against pkl 0.32.2: `String` here is the alias of a listing.
+    let json = eval(
+        "class T { x: Int = 1 }\n\
+         typealias String = Listing<T>\n\
+         class H { xs: String }\n\
+         h = new H { xs { new {} } }\n",
+    );
+    assert_eq!(json["h"]["xs"], serde_json::json!([{"x": 1}]));
+}
+
+#[test]
+fn nested_listing_of_an_imported_class_builds_elements_from_the_declaring_class() {
+    // Verified against pkl 0.32.2: `T` is not visible in `main.pkl`.
+    let lib = "class T { x: Int = 1; y: String = \"d\" }\n\
+         class H { xs: Listing<Listing<T>>; ys: Listing<Listing<T>>?; zs: Listing<Listing<T>> = new {} }\n";
+    let main = "import \"lib.pkl\" as lib\n\
+         a = new lib.H { xs { new { new { x = 5 } } } }\n\
+         b = new lib.H { ys { new { new { x = 5 } } } }\n\
+         c = new lib.H { zs { new { new { x = 5 } } } }\n";
+    let json = eval_union_files(
+        "nested_listing_import",
+        &[("lib.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap();
+    let want = serde_json::json!([[{"x": 5, "y": "d"}]]);
+    assert_eq!(json["a"]["xs"], want);
+    assert_eq!(json["b"]["ys"], want);
+    assert_eq!(json["c"]["zs"], want);
+}
+
+#[test]
+fn nested_listing_amendment_still_infers_mapping_values_below_the_saved_class() {
+    // Verified against pkl 0.32.2: a `Mapping` below a `Listing` of listings
+    // builds a `Mapping` (and its values a `Foo`) when the class declaring
+    // the property saved an element class for the listings above it.
+    let json = eval(
+        "class Foo { n: Int = 1; s: String = \"d\" }\n\
+         class H {\n\
+           a: Listing<Listing<Mapping<String, Int>>>\n\
+           c: Listing<Mapping<String, Foo>>\n\
+           d: Listing<Listing<Mapping<String, Foo>>>\n\
+           b: Listing<Listing<Listing<Foo>>>\n\
+         }\n\
+         h = new H {\n\
+           a { new { new { [\"k\"] = 1 } } }\n\
+           b { new { new { new { n = 5 } } } }\n\
+           c { new { [\"k\"] { n = 5 } } }\n\
+           d { new { new { [\"k\"] { n = 5 } } } }\n\
+         }\n\
+         isMapping = h.a[0][0] is Mapping\n\
+         ds = h.d[0][0][\"k\"].s\n\
+         cs = h.c[0][\"k\"].s\n\
+         bs = h.b[0][0][0].s\n",
+    );
+    assert_eq!(json["isMapping"], serde_json::json!(true));
+    assert_eq!(json["ds"], serde_json::json!("d"));
+    assert_eq!(json["cs"], serde_json::json!("d"));
+    assert_eq!(json["bs"], serde_json::json!("d"));
+}
+
+#[test]
+fn listing_element_types_are_judged_where_the_property_was_declared() {
+    // Verified against pkl 0.32.2 with `a.pkl` declaring the classes and
+    // aliases and `main.pkl` an alias of its own named like a class of `a.pkl`.
+    let lib = "class E { x: Int = 1 }\n\
+         typealias M = Mapping<String, E>\n\
+         class H { xs: Listing<E>?; ls: Listing<Listing<E>>; ms: Listing<Listing<M>> }\n";
+    let main = "import \"a.pkl\" as A\n\
+         typealias E = Mapping<String, Int>\n\
+         r = new A.H {\n\
+           xs { new {} }\n\
+           ls { new { new {} } }\n\
+           ms { new { new { [\"k\"] { x = 4 } } } }\n\
+         }\n";
+    let json = eval_union_files(
+        "declaring_scope_chain",
+        &[("a.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(json["r"]["xs"], serde_json::json!([{"x": 1}]));
+    assert_eq!(json["r"]["ls"], serde_json::json!([[{"x": 1}]]));
+    assert_eq!(json["r"]["ms"], serde_json::json!([[{"k": {"x": 4}}]]));
+}
+
+#[test]
+fn a_mapping_alias_of_the_declaring_module_is_inferred_below_a_listing() {
+    // Verified against pkl 0.32.2: the alias `M` is private to `lib.pkl`.
+    let lib = "typealias M = Mapping<String, Int>\nclass H { ys: Listing<Listing<M>> }\n";
+    let main = "import \"lib.pkl\" as L\n\
+         r = new L.H { ys { new { new { [\"k\"] = 4 } } } }\n\
+         isMapping = r.ys[0][0] is Mapping\n";
+    let json = eval_union_files(
+        "declaring_mapping_alias",
+        &[("lib.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(json["isMapping"], serde_json::json!(true));
+}
+
+#[test]
+fn imported_mapping_members_are_built_from_the_declared_type() {
+    // Verified against pkl 0.32.2: `E` and `M` are private to `lib.pkl`, and
+    // `main.pkl` declares aliases of the same names.
+    let lib = "class E { x: Int = 1; s: String = \"d\" }\n\
+         typealias M = Mapping<String, E>\n\
+         class H {\n\
+           m: Mapping<String, E>\n\
+           mm: M\n\
+           lm: Listing<Mapping<String, E>>\n\
+           llm: Listing<Listing<M>>\n\
+         }\n";
+    let body = "r = new L.H {\n\
+           m { [\"k\"] { x = 5 } }\n\
+           mm { [\"k\"] { x = 5 } }\n\
+           lm { new { [\"k\"] { x = 5 } } }\n\
+           llm { new { new { [\"k\"] { x = 5 } } } }\n\
+         }\n\
+         v = List(r.m[\"k\"].s, r.mm[\"k\"].s, r.lm[0][\"k\"].s, r.llm[0][0][\"k\"].s)\n";
+    for (tag, aliases) in [
+        ("plain", ""),
+        (
+            "shadowed",
+            "typealias E = Mapping<String, Int>\ntypealias M = Listing<Int>\n",
+        ),
+    ] {
+        let main = format!("import \"lib.pkl\" as L\n{aliases}{body}");
+        let json = eval_union_files(
+            &format!("declared_mapping_{tag}"),
+            &[("lib.pkl", lib), ("main.pkl", &main)],
+        )
+        .unwrap();
+        assert_eq!(json["v"], serde_json::json!(["d", "d", "d", "d"]), "{tag}");
+    }
+}
+
+#[test]
+fn same_named_classes_of_different_modules_stay_apart_in_mapping_members() {
+    // Verified against pkl 0.32.2: `a.pkl` and `b.pkl` each declare an `E`.
+    let a = "class E { x: Int = 1; s: String = \"a\" }\n\
+         open class Base { xs: Listing<Mapping<String, E>> }\n";
+    let b = "import \"a.pkl\" as A\n\
+         class E { x: Int = 2; s: String = \"b\" }\n\
+         class Sub extends A.Base { ys: Listing<Mapping<String, E>> }\n";
+    let main = "import \"b.pkl\" as B\n\
+         r = new B.Sub { xs { new { [\"k\"] { x = 5 } } }; ys { new { [\"k\"] { x = 6 } } } }\n\
+         v = List(r.xs[0][\"k\"].s, r.ys[0][\"k\"].s)\n";
+    let json = eval_union_files(
+        "declared_same_names",
+        &[("a.pkl", a), ("b.pkl", b), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(json["v"], serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn mapping_members_keep_default_markers_and_constraints_and_declared_checks() {
+    // Verified against pkl 0.32.2: a `*L` default alternative, constrained
+    // mappings, and an amending module whose alias `E` differs from the class.
+    let json = eval(
+        "typealias L = Listing<String>\n\
+         class H { m: Listing<Mapping<String, *L | Int>> }\n\
+         r = new H { m { new { [\"k\"] { \"x\" } } } }\n\
+         v = r.m[0][\"k\"]\n",
+    );
+    assert_eq!(json["v"], serde_json::json!(["x"]));
+    let lib = "class E { x: Int = 1; s: String = \"d\" }\n\
+         class H { cm: Listing<Mapping<String, E>(true)>; ccm: Listing<Mapping<String, E>(length > 0)> }\n";
+    let main = "import \"lib.pkl\" as L\n\
+         typealias E = Mapping<String, Int>\n\
+         r = new L.H { cm { new { [\"k\"] { x = 5 } } }; ccm { new { [\"k\"] { x = 5 } } } }\n\
+         v = List(r.cm[0][\"k\"].s, r.ccm[0][\"k\"].s)\n";
+    let json = eval_union_files(
+        "declared_constrained",
+        &[("lib.pkl", lib), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(json["v"], serde_json::json!(["d", "d"]));
+}
+
+#[test]
+fn nested_listings_of_a_class_naming_itself_build_their_innermost_elements() {
+    // Verified against pkl 0.32.2: a class cannot see itself, or a class
+    // declared after it, in the scope it was saved with. Same module and
+    // imported, directly recursive and mutually recursive.
+    let classes = "class Node { x: Int = 1; s: String = \"d\"; children: Listing<Listing<Node>>? }\n\
+         class N2 { x: Int = 1; s: String = \"d\"; kids: Listing<Node2>? }\n\
+         class Node2 { s: String = \"d\"; back: Listing<Listing<N2>>? }\n";
+    let uses = "a = new Node { children { new { new { x = 3 } } } }\n\
+         b = new N2 { kids { new { back { new { new { x = 4 } } } } } }\n\
+         v = List(a.children[0][0].s, b.kids[0].back[0][0].s)\n";
+    let json = eval(&format!("{classes}{uses}"));
+    assert_eq!(json["v"], serde_json::json!(["d", "d"]));
+    let main = format!(
+        "import \"lib.pkl\" as L\n{}",
+        uses.replace("new Node", "new L.Node")
+            .replace("new N2", "new L.N2")
+    );
+    let json = eval_union_files(
+        "nested_self_listing",
+        &[("lib.pkl", classes), ("main.pkl", &main)],
+    )
+    .unwrap();
+    assert_eq!(json["v"], serde_json::json!(["d", "d"]));
+}
+
+#[test]
+fn declared_mapping_members_accept_existing_instances_of_the_declared_class() {
+    // Verified against pkl 0.32.2.
+    let json = eval(
+        "class E { x: Int = 1; s: String = \"d\" }\n\
+         class H { xs: Listing<Mapping<String, E>> }\n\
+         e = new E {}\n\
+         r = new H { xs { new { [\"k\"] = e } } }\n\
+         v = r.xs[0][\"k\"].s\n",
+    );
+    assert_eq!(json["v"], serde_json::json!("d"));
+}
+
+#[test]
+fn a_second_amendment_reads_the_type_where_it_was_declared() {
+    // Verified against pkl 0.32.2: the caller's `E` differs from `lib.pkl`'s,
+    // and the amended instance is amended again.
+    let lib = "class E { x: Int = 1; s: String = \"lib\" }\n\
+         open class H { xs: Listing<Mapping<String, E>> }\n";
+    let main = "import \"lib.pkl\" as L\n\
+         class E { x: Int = 2; s: String = \"caller\" }\n\
+         a = new L.H { xs { new { [\"a\"] { x = 5 } } } }\n\
+         b = (a) { xs { new { [\"b\"] { x = 6 } } } }\n\
+         v = List(b.xs[0][\"a\"].s, b.xs[1][\"b\"].s)\n";
+    let json =
+        eval_union_files("second_amendment", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(json["v"], serde_json::json!(["lib", "lib"]));
+}
+
+#[test]
+fn nullable_and_aliased_mapping_properties_inherit_the_value_class() {
+    // Verified against pkl 0.32.2: `M`, `Mapping<String, E>?` and an alias of
+    // an alias, in one module.
+    let classes = "class E { x: Int = 1; s: String = \"d\" }\n\
+         typealias M = Mapping<String, E>\n\
+         typealias M2 = M\n\
+         class H { m: M; n: Mapping<String, E>?; o: M2 }\n";
+    let uses = "r = new H { m { [\"k\"] { x = 5 } }; n { [\"k\"] { x = 5 } }; o { [\"k\"] { x = 5 } } }\n\
+         v = List(r.m[\"k\"].s, r.n[\"k\"].s, r.o[\"k\"].s)\n";
+    let json = eval(&format!("{classes}{uses}"));
+    assert_eq!(json["v"], serde_json::json!(["d", "d", "d"]));
+}
+
+#[test]
+fn an_amendment_chain_across_three_modules_reads_each_type_in_its_own_module() {
+    // Verified against pkl 0.32.2: each module declares its own `E`.
+    let lib = "class E { x: Int = 1; s: String = \"lib\" }\n\
+         open class H { xs: Listing<Mapping<String, E>> }\n";
+    let mid = "import \"lib.pkl\" as L\n\
+         class E { x: Int = 9; s: String = \"mid\" }\n\
+         open class Mid extends L.H { ys: Listing<Mapping<String, E>> }\n";
+    let main = "import \"mid.pkl\" as M\n\
+         class E { x: Int = 2; s: String = \"top\" }\n\
+         class Top extends M.Mid { zs: Listing<Mapping<String, E>> }\n\
+         a = new Top { xs { new { [\"a\"] { x = 5 } } }; ys { new { [\"b\"] { x = 5 } } }; zs { new { [\"c\"] { x = 5 } } } }\n\
+         b = (a) { xs { new { [\"a2\"] {} } }; ys { new { [\"b2\"] {} } }; zs { new { [\"c2\"] {} } } }\n\
+         v = List(b.xs[0][\"a\"].s, b.xs[1][\"a2\"].s, b.ys[0][\"b\"].s, b.ys[1][\"b2\"].s, b.zs[0][\"c\"].s, b.zs[1][\"c2\"].s)\n";
+    let json = eval_union_files(
+        "three_module_chain",
+        &[("lib.pkl", lib), ("mid.pkl", mid), ("main.pkl", main)],
+    )
+    .unwrap();
+    assert_eq!(
+        json["v"],
+        serde_json::json!(["lib", "lib", "mid", "mid", "top", "top"])
+    );
+}
+
+#[test]
+fn nested_listing_fallback_only_completes_unresolved_class_names() {
+    // Verified against pkl 0.32.2: a built-in element type of the declaring
+    // module stays what it is when the importing module declares an alias of
+    // the same name, and a constrained self-referential listing is completed.
+    let lib = "class H { xs: Listing<Listing<Dynamic>>?; ys: Listing<Listing<String>>?; ms: Listing<Listing<Mapping<String, Int>>>? }\n\
+         class Node { x: Int = 1; s: String = \"d\"; c1: Listing<Listing<Node>(true)>?; c2: Listing<Node>(!isEmpty)?; c3: Listing<Listing<Node>>(!isEmpty)? }\n\
+         class N2 { s: String = \"d\"; kids: Listing<Node2(true)>? }\n\
+         class Node2 { s: String = \"d\"; back: Listing<Listing<N2>(true)>? }\n";
+    let main = "import \"lib.pkl\" as L\n\
+         class T { x: Int = 1 }\n\
+         typealias Dynamic = T\n\
+         h = new L.H { xs { new { new {} } }; ys { new { \"a\" } }; ms { new { new { [\"k\"] = 1 } } } }\n\
+         r = new L.Node { c1 { new { new { x = 3 } } }; c2 { new { x = 4 } }; c3 { new { new { x = 5 } } } }\n\
+         a = new L.N2 { kids { new { back { new { new { s = \"z\" } } } } } }\n\
+         v = List(h.xs[0][0] is T, h.ys[0][0] is T, h.ms[0][0] is Mapping,\n\
+                  r.c1[0][0].s, r.c2[0].s, r.c3[0][0].s, a.kids[0].s, a.kids[0].back[0][0].s)\n";
+    let json =
+        eval_union_files("nested_fallback", &[("lib.pkl", lib), ("main.pkl", main)]).unwrap();
+    assert_eq!(
+        json["v"],
+        serde_json::json!([false, false, true, "d", "d", "d", "d", "z"])
+    );
+}
+
+#[test]
+fn starred_mapping_value_alternatives_keep_their_default_in_declared_members() {
+    // Verified against pkl 0.32.2: `*E | F` builds `E` for the members of a
+    // listing, nested listings and a nullable alternative, in one module and
+    // imported under an unrelated `E`.
+    let classes = "class E { x: Int = 1; s: String = \"E\" }\n\
+         class F { y: Int = 2; s: String = \"F\" }\n\
+         class H {\n\
+           lm: Listing<Mapping<String, *E | F>>\n\
+           llm: Listing<Listing<Mapping<String, *E | F>>>\n\
+           nul: Listing<Mapping<String, (*E | F)?>>\n\
+         }\n";
+    let uses = "r = new H {\n\
+           lm { new { [\"k\"] { x = 5 } } }\n\
+           llm { new { new { [\"k\"] { x = 5 } } } }\n\
+           nul { new { [\"k\"] { x = 5 } } }\n\
+         }\n\
+         v = List(r.lm[0][\"k\"] is E, r.llm[0][0][\"k\"] is E, r.nul[0][\"k\"] is E,\n\
+                  r.lm[0][\"k\"].s, r.nul[0][\"k\"].s)\n";
+    let want = serde_json::json!([true, true, true, "E", "E"]);
+    assert_eq!(eval(&format!("{classes}{uses}"))["v"], want);
+    let main = format!(
+        "import \"lib.pkl\" as L\nclass E {{ x: Int = 7; s: String = \"caller\" }}\n{}",
+        "r = new L.H {\n\
+           lm { new { [\"k\"] { x = 5 } } }\n\
+           llm { new { new { [\"k\"] { x = 5 } } } }\n\
+           nul { new { [\"k\"] { x = 5 } } }\n\
+         }\n\
+         v = List(r.lm[0][\"k\"].s, r.llm[0][0][\"k\"].s, r.nul[0][\"k\"].s, r.lm[0][\"k\"].x)\n"
+    );
+    let json = eval_union_files(
+        "starred_alternatives",
+        &[("lib.pkl", classes), ("main.pkl", &main)],
+    )
+    .unwrap();
+    assert_eq!(json["v"], serde_json::json!(["E", "E", "E", 5]));
+}
+
+#[test]
+fn a_callers_alias_of_the_same_name_does_not_retype_an_imported_mapping() {
+    // Verified against pkl 0.32.2: `lib.pkl` declares `typealias M =
+    // Mapping<String, E>`, the caller declares its own `M` over another class.
+    let lib = "class E { x: Int = 1; s: String = \"E\" }\n\
+         typealias M = Mapping<String, E>\n\
+         class H { mm: M; mn: M?; lm: Listing<M> }\n";
+    let main = "import \"lib.pkl\" as L\n\
+         class Other { y: Int = 3; s: String = \"callerOther\" }\n\
+         typealias M = Mapping<String, Other>\n\
+         a = new L.H { mm = new Mapping<String, L.E> {}; mn { [\"k\"] { x = 5 } }; lm { new { [\"k\"] { x = 5 } } } }\n\
+         b = (a) { mm { [\"k\"] { x = 5 } } }\n\
+         v = List(b.mm[\"k\"].s, b.lm[0][\"k\"].s)\n";
+    let json = eval_union_files("caller_alias", &[("lib.pkl", lib), ("main.pkl", main)]);
+    assert_eq!(json.unwrap()["v"], serde_json::json!(["E", "E"]));
+}
+
+// ============================================================
+// Mapping `default`
+// ============================================================
+
+#[test]
+fn mapping_function_default_builds_entries_from_keys() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default { key -> name = key }
+  ["a"] { age = 1 }
+  ["b"] { name = super.name + "!" }
+}
+"#,
+    );
+    assert_eq!(json["m"]["a"]["name"], "a");
+    assert_eq!(json["m"]["a"]["age"], 1);
+    assert_eq!(json["m"]["b"]["name"], "b!");
+}
+
+#[test]
+fn mapping_amended_default_rebuilds_entries() {
+    let json = eval(
+        r#"
+res1 = new Mapping {
+  default { age = 42 }
+  ["pigeon"] { name = "Pigeon" }
+  ["parrot"] { name = "Parrot"; age = 50 }
+}
+res2 = (res1) { default { age = 45 } }
+"#,
+    );
+    assert_eq!(json["res2"]["pigeon"]["age"], 45);
+    assert_eq!(json["res2"]["parrot"]["age"], 50);
+}
+
+#[test]
+fn mapping_get_or_default_reads_missing_entry_from_default() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default { key -> name = key }
+  ["a"] { age = 1 }
+}
+hit = m.getOrDefault("a")
+miss = (m.getOrDefault("zed")) { age = 99 }
+"#,
+    );
+    assert_eq!(json["hit"]["age"], 1);
+    assert_eq!(json["miss"]["name"], "zed");
+    assert_eq!(json["miss"]["age"], 99);
+}
+
+#[test]
+fn mapping_get_or_default_sees_locals_and_equivalent_keys() {
+    let json = eval(
+        r#"
+m = new Mapping { local n = 42; default { value = n }; [1.s] = 7 }
+missing = m.getOrDefault("missing")
+hit = m.getOrDefault(1000.ms)
+"#,
+    );
+    assert_eq!(json["missing"]["value"], 42);
+    assert_eq!(json["hit"], 7);
+}
+
+#[test]
+fn mapping_function_default_is_not_called_for_typed_new_entries() {
+    let json = eval(
+        r#"
+u = new Mapping {
+  default = (key) -> throw("unused")
+  ["a"] = new Dynamic { x = 1 }
+}
+"#,
+    );
+    assert_eq!(json["u"]["a"]["x"], 1);
+}
+
+#[test]
+fn mapping_amended_body_default_keeps_inherited_default_members() {
+    let json = eval(
+        r#"
+res1 = new Mapping {
+  default { name = "x"; age = 42 }
+  ["pigeon"] { }
+}
+res2 = (res1) { default { age = 45 } }
+miss = res2.getOrDefault("missing")
+"#,
+    );
+    assert_eq!(json["res2"]["pigeon"]["name"], "x");
+    assert_eq!(json["res2"]["pigeon"]["age"], 45);
+    assert_eq!(json["miss"]["name"], "x");
+    assert_eq!(json["miss"]["age"], 45);
+}
+
+#[test]
+fn mapping_replacement_entry_keeps_function_default() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default = (key) -> new Dynamic { name = key; age = 1 }
+  ["a"] {}
+}
+n = (m) { ["a"] = new { age = 2 } }
+"#,
+    );
+    assert_eq!(json["n"]["a"]["name"], "a");
+    assert_eq!(json["n"]["a"]["age"], 2);
+}
+
+#[test]
+fn mapping_function_default_is_not_called_for_plain_replacements() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default = (key) -> throw("unused")
+  ["a"] = 1
+}
+n = (m) { ["a"] = 42; ["b"] = "x" }
+"#,
+    );
+    assert_eq!(json["n"]["a"], 42);
+    assert_eq!(json["n"]["b"], "x");
+}
+
+#[test]
+fn mapping_function_default_is_not_called_for_computed_replacements() {
+    let json = eval(
+        r#"
+x = 3
+m = new Mapping {
+  default = (key) -> throw("unused")
+  ["a"] = 1
+}
+n = (m) { ["a"] = x + 1; ["b"] = -x; ["c"] = 2.s }
+"#,
+    );
+    assert_eq!(json["n"]["a"], 4);
+    assert_eq!(json["n"]["b"], -3);
+}
+
+#[test]
+fn property_reads_a_sibling_declared_later_in_its_body() {
+    let v = eval("foo {\n  x = y\n  y = 3\n}");
+    assert_eq!(v["foo"]["x"], 3);
+}
+
+#[test]
+fn forward_sibling_read_sees_the_amended_value_not_the_inherited_one() {
+    let v = eval("f {\n  x = y\n  y = 3\n}\ng = (f) {\n  y = 4\n}\nh = (f) {\n  y = 5\n  z = 1\n}");
+    assert_eq!(v["f"]["x"], 3);
+    assert_eq!(v["g"]["x"], 4);
+    assert_eq!(v["h"]["x"], 5);
+}
+
+#[test]
+fn local_property_with_a_body_is_a_dynamic_object() {
+    let v = eval("local o {\n  foo = 1\n}\nr = o.foo\ns = (o) { bar = 2 }");
+    assert_eq!(v["r"], 1);
+    assert_eq!(v["s"]["bar"], 2);
+    assert_eq!(v["s"]["foo"], 1);
+}
+
+#[test]
+fn spread_cannot_duplicate_a_member_the_body_declares() {
+    for src in [
+        "local s { foo = 1 }\nres { ...s\n foo = 2 }",
+        "local s { foo = 1 }\nres { foo = 2\n ...s }",
+        "local s { [\"foo\"] = 1 }\nres: Mapping = new { [\"foo\"] = 2\n ...s }",
+        "local s { [\"foo\"] = 1 }\nres: Mapping = new { ...s\n [\"foo\"] = 2 }",
+    ] {
+        eval_fails(src);
+    }
+}
+
+#[test]
+fn spread_cannot_add_a_member_to_a_closed_class_instance() {
+    let msg = eval_fails(
+        "class P { name: String }\nlocal d { name = \"a\"\n age = 3 }\nres: P = new { ...d }",
+    );
+    assert!(msg.contains("age"), "{msg}");
+}
+
+#[test]
+fn spread_cannot_add_a_local_or_method_name_to_a_closed_class_instance() {
+    let msg = eval_fails(
+        "class P { name: String\n local secret = 1 }\nlocal d { secret = 2 }\nres: P = new { name = \"a\"; ...d }",
+    );
+    assert!(msg.contains("Cannot find property `secret`"), "{msg}");
+}
+
+#[test]
+fn mapping_function_default_is_not_called_for_unselected_branch() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default = (key) -> throw("unused")
+  ["a"] = if (true) 42 else new {}
+}
+"#,
+    );
+    assert_eq!(json["m"]["a"], 42);
+}
+
+#[test]
+fn default_named_value_keeps_its_own_apply_method() {
+    let json = eval(
+        r#"
+class Adder {
+  function apply(x) = x + 1
+}
+local f = (default) -> default.apply(1)
+r = f.apply(new Adder {})
+"#,
+    );
+    assert_eq!(json["r"], 2);
+}
+
+#[test]
+fn amended_function_default_can_apply_an_element_only_default() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  default { 1 }
+  ["a"] { 2 }
+}
+n = (m) { default = (k) -> (super.default.apply(k)) { 3 } }
+"#,
+    );
+    assert_eq!(json["n"]["a"], serde_json::json!([1, 3, 2]));
+}
+
+#[test]
+fn a_parameter_named_default_is_not_treated_as_a_mapping_default() {
+    let (_, err) = (
+        0,
+        eval_fails(
+            r#"
+f = (default) -> default.apply(1)
+r = f.apply(new Dynamic { x = 1 })
+"#,
+        ),
+    );
+    assert!(err.contains("apply"), "{err}");
+}
+
+#[test]
+fn mapping_get_or_default_body_default_reads_mapping_locals() {
+    let json = eval(
+        r#"
+m = new Mapping {
+  local base = 10
+  default { key -> n = base }
+  ["a"] {}
+}
+miss = m.getOrDefault("zed")
+"#,
+    );
+    assert_eq!(json["miss"]["n"], 10);
+}
+
+/// Render `src` as `pkl eval -f json` does, which reads every rendered
+/// property.
+fn render_json(src: &str) -> Result<serde_json::Value, String> {
+    let temp = TestTempDir::new("pklr_test_render_json");
+    let path = temp.path().join("main.pkl");
+    std::fs::write(&path, src).unwrap();
+    pklr::eval_to_json(&path).map_err(|error| error.to_string())
+}
+
+#[test]
+fn property_without_value_or_default_is_undefined_when_rendered() {
+    let message = "Tried to read property";
+    // A primitive type supplies no default, so the property has no value.
+    for src in [
+        "name: String",
+        "class C { x: Int }\nc: C = new C {}",
+        "class C { x: Int }\nc: C = new C {}\ny = c.x",
+        "class C { x: Int }\noutput { value = new C {} }",
+    ] {
+        let error = render_json(src).unwrap_err();
+        assert!(
+            error.contains(message) && error.contains("but its value is undefined."),
+            "{src}: {error}"
+        );
+    }
+}
+
+#[test]
+fn property_without_value_is_fine_when_it_has_a_default_or_is_not_read() {
+    let json = render_json(
+        "class D { q: Int = 1 }\nclass C { x: Int; hidden h: Int; y: Int?; z: Listing<Int>; w: D }\nc: C = new C { x = 1 }\nhidden k: String",
+    )
+    .unwrap();
+    assert_eq!(
+        json["c"],
+        serde_json::json!({"x": 1, "z": [], "w": {"q": 1}})
+    );
+    // A module that renders something else never reads the property.
+    let json = render_json("name: String\noutput { value = 1 }").unwrap();
+    assert_eq!(json, serde_json::json!(1));
+}
+
+#[test]
+fn undefined_property_is_not_read_when_output_or_a_converter_avoids_it() {
+    let json = render_json(
+        "class C { x: Int }\noutput { value = new C {}; renderer = new JsonRenderer { converters { [C] = (_) -> \"ok\" } } }",
+    )
+    .unwrap();
+    assert_eq!(json, serde_json::json!("ok"));
+
+    // An inherited `output` that does not render the property.
+    let temp = TestTempDir::new("pklr_test_inherited_output_undefined");
+    std::fs::write(
+        temp.path().join("P.pkl"),
+        "open module P\noutput { value = 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("main.pkl"),
+        "extends \"P.pkl\"\nname: String\n",
+    )
+    .unwrap();
+    let json = pklr::eval_to_json(&temp.path().join("main.pkl")).unwrap();
+    assert_eq!(json, serde_json::json!(1));
+}
+
+#[test]
+fn undefined_property_is_reported_despite_unrelated_converters_or_inherited_renderer() {
+    let error = render_json(
+        "class C { x: Int }\noutput { value = new C {}; renderer = new JsonRenderer { converters { [String] = (s) -> s } } }",
+    )
+    .unwrap_err();
+    assert!(error.contains("but its value is undefined."), "{error}");
+
+    let temp = TestTempDir::new("pklr_test_inherited_renderer_undefined");
+    std::fs::write(
+        temp.path().join("P.pkl"),
+        "open module P\noutput { renderer = new JsonRenderer {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("main.pkl"),
+        "extends \"P.pkl\"\nname: String\n",
+    )
+    .unwrap();
+    let error = pklr::eval_to_json(&temp.path().join("main.pkl")).unwrap_err();
+    assert!(
+        error.to_string().contains("but its value is undefined."),
+        "{error}"
+    );
+}
+
+#[test]
+fn undefined_property_is_not_read_when_a_broad_converter_replaces_the_value() {
+    for converters in ["[Any] = (_) -> \"ok\"", "[Typed] = (_) -> \"ok\""] {
+        let json = render_json(&format!(
+            "class C {{ x: Int }}\noutput {{ value = new C {{}}; renderer = new JsonRenderer {{ converters {{ {converters} }} }} }}"
+        ))
+        .unwrap();
+        assert_eq!(json, serde_json::json!("ok"), "{converters}");
+    }
+    let json = render_json(
+        "class C { x: Int }\noutput { value = List(new C {}); renderer = new JsonRenderer { converters { [List] = (_) -> \"ok\" } } }",
+    )
+    .unwrap();
+    assert_eq!(json, serde_json::json!("ok"));
+    // The module itself is replaced without reading its properties.
+    let json = render_json(
+        "name: String\noutput { renderer = new JsonRenderer { converters { [Any] = (_) -> \"ok\" } } }",
+    )
+    .unwrap();
+    assert_eq!(json, serde_json::json!("ok"));
+}
+
+#[test]
+fn dynamic_converter_does_not_replace_a_module_with_an_undefined_property() {
+    let result = render_json(
+        "name: String\noutput { renderer = new JsonRenderer { converters { [Dynamic] = (_) -> \"ok\" } } }",
+    );
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[test]
+fn mapping_get_or_default_amended_body_function_default() {
+    let json = eval(
+        r#"
+base = new Mapping {
+  default { key -> name = key; age = 42 }
+}
+m = (base) { default { key -> age = 45 } }
+miss = m.getOrDefault("zed")
+again = (m) { ["k"] { age = 5 } }
+miss2 = again.getOrDefault("zed")
+"#,
+    );
+    assert_eq!(json["miss"], serde_json::json!({"name": "zed", "age": 45}));
+    assert_eq!(json["miss2"], serde_json::json!({"name": "zed", "age": 45}));
+    assert_eq!(
+        json["again"]["k"],
+        serde_json::json!({"name": "k", "age": 5})
+    );
+}
+
+#[test]
+fn mapping_get_or_default_amended_assigned_function_default() {
+    let json = eval(
+        r#"
+local suffix = "!"
+base = new Mapping { default = (k) -> "v-\(k)" }
+m = (base) { default = (k) -> "w-\(k)\(suffix)" }
+miss = m.getOrDefault("z")
+kept = (base) { ["x"] = "y" }.getOrDefault("z")
+"#,
+    );
+    assert_eq!(json["miss"], "w-z!");
+    assert_eq!(json["kept"], "v-z");
+}
+
+#[test]
+fn mapping_get_or_default_amended_function_default_with_local_member() {
+    let json = eval(
+        r#"
+base = new Mapping { local n = 1; default = (k) -> "old\(n)" }
+m = (base) { default = (k) -> "new-\(k)" }
+miss = m.getOrDefault("z")
+"#,
+    );
+    assert_eq!(json["miss"], "new-z");
+}
+
+#[test]
+fn mapping_get_or_default_amended_function_default_reads_amendment_local() {
+    let json = eval(
+        r#"
+base = new Mapping { local unused = 0; default = (k) -> 1 }
+m = (base) { local r = 2; default = (k) -> r }
+miss = m.getOrDefault("z")
+"#,
+    );
+    assert_eq!(json["miss"], 2);
+}
+
+#[test]
+fn mapping_get_or_default_amended_function_default_with_unsaveable_replacement() {
+    let json = eval(
+        r#"
+base = new Mapping {
+  default = (k) -> 1
+  ["x"] = new Dynamic { a = 1 }
+  ["y"] = this["x"]
+}
+m = (base) {
+  default = (k) -> 2
+  ["x"] = new Dynamic { a = 2 }
+}
+miss = m.getOrDefault("z")
+"#,
+    );
+    assert_eq!(json["miss"], 2);
+}
+
+#[test]
+fn local_member_does_not_override_a_non_local_inherited_member() {
+    let json = eval(
+        r#"
+open class Foo5 {
+  function f() = "original"
+  x = f()
+}
+class Foo6 extends Foo5 {
+  local function f() = "override"
+}
+res1 = new Foo6 {}.x
+foo5 { l = "original"; x = l }
+res2 = (foo5) { local l = "override" }.x
+"#,
+    );
+    assert_eq!(json["res1"], "original");
+    assert_eq!(json["res2"], "original");
+    assert_eq!(json["foo5"]["l"], "original");
+}
+
+#[test]
+fn function_argument_type_error_names_the_bad_list_element() {
+    let json = eval(
+        r#"
+import "pkl:test"
+local function f(x: List<String>): Int = x.length
+res = test.catch(() -> f(List("foo", 42)))
+"#,
+    );
+    assert_eq!(
+        json["res"],
+        "Expected value of type `String`, but got type `Int`. Value: 42"
+    );
+}
+
+#[test]
+fn function_literal_body_cannot_infer_an_untyped_new() {
+    assert!(eval_fails("foo = () -> new {}").contains("Cannot tell which parent to amend"));
+}
+
+#[test]
+fn generated_members_are_readable_by_bare_name_from_later_siblings() {
+    let v = eval(
+        "a {\n  when (true) {\n    q = 1\n    local secret = 5\n  }\n  t = q\n  u = secret\n}\n",
+    );
+    assert_eq!(v["a"]["t"], 1);
+    assert_eq!(v["a"]["u"], 5);
+    assert!(v["a"].get("secret").is_none());
+}
+
+#[test]
+fn nested_generator_locals_are_readable_after_the_outer_generator() {
+    let v = eval(
+        "a {\n  when (true) {\n    when (true) { local secret = 5 }\n    inside = secret\n  }\n  outside = secret\n}\n",
+    );
+    assert_eq!(v["a"]["inside"], 5);
+    assert_eq!(v["a"]["outside"], 5);
+}
+
+#[test]
+fn a_local_read_by_its_own_body_is_still_bound() {
+    let v = eval(
+        "open class P { x = 1 }\nclass C extends P { local x = 2; y = x }\nc = new C {}\nbase = new Dynamic { x = 1 }\nr = (base) { local x = 2; local y = x; z = y }\n",
+    );
+    assert_eq!(v["c"]["y"], 2);
+    assert_eq!(v["r"]["z"], 2);
+}
+
+#[test]
+fn function_argument_set_for_list_names_the_collection() {
+    let e = eval_fails("function f(x: List<Int>) = x\nr = f(Set(\"a\"))\n");
+    assert!(e.contains("Set"), "{e}");
+    assert!(!e.contains("got type String"), "{e}");
+}
+
+// ============================================================
+// Subscripts, class amendments and spreads of Listing and Mapping
+// ============================================================
+
+#[test]
+fn subscript_errors_name_the_key_or_index() {
+    let val = eval(
+        r#"
+import "pkl:test"
+local l = List(1, 2)
+local m = new Mapping { ["a"] = 1 }
+local li = new Listing { 1 }
+res1 = test.catch(() -> l[5])
+res2 = test.catch(() -> m["b"])
+res3 = test.catch(() -> m[3])
+res4 = test.catch(() -> li[-1])
+res5 = test.catch(() -> l["a"])
+res6 = test.catch(() -> m[1.5])
+"#,
+    );
+    assert_eq!(
+        val["res1"],
+        "Element index `5` is out of range `0`..`1`. Collection: List(1, 2)"
+    );
+    assert_eq!(val["res2"], "Cannot find key `\"b\"`.");
+    assert_eq!(val["res3"], "Cannot find key `3`.");
+    assert_eq!(val["res4"], "Element index `-1` is out of range `0`..`0`.");
+    assert_eq!(
+        val["res5"],
+        "Operator `[]` is not defined for operand types `List` and `String`. Left operand : List(1, 2) Right operand: \"a\""
+    );
+    assert_eq!(val["res6"], "Cannot find key `1.5`.");
+}
+
+#[test]
+fn amending_the_mapping_and_listing_classes_amends_an_empty_one() {
+    let val = eval(
+        r#"
+a = (Mapping) { ["k"] = 1 }
+b = (Listing) { 1; 2 }
+c = (Mapping) { when (true) {} }
+d = (Listing) { when (true) {} }
+e = (Dynamic) { when (true) {} }
+"#,
+    );
+    assert_eq!(val["a"], serde_json::json!({ "k": 1 }));
+    assert_eq!(val["b"], serde_json::json!([1, 2]));
+    assert_eq!(val["c"], serde_json::json!({}));
+    assert_eq!(val["d"], serde_json::json!([]));
+    assert_eq!(val["e"], serde_json::json!({}));
+}
+
+#[test]
+fn spreading_the_wrong_value_into_a_mapping_says_what_it_held() {
+    let val = eval(
+        r#"
+import "pkl:test"
+local listing = new Listing { 1; 2 }
+local dynamic = new Dynamic { 1; foo = "foo" }
+res1 = test.catch(() -> new Mapping { ...listing })
+res2 = test.catch(() -> new Mapping { ...dynamic })
+res3 = test.catch(() -> new Mapping { ...List(1, 2, 3) })
+res4 = test.catch(() -> new Mapping { ...Set(10, 20) })
+"#,
+    );
+    assert_eq!(
+        val["res1"],
+        "Cannot spread object containing elements into object of type `Mapping`."
+    );
+    assert_eq!(
+        val["res2"],
+        "Cannot spread object containing properties into object of type `Mapping`."
+    );
+    assert_eq!(
+        val["res3"],
+        "Cannot spread value of type `List` into object of type `Mapping`. Value: List(1, 2, 3)"
+    );
+    assert_eq!(
+        val["res4"],
+        "Cannot spread value of type `Set` into object of type `Mapping`. Value: Set(10, 20)"
+    );
+}
+
+#[test]
+fn an_amended_mapping_entry_is_seen_by_the_entries_that_read_it() {
+    let val = eval(
+        r#"
+a = new Mapping { ["one"] = 1; ["two"] = this["one"] + 1; ["three"] = 3 }
+b = (a) { ["one"] = 2 }
+c = (a) { ["three"] = 4; ["one"] = 10 }
+"#,
+    );
+    assert_eq!(
+        val["b"],
+        serde_json::json!({ "one": 2, "two": 3, "three": 3 })
+    );
+    assert_eq!(
+        val["c"],
+        serde_json::json!({ "one": 10, "two": 11, "three": 4 })
+    );
+}
+
+#[test]
+fn a_generated_member_may_not_repeat_a_declared_property() {
+    for src in [
+        "x { y = 123; when (true) { y = 456 } }",
+        "x { when (true) { y = 456 }; y = 123 }",
+        "x { y { a = 1 }; when (true) { y = 2 } }",
+    ] {
+        let err = eval_fails(src);
+        assert!(
+            err.contains("Duplicate definition of member `y`."),
+            "{src}: {err}"
+        );
+    }
+    let val =
+        eval("x { y = 1; when (false) { y = 2 } }\nz { when (true) { y = 1 } else { y = 2 } }");
+    assert_eq!(val["x"], serde_json::json!({ "y": 1 }));
+    assert_eq!(val["z"], serde_json::json!({ "y": 1 }));
+}
+
+#[test]
+fn an_amended_mapping_replaces_numeric_entries_and_dynamic_entries_spread() {
+    let v = eval(
+        "a = new Mapping { [1] = 1; [2] = this[1] + 1 }\n\
+         b = (a) { [1] = 10 }\n\
+         r = b[2]\n\
+         local d = new Dynamic { [\"a\"] = 1; [2] = 3 }\n\
+         m = new Mapping { ...d }\n\
+         n = m[2]\n\
+         c = ((Dynamic) { a = 1 }) is Mapping",
+    );
+    assert_eq!(v["r"], 11);
+    assert_eq!(v["n"], 3);
+    assert_eq!(v["c"], false);
+}
+
+#[test]
+fn spreading_a_dynamic_with_generated_properties_into_a_mapping_fails() {
+    let err =
+        eval_fails("local d = new Dynamic { when (true) { a = 1 } }\nm = new Mapping { ...d }");
+    assert!(
+        err.contains("Cannot spread object containing properties"),
+        "{err}"
+    );
+}
+
+#[test]
+fn spreading_a_dynamic_whose_skipped_generator_holds_a_property_works() {
+    let v = eval(
+        "local d = new Dynamic { [\"k\"] = 1; when (false) { p = 2 } }\nm = new Mapping { ...d }\nr = m[\"k\"]",
+    );
+    assert_eq!(v["r"], 1);
+}
+
+#[test]
+fn replacing_an_amended_mapping_entry_drops_its_old_body_amendments() {
+    let v = eval(
+        "a = new Mapping { [\"k\"] = new Dynamic { x = 1 } }\n\
+         b = (a) { [\"k\"] { y = 2 } }\n\
+         c = (b) { [\"k\"] = new Dynamic { z = 3 } }\n\
+         r = c[\"k\"]\n\
+         local u = new { [\"k\"] = 1 }\n\
+         m = new Mapping { ...u }\n\
+         n = m[\"k\"]",
+    );
+    assert_eq!(v["r"], serde_json::json!({"z": 3}));
+    assert_eq!(v["n"], 1);
+}
+
+#[test]
+fn amending_module_rejects_properties_the_base_lacks() {
+    let dir = std::env::temp_dir().join(format!("pklr_amend_unknown_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("base.pkl"), "a = 1\n").unwrap();
+    std::fs::write(dir.join("child.pkl"), "amends \"base.pkl\"\nb = 2\n").unwrap();
+    let r = pklr::eval_to_json(&dir.join("child.pkl"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let msg = format!("{:?}", r.unwrap_err());
+    assert!(msg.contains("Cannot find property `b` in module"), "{msg}");
+}
+
+#[test]
+fn list_to_map_with_key_and_value_functions() {
+    let v = eval(
+        "r = List(1, 2).toMap((x) -> \"k\\(x)\", (x) -> x * 10)\ns = Set(3).toMap((x) -> x, (x) -> x)",
+    );
+    assert_eq!(v["r"], serde_json::json!({"k1": 10, "k2": 20}));
+    assert_eq!(v["s"], serde_json::json!({"3": 3}));
+}
+
+#[test]
+fn map_spread_into_listing_is_rejected() {
+    let e = eval_fails("x = new Listing { ...Map(1, 2) }");
+    assert!(e.contains("Cannot spread"), "{e}");
+}
+
+#[test]
+fn file_uri_base_rejects_undeclared_properties() {
+    let dir = std::env::temp_dir().join(format!("pklr_amend_fileuri_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("base.pkl"), "a = 1\n").unwrap();
+    let uri = format!("file://{}", dir.join("base.pkl").display());
+    std::fs::write(dir.join("child.pkl"), format!("amends \"{uri}\"\nb = 2\n")).unwrap();
+    let r = pklr::eval_to_json(&dir.join("child.pkl"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let msg = format!("{:?}", r.unwrap_err());
+    assert!(
+        msg.contains("Cannot find property `b` in module `base`"),
+        "{msg}"
+    );
+}
+
+// ============================================================
+// Late binding and super calls
+// ============================================================
+
+#[test]
+fn typed_object_entry_error_names_a_generator_body_by_its_expression() {
+    let json = eval(
+        r#"
+import "pkl:test"
+class Person {}
+plain = test.catch(() -> new Person { ["a"] = true })
+generated = test.catch(() -> new Person { when (false) { [0] = 0 }; ["a"] = true })
+"#,
+    );
+    assert_eq!(
+        json["plain"],
+        "Object of type `test#Person` cannot have an entry."
+    );
+    assert_eq!(
+        json["generated"],
+        "Object of type `new Person {}` cannot have an entry."
+    );
+}
+
+#[test]
+fn class_super_method_call_reads_the_receivers_members() {
+    let json = eval(
+        r#"
+open class A {
+  prefix = "a"
+  function say(s: String) = prefix + s
+}
+class B extends A {
+  prefix = "b"
+  function say(s: String) = super.say(s) + "!"
+  greeting = say("hi")
+}
+b = new B {}
+c = new B { prefix = "c" }
+"#,
+    );
+    assert_eq!(json["b"]["greeting"], "bhi!");
+    assert_eq!(json["c"]["greeting"], "chi!");
+}
+
+#[test]
+fn module_super_calls_late_bind_through_an_extends_chain() {
+    let temp = TestTempDir::new("pklr_test_super_calls_chain");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("base.pkl"),
+        "open module base\nprefix = \"a\"\nfunction say(s: String) = prefix + s\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mid.pkl"),
+        "open module mid\nextends \"base.pkl\"\nprefix = \"b\"\nfunction twice() = super.say(\"x\") + super.say(\"y\")\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "extends \"mid.pkl\"\nimport \"pkl:test\"\nprefix = \"c\"\nr1 = twice()\nr2 = super.say(\"z\")\nr3 = test.catch(() -> missing())\nfunction missing() = super.missing()\n",
+    )
+    .unwrap();
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["r1"], "cxcy");
+    assert_eq!(json["r2"], "cz");
+    assert_eq!(json["r3"], "Cannot find method `missing` in module `mid`.");
+}
+
+#[test]
+fn new_class_body_reads_an_enclosing_member_declared_later() {
+    let json = eval(
+        r#"
+class Foo {
+  x: Int
+  y = 1
+}
+v1 {
+  foo = new Foo { x = y }
+  y = 3
+}
+v2 = (v1) { y = 4 }
+v3 = (v1) { foo { y = 5 } }
+"#,
+    );
+    assert_eq!(json["v1"]["foo"]["x"], 3);
+    assert_eq!(json["v2"]["foo"]["x"], 4);
+    assert_eq!(json["v3"]["foo"]["x"], 3);
+    assert_eq!(json["v3"]["foo"]["y"], 5);
+}
+
+#[test]
+fn new_class_body_late_member_read_respects_shadowing_and_wrapping() {
+    let json = eval(
+        r#"
+class Foo { x: Int; y = 1 }
+v {
+  foo = new Foo { x = let (y = 2) y }
+  y = foo.x
+  bar = if (true) new Foo { x = z } else new Foo { x = 0 }
+  z = 3
+  baz = let (q = 1) new Foo { x = z + q }
+}
+"#,
+    );
+    assert_eq!(json["v"]["foo"]["x"], 2);
+    assert_eq!(json["v"]["y"], 2);
+    assert_eq!(json["v"]["bar"]["x"], 3);
+    assert_eq!(json["v"]["baz"]["x"], 4);
+}
+
+#[test]
+fn module_super_call_keeps_the_declaring_modules_locals() {
+    let temp = TestTempDir::new("pklr_test_super_call_locals");
+    let dir = temp.path();
+    std::fs::write(
+        dir.join("base.pkl"),
+        "open module base\nlocal prefix = \"local\"\nfunction say() = prefix\n",
+    )
+    .unwrap();
+    let main = dir.join("main.pkl");
+    std::fs::write(
+        &main,
+        "extends \"base.pkl\"\nprefix = \"child\"\nr = super.say()\n",
+    )
+    .unwrap();
+    let json = pklr::eval_to_json(&main).unwrap();
+    assert_eq!(json["r"], "local");
+}
+
+#[test]
+fn new_class_body_inside_let_reads_the_let_binding() {
+    let json = eval(
+        r#"
+class Foo { x: Int }
+v {
+  foo = let (y = 2) new Foo { x = y }
+  y = foo.x
+}
+"#,
+    );
+    assert_eq!(json["v"]["foo"]["x"], 2);
+    assert_eq!(json["v"]["y"], 2);
+}
+
+#[test]
+fn let_in_an_unused_branch_does_not_hide_reads_in_the_selected_one() {
+    let json = eval(
+        r#"
+class Foo { x: Int; y = 1 }
+v {
+  foo = if (false) let (y = 2) new Foo { x = y } else new Foo { x = y }
+  y = 3
+}
+"#,
+    );
+    assert_eq!(json["v"]["foo"]["x"], 3);
+}
+
+#[test]
+fn map_spread_into_listing_names_map_and_int_seq_has_no_to_map() {
+    let v = eval(
+        "import \"pkl:test\"\n\
+         a = test.catch(() -> new Listing { ...Map() })\n\
+         b = test.catch(() -> IntSeq(1, 3).toMap((x) -> x, (x) -> x))",
+    );
+    assert!(v["a"].as_str().unwrap().contains("type `Map`"), "{v}");
+    assert!(v["b"].as_str().is_some(), "{v}");
+}

@@ -1,0 +1,10 @@
+{
+  "engine_revision": "f20515796cd4986c4f3dcba929fd6ddfdaedc1c1",
+  "verified_against_pristine_upstream_worktree": true,
+  "tests": [
+    "imports::typed_listing_elements_of_recursive_classes_in_an_imported_module",
+    "objects::nested_listing_fallback_only_completes_unresolved_class_names",
+    "objects::nested_listings_of_a_class_naming_itself_build_their_innermost_elements"
+  ],
+  "status": "unresolved native evaluator bugs; not claimed conformant"
+}

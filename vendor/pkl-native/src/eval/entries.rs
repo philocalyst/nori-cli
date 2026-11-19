@@ -1,0 +1,2669 @@
+//! Evaluating properties and the entries of an object body.
+
+use super::*;
+
+impl Evaluator {
+    /// Evaluate a property declared inside a class or object body. A union
+    /// without a selected default stays undefined here, so an instance can
+    /// assign it; only a module property must have a value to render.
+    pub(super) fn eval_property(
+        &mut self,
+        prop: &Property,
+        scope: &Scope,
+        depth: usize,
+    ) -> Result<Option<Value>> {
+        self.eval_property_with(prop, scope, depth, false)
+    }
+
+    /// The error for a value of type `module` that names an imported module,
+    /// which is another module than the one declaring the property.
+    fn other_module_error(&self, import: &str, scope: &Scope) -> Option<String> {
+        let identity = scope.module_identity(import)?;
+        let namespace = scope.type_namespace.as_deref()?;
+        if identity == namespace {
+            return None;
+        }
+        let name_of = |namespace: &str| {
+            self.module_names
+                .get(namespace)
+                .cloned()
+                .unwrap_or_else(|| {
+                    let file = namespace.rsplit(['/', '\\']).next().unwrap_or(namespace);
+                    file.strip_suffix(".pkl").unwrap_or(file).to_string()
+                })
+        };
+        // A local path becomes a `file:` URI; a namespace with a scheme is one.
+        let as_uri = |namespace: &str| {
+            if namespace.contains("://")
+                || namespace.starts_with("modulepath:")
+                || namespace.starts_with("pkl:")
+            {
+                namespace.to_string()
+            } else {
+                match namespace.strip_prefix(r"\\?\UNC\") {
+                    // A verbatim UNC path names `file://server/share/...`.
+                    Some(unc) => format!(
+                        "file://{}",
+                        super::resource::percent_encode(&unc.replace('\\', "/"))
+                    ),
+                    None => super::resource::file_uri(std::path::Path::new(
+                        namespace.strip_prefix(r"\\?\").unwrap_or(namespace),
+                    )),
+                }
+            }
+        };
+        let (expected, actual) = (name_of(namespace), name_of(identity));
+        Some(if expected == actual {
+            format!(
+                "Module version conflict: Expected value of type `{expected}` defined by module `{}`, but got type `{actual}` defined by module `{}`.",
+                as_uri(namespace),
+                as_uri(identity)
+            )
+        } else {
+            format!("Expected value of type `module`, but got a value of type `{actual}`.")
+        })
+    }
+
+    pub(super) fn eval_property_with(
+        &mut self,
+        prop: &Property,
+        scope: &Scope,
+        depth: usize,
+        require_union_default: bool,
+    ) -> Result<Option<Value>> {
+        let tracked = self.spans.enter(prop);
+        let result = self.eval_property_located(prop, scope, depth, require_union_default);
+        if tracked {
+            self.spans.leave(&result);
+        }
+        result
+    }
+
+    fn eval_property_located(
+        &mut self,
+        prop: &Property,
+        scope: &Scope,
+        depth: usize,
+        require_union_default: bool,
+    ) -> Result<Option<Value>> {
+        let result = self.eval_property_unchecked(prop, scope, depth, require_union_default)?;
+        // The members of a declared `Listing` or `Mapping` that an amendment
+        // body makes are checked as they are read too. Only a type of built-in
+        // names is read here: the amending module may not see the others as
+        // the declaring one does, which checks them.
+        if prop.value.is_none()
+            && let Some(ty) = &prop.type_ann
+            && let Some(value) = &result
+            && !super::failed::is_empty_collection(value)
+            && super::failed::type_holds_lazy(ty)
+            && super::failed::names_only_builtins(ty)
+            && type_is_runtime_checkable(ty, scope)
+            && let Ok(coerced) = self.coerce_lazy(value.clone(), ty, scope, depth)
+        {
+            self.last_coerced = Some((coerced.clone(), ty as *const _ as usize));
+            return Ok(Some(coerced));
+        }
+        Ok(result)
+    }
+
+    fn eval_property_unchecked(
+        &mut self,
+        prop: &Property,
+        scope: &Scope,
+        depth: usize,
+        require_union_default: bool,
+    ) -> Result<Option<Value>> {
+        if let Some(expr) = &prop.value {
+            // `x: T = new { ... }` amends T's default, so an untyped `new`
+            // takes its parent from the declared type.
+            let mut value = match &prop.type_ann {
+                Some(ty) if parser::has_untyped_result_new(expr) && type_is_any(ty) => {
+                    return Err(Error::Eval("Cannot tell which parent to amend.".into()));
+                }
+                Some(ty) if parser::has_untyped_result_new(expr) => {
+                    let mut inferred = expr.clone();
+                    if let Some(mixin) = parser::mixin_typed_new(expr, ty) {
+                        inferred = mixin;
+                    } else {
+                        parser::infer_method_return_new(&mut inferred, ty);
+                    }
+                    self.eval_expr(&inferred, scope, depth)?
+                }
+                _ => self.eval_expr(expr, scope, depth)?,
+            };
+            if let Some(crate::parser::TypeExpr::Named(ty)) = &prop.type_ann
+                && ty == "module"
+                && let Expr::Ident(name) = expr
+                && let Some(message) = self.other_module_error(name, scope)
+            {
+                return Err(Error::Eval(message));
+            }
+            apply_mapping_type_annotation(&mut value, prop.type_ann.as_ref(), scope);
+            // The members of a declared `Listing` or `Mapping` are checked as
+            // they are read. A value of the wrong kind is left for the
+            // declaration's own check to report.
+            if let Some(ty) = &prop.type_ann
+                && !super::failed::is_empty_collection(&value)
+                && super::failed::type_holds_lazy(ty)
+                && type_is_runtime_checkable(ty, scope)
+                && let Ok(coerced) = self.coerce_lazy(value.clone(), ty, scope, depth)
+            {
+                self.last_coerced = Some((coerced.clone(), ty as *const _ as usize));
+                value = coerced;
+            }
+            return Ok(Some(value));
+        }
+        if let Some(body) = &prop.body {
+            // An untyped `new` member of a declared `Listing` or `Mapping`
+            // takes its parent from the declared member type.
+            // A listing whose element class the declaring class bound (the
+            // type it names may not be visible here) builds its elements
+            // from that class instead.
+            let bound_class = scope.get(&listing_elem_class_binding(&prop.name)).is_some()
+                && owns_listing_bindings(scope, &prop.name, body);
+            let inferred = prop
+                .type_ann
+                .as_ref()
+                .filter(|_| !bound_class)
+                .and_then(|ty| infer_amendment_members(ty, body, scope));
+            // Inferring rewrites the body, which then has another identity
+            // than the one the amended class recorded its listing bindings for.
+            let declared_body = body;
+            let body = inferred.as_ref().unwrap_or(body);
+            let mut nullable_default = prop
+                .type_ann
+                .as_ref()
+                .and_then(|ty| nullable_inner_default(ty, scope));
+            // A class the declaring module bound to this property is the class to amend,
+            // whatever the type name means in the amending module's scope (which may
+            // declare another class of that name).
+            if let Some(Value::NullDefault(default)) = scope
+                .get(&prop.name)
+                .filter(|_| scope.vars.contains_key(prop.name.as_ref()))
+                && let crate::value::NullDefault::DeferredClass {
+                    class_name,
+                    type_namespace,
+                    class_value: Some(class_value),
+                } = default.as_ref()
+            {
+                nullable_default = Some(self.instantiate_deferred_class(
+                    class_name,
+                    type_namespace.as_deref(),
+                    Some(class_value),
+                    scope,
+                    depth,
+                )?);
+            }
+            // An amendment of an inherited `Listing` property records its
+            // element class where the class declared the type. The type name
+            // may mean something else here (an alias the amending module
+            // shadows with a class), so the default read from it is not the
+            // listing the declaration gives.
+            let declared_listing = matches!(&prop.type_ann, Some(crate::parser::TypeExpr::Nullable(inner))
+                    if matches!(**inner, crate::parser::TypeExpr::Named(_)))
+                && owns_listing_bindings(scope, &prop.name, declared_body);
+            if declared_listing {
+                nullable_default = None;
+            }
+            if let Some(default) = &mut nullable_default {
+                apply_mapping_type_annotation(default, prop.type_ann.as_ref(), scope);
+            }
+            // A body amendment amends a member the receiver itself holds. A
+            // same-named property of an enclosing object, declared or
+            // inherited, is a different member and must not become the base.
+            let scoped = scope
+                .get(&prop.name)
+                .filter(|_| scope.vars.contains_key(prop.name.as_ref()));
+            if let Some(base @ Value::NullDefault(default)) = scoped
+                && !matches!(
+                    default.as_ref(),
+                    crate::value::NullDefault::TypeDefault(_)
+                        | crate::value::NullDefault::DeferredClass { .. }
+                )
+            {
+                return self
+                    .eval_value_amendment(base.clone(), body, scope, depth)
+                    .map(Some);
+            }
+            let amendment_base = scoped
+                .filter(|value| !is_null_value(value))
+                .or(nullable_default.as_ref())
+                .or(scoped);
+            // A union without a `*` alternative has no default, so there is
+            // nothing for the body to amend. A nullable one defaults to null,
+            // and the Dynamic that amending null builds must itself satisfy
+            // the union.
+            if let Some(ty) = &prop.type_ann
+                && (amendment_base.is_none() || amendment_base.is_some_and(is_null_value))
+            {
+                let state = recorded_union_amend(scope, &prop.name, ty, body)
+                    .unwrap_or_else(|| self.union_amend_state(ty, scope));
+                match state {
+                    UnionAmendState::NoDefault if amendment_base.is_none() => {
+                        let message = format!(
+                            "Tried to read property `{}` but its value is undefined.",
+                            prop.name
+                        );
+                        self.spans.failed(&message, Some(prop));
+                        return Err(Error::Eval(message));
+                    }
+                    UnionAmendState::NullDefault(union) => {
+                        return Err(Error::Eval(format!(
+                            "Expected value of type `{union}`, but got type `Dynamic`."
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(Value::List(items)) = amendment_base
+                && matches!(items.kind(), ListKind::List | ListKind::Set)
+            {
+                let class = if items.kind() == ListKind::List {
+                    "List"
+                } else {
+                    "Set"
+                };
+                return Err(Error::Eval(format!(
+                    "Cannot instantiate, or amend an instance of, external class `{class}`."
+                )));
+            }
+            if let Some(function @ Value::Lambda(params, ..)) = amendment_base {
+                return Ok(Some(amended_function(
+                    params.len(),
+                    function.clone(),
+                    body,
+                    scope,
+                )));
+            }
+            // Members make an element-only `Dynamic` one with elements and
+            // members.
+            if let Some(base @ Value::List(items)) = amendment_base
+                && items.kind() == ListKind::Dynamic
+                && entries_define_members(body)
+            {
+                return Ok(Some(self.eval_value_amendment(
+                    base.clone(),
+                    body,
+                    scope,
+                    depth,
+                )?));
+            }
+            if matches!(amendment_base, Some(Value::List(_)))
+                || (!matches!(amendment_base, Some(Value::Object(..)))
+                    && (declared_listing
+                        || prop.type_ann.as_ref().is_some_and(type_is_listing)
+                        || entries_are_listing_amendment(body)))
+            {
+                let items = match amendment_base {
+                    Some(Value::List(existing)) => existing.clone(),
+                    // Amending nothing makes a `Dynamic`, unless the declared
+                    // type is a `Listing` (or an alias or `*` union of one),
+                    // whose default the body amends. Any declared type that
+                    // does not take a `Dynamic` is amended the same way.
+                    _ if prop.type_ann.as_ref().is_some_and(|ty| {
+                        type_is_listing(ty)
+                            || self.union_amend_state(ty, scope) == UnionAmendState::HasDefault
+                            || !self.type_takes_dynamic(ty, scope, &mut Vec::new())
+                    }) =>
+                    {
+                        ListValue::new(ListKind::Listing, Vec::new())
+                    }
+                    _ => ListValue::new(ListKind::Dynamic, Vec::new()),
+                };
+                // A body that amends nothing and defines members besides its
+                // elements makes a `Dynamic` with both, as it does on an
+                // existing element-only one.
+                if items.kind() == ListKind::Dynamic
+                    && !matches!(amendment_base, Some(Value::List(_)))
+                    && entries_define_members(body)
+                {
+                    return Ok(Some(self.eval_value_amendment(
+                        Value::List(items),
+                        body,
+                        scope,
+                        depth,
+                    )?));
+                }
+                // `x: Listing<T>` makes each `new { ... }` element a `T`. A
+                // listing the declaring class built already knows `T`, as does
+                // an amendment of a class's `Listing<T>?` property.
+                // The class the declaring class bound is resolved where the type
+                // was declared, which an element class read from a default
+                // built in this scope (aliases here may shadow it) is not.
+                let bound = match scope
+                    .get(&listing_elem_class_binding(&prop.name))
+                    .filter(|_| owns_listing_bindings(scope, &prop.name, declared_body))
+                {
+                    Some(class @ (Value::Object(..) | Value::List(_) | Value::NullDefault(_))) => {
+                        Some(Arc::new(class.clone()))
+                    }
+                    _ => None,
+                };
+                // A nested listing whose innermost class the declaring scope
+                // could not see (a class naming itself) has no class bound
+                // there: the amending scope may know it.
+                let bound_is_complete = bound.as_deref().is_none_or(has_leaf_class)
+                    || scope
+                        .get(&listing_leaf_unresolved_binding(&prop.name))
+                        .is_none();
+                let elem_class = bound
+                    .clone()
+                    .filter(|_| bound_is_complete)
+                    .or_else(|| items.elem_class().cloned())
+                    .or_else(|| {
+                        prop.type_ann
+                            .as_ref()
+                            .and_then(|ty| self.declared_elem_class(ty, scope))
+                    })
+                    .or(bound);
+                return Ok(Some(Value::List(self.eval_listing_body(
+                    Some(items),
+                    body,
+                    scope,
+                    depth,
+                    elem_class,
+                )?)));
+            }
+            // `foo { ... }` — object body amendment.
+            // If the property already has a value in scope (e.g., from a base class),
+            // amend that value so its ObjectSource (type info, default template) is preserved.
+            if let Some(Value::Object(existing_map, Some(src))) = amendment_base {
+                if !src.mapping_value_types.is_empty() {
+                    // Mapping ObjectSource entries are mapping body entries such as
+                    // `default` and dynamic keys. Rebuild the entry map with the
+                    // type-aware evaluator so single-type and union mappings both keep
+                    // mapping defaults plus converter type metadata after amendment.
+                    let (inherited_scope, mut amendment_scope) =
+                        mapping_amendment_scopes(src.scope(), src.scope_declared(), scope);
+                    amendment_scope.set(
+                        "super",
+                        Value::Object(Arc::clone(existing_map), Some(Arc::clone(src))),
+                    );
+                    let mut receiver_entries = existing_map
+                        .keys()
+                        .map(|key| Entry::DynProperty(Expr::String(Arc::clone(key)), Expr::Null))
+                        .collect::<Vec<_>>();
+                    receiver_entries.extend_from_slice(body);
+                    amendment_scope.receiver_entries = Some(Arc::new(receiver_entries));
+                    let value_type_defaults =
+                        mapping_type_defaults(&src.mapping_value_types, &inherited_scope);
+                    let inherited_default =
+                        self.find_default_template(&src.entries, &inherited_scope, depth)?;
+                    let mut amended = ObjectMap::default();
+                    self.eval_mapping_entries_with_type_default(
+                        &src.entries,
+                        &inherited_scope,
+                        depth,
+                        &mut amended,
+                        &value_type_defaults,
+                        &src.mapping_value_types,
+                        MappingInheritedDefault::default(),
+                    )?;
+                    amended.extend(existing_map.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    self.eval_mapping_entries_with_type_default(
+                        body,
+                        &amendment_scope,
+                        depth,
+                        &mut amended,
+                        &value_type_defaults,
+                        &src.mapping_value_types,
+                        MappingInheritedDefault {
+                            value: inherited_default,
+                            entries: find_default_body_entries(&src.entries),
+                        },
+                    )?;
+                    return Ok(Some(Value::Object(
+                        Arc::new(amended),
+                        Some(Arc::clone(src)),
+                    )));
+                }
+                return Ok(Some(self.eval_amended_object(
+                    existing_map,
+                    src,
+                    body,
+                    scope,
+                    depth,
+                )?));
+            }
+            let mut body_scope = scope.child();
+            body_scope.set("super", Value::Object(Arc::default(), None));
+            let val = self.eval_entries(body, &body_scope, depth)?;
+            return Ok(Some(val));
+        }
+        if let Some(ty) = &prop.type_ann {
+            if let Some(message) = type_default_error(ty, scope) {
+                return Err(Error::Eval(message));
+            }
+            let mut default = type_default_value(ty, scope);
+            // A class used as a property's implicit default denotes a fresh
+            // instance, not its unchecked class template. Rebuild it so
+            // member failures and declared types are checked before the
+            // property can render.
+            if let Some(Value::Object(map, Some(source))) = default.as_ref()
+                && source.type_name.is_some()
+            {
+                let class_identity = source
+                    .type_identity
+                    .clone()
+                    .or_else(|| source.type_name.clone())
+                    .expect("typed class defaults always have an identity or name");
+                if !self.active_typed_defaults.insert(nm(&class_identity)) {
+                    return Err(Error::Eval("recursive typed default".into()));
+                }
+                let instance = self.eval_amended_object(map, source, &[], scope, depth);
+                self.active_typed_defaults.remove(class_identity.as_str());
+                let instance = instance?;
+                // A member the default leaves undefined is only an error if
+                // nothing amends it before it is read.
+                if let Some(message) = rendered_member_failure(&instance)
+                    .filter(|message| !message.ends_with("but its value is undefined."))
+                {
+                    return Err(Error::Eval(message.to_string()));
+                }
+                default = Some(instance);
+            }
+            if let Some(default) = &mut default {
+                match default {
+                    Value::NullDefault(nd) => {
+                        if let crate::value::NullDefault::TypeDefault(mut inner) = (**nd).clone() {
+                            apply_mapping_type_annotation(&mut inner, Some(ty), scope);
+                            if let Value::List(list) = &mut inner
+                                && list.kind() == ListKind::Listing
+                            {
+                                *list = std::mem::take(list)
+                                    .with_elem_class(self.declared_elem_class(ty, scope));
+                            }
+                            *default = Value::NullDefault(Arc::new(
+                                crate::value::NullDefault::TypeDefault(inner),
+                            ));
+                        }
+                    }
+                    other => {
+                        apply_mapping_type_annotation(other, Some(ty), scope);
+                        if let Value::List(list) = other
+                            && list.kind() == ListKind::Listing
+                        {
+                            *list = std::mem::take(list)
+                                .with_elem_class(self.declared_elem_class(ty, scope));
+                        }
+                    }
+                }
+            }
+            // The default of a constrained `Dynamic` is checked against its
+            // constraint like any other value. (Other defaults are template
+            // values that a subclass or amendment may replace.)
+            // Only a module's own property: a class member's default is a
+            // template that an instance replaces.
+            if require_union_default
+                && (names_constrained_dynamic(ty, scope) || names_constrained_collection(ty))
+                && let Some(default) = &default
+            {
+                self.check_declared_value(default, ty, scope, depth)?;
+            }
+            if require_union_default
+                && default.is_none()
+                && matches!(ty, crate::parser::TypeExpr::Union(variants) if !variants.iter().any(is_default_type))
+            {
+                return Err(Error::Eval(format!(
+                    "union property '{}' has no selected default",
+                    prop.name
+                )));
+            }
+            return Ok(default);
+        }
+        Ok(None)
+    }
+
+    pub(super) fn eval_entries(
+        &mut self,
+        entries: &Body,
+        scope: &Scope,
+        depth: usize,
+    ) -> Result<Value> {
+        let mut receiver_scope = scope.clone();
+        receiver_scope.receiver_entries = Some(entries.clone());
+        receiver_scope.receiver_list_base = None;
+        self.eval_entries_with_lexical_scopes(
+            entries,
+            &receiver_scope,
+            depth,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mapping context is independent of inherited source.
+    pub(super) fn eval_entries_with_lexical_scopes(
+        &mut self,
+        entries: &Body,
+        scope: &Scope,
+        depth: usize,
+        entry_scopes: Option<&[Option<Arc<CapturedScope>>]>,
+        inherited_source: Option<&ObjectSource>,
+        initial_non_const_members: Option<&HashSet<Name>>,
+        // Generator bodies do not inherit the receiver's source entries, but
+        // they do inherit its mapping-key semantics.
+        mapping_context: bool,
+        // For a generator body, the members its receiver holds so far. Its
+        // members are the receiver's, so a body amendment (`o { ... }` or
+        // `["k"] { ... }`) amends the receiver's existing member.
+        receiver_members: Option<&ReceiverMembers<'_>>,
+    ) -> Result<Value> {
+        // A Mapping may retain the first spelling of a native-unit key, while
+        // Pkl identity is its normalized amount. Keep that rule in the shared
+        // amendment evaluator rather than selecting a second evaluator from
+        // the key's surface syntax.
+        let mapping_entries = mapping_context
+            || inherited_source.is_some_and(|source| source.kind == ObjectKind::Mapping);
+        let mut child_scope = scope.child();
+        if crate::parser::BARE_GET_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
+            child_scope.set(THIS_CLASS, this_class(inherited_source, mapping_entries));
+        }
+        let entry_owners = entry_scope_owners(entries, entry_scopes, inherited_source);
+        let own_body = own_body_names(entries, entry_scopes, inherited_source);
+        // Inherited members whose entries are evaluated again below. Until its
+        // first entry runs, a member holds the parent's final value.
+        let mut inherited_seeded: HashSet<&str> = HashSet::default();
+        if let Some(source) = inherited_source {
+            for entry in source.entries.iter() {
+                if let Entry::Property(prop) = entry
+                    && !has_modifier(&prop.modifiers, Modifier::Local)
+                    && source.evaluated_properties.contains(&prop.name)
+                    && let Some(value) = source.scope().get(prop.name.as_ref())
+                {
+                    child_scope.set(&prop.name, value.clone());
+                    inherited_seeded.insert(prop.name.as_ref());
+                }
+            }
+        }
+        // Locals of an enclosing object that alias its `this` (`local self =
+        // this`) hold the same snapshot. Drop the ones this body never names so
+        // they are not captured by the object built here; `outer` keeps them
+        // when the body uses `outer`, since `outer.self` would still reach them.
+        let unused_this_aliases = {
+            let aliases = scope.visible_this_aliases();
+            if aliases.is_empty() {
+                aliases
+            } else {
+                let refs = self.body_referenced_roots(entries);
+                if refs.contains("outer") {
+                    Vec::new()
+                } else {
+                    aliases
+                        .into_iter()
+                        .filter(|name| !refs.contains(name))
+                        .collect()
+                }
+            }
+        };
+        // `outer` is only reachable by name, so a body that never mentions it
+        // (the common case) skips flattening the enclosing scope for it.
+        if entries_mention(entries, "outer") || scope.type_aliases_mention("outer") {
+            bind_outer(&mut child_scope, scope, entries, &unused_this_aliases);
+        }
+        // Class-as-a-function definitions commonly use `local self = this` so
+        // output properties can close over the amended instance. Bind `this`
+        // before locals are evaluated, then keep direct aliases synchronized as
+        // properties populate the instance.
+        // A generator body is evaluated as a temporary object, but its `this`
+        // is the enclosing receiver. Seed its receiver view without copying
+        // those members into its output map.
+        let all_props: Arc<ObjectMap> = receiver_members.map_or_else(Arc::default, |members| {
+            let mut receiver = members
+                .outer
+                .map_or_else(ObjectMap::default, |outer| (*outer.own).clone());
+            receiver.extend(
+                members
+                    .own
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            Arc::new(receiver)
+        });
+        let this_aliases = Vec::<Name>::new();
+        // With `pkl:ref` in use, `this` of an instance body keeps the class it
+        // is an instance of, so a Reference to it is a Reference to that type.
+        let this_source = (self.refs.active
+            && inherited_source.is_some_and(|source| source.type_identity.is_some()))
+        .then(|| {
+            inherited_source.map(|source| {
+                let mut source = source.clone();
+                source.kind = ObjectKind::Object;
+                Arc::new(source)
+            })
+        })
+        .flatten();
+        refresh_this_aliases(
+            &mut child_scope,
+            &this_aliases,
+            &all_props,
+            this_source.as_ref(),
+        );
+        // Locals run before properties, so an untyped local may initially be
+        // unable to read a member of this body. Keep only those locals for a
+        // later retry as members bind; typed locals retain their existing
+        // failure behavior.
+        let failed_locals: Vec<usize> = Vec::new();
+        // A property may depend on one of those locals. This is deliberately
+        // narrower than a general object retry: only value properties that
+        // failed while a local was pending are revisited.
+        let failed_properties: Vec<(usize, String)> = Vec::new();
+        // Generators and other output entries can also read one of those
+        // deferred properties. Keep the whole entry for the same retry phase
+        // instead of treating the temporary poison as its final error.
+        let mut failed_entries: Vec<(usize, String)> = Vec::new();
+        // A const local may only read const members. Seed this with actual
+        // inherited members, then add own and generated members as they bind.
+        let mut non_const_members: HashSet<Name> = HashSet::default();
+        if let Some(source) = inherited_source {
+            for name in &source.evaluated_properties {
+                if body_member_is_non_const(&source.entries, name) {
+                    non_const_members.insert(nm(name));
+                }
+            }
+        }
+        if let Some(initial) = initial_non_const_members {
+            non_const_members.extend(initial.iter().cloned());
+        }
+        // An own member shadows an enclosing binding even before evaluation.
+        // Include generator bodies too: an untaken branch must not make a
+        // const local capture an outer member of the same name.
+        let pending_members = body_property_names(entries);
+        let bound_members: HashSet<Name> = HashSet::default();
+        let mut cx = BodyContext {
+            entries,
+            scope,
+            depth,
+            entry_scopes,
+            inherited_source,
+            receiver_members,
+            mapping_entries,
+            entry_owners,
+            own_body,
+            stale_members: inherited_source.map_or_else(Vec::new, |source| {
+                if pending_members.is_empty() {
+                    return Vec::new();
+                }
+                source
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        Entry::Property(prop) if pending_members.contains(&prop.name) => {
+                            Some(prop.name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }),
+            pending_members,
+            deferred_lambdas: Vec::new(),
+            default_template: None,
+            track_dynamic_members: tracks_dynamic_members(entries),
+        };
+        let mut st = BodyState {
+            child_scope,
+            all_props,
+            this_aliases,
+            this_source,
+            failed_locals,
+            failed_properties,
+            deferred_undefined: IndexMap::new(),
+            non_const_members,
+            bound_members,
+            inherited_seeded,
+            map: ObjectMap::default(),
+            member_entry_indices: HashMap::default(),
+            elements: Vec::new(),
+            shadow: None,
+            failed_iteration: 0,
+            resume_from: 0,
+            generated: HashSet::default(),
+            defined_by_layer: None,
+        };
+        // First pass: collect locals, class definitions, and type aliases in
+        // declaration order so they can reference each other correctly.
+        // Non-lambda locals are evaluated eagerly; lambda locals are deferred
+        // to a second pass so they capture the fully-populated scope.
+        cx.deferred_lambdas = self.eval_body_declarations(&cx, &mut st)?;
+        self.guard_const_local_lambdas(
+            &mut st.child_scope,
+            &cx.deferred_lambdas,
+            &st.non_const_members,
+        );
+        cx.default_template = self.eval_default_template(&cx, &st)?;
+        let cx = cx;
+        // An element, spread or generator may read a member declared after it
+        // (`new Dynamic { z; z = 1 }`). One that fails while a member follows
+        // is retried once the members are bound.
+        //
+        // A bare element, a spread and a `when` change nothing when they fail.
+        // A `for` may have emitted its earlier iterations, so it is resumed at
+        // the iteration that failed. No copy of the state is made, and where
+        // a member follows is looked up only for the first such entry.
+        let mut last_member: Option<Option<usize>> = None;
+        let mut shadow_epoch: Option<usize> = None;
+        let mut deferred_elements: Vec<(usize, usize, usize)> = Vec::new();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            // A spread, and the collection or condition of a generator, are
+            // evaluated outside the body and cannot read its members.
+            let element_like = matches!(
+                entry,
+                Entry::Elem(_) | Entry::ForGenerator(_) | Entry::WhenGenerator(_)
+            );
+            // The members of the body that are not bound yet shadow the
+            // enclosing bindings of the same name, so the entry fails on them
+            // and waits.
+            // The set is built again only when a member has been bound since.
+            let mut deferrable = false;
+            if element_like {
+                let last =
+                    *last_member.get_or_insert_with(|| entries.iter().rposition(entry_is_member));
+                deferrable = last.is_some_and(|last| entry_index < last);
+            }
+            if deferrable && !cx.pending_members.is_empty() {
+                if shadow_epoch != Some(st.bound_members.len()) {
+                    shadow_epoch = Some(st.bound_members.len());
+                    let mut pending = cx
+                        .pending_members
+                        .iter()
+                        .filter(|name| !st.bound_members.contains(*name))
+                        .peekable();
+                    st.shadow = pending.peek().is_some().then(|| {
+                        let mut poisoned = (*st.child_scope.poisoned).clone();
+                        for name in pending {
+                            poisoned.insert(name.clone(), format!("undefined variable: {name}"));
+                        }
+                        Arc::new(poisoned)
+                    });
+                }
+            } else if st.shadow.is_some() {
+                st.shadow = None;
+                shadow_epoch = None;
+            }
+            // A generator that fails before its body leaves the marker, which
+            // keeps it from waiting; a `for` sets the iteration it stood at.
+            st.failed_iteration =
+                if matches!(entry, Entry::ForGenerator(_) | Entry::WhenGenerator(_)) {
+                    usize::MAX
+                } else {
+                    0
+                };
+            // Only a failure while locals are still pending is deferred and
+            // retried, so the state is snapshotted only then. Entries never add
+            // to `failed_locals`, so empty before means empty after and the
+            // rollback arm below cannot be taken.
+            let rollback = (!st.failed_locals.is_empty()).then(|| st.clone());
+            let result = self.eval_output_entry(&cx, &mut st, entry_index, entry);
+            match result {
+                Ok(()) => {}
+                Err(Error::Eval(message)) if rollback.is_some() && !st.failed_locals.is_empty() => {
+                    st = rollback.expect("checked by the guard");
+                    failed_entries.push((entry_index, message));
+                }
+                Err(Error::Eval(_)) if deferrable && st.failed_iteration != usize::MAX => {
+                    let resume = std::mem::take(&mut st.failed_iteration);
+                    deferred_elements.push((entry_index, st.elements.len(), resume));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        st.shadow = None;
+        // Revisit only the ordinary value properties deferred because they
+        // read a still-pending local. Once no deferred property recovers, the
+        // first current error is the one Pkl surfaces.
+        self.retry_failed_properties(&cx, &mut st)?;
+        // Elements that read a later member are evaluated now that it is
+        // bound, and keep their place among the elements.
+        let mut inserted = 0;
+        for (entry_index, position, resume) in deferred_elements {
+            let before = st.elements.len();
+            st.resume_from = resume;
+            self.eval_output_entry(&cx, &mut st, entry_index, &entries[entry_index])?;
+            let added = st.elements.split_off(before);
+            let at = position + inserted;
+            inserted += added.len();
+            st.elements.splice(at..at, added);
+        }
+        // Retry non-property output entries only after ordinary properties
+        // have had a chance to resolve their deferred local dependencies.
+        // This includes nested generator bodies, spreads, elements, and
+        // dynamic entries that encountered a temporary poisoned property.
+        self.retry_failed_entries(&cx, &mut st, failed_entries)?;
+        // Evaluate deferred local lambdas (function definitions) AFTER all
+        // properties so they capture overridden values (late binding).
+        self.bind_deferred_lambdas(&cx, &mut st)?;
+        let hidden_aliases = unused_this_aliases
+            .iter()
+            // A binding of the same name made by this body shadows the alias.
+            .filter(|name| {
+                !st.child_scope.vars.contains_key(&**name)
+                    && !st.child_scope.poisoned.contains_key(&**name)
+            })
+            .map(|name| name_of(name))
+            .collect();
+        // A body that yields only elements (`...list`, a generator) makes an
+        // element-only `Dynamic`, as `new Dynamic { 1; 2 }` does.
+        if st.map.is_empty() && st.all_props.is_empty() && !st.elements.is_empty() {
+            return Ok(Value::List(ListValue::new(ListKind::Dynamic, st.elements)));
+        }
+        let source = ObjectSource {
+            entries: entries.clone(),
+            captured: SourceScope::lazy(&st.child_scope, hidden_aliases, Vec::new()),
+            body_members: cx
+                .own_body
+                .clone()
+                .unwrap_or_else(|| entries.iter().filter_map(entry_member_name).collect()),
+            is_open: true, // default: allow new properties
+            is_abstract: false,
+            type_name: None,
+            type_identity: None,
+            display_module: None,
+            parent_type_names: Vec::new(),
+            parent_type_identities: Vec::new(),
+            entry_scopes: cx.entry_scopes.map(<[_]>::to_vec).unwrap_or_default(),
+            evaluated_properties: st.all_props.keys().cloned().collect(),
+            elements: st.elements,
+            mapping_value_types: Vec::new(),
+            deprecated: collect_deprecated(entries),
+            poisoned_members: (!st.deferred_undefined.is_empty())
+                .then(|| Arc::new(std::mem::take(&mut st.deferred_undefined))),
+            module_annotations: inherited_source
+                .and_then(|source| source.module_annotations.clone()),
+            declared_as: None,
+            kind: ObjectKind::Object,
+            is_parsed_json: false,
+            is_module: false,
+            prototype: None,
+        };
+        Ok(Value::Object(Arc::new(st.map), Some(Arc::new(source))))
+    }
+
+    /// Evaluate the locals, classes and type aliases of a body in declaration
+    /// order so they can reference each other. Non-lambda locals are
+    /// evaluated eagerly. Lambda locals are bound now for declaration-order
+    /// visibility, and returned to be bound again once the properties are
+    /// in scope.
+    fn eval_body_declarations<'a>(
+        &mut self,
+        cx: &BodyContext<'a, '_>,
+        st: &mut BodyState<'a>,
+    ) -> Result<Vec<DeferredLambda<'a>>> {
+        // Direct properties are known to be non-const from their declaration,
+        // even before their value binds. Generator members stay absent here
+        // until a branch actually yields them.
+        let declared_direct_non_const_members: HashSet<Name> = cx
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Property(prop)
+                    if !has_modifier(&prop.modifiers, Modifier::Local)
+                        && !has_modifier(&prop.modifiers, Modifier::Const) =>
+                {
+                    Some(prop.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut deferred_lambdas: Vec<(Name, &Property, &crate::parser::Expr, usize)> = Vec::new();
+        for (entry_index, entry) in cx.entries.iter().enumerate() {
+            // Only locals, classes and type aliases are handled in this pass,
+            // so build the entry's scope only for those.
+            if !matches!(
+                entry,
+                Entry::Property(prop)
+                    if has_modifier(&prop.modifiers, Modifier::Local) && prop.value.is_some()
+            ) && !matches!(entry, Entry::ClassDef(..) | Entry::TypeAlias(..))
+            {
+                continue;
+            }
+            let mut active_scope = scope_for_object_entry(
+                entry_index,
+                &st.child_scope,
+                cx.entry_scopes,
+                &cx.entry_owners,
+                cx.own_body_scope(),
+            );
+            if matches!(entry, Entry::Property(prop)
+                if has_modifier(&prop.modifiers, Modifier::Local)
+                    && (!matches!(prop.value.as_ref(), Some(Expr::Lambda(..)))
+                        || has_modifier(&prop.modifiers, Modifier::Const)))
+            {
+                for name in cx
+                    .pending_members
+                    .iter()
+                    .filter(|name| !st.bound_members.contains(*name))
+                {
+                    active_scope.poison(name.clone(), format!("undefined variable: {name}"));
+                }
+            }
+            match entry {
+                Entry::Property(prop)
+                    if has_modifier(&prop.modifiers, Modifier::Local) && prop.value.is_some() =>
+                {
+                    let expr = prop.value.as_ref().unwrap();
+                    // Bind every local in declaration order so later locals and
+                    // entries can reference it (e.g. a non-lambda local that
+                    // calls a lambda local defined just above it).
+                    let is_lambda = matches!(expr, Expr::Lambda(..));
+                    let const_message = if is_lambda {
+                        let mut lambda_non_const_members = st.non_const_members.clone();
+                        lambda_non_const_members
+                            .extend(declared_direct_non_const_members.iter().cloned());
+                        const_local_reads_non_const(prop, &lambda_non_const_members)
+                    } else {
+                        const_local_reads_non_const(prop, &st.non_const_members)
+                    };
+                    let result = if is_lambda {
+                        self.eval_expr(expr, &active_scope, cx.depth)
+                            .map(|value| self.const_local_lambda_guard(value, const_message))
+                            .and_then(|value| match &prop.type_ann {
+                                Some(ty) => {
+                                    self.check_local_value(value, ty, &active_scope, cx.depth)
+                                }
+                                None => Ok(value),
+                            })
+                    } else {
+                        match const_message {
+                            Some(message) => Err(Error::Eval(message)),
+                            None => {
+                                let mixin = prop
+                                    .type_ann
+                                    .as_ref()
+                                    .and_then(|ty| parser::mixin_typed_new(expr, ty));
+                                self.eval_expr(
+                                    mixin.as_ref().unwrap_or(expr),
+                                    &active_scope,
+                                    cx.depth,
+                                )
+                                .and_then(|value| {
+                                    // A declared type is checked when the local
+                                    // is read, so a mismatch poisons it.
+                                    match &prop.type_ann {
+                                        Some(ty) => self.check_local_value(
+                                            value,
+                                            ty,
+                                            &active_scope,
+                                            cx.depth,
+                                        ),
+                                        None => Ok(value),
+                                    }
+                                })
+                            }
+                        }
+                    };
+                    // Release the entry scope before binding, as for properties.
+                    drop(active_scope);
+                    match result {
+                        Ok(val) => {
+                            if cx.binds_declared(&prop.name) {
+                                st.child_scope.declare(&prop.name, val);
+                            } else {
+                                st.child_scope.set(&prop.name, val);
+                            }
+                            if matches!(expr, Expr::Ident(name) if name == "this" || st.this_aliases.iter().any(|alias| **alias == **name))
+                            {
+                                st.this_aliases.push(prop.name.clone());
+                                st.child_scope.mark_this_alias(&prop.name);
+                            }
+                        }
+                        Err(Error::Eval(message)) => {
+                            if prop.type_ann.is_none()
+                                && const_local_reads_non_const(prop, &st.non_const_members)
+                                    .is_none()
+                            {
+                                st.failed_locals.push(entry_index);
+                            }
+                            if cx.binds_declared(&prop.name) {
+                                st.child_scope.declare_poisoned(prop.name.clone(), message);
+                            } else {
+                                st.child_scope.poison(prop.name.clone(), message);
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if matches!(expr, crate::parser::Expr::Lambda(..)) {
+                        // Lambda evaluation only captures the current scope; it
+                        // does not run the body. Bind once for declaration-order
+                        // visibility, then re-bind after properties for late
+                        // binding of overrides.
+                        deferred_lambdas.push((prop.name.clone(), prop, expr, entry_index));
+                    }
+                }
+                Entry::ClassDef(name, class_mods, parent, body) => {
+                    let defaults = self.eval_class_def(
+                        name,
+                        class_mods,
+                        parent.as_deref(),
+                        body,
+                        &active_scope,
+                        cx.depth,
+                    )?;
+                    if cx.binds_declared(name) {
+                        st.child_scope.declare(name, defaults);
+                    } else {
+                        st.child_scope.set(name, defaults);
+                    }
+                }
+                Entry::TypeAlias(name, ty, generic) => {
+                    let mut resolved_scope = active_scope;
+                    self.eval_type_alias(name, ty, generic.as_ref(), &mut resolved_scope);
+                    st.child_scope.set_type_alias(name.clone(), ty.clone());
+                    if let Some(generic) = generic {
+                        st.child_scope.set_type_alias(
+                            generic_alias_key(name),
+                            crate::parser::TypeExpr::Generic(
+                                generic.0.join(","),
+                                vec![generic.1.clone()],
+                            ),
+                        );
+                    }
+                    if let Some(value) = resolved_scope.vars.get(name.as_str()) {
+                        st.child_scope.set(name, value.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(deferred_lambdas)
+    }
+
+    /// Evaluate the body's `default` property, the template its other entries
+    /// amend.
+    fn eval_default_template(&mut self, cx: &BodyContext, st: &BodyState) -> Result<Option<Value>> {
+        let mut default_template: Option<Value> = None;
+        for (entry_index, entry) in cx.entries.iter().enumerate() {
+            let Entry::Property(prop) = entry else {
+                continue;
+            };
+            if &*prop.name != "default" || has_modifier(&prop.modifiers, Modifier::Local) {
+                continue;
+            }
+            let mut active_scope = scope_for_object_entry(
+                entry_index,
+                &st.child_scope,
+                cx.entry_scopes,
+                &cx.entry_owners,
+                cx.own_body_scope(),
+            );
+            if let Some(template) = &default_template {
+                active_scope.set("default", template.clone());
+            }
+            default_template = self.eval_property(prop, &active_scope, cx.depth)?;
+        }
+        Ok(default_template)
+    }
+
+    /// Retry the untyped locals that failed because they read a member not
+    /// yet bound, until a pass recovers none.
+    fn retry_failed_locals(&mut self, cx: &BodyContext, st: &mut BodyState) -> Result<()> {
+        let mut recovered = true;
+        while recovered {
+            recovered = false;
+            let mut retry_index = 0;
+            while retry_index < st.failed_locals.len() {
+                let entry_index = st.failed_locals[retry_index];
+                let Entry::Property(prop) = &cx.entries[entry_index] else {
+                    unreachable!("only local properties are retried");
+                };
+                let Some(expr) = &prop.value else {
+                    unreachable!("only valued local properties are retried");
+                };
+                if let Some(message) = const_local_reads_non_const(prop, &st.non_const_members) {
+                    if cx.binds_declared(&prop.name) {
+                        st.child_scope.declare_poisoned(prop.name.clone(), message);
+                    } else {
+                        st.child_scope.poison(prop.name.clone(), message);
+                    }
+                    st.failed_locals.swap_remove(retry_index);
+                    continue;
+                }
+                let mut active_scope = scope_for_object_entry(
+                    entry_index,
+                    &st.child_scope,
+                    cx.entry_scopes,
+                    &cx.entry_owners,
+                    cx.own_body_scope(),
+                );
+                for name in cx
+                    .pending_members
+                    .iter()
+                    .filter(|name| !st.bound_members.contains(*name))
+                {
+                    active_scope.poison(name.clone(), format!("undefined variable: {name}"));
+                }
+                let result = self.eval_expr(expr, &active_scope, cx.depth);
+                drop(active_scope);
+                match result {
+                    Ok(value) => {
+                        if cx.binds_declared(&prop.name) {
+                            st.child_scope.declare(&prop.name, value);
+                        } else {
+                            st.child_scope.set(&prop.name, value);
+                        }
+                        if matches!(expr, Expr::Ident(name) if name == "this" || st.this_aliases.iter().any(|alias| **alias == **name))
+                        {
+                            st.this_aliases.push(prop.name.clone());
+                            st.child_scope.mark_this_alias(&prop.name);
+                        }
+                        st.failed_locals.swap_remove(retry_index);
+                        recovered = true;
+                    }
+                    Err(Error::Eval(message)) => {
+                        if cx.binds_declared(&prop.name) {
+                            st.child_scope.declare_poisoned(prop.name.clone(), message);
+                        } else {
+                            st.child_scope.poison(prop.name.clone(), message);
+                        }
+                        retry_index += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind a property's value in the body: in its scope, its members and,
+    /// unless hidden, its output. A `recovered` property, one evaluated again
+    /// after its local bound, returns to its declaration position.
+    fn bind_object_property_value(
+        &mut self,
+        cx: &BodyContext,
+        st: &mut BodyState,
+        prop: &Property,
+        value: Value,
+        entry_index: usize,
+        recovered: bool,
+    ) -> Result<()> {
+        st.generated.remove(prop.name.as_ref());
+        if cx.binds_declared(&prop.name) {
+            st.child_scope.declare(&prop.name, value.clone());
+        } else {
+            st.child_scope.set(&prop.name, value.clone());
+        }
+        cx.entry_owners.release_this(&st.this_aliases);
+        if recovered {
+            let index = st
+                .all_props
+                .iter()
+                .position(|(key, _)| {
+                    st.member_entry_indices
+                        .get(key)
+                        .is_some_and(|existing| *existing > entry_index)
+                })
+                .unwrap_or_else(|| st.all_props.len());
+            props_shift_insert(
+                &mut st.child_scope,
+                &st.this_aliases,
+                &mut st.all_props,
+                index,
+                prop.name.clone(),
+                value.clone(),
+            );
+        } else {
+            props_insert(
+                &mut st.child_scope,
+                &st.this_aliases,
+                &mut st.all_props,
+                prop.name.clone(),
+                value.clone(),
+            );
+        }
+        if !has_modifier(&prop.modifiers, Modifier::Hidden) {
+            if recovered {
+                let index = st
+                    .map
+                    .iter()
+                    .position(|(key, _)| {
+                        st.member_entry_indices
+                            .get(key)
+                            .is_some_and(|existing| *existing > entry_index)
+                    })
+                    .unwrap_or_else(|| st.map.len());
+                shift_insert_at(&mut st.map, index, prop.name.as_ref().into(), value);
+            } else {
+                st.map.insert(prop.name.as_ref().into(), value);
+            }
+        }
+        st.member_entry_indices
+            .insert(prop.name.as_ref().into(), entry_index);
+        if !has_modifier(&prop.modifiers, Modifier::Const) {
+            st.non_const_members.insert(prop.name.clone());
+        }
+        st.bound_members.insert(prop.name.clone());
+        self.guard_const_local_lambdas(
+            &mut st.child_scope,
+            &cx.deferred_lambdas,
+            &st.non_const_members,
+        );
+        refresh_this_aliases(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &st.all_props,
+            st.this_source.as_ref(),
+        );
+        self.retry_failed_locals(cx, st)?;
+        Ok(())
+    }
+
+    /// Evaluate one output entry of a body: a property, a dynamic member, a
+    /// spread, a generator or an element.
+    fn eval_output_entry<'a>(
+        &mut self,
+        cx: &BodyContext<'a, '_>,
+        st: &mut BodyState<'a>,
+        entry_index: usize,
+        entry: &'a Entry,
+    ) -> Result<()> {
+        match entry {
+            Entry::Property(prop) => {
+                self.eval_property_entry(cx, st, entry_index, prop)?;
+            }
+            Entry::DynProperty(key_expr, val_expr) => {
+                self.eval_dynamic_entry(cx, st, entry_index, key_expr, val_expr)?;
+            }
+            Entry::Spread(expr) => {
+                let active_scope = scope_for_object_entry(
+                    entry_index,
+                    &st.child_scope,
+                    cx.entry_scopes,
+                    &cx.entry_owners,
+                    cx.own_body_scope(),
+                );
+                let val = self.eval_expr(expr, &active_scope, cx.depth)?;
+                check_iterable(&val)?;
+                match val {
+                    Value::Object(m, source) => {
+                        if let Some(inherited) = cx.inherited_source
+                            && let Some(message) =
+                                immutable_copied_member_error(m.keys(), inherited)
+                        {
+                            return Err(Error::Eval(message));
+                        }
+                        drop(active_scope);
+                        check_spread_duplicates(cx, entry_index, &m)?;
+                        // An instance of a closed class has no members its class
+                        // does not declare, which a spread cannot add either.
+                        if let Some(inherited) = cx.inherited_source
+                            && !inherited.is_open
+                            && matches!(inherited.kind, ObjectKind::Object | ObjectKind::Class)
+                            && let Some(class) = &inherited.type_name
+                            && let Some(key) = m.keys().find(|key| {
+                                !inherited.entries.iter().any(|entry| {
+                                    matches!(entry, Entry::Property(p)
+                                        if *p.name == ***key
+                                            && !p.is_method
+                                            && !has_modifier(&p.modifiers, Modifier::Local))
+                                })
+                            })
+                        {
+                            return Err(Error::Eval(format!(
+                                "Cannot find property `{key}` in object of type `{class}`."
+                            )));
+                        }
+                        cx.entry_owners.release_this(&st.this_aliases);
+                        props_extend_mapping(
+                            &mut st.child_scope,
+                            &st.this_aliases,
+                            &mut st.all_props,
+                            m.iter().map(|(k, v)| (k.clone(), v.clone())),
+                            cx.mapping_entries,
+                        );
+                        extend_object_entries(&mut st.map, &m, cx.mapping_entries);
+                        st.member_entry_indices
+                            .extend(m.keys().cloned().map(|key| (key, entry_index)));
+                        if let Some(source) = source {
+                            st.elements.extend(source.elements.iter().cloned());
+                        }
+                        refresh_this_aliases(
+                            &mut st.child_scope,
+                            &st.this_aliases,
+                            &st.all_props,
+                            st.this_source.as_ref(),
+                        );
+                    }
+                    Value::List(items) => st.elements.extend(items.iter().cloned()),
+                    _ => unreachable!("check_iterable accepted an unsupported value"),
+                }
+            }
+            Entry::ForGenerator(fgen) => {
+                let active_scope = scope_for_object_entry(
+                    entry_index,
+                    &st.child_scope,
+                    cx.entry_scopes,
+                    &cx.entry_owners,
+                    cx.own_body_scope(),
+                );
+                let collection = self.eval_expr(&fgen.collection, &active_scope, cx.depth)?;
+                let items = collection_to_items(collection)?;
+                let resume = std::mem::take(&mut st.resume_from);
+                for (iteration, (k, v)) in items.into_iter().enumerate().skip(resume) {
+                    // Where the loop stands if this iteration fails.
+                    st.failed_iteration = iteration;
+                    let mut iter_scope = shadowed(active_scope.child(), &st.shadow);
+                    iter_scope.set(&fgen.val_var, v);
+                    if let Some(key_var) = &fgen.key_var {
+                        iter_scope.set(key_var, k);
+                    }
+                    let body_val = self.eval_entries_with_lexical_scopes(
+                        &fgen.body,
+                        &iter_scope,
+                        cx.depth,
+                        None,
+                        None,
+                        None,
+                        cx.mapping_entries,
+                        Some(&ReceiverMembers {
+                            own: &st.all_props,
+                            outer: cx.receiver_members,
+                        }),
+                    )?;
+                    match body_val {
+                        Value::Object(m, source) => {
+                            self.merge_generated_members(
+                                cx,
+                                st,
+                                entry_index,
+                                &fgen.body,
+                                &m,
+                                source,
+                            )?;
+                        }
+                        // A body of only elements.
+                        Value::List(items) => st.elements.extend(items.iter().cloned()),
+                        _ => {}
+                    }
+                }
+            }
+            Entry::WhenGenerator(wgen) => {
+                let condition_scope = scope_for_object_entry(
+                    entry_index,
+                    &st.child_scope,
+                    cx.entry_scopes,
+                    &cx.entry_owners,
+                    cx.own_body_scope(),
+                );
+                let cond = self.eval_expr(&wgen.condition, &condition_scope, cx.depth)?;
+                // From here a failure is in the body, which may read a later
+                // member.
+                st.failed_iteration = 0;
+                let active_scope = shadowed(condition_scope, &st.shadow);
+                if expect_bool(&cond)? {
+                    let body_val = self.eval_entries_with_lexical_scopes(
+                        &wgen.body,
+                        &active_scope,
+                        cx.depth,
+                        None,
+                        None,
+                        None,
+                        cx.mapping_entries,
+                        Some(&ReceiverMembers {
+                            own: &st.all_props,
+                            outer: cx.receiver_members,
+                        }),
+                    )?;
+                    match body_val {
+                        Value::Object(m, source) => {
+                            self.merge_generated_members(
+                                cx,
+                                st,
+                                entry_index,
+                                &wgen.body,
+                                &m,
+                                source,
+                            )?;
+                        }
+                        Value::List(items) => st.elements.extend(items.iter().cloned()),
+                        _ => {}
+                    }
+                } else if let Some(else_body) = &wgen.else_body {
+                    let else_val = self.eval_entries_with_lexical_scopes(
+                        else_body,
+                        &active_scope,
+                        cx.depth,
+                        None,
+                        None,
+                        None,
+                        cx.mapping_entries,
+                        Some(&ReceiverMembers {
+                            own: &st.all_props,
+                            outer: cx.receiver_members,
+                        }),
+                    )?;
+                    match else_val {
+                        Value::Object(m, source) => {
+                            self.merge_generated_members(
+                                cx,
+                                st,
+                                entry_index,
+                                else_body,
+                                &m,
+                                source,
+                            )?;
+                        }
+                        Value::List(items) => st.elements.extend(items.iter().cloned()),
+                        _ => {}
+                    }
+                }
+            }
+            Entry::Elem(_) if cx.mapping_entries => {
+                return Err(Error::Eval(
+                    "Object of type `Mapping` cannot have an element.".into(),
+                ));
+            }
+            Entry::Elem(expr) => {
+                let active_scope = shadowed(
+                    scope_for_object_entry(
+                        entry_index,
+                        &st.child_scope,
+                        cx.entry_scopes,
+                        &cx.entry_owners,
+                        cx.own_body_scope(),
+                    ),
+                    &st.shadow,
+                );
+                st.elements
+                    .push(self.eval_expr(expr, &active_scope, cx.depth + 1)?);
+            }
+            Entry::ClassDef(..) | Entry::TypeAlias(..) => {} // handled in scope setup
+            Entry::Predicate(..) => return Err(member_predicates_unsupported()),
+        }
+        Ok(())
+    }
+
+    /// Evaluate a property entry of the body and bind its value.
+    fn eval_property_entry(
+        &mut self,
+        cx: &BodyContext,
+        st: &mut BodyState,
+        entry_index: usize,
+        prop: &Property,
+    ) -> Result<()> {
+        let mods = &prop.modifiers;
+        if has_modifier(mods, Modifier::Local) {
+            return Ok(());
+        }
+        // Skip the `default` property — it's a template, not an output entry
+        if &*prop.name == "default" && cx.default_template.is_some() {
+            return Ok(());
+        }
+        if has_modifier(mods, Modifier::Abstract) && prop.value.is_none() && prop.body.is_none() {
+            return Ok(()); // abstract without value — skip (must be overridden)
+        }
+        // The first entry of a re-evaluated inherited member starts
+        // its amendment chain. Amending the parent's final value
+        // would apply the inherited bodies twice (`l { 1 }`
+        // amended again with `1`), so it starts from no value.
+        if st.inherited_seeded.remove(prop.name.as_ref())
+            && prop.value.is_none()
+            && prop.body.is_some()
+        {
+            st.child_scope.set(&prop.name, Value::Null);
+        }
+        refresh_this_aliases(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &st.all_props,
+            st.this_source.as_ref(),
+        );
+        let mut active_scope = scope_for_object_entry(
+            entry_index,
+            &st.child_scope,
+            cx.entry_scopes,
+            &cx.entry_owners,
+            cx.own_body_scope(),
+        );
+        // An amendment of a member whose own value is deferred waits for it.
+        if prop.value.is_none()
+            && prop.body.is_some()
+            && !st.failed_properties.is_empty()
+            && let Some(message) = st.failed_properties.iter().find_map(|(index, message)| {
+                matches!(&cx.entries[*index], Entry::Property(failed) if failed.name == prop.name)
+                    .then(|| message.clone())
+            })
+        {
+            st.failed_properties.push((entry_index, message));
+            return Ok(());
+        }
+        // eval_property amends the value bound for the name in the
+        // receiver's own scope. A generator body can amend both a
+        // member previously generated in this body and one held by
+        // its enclosing receiver.
+        if prop.value.is_none()
+            && prop.body.is_some()
+            && let Some(existing) = st.all_props.get(prop.name.as_ref()).or_else(|| {
+                cx.receiver_members
+                    .and_then(|members| members.get(prop.name.as_ref()))
+            })
+        {
+            active_scope.set(&prop.name, existing.clone());
+        }
+        // A member declared later in this body shadows an enclosing or
+        // inherited binding of the name, so a read of it waits for the member
+        // rather than seeing the stale value.
+        // A lambda or method only captures its scope, and a poisoned binding
+        // would be captured with it.
+        if !cx.stale_members.is_empty() {
+            poison_stale_members(cx, st, prop, &mut active_scope);
+        }
+        if matches!(
+            prop.value,
+            Some(Expr::New(Some(_), ..) | Expr::If(..) | Expr::Let(..))
+        ) && !cx.pending_members.is_empty()
+        {
+            poison_pending_reads(cx, st, prop, &mut active_scope);
+        }
+        let retryable = (prop.value.is_some() || prop.body.is_some())
+            && (!st.failed_locals.is_empty()
+                || cx
+                    .pending_members
+                    .iter()
+                    .any(|name| *name != prop.name && !st.bound_members.contains(name)));
+        let deferred_before = self.unresolved_deferred;
+        let evaluated = self.eval_property(prop, &active_scope, cx.depth);
+        // A member that failed on a bare name may resolve on a retry, so the
+        // property is retried before the failed member is accepted.
+        let evaluated = match evaluated {
+            Ok(_) if retryable && self.unresolved_deferred != deferred_before => {
+                Err(Error::Eval(self.last_unresolved.clone()))
+            }
+            other => other,
+        };
+        let value = match evaluated {
+            Ok(value) => value,
+            Err(Error::Eval(message)) if retryable => {
+                // This body declaration shadows an enclosing or
+                // inherited property even while its local
+                // dependency is unresolved. Keep later members
+                // from binding that stale value before retry.
+                drop(active_scope);
+                if cx.binds_declared(&prop.name) {
+                    st.child_scope
+                        .declare_poisoned(prop.name.clone(), message.clone());
+                } else {
+                    st.child_scope.poison(prop.name.clone(), message.clone());
+                }
+                st.failed_properties.push((entry_index, message));
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        // Release the entry scope first: it may share the object
+        // scope's bindings, which binding the value would then copy.
+        drop(active_scope);
+        if let Some(v) = value {
+            self.bind_object_property_value(cx, st, prop, v, entry_index, false)?;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate a dynamic member, `[key] = value` or `[key] { ... }`, which
+    /// amends an existing entry of that key.
+    fn eval_dynamic_entry(
+        &mut self,
+        cx: &BodyContext,
+        st: &mut BodyState,
+        entry_index: usize,
+        key_expr: &Expr,
+        val_expr: &Expr,
+    ) -> Result<()> {
+        let active_scope = scope_for_object_entry(
+            entry_index,
+            &st.child_scope,
+            cx.entry_scopes,
+            &cx.entry_owners,
+            cx.own_body_scope(),
+        );
+        let class_key = self.class_key_of(key_expr, &active_scope);
+        let key = class_key
+            .is_none()
+            .then(|| self.eval_expr(key_expr, &active_scope, cx.depth))
+            .transpose()?;
+        let key_str = match class_key {
+            Some(key) => key,
+            None => value_to_key(key.as_ref().expect("non-class mapping keys are evaluated"))?,
+        };
+        let storage_key = if cx.mapping_entries {
+            equivalent_mapping_key(&st.map, &key_str).unwrap_or_else(|| key_str.clone())
+        } else {
+            key_str.clone()
+        };
+        if cx.mapping_entries
+            && let Some(key) = key.as_ref()
+        {
+            self.remember_mapping_key(storage_key.clone(), key);
+        }
+        // A body may define each key once. An object body still
+        // amends an inherited value, but it is a definition in
+        // this body and must participate in duplicate detection.
+        if cx.track_dynamic_members {
+            let defined_by_layer = st.defined_by_layer.get_or_insert_default();
+            let layer = entry_layer(cx.entry_scopes, entry_index);
+            let duplicate = cx.mapping_entries
+                && defined_by_layer.iter().any(|(defined_layer, defined_key)| {
+                    *defined_layer == layer
+                        && crate::value::mapping_storage_keys_equal(defined_key, &key_str)
+                });
+            if duplicate || !defined_by_layer.insert((layer, key_str.clone())) {
+                let key = match key.as_ref() {
+                    None => key_str.to_string(),
+                    Some(Value::String(s)) => format!("{s:?}"),
+                    Some(key) => value_to_display(key),
+                };
+                return Err(Error::Eval(format!(
+                    "Duplicate definition of member `{key}`."
+                )));
+            }
+        }
+        // `["key"] { ... }` amends an entry inherited from the parent
+        // (for example when amending an untyped `Mapping`) rather than
+        // replacing it.
+        if let Expr::ObjectBody(body) = val_expr
+            && let Some(existing @ (Value::Object(..) | Value::List(_))) = st
+                .map
+                .get(&storage_key)
+                .or_else(|| {
+                    cx.receiver_members.and_then(|members| {
+                        if cx.mapping_entries {
+                            equivalent_mapping_key(members.own, &key_str)
+                                .and_then(|key| members.own.get(&key))
+                                .or_else(|| {
+                                    members.outer.and_then(|outer| {
+                                        equivalent_mapping_key(outer.own, &key_str)
+                                            .and_then(|key| outer.own.get(&key))
+                                    })
+                                })
+                        } else {
+                            members.get(&key_str)
+                        }
+                    })
+                })
+                .cloned()
+        {
+            // A listing amendment only takes elements, so a property
+            // would otherwise be dropped silently. Reject it as Pkl does.
+            if matches!(existing, Value::List(_))
+                && let Some(name) = find_listing_body_property(body)
+            {
+                return Err(Error::Eval(format!(
+                    "cannot amend listing entry '{key_str}' with property '{name}': \
+                         object of type Listing cannot have a property (other than default)"
+                )));
+            }
+            let val = self.eval_value_amendment(existing, body, &active_scope, cx.depth)?;
+            drop(active_scope);
+            cx.entry_owners.release_this(&st.this_aliases);
+            props_insert_mapping(
+                &mut st.child_scope,
+                &st.this_aliases,
+                &mut st.all_props,
+                storage_key.clone(),
+                val.clone(),
+                cx.mapping_entries,
+            );
+            st.member_entry_indices
+                .insert(storage_key.clone(), entry_index);
+            st.map.insert(storage_key, val);
+            refresh_this_aliases(
+                &mut st.child_scope,
+                &st.this_aliases,
+                &st.all_props,
+                st.this_source.as_ref(),
+            );
+            self.retry_failed_locals(cx, st)?;
+            return Ok(());
+        }
+        let val = if let Some(Value::Object(template_map, Some(src))) = &cx.default_template
+            && let Expr::ObjectBody(body) = val_expr
+        {
+            // Default template has ObjectSource — use eval_amended_object
+            // so nested property amendments work properly.
+            let mut result =
+                self.eval_amended_object(template_map, src, body, &active_scope, cx.depth)?;
+            // Propagate the template's type_name so converters can match.
+            if let Some(ref tn) = src.type_name
+                && let Value::Object(_, ref mut result_src) = result
+            {
+                let new_src = match result_src.take() {
+                    Some(s) => {
+                        let mut ns = Arc::unwrap_or_clone(s);
+                        ns.type_name = Some(tn.clone());
+                        ns
+                    }
+                    None => ObjectSource {
+                        entries: vec![].into(),
+                        captured: SourceScope::default(),
+                        body_members: HashSet::default(),
+                        is_open: true,
+                        is_abstract: false,
+                        type_name: Some(tn.clone()),
+                        type_identity: src.type_identity.clone(),
+                        display_module: src.display_module.clone(),
+                        parent_type_names: src.parent_type_names.clone(),
+                        parent_type_identities: src.parent_type_identities.clone(),
+                        entry_scopes: Vec::new(),
+                        evaluated_properties: Vec::new(),
+                        elements: Vec::new(),
+                        mapping_value_types: Vec::new(),
+                        deprecated: merge_deprecated(&src.deprecated, body),
+                        poisoned_members: None,
+                        module_annotations: src.module_annotations.clone(),
+                        declared_as: None,
+                        kind: ObjectKind::Object,
+                        is_parsed_json: false,
+                        is_module: false,
+                        prototype: None,
+                    },
+                };
+                *result_src = Some(std::sync::Arc::new(new_src));
+            }
+            result
+        } else {
+            let mut val = self.eval_expr(val_expr, &active_scope, cx.depth)?;
+            if let Some(ref tpl) = cx.default_template {
+                val = merge_values(tpl.clone(), val);
+            }
+            val
+        };
+        drop(active_scope);
+        cx.entry_owners.release_this(&st.this_aliases);
+        props_insert_mapping(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &mut st.all_props,
+            storage_key.clone(),
+            val.clone(),
+            cx.mapping_entries,
+        );
+        st.member_entry_indices
+            .insert(storage_key.clone(), entry_index);
+        st.map.insert(storage_key, val);
+        refresh_this_aliases(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &st.all_props,
+            st.this_source.as_ref(),
+        );
+        self.retry_failed_locals(cx, st)?;
+
+        Ok(())
+    }
+    /// Merge the members a generator body produced into this body: its
+    /// members and output, its elements, and the members const locals may not
+    /// read. Locals waiting on a member are then retried.
+    fn merge_generated_members(
+        &mut self,
+        cx: &BodyContext,
+        st: &mut BodyState,
+        entry_index: usize,
+        body: &Body,
+        m: &ObjectMap,
+        source: Option<Arc<ObjectSource>>,
+    ) -> Result<()> {
+        if let Some(inherited) = cx.inherited_source
+            && let Some(message) = immutable_copied_member_error(m.keys(), inherited)
+        {
+            return Err(Error::Eval(message));
+        }
+        if cx.track_dynamic_members {
+            check_generated_duplicates(cx, entry_index, m)?;
+            record_generated_members(
+                st.defined_by_layer.get_or_insert_default(),
+                entry_layer(cx.entry_scopes, entry_index),
+                m,
+                body,
+                cx.mapping_entries,
+            )?;
+        }
+        cx.entry_owners.release_this(&st.this_aliases);
+        props_extend_mapping(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &mut st.all_props,
+            m.iter().map(|(k, v)| (k.clone(), v.clone())),
+            cx.mapping_entries,
+        );
+        for name in m.keys() {
+            if body_member_is_non_const(body, name) {
+                st.non_const_members.insert(nm(name));
+            }
+        }
+        st.bound_members.extend(m.keys().cloned());
+        // A member a generator emitted is read by its bare name from the
+        // entries after it, as any other member of the body is.
+        if !cx.mapping_entries {
+            for (key, value) in m.iter() {
+                st.child_scope.set(key, value.clone());
+            }
+            if let Some(source) = &source {
+                let mut locals = Vec::new();
+                collect_generated_locals(body, &mut locals);
+                for name in locals {
+                    if let Some(value) = source.scope().get(&name) {
+                        st.child_scope.set(&name, value.clone());
+                    }
+                }
+            }
+        }
+        self.guard_const_local_lambdas(
+            &mut st.child_scope,
+            &cx.deferred_lambdas,
+            &st.non_const_members,
+        );
+        st.generated.extend(m.keys().cloned());
+        extend_object_entries(&mut st.map, m, cx.mapping_entries);
+        st.member_entry_indices
+            .extend(m.keys().cloned().map(|key| (key, entry_index)));
+        if let Some(source) = source {
+            st.elements.extend(source.elements.iter().cloned());
+        }
+        refresh_this_aliases(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &st.all_props,
+            st.this_source.as_ref(),
+        );
+        self.retry_failed_locals(cx, st)?;
+
+        Ok(())
+    }
+
+    /// Evaluate again the value properties deferred because they read a
+    /// still-pending local. Once no deferred property recovers, the first
+    /// current error is the one Pkl surfaces.
+    fn retry_failed_properties(&mut self, cx: &BodyContext, st: &mut BodyState) -> Result<()> {
+        while !st.failed_properties.is_empty() {
+            let mut retrying = std::mem::take(&mut st.failed_properties);
+            let mut recovered_property = false;
+            for (entry_index, _) in retrying.drain(..) {
+                let Entry::Property(prop) = &cx.entries[entry_index] else {
+                    unreachable!("only properties are deferred");
+                };
+                let active_scope = scope_for_object_entry(
+                    entry_index,
+                    &st.child_scope,
+                    cx.entry_scopes,
+                    &cx.entry_owners,
+                    cx.own_body_scope(),
+                );
+                let deferred_before = self.unresolved_deferred;
+                let evaluated = self.eval_property(prop, &active_scope, cx.depth);
+                let evaluated = match evaluated {
+                    Ok(_)
+                        if !self.defer_unresolved_names
+                            && self.unresolved_deferred != deferred_before =>
+                    {
+                        Err(Error::Eval(self.last_unresolved.clone()))
+                    }
+                    other => other,
+                };
+                match evaluated {
+                    Ok(value) => {
+                        drop(active_scope);
+                        if let Some(value) = value {
+                            self.bind_object_property_value(
+                                cx,
+                                st,
+                                prop,
+                                value,
+                                entry_index,
+                                true,
+                            )?;
+                        }
+                        recovered_property = true;
+                    }
+                    Err(Error::Eval(message)) => {
+                        drop(active_scope);
+                        st.failed_properties.push((entry_index, message));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !recovered_property {
+                // A bare name that still does not resolve is a failed member
+                // once the retries have run out.
+                if !self.defer_unresolved_names {
+                    self.defer_unresolved_names = true;
+                    let result = self.retry_failed_properties(cx, st);
+                    self.defer_unresolved_names = false;
+                    return result;
+                }
+                // A read of a sibling declared without a value (`m: Int`)
+                // cannot resolve until an instance supplies it; the member
+                // stays in the source and is evaluated then.
+                // The valueless sibling a failure reads: whether it is hidden.
+                let valueless = |message: &str| {
+                    message
+                        .strip_prefix("Cannot find property `")
+                        .and_then(|rest| rest.strip_suffix("`."))
+                        .and_then(|name| {
+                            cx.entries.iter().find_map(|entry| match entry {
+                                Entry::Property(p)
+                                    if &*p.name == name
+                                        && p.value.is_none()
+                                        && p.body.is_none()
+                                        && !has_modifier(&p.modifiers, Modifier::Local) =>
+                                {
+                                    Some((
+                                        p.name.clone(),
+                                        has_modifier(&p.modifiers, Modifier::Hidden),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                        })
+                };
+                // Only a class's defaults and its instances wait for a member
+                // to be supplied; an ordinary object has nothing to supply it.
+                let template = self
+                    .class_template_bodies
+                    .contains(&(Arc::as_ptr(cx.entries) as usize));
+                if template
+                    || cx.inherited_source.is_some_and(|source| {
+                        source.type_name.is_some() || source.type_identity.is_some()
+                    })
+                {
+                    for (entry_index, message) in std::mem::take(&mut st.failed_properties) {
+                        let Some((sibling, hidden)) = valueless(&message) else {
+                            st.failed_properties.push((entry_index, message));
+                            continue;
+                        };
+                        // A hidden sibling is not reported as undefined later,
+                        // so an instance's member that read it keeps the error.
+                        if hidden
+                            && !template
+                            && let Entry::Property(prop) = &cx.entries[entry_index]
+                            && !has_modifier(&prop.modifiers, Modifier::Hidden)
+                            && !has_modifier(&prop.modifiers, Modifier::Local)
+                        {
+                            self.rendered_member_failed = true;
+                            st.deferred_undefined.insert(
+                                prop.name.clone(),
+                                PoisonedMember {
+                                    message: undefined_property_message(&sibling),
+                                    rendered: true,
+                                },
+                            );
+                        }
+                    }
+                }
+                if st.failed_properties.is_empty() {
+                    break;
+                }
+                return Err(Error::Eval(st.failed_properties[0].1.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate again the non-property output entries that failed while a
+    /// local was pending, restoring the body's state after each that fails
+    /// again. Once none recovers, the first current error is the one Pkl
+    /// surfaces.
+    fn retry_failed_entries<'a>(
+        &mut self,
+        cx: &BodyContext<'a, '_>,
+        st: &mut BodyState<'a>,
+        mut failed_entries: Vec<(usize, String)>,
+    ) -> Result<()> {
+        while !failed_entries.is_empty() {
+            let mut retrying = std::mem::take(&mut failed_entries);
+            let mut recovered_entry = false;
+            for (entry_index, _) in retrying.drain(..) {
+                let entry = &cx.entries[entry_index];
+                let before = st.clone();
+                match self.eval_output_entry(cx, st, entry_index, entry) {
+                    Ok(()) => recovered_entry = true,
+                    Err(Error::Eval(message)) => {
+                        *st = before;
+                        failed_entries.push((entry_index, message));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !recovered_entry {
+                return Err(Error::Eval(failed_entries[0].1.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind the deferred local lambdas again, now that the properties are
+    /// bound, so they capture overridden values (late binding).
+    fn bind_deferred_lambdas(&mut self, cx: &BodyContext, st: &mut BodyState) -> Result<()> {
+        refresh_this_aliases(
+            &mut st.child_scope,
+            &st.this_aliases,
+            &st.all_props,
+            st.this_source.as_ref(),
+        );
+        for &(ref name, prop, expr, entry_index) in &cx.deferred_lambdas {
+            let active_scope = scope_for_object_entry(
+                entry_index,
+                &st.child_scope,
+                cx.entry_scopes,
+                &cx.entry_owners,
+                cx.own_body_scope(),
+            );
+            let val = self.eval_expr(expr, &active_scope, cx.depth)?;
+            drop(active_scope);
+            // Lambda construction is lazy, so const-local validation must be
+            // deferred until invocation too. At this point the final object
+            // members are known; make a forbidden lambda body fail when it is
+            // called without rejecting an otherwise unused local function.
+            let val = self.const_local_lambda_guard(
+                val,
+                const_local_reads_non_const(prop, &st.non_const_members),
+            );
+            st.child_scope.set(name, val);
+        }
+        Ok(())
+    }
+}
+
+/// A local lambda of a body, bound again once the body's properties are:
+/// its name, declaration, value and entry index.
+type DeferredLambda<'a> = (Name, &'a Property, &'a Expr, usize);
+
+/// What stays fixed while one object body is evaluated.
+struct BodyContext<'a, 'r> {
+    entries: &'a Body,
+    /// The scope the body is evaluated in.
+    scope: &'a Scope,
+    depth: usize,
+    entry_scopes: Option<&'a [Option<Arc<CapturedScope>>]>,
+    inherited_source: Option<&'a ObjectSource>,
+    receiver_members: Option<&'a ReceiverMembers<'r>>,
+    /// Whether the body's keys follow Mapping identity: a Mapping may retain
+    /// the first spelling of a native-unit key, while Pkl identity is its
+    /// normalized amount.
+    mapping_entries: bool,
+    entry_owners: EntryOwners,
+    /// The names of the body's own definition body, when it has one.
+    own_body: Option<HashSet<Name>>,
+    /// The body's own members, which shadow an enclosing binding even before
+    /// they are evaluated.
+    pending_members: HashSet<Name>,
+    /// The own members that the amended object already holds. A read of such
+    /// a member must wait for the member rather than take the inherited value.
+    stale_members: Vec<Name>,
+    deferred_lambdas: Vec<DeferredLambda<'a>>,
+    default_template: Option<Value>,
+    /// Whether member names must be tracked for duplicates. A single direct
+    /// dynamic member cannot conflict with anything. Avoid the hash lookup on
+    /// that common shape; tracking is needed only once a second dynamic member
+    /// or a generator can produce another name.
+    track_dynamic_members: bool,
+}
+
+impl BodyContext<'_, '_> {
+    /// Entries without a captured scope belong to the object's own
+    /// definition body. Bindings they see as declared are that body's
+    /// members; members the object inherits from elsewhere (a parent class
+    /// or an amendment) are not, so a nested object's inherited member of
+    /// the same name still resolves through its own `this`.
+    fn binds_declared(&self, name: &str) -> bool {
+        self.own_body.as_ref().is_none_or(|own| own.contains(name))
+    }
+
+    fn own_body_scope(&self) -> Option<(&Scope, &HashSet<Name>)> {
+        self.own_body.as_ref().map(|own| (self.scope, own))
+    }
+}
+
+/// What evaluating an object body builds up. An entry that fails while a
+/// local is still pending restores a copy of it, to be evaluated again.
+#[derive(Clone)]
+struct BodyState<'a> {
+    child_scope: Scope,
+    all_props: Arc<ObjectMap>,
+    this_aliases: Vec<Name>,
+    /// The class `this` is an instance of, while a `pkl:ref` module is in use.
+    this_source: Option<Arc<ObjectSource>>,
+    /// Untyped locals that failed, possibly because they read a member of
+    /// this body not yet bound.
+    failed_locals: Vec<usize>,
+    /// Value properties that failed while a local was pending.
+    failed_properties: Vec<(usize, String)>,
+    /// Members of a class instance that read a hidden property left undefined,
+    /// with the read's error. They stay out of the object and raise it when
+    /// read or rendered.
+    deferred_undefined: IndexMap<Name, PoisonedMember>,
+    /// The members a const local may not read.
+    non_const_members: HashSet<Name>,
+    bound_members: HashSet<Name>,
+    /// Inherited members whose entries are evaluated again. Until its first
+    /// entry runs, a member holds the parent's final value.
+    inherited_seeded: HashSet<&'a str>,
+    map: ObjectMap,
+    /// Source entry positions for members already emitted. A property that
+    /// recovers after its local becomes available uses these to return to
+    /// its declaration position instead of remaining appended at the end.
+    member_entry_indices: HashMap<Arc<str>, usize>,
+    /// A Dynamic body can contain bare elements as well as named members.
+    /// Keep the former separately so XML elements can render precisely the
+    /// values Pkl gives them, in source order.
+    elements: Vec<Value>,
+    /// The poisoned names an element, spread or generator evaluates with: its
+    /// own scope's, and the members of the body not bound yet, which shadow
+    /// the enclosing bindings of the same name.
+    shadow: Option<Arc<FxIndexMap<Name, String>>>,
+    /// The iteration of the `for` generator that is evaluating, set as each
+    /// begins, so one that fails can be resumed there.
+    failed_iteration: usize,
+    /// The iteration a `for` generator being evaluated again starts at.
+    resume_from: usize,
+    /// Names of members produced by generators and not since rebound by a
+    /// property entry.
+    generated: HashSet<Arc<str>>,
+    /// The members each layer defines. The output map is keyed by its
+    /// rendered member name, so duplicate bookkeeping must use that same
+    /// identity. Sharing the set with generators makes direct-before-generator
+    /// and generator-before-direct checks symmetric.
+    defined_by_layer: Option<HashSet<(usize, Arc<str>)>>,
+}
+
+/// Whether a body needs its dynamic member names tracked for duplicates: it
+/// has a second dynamic member, or a generator that can produce one.
+fn tracks_dynamic_members(entries: &[Entry]) -> bool {
+    let mut direct_dynamic_members = 0;
+    let mut track_dynamic_members = false;
+    for entry in entries.iter() {
+        match entry {
+            Entry::DynProperty(..) => {
+                direct_dynamic_members += 1;
+                track_dynamic_members |= direct_dynamic_members > 1;
+            }
+            Entry::ForGenerator(..) | Entry::WhenGenerator(..) => {
+                track_dynamic_members = true;
+            }
+            _ => {}
+        }
+    }
+    track_dynamic_members
+}
+
+/// Set `outer` to a snapshot of the parent scope's variables as an object.
+/// Also insert Null for any nullable-no-default properties declared in these
+/// entries but absent from the parent scope, so that `outer.optionalProp`
+/// resolves to Null rather than failing with "field not found".
+pub(super) fn bind_outer(
+    child_scope: &mut Scope,
+    scope: &Scope,
+    entries: &[Entry],
+    unused_this_aliases: &[Name],
+) {
+    let mut outer_map = scope.flatten();
+    // `this` inside the body is rebound to the new object, so the parent's
+    // `this` snapshot is unreachable through `outer`. Leaving it out keeps
+    // nested objects from holding a reference to the parent's property map,
+    // which would otherwise force a full copy on every parent insert.
+    outer_map.shift_remove("this");
+    // The saved import identities of a function are no member of `outer`.
+    if outer_map.contains_key(CAPTURED_IDENTITIES) {
+        outer_map.shift_remove(CAPTURED_IDENTITIES);
+    }
+    outer_map.retain(|name, _| {
+        !name.starts_with(IMPORT_TYPE_VALUE_PREFIX)
+            && &**name != super::module::MODULE_CLASS_IDENTITY
+    });
+    for name in unused_this_aliases {
+        outer_map.shift_remove(&**name);
+    }
+    for entry in entries.iter() {
+        if let Entry::Property(prop) = entry
+            && prop.value.is_none()
+            && prop.body.is_none()
+            && !has_modifier(&prop.modifiers, Modifier::Local)
+            && !outer_map.contains_key(prop.name.as_ref())
+            && matches!(prop.type_ann, Some(crate::parser::TypeExpr::Nullable(_)))
+        {
+            outer_map.insert(prop.name.as_ref().into(), Value::Null);
+        }
+    }
+    let module_source = scope.get("this").and_then(|value| {
+        let exposed = super::module_values::exposed_module_value(value, scope);
+        match exposed.as_ref().unwrap_or(value) {
+            Value::Object(_, Some(source)) if source.is_module => Some(Arc::clone(source)),
+            _ => None,
+        }
+    });
+    let outer_obj = Value::Object(Arc::new(outer_map), module_source);
+    child_scope.set("outer", outer_obj);
+}
+
+/// Whether a body (or a generator in it) has a member matching `is_kind`.
+pub(super) fn body_has(entries: &[Entry], is_kind: &dyn Fn(&Entry) -> bool) -> bool {
+    entries.iter().any(|entry| match entry {
+        Entry::ForGenerator(generator) => body_has(&generator.body, is_kind),
+        Entry::WhenGenerator(generator) => {
+            body_has(&generator.body, is_kind)
+                || generator
+                    .else_body
+                    .as_deref()
+                    .is_some_and(|body| body_has(body, is_kind))
+        }
+        entry => is_kind(entry),
+    })
+}
+
+/// Whether an evaluated member of `entries` is a non-const property. A name
+/// is considered only after the entry that produced it actually ran, so a
+/// member in an untaken generator branch does not turn a const-local lookup
+/// into a const violation.
+pub(super) fn body_member_is_non_const(entries: &[Entry], name: &str) -> bool {
+    entries.iter().rev().any(|entry| match entry {
+        Entry::Property(prop)
+            if &*prop.name == name && !has_modifier(&prop.modifiers, Modifier::Local) =>
+        {
+            !has_modifier(&prop.modifiers, Modifier::Const)
+        }
+        Entry::ForGenerator(generator) => body_member_is_non_const(&generator.body, name),
+        Entry::WhenGenerator(generator) => {
+            body_member_is_non_const(&generator.body, name)
+                || generator
+                    .else_body
+                    .as_deref()
+                    .is_some_and(|body| body_member_is_non_const(body, name))
+        }
+        _ => false,
+    })
+}
+
+/// Names a body can define as object properties, including names in generator
+/// branches that may later bind. They must shadow enclosing bindings while a
+/// const local waits to learn whether the branch actually produces them.
+pub(super) fn body_property_names(entries: &[Entry]) -> HashSet<Name> {
+    let mut names = HashSet::default();
+    for entry in entries {
+        match entry {
+            Entry::Property(prop) if !has_modifier(&prop.modifiers, Modifier::Local) => {
+                names.insert(prop.name.clone());
+            }
+            Entry::ForGenerator(generator) => names.extend(body_property_names(&generator.body)),
+            Entry::WhenGenerator(generator) => {
+                names.extend(body_property_names(&generator.body));
+                if let Some(else_body) = &generator.else_body {
+                    names.extend(body_property_names(else_body));
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Pkl requires a const local to depend only on const members of its body.
+/// Bare references are collected with the evaluator's normal lexical walker;
+/// `this.member` and `super.member` need their own checks because the walker
+/// records the receiver as the root rather than the selected member.
+pub(super) fn const_local_reads_non_const(
+    prop: &Property,
+    non_const_members: &HashSet<Name>,
+) -> Option<String> {
+    if !has_modifier(&prop.modifiers, Modifier::Const) {
+        return None;
+    }
+    let expr = prop.value.as_ref()?;
+    let mut refs = HashSet::default();
+    collect_expr_refs(expr, &mut refs, &HashSet::default());
+    let name = refs
+        .into_iter()
+        .find(|name| non_const_members.contains(name))
+        .map(|name| name.to_string())
+        .or_else(|| this_member_reads_non_const(expr, non_const_members))?;
+    Some(format!(
+        "Cannot reference property `{name}` from here because it is not `const`."
+    ))
+}
+
+/// Return the first non-const member read through a direct `this.member` or
+/// `super.member` expression. Nested object bodies have their own receiver,
+/// so this deliberately does not descend into them.
+pub(super) fn this_member_reads_non_const(
+    expr: &Expr,
+    non_const_members: &HashSet<Name>,
+) -> Option<String> {
+    match expr {
+        Expr::Field(base, name) | Expr::NullSafeField(base, name)
+            if matches!(base.as_ref(), Expr::Ident(root) if root == "this" || root == "super")
+                && non_const_members.contains(name.as_str()) =>
+        {
+            Some(name.clone())
+        }
+        Expr::Field(base, _) | Expr::NullSafeField(base, _) => {
+            this_member_reads_non_const(base, non_const_members)
+        }
+        Expr::Index(base, index) | Expr::Binop(_, base, index) => {
+            this_member_reads_non_const(base, non_const_members)
+                .or_else(|| this_member_reads_non_const(index, non_const_members))
+        }
+        Expr::Call(callee, args) => {
+            this_member_reads_non_const(callee, non_const_members).or_else(|| {
+                args.iter()
+                    .find_map(|arg| this_member_reads_non_const(arg, non_const_members))
+            })
+        }
+        Expr::If(condition, then_expr, else_expr) => {
+            this_member_reads_non_const(condition, non_const_members)
+                .or_else(|| this_member_reads_non_const(then_expr, non_const_members))
+                .or_else(|| this_member_reads_non_const(else_expr, non_const_members))
+        }
+        Expr::Let(_, value, body) => this_member_reads_non_const(value, non_const_members)
+            .or_else(|| this_member_reads_non_const(body, non_const_members)),
+        Expr::Is(value, _) | Expr::As(value, _) | Expr::Checked(value, _) => {
+            this_member_reads_non_const(value, non_const_members)
+        }
+        Expr::Lambda(_, value) => this_member_reads_non_const(value, non_const_members),
+        Expr::Unop(_, value)
+        | Expr::Throw(value)
+        | Expr::TemplateLocals(_, value)
+        | Expr::Trace(value, _)
+        | Expr::Constraint(value, _)
+        | Expr::Read(value, _)
+        | Expr::ReadOrNull(value, _)
+        | Expr::ReadGlob(value, _) => this_member_reads_non_const(value, non_const_members),
+        Expr::StringInterpolation(parts) => parts.iter().find_map(|part| match part {
+            StringInterpPart::Expr(expr) => this_member_reads_non_const(expr, non_const_members),
+            StringInterpPart::Literal(_) => None,
+        }),
+        // New and anonymous-object bodies create their own receivers.
+        Expr::New(..) | Expr::InferredNew(..) | Expr::ObjectBody(..) | _ => None,
+    }
+}
+
+/// Reject elements in the body of an object of type `type_display`, and
+/// entries too when `typed` (a class instance has only properties).
+pub(super) fn check_member_kinds(
+    type_display: &str,
+    entry_display: &str,
+    entries: &[Entry],
+    typed: bool,
+) -> Result<()> {
+    // A Mapping body checks the elements its generators produce as it runs, so
+    // only a direct element counts here.
+    let is_elem = |entry: &Entry| matches!(entry, Entry::Elem(_));
+    if if typed {
+        body_has(entries, &is_elem)
+    } else {
+        entries.iter().any(is_elem)
+    } {
+        return Err(Error::Eval(format!(
+            "Object of type `{type_display}` cannot have an element."
+        )));
+    }
+    if typed && body_has(entries, &|entry| matches!(entry, Entry::DynProperty(..))) {
+        return Err(Error::Eval(format!(
+            "Object of type `{entry_display}` cannot have an entry."
+        )));
+    }
+    Ok(())
+}
+
+/// The members a generator body's receiver holds so far: those of the object
+/// it is directly in, over those of any generator body enclosing that. The
+/// maps are borrowed rather than merged so nested generators copy nothing.
+pub(super) struct ReceiverMembers<'a> {
+    own: &'a ObjectMap,
+    outer: Option<&'a ReceiverMembers<'a>>,
+}
+
+impl ReceiverMembers<'_> {
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.own
+            .get(name)
+            .or_else(|| self.outer.and_then(|outer| outer.get(name)))
+    }
+}
+
+/// Whether `entry` declares a member of its body that an earlier element can
+/// read, as [`entries_define_members`] decides for the whole body: a property
+/// that is not local, a dynamic one, or one a generator produces.
+fn entry_is_member(entry: &Entry) -> bool {
+    entries_define_members(std::slice::from_ref(entry))
+}
+
+/// `scope` with the poisoned names an entry evaluates with, if it has any.
+fn shadowed(mut scope: Scope, shadow: &Option<Arc<FxIndexMap<Name, String>>>) -> Scope {
+    if let Some(poisoned) = shadow {
+        scope.poisoned = Arc::clone(poisoned);
+    }
+    scope
+}
+
+/// A body may define each member once, so a spread cannot copy a member the
+/// same body declares, before or after the spread. Only the body's own
+/// declarations count, not those it inherits.
+fn check_spread_duplicates(
+    cx: &BodyContext,
+    spread_index: usize,
+    spread: &ObjectMap,
+) -> Result<()> {
+    let layer = entry_layer(cx.entry_scopes, spread_index);
+    for (index, entry) in cx.entries.iter().enumerate() {
+        if entry_layer(cx.entry_scopes, index) != layer {
+            continue;
+        }
+        let (key, shown, what) = match entry {
+            Entry::Property(prop)
+                if !has_modifier(&prop.modifiers, Modifier::Local)
+                    && (prop.value.is_some() || prop.body.is_some()) =>
+            {
+                (&*prop.name, prop.name.to_string(), "property")
+            }
+            Entry::DynProperty(Expr::String(key), _) => (&**key, format!("{key:?}"), "entry key"),
+            _ => continue,
+        };
+        if !spread.contains_key(key) {
+            continue;
+        }
+        return Err(Error::Eval(if index < spread_index {
+            format!(
+                "Cannot spread object because the enclosing object already has a declaration of {what} `{shown}`."
+            )
+        } else {
+            format!("Duplicate definition of member `{shown}`.")
+        }));
+    }
+    Ok(())
+}
+
+/// A member a generator produced is a second definition when the body it is
+/// in also declares it directly, before or after the generator.
+fn check_generated_duplicates(
+    cx: &BodyContext,
+    generator_index: usize,
+    generated: &ObjectMap,
+) -> Result<()> {
+    if generated.is_empty() {
+        return Ok(());
+    }
+    let layer = entry_layer(cx.entry_scopes, generator_index);
+    for (index, entry) in cx.entries.iter().enumerate() {
+        if let Entry::Property(prop) = entry
+            && !has_modifier(&prop.modifiers, Modifier::Local)
+            && (prop.value.is_some() || prop.body.is_some())
+            && generated.contains_key(&*prop.name)
+            && entry_layer(cx.entry_scopes, index) == layer
+        {
+            return Err(Error::Eval(format!(
+                "Duplicate definition of member `{}`.",
+                prop.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Poison the members the amended object already holds that `prop` reads, so
+/// the read waits for the member instead of taking the inherited value. A
+/// lambda or method only captures its scope, and a poisoned binding would be
+/// captured with it.
+#[inline(never)]
+fn poison_stale_members(
+    cx: &BodyContext,
+    st: &BodyState,
+    prop: &Property,
+    active_scope: &mut Scope,
+) {
+    let Some(value) = &prop.value else {
+        // A nested body reads the members of its enclosing object too.
+        if prop.body.is_some() {
+            let reads = property_reference_names(prop);
+            for name in &cx.stale_members {
+                // A property that only declares its type, as a class does, is
+                // no member of the body: a local in an enclosing scope wins.
+                let defined = |entry: &Entry| {
+                    matches!(entry, Entry::Property(p)
+                        if p.name == *name && (p.value.is_some() || p.body.is_some()))
+                };
+                if *name != prop.name
+                    && !st.bound_members.contains(name)
+                    && reads.contains(name)
+                    && body_has(cx.entries, &defined)
+                {
+                    active_scope.poison(name.clone(), format!("undefined variable: {name}"));
+                }
+            }
+        }
+        return;
+    };
+    if matches!(
+        value,
+        Expr::Lambda(..)
+            | Expr::Null
+            | Expr::Bool(_)
+            | Expr::Int(_)
+            | Expr::Float(_)
+            | Expr::String(_)
+    ) {
+        return;
+    }
+    // One scan rules out the common property that names none of them.
+    if !expr_mentions(value, &NeedleSet::new(&cx.stale_members)) {
+        return;
+    }
+    for name in &cx.stale_members {
+        if *name != prop.name && !st.bound_members.contains(name) && expr_mentions(value, name) {
+            active_scope.poison(name.clone(), format!("undefined variable: {name}"));
+        }
+    }
+}
+
+/// A `new Class { .. }` whose body reads a member declared later in this body
+/// reads that member, not the class's own default of the name. The
+/// constructor may be the result of an `if` or `let`.
+#[inline(never)]
+fn poison_pending_reads(
+    cx: &BodyContext,
+    st: &BodyState,
+    prop: &Property,
+    active_scope: &mut Scope,
+) {
+    let mut bodies = Vec::new();
+    if let Some(value) = &prop.value {
+        typed_new_bodies(value, &mut bodies, &HashSet::default());
+    }
+    if bodies.is_empty() {
+        return;
+    }
+    let mut refs = HashSet::default();
+    for (entries, bound) in bodies {
+        collect_entry_refs(entries, &mut refs, &bound);
+    }
+    for name in &cx.pending_members {
+        if *name != prop.name && !st.bound_members.contains(name) && refs.contains(name) {
+            active_scope.poison(name.clone(), format!("undefined variable: {name}"));
+        }
+    }
+}
+
+/// The bodies of the `new Class { .. }` expressions an expression can
+/// evaluate to.
+/// Each body is paired with the names the `let`s on its own path bind.
+fn typed_new_bodies<'a>(
+    expr: &'a Expr,
+    bodies: &mut Vec<(&'a [Entry], HashSet<Name>)>,
+    bound: &HashSet<Name>,
+) {
+    match expr {
+        Expr::New(Some(_), entries, _) => bodies.push((entries, bound.clone())),
+        Expr::If(_, then, otherwise) => {
+            typed_new_bodies(then, bodies, bound);
+            typed_new_bodies(otherwise, bodies, bound);
+        }
+        Expr::Let(name, _, body) => {
+            let mut inner = bound.clone();
+            inner.insert(nm(name));
+            typed_new_bodies(body, bodies, &inner);
+        }
+        _ => {}
+    }
+}
+
+/// The names of the `local` members a body declares, including those its
+/// nested generators declare, which stay readable after the generator.
+fn collect_generated_locals(body: &Body, out: &mut Vec<Name>) {
+    for entry in body.iter() {
+        match entry {
+            Entry::Property(prop) if has_modifier(&prop.modifiers, Modifier::Local) => {
+                out.push(prop.name.clone());
+            }
+            Entry::WhenGenerator(generator) => {
+                collect_generated_locals(&generator.body, out);
+                if let Some(else_body) = &generator.else_body {
+                    collect_generated_locals(else_body, out);
+                }
+            }
+            Entry::ForGenerator(generator) => collect_generated_locals(&generator.body, out),
+            _ => {}
+        }
+    }
+}
+
+/// The binding of the class of the object body being evaluated, for a
+/// `getClass()` called without a receiver.
+pub(super) const THIS_CLASS: &str = "\0pklr:this-class";
+
+#[inline(never)]
+fn this_class(source: Option<&ObjectSource>, mapping: bool) -> Value {
+    if let Some(source) = source
+        && let Some(name) = source.type_name()
+    {
+        let identity = source
+            .type_identity
+            .clone()
+            .unwrap_or_else(|| format!("pkl:base#{name}"));
+        return stdlib::class_value(name, identity);
+    }
+    let name = if mapping { "Mapping" } else { "Dynamic" };
+    stdlib::class_value(name, format!("pkl:base#{name}"))
+}
+
+/// Whether `ty`, directly or through type aliases, is a constrained `Dynamic`.
+/// Whether `ty` is a `Listing` or `Mapping` with a constraint, whose empty
+/// default the constraint checks.
+fn names_constrained_collection(ty: &crate::parser::TypeExpr) -> bool {
+    matches!(ty, crate::parser::TypeExpr::Constrained(base, ..)
+        if matches!(base.split('<').next(), Some("Listing" | "Mapping")))
+}
+
+fn names_constrained_dynamic(ty: &crate::parser::TypeExpr, scope: &Scope) -> bool {
+    use crate::parser::TypeExpr;
+    let mut ty = ty;
+    for _ in 0..32 {
+        match ty {
+            TypeExpr::Constrained(base, ..) => return base == "Dynamic",
+            TypeExpr::Named(name) => match scope.get_type_alias(name) {
+                Some(next) => ty = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
+}

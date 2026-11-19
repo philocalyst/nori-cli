@@ -1,0 +1,217 @@
+[
+  {
+    "name": "local-list-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal items = List(this)\nx=1\nresult=items.first.x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "typed-local-list-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal items:List<module> = List(this)\nx=1\nresult=items.first.x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "nested-collection-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal items = List(Pair(module,0))\nx=1\nresult=items.first.first.x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "map-value-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal items = Map(\"key\",module)\nx=1\nresult=items[\"key\"].x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "conditional-module-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal items = if(true) module else new Dynamic {}\nx=1\nresult=items.x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "local-function-collection-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nlocal function values()=List(module)\nx=1\nresult=values().first.x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "local-function-module-result",
+    "files": {
+      "test.pkl": "open module birds\nlocal function owner()=module\nx=1\nresult=owner().x\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "collection-module-identity",
+    "files": {
+      "test.pkl": "open module birds\nlocal items = List(module)\nx=1\nresult=List(items.first.getClass().toString(), items.first is module, items.first is Map, items.first.getClass()==module.getClass())\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": [
+        "birds",
+        true,
+        false,
+        true
+      ]
+    }
+  },
+  {
+    "name": "shadowed-module-map",
+    "files": {
+      "test.pkl": "open module birds\nresult=let(`module`=Map(\"x\",2)) List(`module`).first.getClass()==Map\n"
+    },
+    "expected": {
+      "result": true
+    }
+  },
+  {
+    "name": "nested-object-this-is-not-module",
+    "files": {
+      "test.pkl": "open module birds\nresult=let(obj=new Dynamic {x=2; y=List(this).first.x}) List(obj.x,obj.y,obj is Dynamic)\n"
+    },
+    "expected": {
+      "result": [
+        2,
+        2,
+        true
+      ]
+    }
+  },
+  {
+    "name": "imported-generic-alias-module-snapshot",
+    "files": {
+      "test.pkl": "open module birds\nimport \"alias.pkl\"\nlocal items:alias.Items<module> = List(this)\nx=1\nresult=items.first.x\n",
+      "alias.pkl": "typealias Items<T> = List<T>\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": 1
+    }
+  },
+  {
+    "name": "hidden-import-members",
+    "files": {
+      "test.pkl": "import \"lib.pkl\"\nresult=lib.secret\nvisible=lib.toMap()\n",
+      "lib.pkl": "module birds\nhidden secret=7\nx=1\n"
+    },
+    "expected": {
+      "result": 7,
+      "visible": {
+        "x": 1
+      }
+    }
+  },
+  {
+    "name": "hidden-inherited-members",
+    "files": {
+      "test.pkl": "import \"child.pkl\"\nresult=child.secret\nvisible=child.toMap()\n",
+      "base.pkl": "open module birds\nhidden secret=7\nx=1\n",
+      "child.pkl": "extends \"base.pkl\"\nx=2\n"
+    },
+    "expected": {
+      "result": 7,
+      "visible": {
+        "x": 2
+      }
+    }
+  },
+  {
+    "name": "hidden-inherited-module-function",
+    "files": {
+      "test.pkl": "import \"child.pkl\"\nresult=child.check.apply(child) is child\n",
+      "base.pkl": "open module birds\nhidden check=(it:module)->it\n",
+      "child.pkl": "extends \"base.pkl\"\n"
+    },
+    "expected": {
+      "result": true
+    }
+  },
+  {
+    "name": "hidden-inherited-outer-module",
+    "files": {
+      "test.pkl": "import \"child.pkl\"\nresult=List(child.readOwner.result.getClass().toString(),child.getClass().toString(),child.readOwner.result is child)\n",
+      "base.pkl": "open module birds\nhidden readOwner {local owner:module=outer; result=owner}\n",
+      "child.pkl": "extends \"base.pkl\"\n"
+    },
+    "expected": {
+      "result": [
+        "child",
+        "child",
+        true
+      ]
+    }
+  },
+  {
+    "name": "function-module-parameter-shadowing",
+    "files": {
+      "test.pkl": "module birds\nx=1\nlocal function owner()=module\nlocal function withModule(`module`)=`module`.getClass()==Map\nlocal function withObject(`module`)=`module`.x\nresult=List(owner().getClass()==module.getClass(),owner().x,withModule(Map(\"x\",2)),withObject(module))\n"
+    },
+    "expected": {
+      "x": 1,
+      "result": [
+        true,
+        1,
+        true,
+        1
+      ]
+    }
+  },
+  {
+    "name": "outer-module-identity",
+    "files": {
+      "test.pkl": "module birds\nx=1\nobj=new {isModule=outer is module; classSame=outer.getClass()==module.getClass(); value=outer.x}\n"
+    },
+    "expected": {
+      "x": 1,
+      "obj": {
+        "isModule": true,
+        "classSame": true,
+        "value": 1
+      }
+    }
+  },
+  {
+    "name": "amended-module-retains-evaluated-members",
+    "files": {
+      "lib.pkl": "module action\nhidden owner=\"actions/checkout\"\nhidden version=\"v6\"\nuses=\"\\(owner)@\\(version)\"\nwith:Dynamic=new {}\n",
+      "test.pkl": "import \"lib.pkl\"\nresult=(lib) {with {depth=0}}\n"
+    },
+    "expected": {
+      "result": {
+        "uses": "actions/checkout@v6",
+        "with": {
+          "depth": 0
+        }
+      }
+    }
+  }
+]

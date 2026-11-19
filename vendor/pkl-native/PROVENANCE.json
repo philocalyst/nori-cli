@@ -1,0 +1,17 @@
+{
+  "official_pkl": {
+    "version": "0.33.0",
+    "repository": "https://github.com/apple/pkl",
+    "revision": "5ee1f296e3503abd8ac8e9b27d197b2f779ea408",
+    "binary_asset": "https://github.com/apple/pkl/releases/download/0.33.0/pkl-macos-aarch64",
+    "binary_digest": "sha256:e39c157df0f00a35d34b46270a768784edcaf509aafbf743849b27b4c83ef83b",
+    "release_digest": "sha256:e39c157df0f00a35d34b46270a768784edcaf509aafbf743849b27b4c83ef83b"
+  },
+  "native_engine": {
+    "repository": "https://github.com/jdx/pklr",
+    "version": "6.0.3",
+    "revision": "f20515796cd4986c4f3dcba929fd6ddfdaedc1c1",
+    "license": "MIT",
+    "mode": "forked experimental source; not production Nori"
+  }
+}

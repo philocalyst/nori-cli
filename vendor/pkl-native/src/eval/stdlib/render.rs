@@ -1,0 +1,588 @@
+//! Pkl's text forms of values: what `toString()` and string interpolation
+//! produce, and how error messages quote values. Ports pkl-core's
+//! `VmValueRenderer` (single-line mode) and `ValueFormatter`.
+
+use crate::value::{ListKind, ListValue, ObjectKind, ObjectSource, Value};
+
+/// Java's `Double.toString`, which pkl uses to print a `Float`: the shortest
+/// digits that round-trip, in plain notation for magnitudes in
+/// `[1e-3, 1e7)` and in `1.0E7` form otherwise, always with a fraction digit.
+pub(crate) fn format_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.into();
+    }
+    // `{:e}` prints the shortest round-trip digits, e.g. `1.2345e7` or `5e-324`.
+    // `{:e}` finds how many digits the shortest round-trip form needs, but
+    // when two such forms are equally close it rounds up, where Java takes
+    // the even one; rounding the exact value to that many digits (`{:.Ne}`
+    // rounds half to even) picks Java's.
+    let shortest = format!("{:e}", f.abs());
+    let digit_count = shortest
+        .split_once('e')
+        .map_or(1, |(m, _)| m.chars().filter(char::is_ascii_digit).count());
+    let sci = format!("{:.*e}", digit_count - 1, f.abs());
+    let (mantissa, exponent) = sci.split_once('e').expect("`{:e}` has an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let mut out = String::new();
+    if f < 0.0 {
+        out.push('-');
+    }
+    let abs = f.abs();
+    if (1e-3..1e7).contains(&abs) {
+        if exponent >= 0 {
+            let int_len = exponent as usize + 1;
+            if digits.len() <= int_len {
+                out.push_str(&digits);
+                out.extend(std::iter::repeat_n('0', int_len - digits.len()));
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            }
+        } else {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-exponent - 1) as usize));
+            out.push_str(&digits);
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        out.push('.');
+        if digits.len() > 1 {
+            out.push_str(&digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push_str(&exponent.to_string());
+    }
+    out
+}
+
+/// A pkl string literal for `s`. With `custom_delimiters`, the literal uses
+/// as many `#`s as needed to avoid escaping backslashes and quotes, as
+/// `Regex.toString()` does; otherwise they are escaped.
+pub(crate) fn quote_string(s: &str, custom_delimiters: bool) -> String {
+    let pounds = if custom_delimiters {
+        "#".repeat(pound_count(s))
+    } else {
+        String::new()
+    };
+    let escape = format!("\\{pounds}");
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push_str(&pounds);
+    out.push('"');
+    let mut rest = s;
+    if custom_delimiters {
+        if s == "\"" {
+            out.push_str(&escape);
+            out.push('"');
+            rest = "";
+        } else if let Some(tail) = s.strip_prefix("\"\"") {
+            out.push('"');
+            out.push_str(&escape);
+            out.push('"');
+            rest = tail;
+        }
+    }
+    for ch in rest.chars() {
+        match ch {
+            '\n' => {
+                out.push_str(&escape);
+                out.push('n');
+            }
+            '\r' => {
+                out.push_str(&escape);
+                out.push('r');
+            }
+            '\t' => {
+                out.push_str(&escape);
+                out.push('t');
+            }
+            '\\' if !custom_delimiters => out.push_str("\\\\"),
+            '"' if !custom_delimiters => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out.push_str(&pounds);
+    out
+}
+
+/// How many `#`s a single-line custom-delimited literal for `s` needs: one
+/// more than the longest run of `#`s after a quote or backslash.
+fn pound_count(s: &str) -> usize {
+    #[derive(PartialEq)]
+    enum Context {
+        Other,
+        Quote,
+        Backslash,
+    }
+    let mut context = Context::Other;
+    let (mut current, mut max) = (0, 0);
+    for ch in s.chars() {
+        match ch {
+            '\\' | '"' => {
+                context = if ch == '\\' {
+                    Context::Backslash
+                } else {
+                    Context::Quote
+                };
+                current = 1;
+                max = max.max(current);
+            }
+            '#' if context != Context::Other => {
+                current += 1;
+                max = max.max(current);
+            }
+            _ => context = Context::Other,
+        }
+    }
+    max
+}
+
+/// Whether `name` can be written as a member name without backticks.
+pub(crate) fn is_regular_identifier(name: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "_",
+        "abstract",
+        "amends",
+        "as",
+        "case",
+        "class",
+        "const",
+        "delete",
+        "else",
+        "extends",
+        "external",
+        "false",
+        "fixed",
+        "for",
+        "function",
+        "hidden",
+        "if",
+        "import",
+        "in",
+        "is",
+        "let",
+        "local",
+        "module",
+        "new",
+        "nothing",
+        "null",
+        "open",
+        "out",
+        "outer",
+        "override",
+        "protected",
+        "read",
+        "record",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "trace",
+        "true",
+        "typealias",
+        "unknown",
+        "vararg",
+        "when",
+    ];
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    !KEYWORDS.contains(&name)
+        && (first == '$' || first == '_' || first.is_alphabetic())
+        && chars.all(|c| c == '$' || c == '_' || c.is_alphanumeric())
+}
+
+/// The result of `value.toString()`: strings as they are, every other value
+/// in its single-line source form.
+pub(crate) fn to_pkl_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.to_string(),
+        Value::Object(map, Some(source))
+            if source.type_identity.as_deref() == Some("pkl:base#RegexMatch") =>
+        {
+            map.get("value").map(to_pkl_string).unwrap_or_default()
+        }
+        _ => render_value(value),
+    }
+}
+
+/// A value's single-line source form, e.g. `List(1, "a")` or
+/// `new Dynamic { a = 1 }`, as pkl prints values in `toString()` and errors.
+pub(crate) fn render_value(value: &Value) -> String {
+    let mut out = String::new();
+    render(value, true, &mut out);
+    out
+}
+
+/// `render_value` cut to `limit` characters (ending in `...`), as error
+/// messages quote values.
+pub(crate) fn render_value_limited(value: &Value, limit: usize) -> String {
+    let rendered = render_value(value);
+    if rendered.chars().count() < limit {
+        return rendered;
+    }
+    let mut cut: String = rendered.chars().take(limit.saturating_sub(3)).collect();
+    cut.push_str("...");
+    cut
+}
+
+/// The class name `new <Name> {...}` shows for an object.
+fn object_class_name(source: &Option<std::sync::Arc<ObjectSource>>) -> String {
+    if source
+        .as_deref()
+        .is_some_and(|source| source.kind == ObjectKind::Mapping)
+    {
+        return "Mapping".into();
+    }
+    source
+        .as_deref()
+        .filter(|source| source.type_name().is_some() || source.is_module)
+        .map(class_display_name)
+        .unwrap_or_else(|| "Dynamic".into())
+}
+
+/// The name of the module file in `namespace`, without its directory and
+/// extension.
+fn module_file_name(namespace: &str) -> &str {
+    namespace
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(namespace)
+        .trim_end_matches(".pkl")
+}
+
+/// A definition namespace as its module is named in value text. Standard
+/// module URI `pkl:json` names the language module `pkl.json`.
+pub(crate) fn module_display_name(namespace: &str) -> String {
+    let name = module_file_name(namespace);
+    name.strip_prefix("pkl:")
+        .map_or_else(|| name.to_string(), |module| format!("pkl.{module}"))
+}
+
+/// A class's `toString()`: `Int` for a standard library class and
+/// `module#Class` otherwise, naming the module by its file. (pkl names a
+/// module with a `module` declaration by that name instead.)
+pub(crate) fn class_display_name(source: &ObjectSource) -> String {
+    // A module's class shows as the module's name.
+    if let Some(name) = source
+        .type_identity
+        .as_deref()
+        .and_then(super::module_class_name)
+    {
+        return name.to_string();
+    }
+    let name = source.type_name().unwrap_or("Class");
+    let namespace = source
+        .type_identity
+        .as_deref()
+        .and_then(|identity| identity.strip_suffix(name))
+        .and_then(|namespace| namespace.strip_suffix('.'));
+    match namespace {
+        Some(namespace) => {
+            let module = source
+                .display_module
+                .clone()
+                .unwrap_or_else(|| module_display_name(namespace));
+            format!("{module}#{name}")
+        }
+        None => name.to_string(),
+    }
+}
+
+/// Whether pkl writes a list as an object body (`{ 1; 2 }`) rather than as a
+/// `List(...)` or `Set(...)` call: a `Listing` and an element-only `Dynamic`.
+fn is_braced_list(items: &ListValue) -> bool {
+    matches!(items.kind(), ListKind::Listing | ListKind::Dynamic)
+}
+
+/// Render `value`. `explicit` is false for an object that is a property's
+/// value, which pkl writes without its `new <Class>` prefix.
+fn render(value: &Value, explicit: bool, out: &mut String) {
+    match value {
+        Value::Null | Value::NullDefault(_) => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Int(n) => out.push_str(&n.to_string()),
+        Value::Float(f) => out.push_str(&format_float(*f)),
+        Value::String(s) => out.push_str(&quote_string(s, false)),
+        Value::List(items) if is_braced_list(items) => {
+            if explicit {
+                out.push_str(if items.kind() == ListKind::Dynamic {
+                    "new Dynamic "
+                } else {
+                    "new Listing "
+                });
+            }
+            out.push('{');
+            for (i, item) in items.iter().enumerate() {
+                out.push_str(if i == 0 { " " } else { "; " });
+                render(item, true, out);
+            }
+            if !items.is_empty() {
+                out.push(' ');
+            }
+            out.push('}');
+        }
+        Value::List(items) if items.int_seq_bounds().is_some() => {
+            let (start, end, step) = items.int_seq_bounds().unwrap_or_default();
+            out.push_str(&format!("IntSeq({start}, {end})"));
+            if step != 1 {
+                out.push_str(&format!(".step({step})"));
+            }
+        }
+        Value::List(items) => {
+            out.push_str(if items.is_bytes() {
+                "Bytes("
+            } else if items.kind() == ListKind::Set {
+                "Set("
+            } else {
+                "List("
+            });
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render(item, true, out);
+            }
+            out.push(')');
+        }
+        Value::Object(_, Some(source)) if source.kind == ObjectKind::Class => {
+            out.push_str(&class_display_name(source));
+        }
+        Value::Object(map, Some(source))
+            if source.type_identity.as_deref() == Some("pkl:base#Pair") =>
+        {
+            out.push_str("Pair(");
+            if let Some(first) = map.get("first") {
+                render(first, true, out);
+            }
+            out.push_str(", ");
+            if let Some(second) = map.get("second") {
+                render(second, true, out);
+            }
+            out.push(')');
+        }
+        Value::Object(map, Some(source))
+            if source.type_identity.as_deref() == Some("pkl:base#TypeAlias") =>
+        {
+            // The alias's identity is an internal member, not public text.
+            match map.get(super::TYPE_ALIAS_NAME_KEY) {
+                Some(Value::String(name)) => {
+                    // A user's alias is named by its module, as its class is.
+                    if let Some(Value::String(identity)) = map.get(super::TYPE_ALIAS_IDENTITY_KEY)
+                        && let Some(module) = identity
+                            .strip_suffix(&**name)
+                            .and_then(|namespace| namespace.strip_suffix('.'))
+                            .map(module_file_name)
+                    {
+                        out.push_str(module);
+                        out.push('#');
+                    }
+                    out.push_str(name);
+                }
+                _ => out.push_str("TypeAlias"),
+            }
+        }
+        Value::Object(map, Some(source)) if source.kind == ObjectKind::Reference => {
+            out.push_str(&crate::eval::reference::render_text(map, |value| {
+                let mut text = String::new();
+                render(value, true, &mut text);
+                text
+            }));
+        }
+        Value::Object(map, None) => {
+            out.push_str("Map(");
+            for (i, (key, member)) in map
+                .iter()
+                .filter(|(key, member)| !member.is_class_member(key, None))
+                .enumerate()
+            {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render(&crate::value::mapping_storage_value(key), true, out);
+                out.push_str(", ");
+                render(member, true, out);
+            }
+            out.push(')');
+        }
+        Value::Object(map, source) => {
+            if explicit {
+                out.push_str("new ");
+                out.push_str(&object_class_name(source));
+                out.push(' ');
+            }
+            out.push('{');
+            let mut first = true;
+            let members = crate::eval::render::Members::new(
+                crate::eval::render::kind_of(value),
+                source.as_deref(),
+            );
+            for (key, member) in map.iter() {
+                if member.is_unrendered_member(key, source.as_deref()) {
+                    continue;
+                }
+                out.push_str(if first { " " } else { "; " });
+                first = false;
+                if members.kind_of(key) == crate::eval::render::MemberKind::Entry {
+                    out.push('[');
+                    render(&crate::value::mapping_storage_value(key), true, out);
+                    out.push(']');
+                } else if is_regular_identifier(key) {
+                    out.push_str(key);
+                } else {
+                    out.push('`');
+                    out.push_str(key);
+                    out.push('`');
+                }
+                out.push_str(
+                    if matches!(member, Value::Object(_, Some(source))
+                        if !(source.kind == ObjectKind::Class
+                            || source.kind == ObjectKind::Reference
+                            || source.type_identity.as_deref() == Some("pkl:base#TypeAlias")))
+                        || matches!(member, Value::List(items) if is_braced_list(items))
+                    {
+                        " "
+                    } else {
+                        " = "
+                    },
+                );
+                render(member, false, out);
+            }
+            // The elements of a `Dynamic` that has members too follow them.
+            for element in source
+                .as_deref()
+                .map_or(&[][..], |source| &source.elements[..])
+            {
+                out.push_str(if first { " " } else { "; " });
+                first = false;
+                render(element, true, out);
+            }
+            if !first {
+                out.push(' ');
+            }
+            out.push('}');
+        }
+        Value::Lambda(..) => {
+            out.push_str("new ");
+            out.push_str(value.type_name());
+            out.push_str(" {}");
+        }
+        Value::Regex(regex) => {
+            out.push_str("Regex(");
+            out.push_str(&quote_string(regex.pattern(), true));
+            out.push(')');
+        }
+        Value::Duration(d) => {
+            out.push_str(&format_unit_value(d.value));
+            out.push('.');
+            out.push_str(d.unit.symbol());
+        }
+        Value::DataSize(d) => {
+            out.push_str(&format_unit_value(d.value));
+            out.push('.');
+            out.push_str(d.unit.symbol());
+        }
+        Value::Failed(_) => out.push_str("null"),
+    }
+}
+
+/// A duration's or data size's value as pkl prints it: without a fraction
+/// when it is a whole number.
+fn format_unit_value(value: f64) -> String {
+    if is_mathematical_integer(value) {
+        (value as i64).to_string()
+    } else {
+        format_float(value)
+    }
+}
+
+/// Whether `f` is a finite whole number.
+pub(crate) fn is_mathematical_integer(f: f64) -> bool {
+    f.is_finite() && f.fract() == 0.0
+}
+/// An integer as Java's `MessageFormat` prints it in error messages, with
+/// `,` grouping (`1,114,112`).
+pub(crate) fn group_digits(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        out.push('-');
+    }
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn class_display_name_strips_either_path_separator() {
+        for namespace in ["/tmp/dir/test.pkl", "C:\\dir\\test.pkl"] {
+            let Value::Object(_, Some(source)) =
+                crate::eval::stdlib::class_value("Foo", format!("{namespace}.Foo"))
+            else {
+                unreachable!()
+            };
+            assert_eq!(class_display_name(&source), "test#Foo", "{namespace}");
+        }
+    }
+
+    #[test]
+    fn floats_print_like_java() {
+        for (f, s) in [
+            (1.0, "1.0"),
+            (1e20, "1.0E20"),
+            (1e-7, "1.0E-7"),
+            (0.001, "0.001"),
+            (0.0001, "1.0E-4"),
+            (123456789.0, "1.23456789E8"),
+            (1234567.0, "1234567.0"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (-0.0, "-0.0"),
+            (2.5e-5, "2.5E-5"),
+            (100.0, "100.0"),
+            (1e7, "1.0E7"),
+            (9999999.0, "9999999.0"),
+            (-1.5, "-1.5"),
+            (f64::MAX, "1.7976931348623157E308"),
+            // Two shortest forms are equally close; Java takes the even one.
+            (88_486_131_246_206.12, "8.848613124620612E13"),
+        ] {
+            assert_eq!(format_float(f), s, "{f}");
+        }
+    }
+
+    #[test]
+    fn digits_are_grouped_like_message_format() {
+        assert_eq!(group_digits(1_114_112), "1,114,112");
+        assert_eq!(group_digits(-1000), "-1,000");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(i64::MIN), "-9,223,372,036,854,775,808");
+    }
+
+    #[test]
+    fn custom_delimiters_cover_backslashes_and_quotes() {
+        assert_eq!(quote_string(r"a\d", true), r##"#"a\d"#"##);
+        assert_eq!(quote_string("abc", true), r#""abc""#);
+        assert_eq!(quote_string("a\"#b", true), "##\"a\"#b\"##");
+        assert_eq!(quote_string("a\"b\\", false), r#""a\"b\\""#);
+    }
+}

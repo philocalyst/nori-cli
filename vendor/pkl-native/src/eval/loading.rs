@@ -1,0 +1,1097 @@
+//! Locating, fetching, parsing and caching modules and their imports.
+
+use super::*;
+
+impl Evaluator {
+    /// The local file a `file:` or relative module URI in the module at
+    /// `current_path` names.
+    pub(super) fn local_file_path(&mut self, current_path: &Path, uri: &str) -> Result<PathBuf> {
+        if uri.starts_with("file:") {
+            file_uri_path(uri)
+        } else if uri.starts_with("modulepath:") {
+            self.module_path_file(uri, false)
+        } else {
+            self.resolve_local_path(current_path, uri)
+        }
+    }
+
+    /// The file a `modulepath:/path` module URI names: the first module path
+    /// directory holding a regular file at that path. A URI that names nothing
+    /// is [`Error::ImportNotFound`]. This is the single place module path
+    /// lookups happen.
+    fn module_path_file(&mut self, uri: &str, resource: bool) -> Result<PathBuf> {
+        let segments = module_path_segments(uri)?;
+        for dir in self.module_path.clone() {
+            let mut candidate = dir;
+            candidate.extend(&segments);
+            // A resource is located through the resource hooks.
+            let found = if resource {
+                self.resource_is_file_io(&candidate)?
+            } else {
+                self.is_file_io(&candidate)?
+            };
+            if found {
+                return Ok(candidate);
+            }
+        }
+        Err(Error::ImportNotFound(uri.to_string()))
+    }
+
+    /// The module path file a `modulepath:` URI names, with the URI normalized
+    /// as Pkl reports it (`modulepath:/a//b/../c` is `modulepath:/a/c`).
+    /// `None` when no module path directory holds it.
+    pub(super) fn module_path_resource(&mut self, uri: &str) -> Result<Option<(PathBuf, String)>> {
+        let Some(normalized) = normalize_module_path_uri(uri)? else {
+            return Ok(None);
+        };
+        // The file is named by the path alone, not a query or fragment.
+        match self.module_path_file(split_query(uri).0, true) {
+            Ok(path) => Ok(Some((path, normalized))),
+            Err(Error::ImportNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// The `modulepath:` URI `uri` with dot segments and empty segments removed
+/// and the path percent-encoded, and any query or fragment kept as written, which is the spelling Pkl matches against the
+/// allowlist and reports as a resource's `uri`. `None` when the path climbs out
+/// of the module path or names nothing.
+pub(super) fn normalize_module_path_uri(uri: &str) -> Result<Option<String>> {
+    let (path, query) = split_query(uri);
+    let segments = match module_path_segments(path) {
+        Ok(segments) => segments,
+        Err(Error::ImportNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut out = String::from("modulepath:");
+    for segment in segments {
+        out.push('/');
+        for byte in segment.bytes() {
+            if byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=@".contains(&byte) {
+                out.push(byte as char);
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out.push_str(query);
+    Ok(Some(out))
+}
+
+/// Split a URI into its path and its `?query`/`#fragment` suffix.
+fn split_query(uri: &str) -> (&str, &str) {
+    uri.split_at(uri.find(['?', '#']).unwrap_or(uri.len()))
+}
+
+/// The normalized path segments of a `modulepath:/path` URI.
+fn module_path_segments(uri: &str) -> Result<Vec<String>> {
+    // The file is named by the path alone, not a query or fragment.
+    let Some(rest) = split_query(uri).0.strip_prefix("modulepath:/") else {
+        return Err(Error::Eval(format!(
+            "Module URI `{uri}` is missing a `/` after `modulepath:`."
+        )));
+    };
+    let not_found = || Error::ImportNotFound(uri.to_string());
+    // Decode the URI path and remove dot segments. A segment that could be
+    // a host path root, prefix or separator (`\`, `:`, NUL), or a `..` that
+    // climbs out of the module path directory, finds nothing.
+    let decoded = super::resource::percent_decode(rest);
+    let mut segments: Vec<&str> = Vec::new();
+    for part in decoded.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                segments.pop().ok_or_else(not_found)?;
+            }
+            _ if part.contains(['\\', ':', '\0']) => return Err(not_found()),
+            _ => segments.push(part),
+        }
+    }
+    if segments.is_empty() {
+        return Err(not_found());
+    }
+    Ok(segments.into_iter().map(String::from).collect())
+}
+
+impl Evaluator {
+    /// Resolve a local module or resource URI against the module at
+    /// `current_path`. A triple-dot URI is searched for upward from the
+    /// module's directory (see [`Self::resolve_triple_dot`]); a path that
+    /// cannot be found resolves to a path that does not exist.
+    pub(super) fn resolve_local_path(&mut self, current_path: &Path, uri: &str) -> Result<PathBuf> {
+        if let Some(triple_dot) = parse_triple_dot_path(uri)? {
+            return Ok(self
+                .resolve_triple_dot(current_path, triple_dot)?
+                // Keep a miss in the importing module's namespace. Returning
+                // the URI by itself would let a CWD entry named `...` win.
+                .unwrap_or_else(|| current_path.parent().unwrap_or(Path::new(".")).join(uri)));
+        }
+        Ok(current_path.parent().unwrap_or(Path::new(".")).join(uri))
+    }
+
+    /// Resolve the triple-dot `path` for the module at `current_path`.
+    /// Inside an extracted package the search stops at the package root.
+    pub(super) fn resolve_triple_dot(
+        &mut self,
+        current_path: &Path,
+        path: &str,
+    ) -> Result<Option<PathBuf>> {
+        // Canonicalize through the evaluator's capabilities, which resolves
+        // native relative entry paths and supports virtual path namespaces.
+        // Unlike an unconditional `std::path::absolute`, this never
+        // substitutes the host CWD for a capability-backed evaluator.
+        let current_path = match self.canonicalize_io(current_path) {
+            Ok(path) => path,
+            // Native evaluators use the default base path. When a relative
+            // unsaved path cannot be canonicalized yet, make its ancestors
+            // concrete so the normal upward search still works.
+            Err(_) if current_path.is_relative() && self.base_path == Path::new(".") => {
+                std::path::absolute(current_path).unwrap_or_else(|_| current_path.to_path_buf())
+            }
+            // A capability host owns its namespace, including relative
+            // virtual paths, so retain the path it supplied on a failure.
+            Err(_) => current_path.to_path_buf(),
+        };
+        #[cfg(feature = "package-zip")]
+        let roots: Vec<PathBuf> = self.package_dirs.values().cloned().collect();
+        #[cfg(feature = "package-zip")]
+        let root = roots.into_iter().find_map(|root| {
+            let root = self.canonicalize_io(&root).unwrap_or(root);
+            current_path.starts_with(&root).then_some(root)
+        });
+        #[cfg(not(feature = "package-zip"))]
+        let root: Option<PathBuf> = None;
+        resolve_triple_dot(&current_path, path, root.as_deref(), |candidate| {
+            self.path_exists_io(candidate)
+        })
+    }
+
+    pub(super) fn module_type_namespace(&mut self, path: &Path) -> String {
+        let lossy = path.to_string_lossy();
+        if lossy.contains("://") || lossy.starts_with("nori:") {
+            return path.display().to_string();
+        }
+        self.canonicalize_io(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+    }
+
+    pub(super) fn fetch_source(&mut self, url: &str) -> Result<String> {
+        self.check_module_path_allowed(Path::new(url))?;
+        if url.starts_with("nori:") {
+            return self
+                .virtual_modules
+                .get(url)
+                .cloned()
+                .ok_or_else(|| Error::ImportNotFound(url.to_string()));
+        }
+        if self
+            .package_http_roots
+            .iter()
+            .any(|root| url.starts_with(root))
+        {
+            return self.fetch_package_source(url);
+        }
+        let rewritten = self.rewrite_url(url);
+        let fetch_url = rewritten.as_ref();
+        if let Some(cached) = self.http_cache.get(fetch_url) {
+            return Ok(cached.clone());
+        }
+        if self.offline {
+            return Err(Error::Eval(format!(
+                "offline mode prevented HTTP fetch for {url}"
+            )));
+        }
+        let body = self.fetch_text_io(fetch_url)?;
+        self.http_cache.insert(fetch_url.to_string(), body.clone());
+        Ok(body)
+    }
+
+    /// The names the modules `module` amends or extends (transitively) read,
+    /// adding to `type_names` the type aliases and classes they declare.
+    pub(super) fn inherited_reference_roots(
+        &mut self,
+        module: &Module,
+        path: &Path,
+        depth: usize,
+        type_names: &mut HashSet<Name>,
+    ) -> Result<HashSet<Name>> {
+        let mut refs = HashSet::default();
+        if depth > self.max_depth || crate::stack::exhausted() {
+            crate::stack::limit_hit();
+            return Ok(refs);
+        }
+        for uri in [module.amends.as_deref(), module.extends.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Some((base_module, source_path)) = self.load_parsed_module(uri, path)? {
+                refs.extend(referenced_roots(&base_module.body));
+                type_names.extend(base_module.body.iter().filter_map(|entry| match entry {
+                    Entry::TypeAlias(name, ..) | Entry::ClassDef(name, ..) => Some(nm(name)),
+                    _ => None,
+                }));
+                refs.extend(self.inherited_reference_roots(
+                    &base_module,
+                    Path::new(&source_path),
+                    depth + 1,
+                    type_names,
+                )?);
+            }
+        }
+        Ok(refs)
+    }
+
+    pub(super) fn load_module_source(
+        &mut self,
+        uri: &str,
+        path: &Path,
+    ) -> Result<Option<(String, String)>> {
+        let resolved = self.resolve_relative(path, uri);
+        let uri = resolved.as_deref().unwrap_or(uri);
+        if uri.starts_with("https://") || uri.starts_with("http://") || uri.starts_with("nori:") {
+            let source = self.fetch_source(uri)?;
+            return Ok(Some((source, uri.to_string())));
+        }
+        if uri.starts_with("package://") {
+            self.check_module_allowed(uri)?;
+            let pkg = self.resolve_package(uri)?;
+            self.note_package_base(uri, &pkg);
+            match &pkg {
+                PackageSource::Direct { url, root } => {
+                    let source = self.fetch_direct_package_source(url, root)?;
+                    return Ok(Some((source, url.clone())));
+                }
+                PackageSource::Zip(zip_url, entry) => {
+                    #[cfg(feature = "package-zip")]
+                    {
+                        let pkg_dir = self.extract_package_zip(zip_url)?;
+                        let local_path = pkg_dir.join(entry);
+                        let source = self.read_to_string_io(&local_path)?;
+                        return Ok(Some((source, local_path.display().to_string())));
+                    }
+                    #[cfg(not(feature = "package-zip"))]
+                    {
+                        let _ = entry;
+                        return Err(Error::Unsupported(format!(
+                            "package zip imports require pklr's 'package-zip' feature: {zip_url}"
+                        )));
+                    }
+                }
+            }
+        }
+        if uri.starts_with("pkl:") || (uri.contains("://") && !uri.starts_with("file://")) {
+            return Ok(None);
+        }
+        self.check_module_path_uri(uri)?;
+        let import_path = match self.local_file_path(path, uri) {
+            Ok(import_path) => import_path,
+            Err(Error::ImportNotFound(_)) if uri.starts_with("modulepath:") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.check_import_allowed(uri, &import_path)?;
+        if !self.path_exists_io(&import_path)? {
+            return Ok(None);
+        }
+        let source = self.read_to_string_io(&import_path)?;
+        Ok(Some((source, import_path.display().to_string())))
+    }
+
+    /// Fail unless the module policy allows loading the module `uri`.
+    pub(super) fn check_module_allowed(&self, uri: &str) -> Result<()> {
+        let Some(policy) = &self.allowed_modules else {
+            return Ok(());
+        };
+        let patterns = policy.as_ref().map_err(|e| Error::Eval(e.clone()))?;
+        // The standard library is always loadable.
+        if uri.starts_with("pkl:") {
+            return Ok(());
+        }
+        if patterns
+            .iter()
+            .any(|pattern| pattern.is_match(uri).unwrap_or(false))
+        {
+            return Ok(());
+        }
+        Err(Error::Eval(format!(
+            "Refusing to load module `{uri}` because it does not match any entry in the module allowlist."
+        )))
+    }
+
+    /// Remember the package `uri` (a `package:` module URI) names, so modules
+    /// read from it are checked by their package URI. A no-op without a policy.
+    pub(super) fn note_package_base(&mut self, uri: &str, pkg: &PackageSource) {
+        if self.allowed_modules.is_none() {
+            return;
+        }
+        let key = match pkg {
+            PackageSource::Direct { root, .. } => root.clone(),
+            PackageSource::Zip(zip_url, _) => zip_url.clone(),
+        };
+        let base = uri.split_once('#').map_or(uri, |(base, _)| base);
+        self.package_bases.insert(key, base.to_string());
+    }
+
+    /// The URI the module policy sees for the module at `path`, which is a URL
+    /// for a remote module and a file otherwise. A module read from a package
+    /// is named by its `package:` URI.
+    fn module_policy_uri(&mut self, path: &Path) -> String {
+        let name = path.to_string_lossy();
+        //Inline and virtual modules keep their logical URI for capability checks.
+        if name.starts_with("repl:") || name.starts_with("nori:") {
+            return name.into_owned();
+        }
+        if name.contains("://") {
+            let package = self.package_bases.iter().find_map(|(root, base)| {
+                let rest = name.strip_prefix(root.as_str())?;
+                Some(format!("{base}#/{rest}"))
+            });
+            return package.unwrap_or_else(|| name.into_owned());
+        }
+        let absolute = absolute_clean(&self.host_absolute_path(path.to_path_buf()));
+        #[cfg(feature = "package-zip")]
+        for (zip_url, dir) in &self.package_dirs {
+            if let Ok(rest) = absolute.strip_prefix(dir)
+                && let Some(base) = self.package_bases.get(zip_url)
+            {
+                let rest = rest.to_string_lossy().replace('\\', "/");
+                return format!("{base}#/{rest}");
+            }
+        }
+        file_uri(&absolute)
+    }
+
+    /// [`Self::check_module_allowed`] for the module at `path`.
+    pub(super) fn check_module_path_allowed(&mut self, path: &Path) -> Result<()> {
+        if self.allowed_modules.is_none() {
+            return Ok(());
+        }
+        if !self.module_path_admitted.is_empty() {
+            let absolute = absolute_clean(&self.host_absolute_path(path.to_path_buf()));
+            if self.module_path_admitted.contains_key(&absolute) {
+                return Ok(());
+            }
+        }
+        self.check_file_path_allowed(path)
+    }
+
+    /// Check the module at `path` by its `file:` (or remote) URI, even if the
+    /// file was admitted earlier through a `modulepath:` import.
+    fn check_file_path_allowed(&mut self, path: &Path) -> Result<()> {
+        if self.allowed_modules.is_none() {
+            return Ok(());
+        }
+        let uri = self.module_policy_uri(path);
+        self.check_module_allowed(&uri)
+    }
+
+    /// Check the import `uri` that resolved to the file `path`: a `modulepath:`
+    /// import by its URI, any other import by the file it names, so one
+    /// import's admission never covers another import of the same file.
+    pub(super) fn check_import_allowed(&mut self, uri: &str, path: &Path) -> Result<()> {
+        if uri.starts_with("modulepath:") {
+            self.admit_module_path(uri, path)
+        } else {
+            self.check_file_path_allowed(path)
+        }
+    }
+
+    /// Check the `modulepath:` URI `uri`, which Pkl matches against the
+    /// policy rather than the file it names, before looking for that file.
+    /// A no-op for any other URI.
+    pub(super) fn check_module_path_uri(&self, uri: &str) -> Result<()> {
+        if uri.starts_with("modulepath:") {
+            self.check_module_allowed(uri)?;
+        }
+        Ok(())
+    }
+
+    /// Record that the policy admitted the `modulepath:` URI `uri`, which was
+    /// resolved to the file `path`, so loading the file is not refused as a
+    /// `file:` URI. Call it only for a module that is actually loaded.
+    pub(super) fn admit_module_path(&mut self, uri: &str, path: &Path) -> Result<()> {
+        if !uri.starts_with("modulepath:") {
+            return Ok(());
+        }
+        self.check_module_allowed(uri)?;
+        // The file's URI is what its relative imports resolve against.
+        if let Some(normalized) = normalize_module_path_uri(split_query(uri).0)? {
+            let absolute = absolute_clean(&self.host_absolute_path(path.to_path_buf()));
+            // The first URI that loads a file names it, so one file is not
+            // renamed by a later import of it through another URI.
+            self.module_path_admitted
+                .entry(absolute)
+                .or_insert(normalized);
+        }
+        Ok(())
+    }
+
+    /// Resolve the relative reference `uri` made from the module at
+    /// `current_path` to the absolute URI it names, when that is not a local
+    /// file: against a remote module's URL, or against a module path module's
+    /// `modulepath:` URI, as Pkl does. `None` when the import stays local.
+    pub(super) fn resolve_relative(&mut self, current_path: &Path, uri: &str) -> Option<String> {
+        if let Some(remote) = resolve_remote_relative(current_path, uri) {
+            return Some(remote);
+        }
+        if self.module_path_admitted.is_empty() || has_scheme(uri) {
+            return None;
+        }
+        let absolute = absolute_clean(&self.host_absolute_path(current_path.to_path_buf()));
+        let base = self.module_path_admitted.get(&absolute)?.clone();
+        self.join_module_path_uri(&base, uri)
+    }
+
+    /// The `modulepath:` URI the relative reference `rel` names from the module
+    /// `base`. Dot segments are removed, but ones that climb out of the module
+    /// path root are kept, so the URI Pkl matches against the allowlist
+    /// (`modulepath:/../x.pkl`) names nothing and is not mistaken for a file
+    /// inside the root. A triple-dot reference names the nearest ancestor
+    /// directory that holds the file, or the root when none does.
+    fn join_module_path_uri(&mut self, base: &str, rel: &str) -> Option<String> {
+        let (rel_path, suffix) = split_query(rel);
+        let mut dir: Vec<&str> = base
+            .strip_prefix("modulepath:/")
+            .unwrap_or_default()
+            .split('/')
+            .collect();
+        dir.pop();
+        // An invalid triple-dot URI stays as written, to be reported as such.
+        let Ok(triple_dot) = parse_triple_dot_path(rel_path) else {
+            return None;
+        };
+        if let Some(triple_dot) = triple_dot {
+            // Pkl matches the unnormalized candidates and finds nothing for a
+            // `..` that climbs, so such a path is refused here as an escape
+            // rather than normalized into the module path.
+            if triple_dot.split('/').any(|part| part == "..") {
+                return Some(format!("modulepath:/../{triple_dot}{suffix}"));
+            }
+            let module = Path::new("/").join(base.strip_prefix("modulepath:/").unwrap_or_default());
+            let found =
+                resolve_triple_dot(&module, triple_dot, Some(Path::new("/")), |candidate| {
+                    let uri = format!(
+                        "modulepath:{}",
+                        candidate.to_string_lossy().replace('\\', "/")
+                    );
+                    Ok(self.module_path_file(&uri, false).is_ok())
+                });
+            // Nothing found names the root, as Pkl reports it.
+            let name = match found {
+                Ok(Some(path)) => path.to_string_lossy().replace('\\', "/"),
+                _ => format!("/{triple_dot}"),
+            };
+            let joined = format!("modulepath:{name}{suffix}");
+            return Some(
+                normalize_module_path_uri(&joined)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(joined),
+            );
+        }
+        let mut stack: Vec<&str> = if rel_path.starts_with('/') {
+            Vec::new()
+        } else {
+            dir
+        };
+        for part in rel_path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." if stack.last().is_some_and(|last| *last != "..") => {
+                    stack.pop();
+                }
+                part => stack.push(part),
+            }
+        }
+        let joined = format!("modulepath:/{}{suffix}", stack.join("/"));
+        Some(
+            normalize_module_path_uri(&joined)
+                .ok()
+                .flatten()
+                .unwrap_or(joined),
+        )
+    }
+
+    /// Load and parse the module `uri` names, sharing the parse cache with
+    /// evaluation so a base module is not lexed and parsed again for each
+    /// analysis. `None` when the module is absent or does not parse.
+    pub(super) fn load_parsed_module(
+        &mut self,
+        uri: &str,
+        path: &Path,
+    ) -> Result<Option<(Arc<Module>, String)>> {
+        let Some((source, source_path)) = self.load_module_source(uri, path)? else {
+            return Ok(None);
+        };
+        // Remote and virtual sources are keyed by URI, which never collides with an
+        // absolute local path.
+        let key = if source_path.contains("://") || source_path.starts_with("nori:") {
+            Some(PathBuf::from(&source_path))
+        } else {
+            self.canonicalize_io(Path::new(&source_path)).ok()
+        };
+        if let Some(module) = key.as_ref().and_then(|key| self.parse_cache.get(key)) {
+            return Ok(Some((Arc::clone(module), source_path)));
+        }
+        let Ok(tokens) = lexer::lex_named(&source, &source_path) else {
+            return Ok(None);
+        };
+        let Ok(module) = self.parse_registered(&tokens, &source, &source_path) else {
+            return Ok(None);
+        };
+        let module = Arc::new(module);
+        if let Some(key) = key {
+            self.parse_cache.insert(key, Arc::clone(&module));
+        }
+        Ok(Some((module, source_path)))
+    }
+
+    /// Evaluate `source` as the module at `path`.
+    pub fn eval_source(&mut self, source: &str, path: &Path) -> Result<Value> {
+        self.on_grown_stack(|this| {
+            this.begin_evaluation();
+            this.eval_source_inner(source, path)
+        })
+    }
+
+    pub(super) fn eval_source_inner(&mut self, source: &str, path: &Path) -> Result<Value> {
+        // Seed import cache for the entry file so circular back-references work.
+        // Mark it in flight too, so a narrowed import that reads this
+        // placeholder is not cached.
+        let canonical = self.canonicalize_io(path).ok();
+        if let Some(canonical) = &canonical {
+            self.import_cache
+                .insert(canonical.clone(), Value::Object(Arc::default(), None));
+            self.imports_in_flight.insert(canonical.clone());
+        }
+        let result = self.eval_entry_module(source, path);
+        if let Some(canonical) = canonical {
+            self.imports_in_flight.remove(&canonical);
+            // Update cache with real value
+            if let Ok(val) = &result {
+                self.import_cache.insert(canonical, val.clone());
+            }
+        }
+        result
+    }
+
+    pub(super) fn eval_entry_module(&mut self, source: &str, path: &Path) -> Result<Value> {
+        let name = path.display().to_string();
+        let tokens = lexer::lex_named(source, &name)?;
+        let module = self.parse_registered(&tokens, source, &name)?;
+        self.eval_module(&module, path, 0)
+    }
+
+    /// Evaluate a local pkl file by path.
+    pub fn eval_file(&mut self, path: &Path) -> Result<Value> {
+        self.on_grown_stack(|this| {
+            this.begin_evaluation();
+            this.check_module_path_allowed(path)?;
+            let source = this.read_to_string_io(path)?;
+            this.eval_source_inner(&source, path)
+        })
+    }
+
+    /// Read, lex, parse, and evaluate a local file (with caching).
+    /// Inserts a placeholder before evaluation to break circular imports.
+    pub(super) fn eval_import_file(&mut self, path: &Path, depth: usize) -> Result<Value> {
+        // Check the requested path, not just the canonical file a cache keys on.
+        self.check_module_path_allowed(path)?;
+        let canonical = self.canonicalize_io(path)?;
+        if let Some(cached) = self.cached_import(&canonical) {
+            return Ok(cached);
+        }
+        // Insert empty placeholder to break circular imports
+        self.import_cache
+            .insert(canonical.clone(), Value::Object(Arc::default(), None));
+        self.imports_in_flight.insert(canonical.clone());
+        let result = self.eval_file_inner(path, &canonical, depth);
+        self.imports_in_flight.remove(&canonical);
+        if result.is_err() {
+            // Remove stale placeholder on failure so retries can re-evaluate
+            self.import_cache.remove(&canonical);
+        }
+        result
+    }
+
+    pub(super) fn eval_file_with_requested_fields(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        requested_fields: Option<HashSet<Name>>,
+    ) -> Result<Value> {
+        if requested_fields.is_none() {
+            return self.eval_import_file(path, depth);
+        }
+        self.check_module_path_allowed(path)?;
+        let canonical = self.canonicalize_io(path)?;
+        let mut fields: Vec<Name> = requested_fields.iter().flatten().cloned().collect();
+        fields.sort_unstable();
+        let key = (canonical.clone(), fields);
+        if self.imports_in_flight.contains(&canonical) {
+            // A module that reads itself finds its own placeholder. Evaluate
+            // just the members it reads, unless that is already under way.
+            if !self.narrowed_in_flight.insert(key.clone()) {
+                return Ok(self.cached_import(&canonical).unwrap_or_default());
+            }
+            self.placeholder_reads += 1;
+            let result = self.eval_file_requested_fields_inner(path, depth, requested_fields);
+            self.narrowed_in_flight.remove(&key);
+            return result;
+        }
+        if let Some(cached) = self.cached_import(&canonical) {
+            return Ok(cached);
+        }
+        if let Some(cached) = self.narrowed_import_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+        self.import_cache
+            .insert(canonical.clone(), Value::Object(Arc::default(), None));
+        self.imports_in_flight.insert(canonical.clone());
+        let placeholder_reads = self.placeholder_reads;
+        let result = self.eval_file_requested_fields_inner(path, depth, requested_fields);
+        self.imports_in_flight.remove(&canonical);
+        self.import_cache.remove(&canonical);
+        // A module evaluated while one of its imports was still in flight may
+        // have seen that import's placeholder, so only cache self-contained
+        // results.
+        if let Ok(value) = &result
+            && self.placeholder_reads == placeholder_reads
+        {
+            self.narrowed_import_cache.insert(key, value.clone());
+        }
+        result
+    }
+
+    /// The cached value of a local import, counting reads of an in-flight
+    /// placeholder.
+    pub(super) fn cached_import(&mut self, canonical: &Path) -> Option<Value> {
+        let cached = self.import_cache.get(canonical)?.clone();
+        if self.imports_in_flight.contains(canonical) {
+            self.placeholder_reads += 1;
+        }
+        Some(cached)
+    }
+
+    pub(super) fn eval_file_requested_fields_inner(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        requested_fields: Option<HashSet<Name>>,
+    ) -> Result<Value> {
+        let module = self.parse_file(path)?;
+        self.eval_module_with_scope(&module, path, depth, None, requested_fields)
+    }
+
+    pub(super) fn eval_file_inner(
+        &mut self,
+        path: &Path,
+        canonical: &Path,
+        depth: usize,
+    ) -> Result<Value> {
+        let val = self.eval_file_inner_with_scope(path, depth, None)?;
+        self.import_cache
+            .insert(canonical.to_path_buf(), val.clone());
+        Ok(val)
+    }
+
+    pub(super) fn eval_file_with_scope(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        inherited_scope: Option<Scope>,
+    ) -> Result<Value> {
+        if inherited_scope.is_none() {
+            return self.eval_import_file(path, depth);
+        }
+        self.check_module_path_allowed(path)?;
+        let canonical = self.canonicalize_io(path)?;
+        if !self.scoped_imports_in_flight.insert(canonical.clone()) {
+            self.placeholder_reads += 1;
+            return Ok(Value::Object(Arc::default(), None));
+        }
+        let result = self.eval_file_inner_with_scope(path, depth, inherited_scope);
+        self.scoped_imports_in_flight.remove(&canonical);
+        result
+    }
+
+    pub(super) fn eval_file_inner_with_scope(
+        &mut self,
+        path: &Path,
+        depth: usize,
+        inherited_scope: Option<Scope>,
+    ) -> Result<Value> {
+        let module = self.parse_file(path)?;
+        let val = self.eval_module_with_scope(&module, path, depth, inherited_scope, None)?;
+        Ok(val)
+    }
+
+    pub(super) fn parse_file(&mut self, path: &Path) -> Result<Arc<Module>> {
+        self.check_module_path_allowed(path)?;
+        let canonical = self.canonicalize_io(path).ok();
+        if let Some(module) = canonical.as_ref().and_then(|c| self.parse_cache.get(c)) {
+            return Ok(Arc::clone(module));
+        }
+        let source = self.read_to_string_io(path)?;
+        let name = path.display().to_string();
+        let tokens = lexer::lex_named(&source, &name)?;
+        let module = Arc::new(self.parse_registered(&tokens, &source, &name)?);
+        if let Some(canonical) = canonical {
+            self.parse_cache.insert(canonical, Arc::clone(&module));
+        }
+        Ok(module)
+    }
+
+    /// The name pkl gives the class of a module that amends another: the
+    /// name of the module at the root of its amends chain.
+    pub(super) fn amended_module_name(&mut self, module: &Module, path: &Path) -> String {
+        let mut name = module_display_name(module, path);
+        let mut current = (module.amends.clone(), path.to_path_buf());
+        for _ in 0..self.max_depth {
+            let (Some(uri), from) = current else { break };
+            let local = uri.starts_with("file:") || uri.starts_with("modulepath:");
+            if uri.contains("://") && !local {
+                break;
+            }
+            let Ok(base_path) = self.local_file_path(&from, &uri) else {
+                break;
+            };
+            let Ok(base) = self.parse_file(&base_path) else {
+                break;
+            };
+            name = module_display_name(&base, &base_path);
+            current = (base.amends.clone(), base_path);
+        }
+        name
+    }
+
+    /// Whether a module in the amends or extends chain of `module` is a
+    /// standard library module, whose members this evaluator does not list.
+    pub(super) fn inherits_stdlib_module(&mut self, module: &Module, path: &Path) -> bool {
+        let mut current = (
+            module.amends.clone().or_else(|| module.extends.clone()),
+            path.to_path_buf(),
+        );
+        for _ in 0..self.max_depth {
+            let (Some(uri), from) = current else {
+                return false;
+            };
+            if uri.starts_with("pkl:") {
+                return true;
+            }
+            // A remote base is not followed here; assume it may reach the
+            // standard library rather than reject members it might declare.
+            let local = uri.starts_with("file:") || uri.starts_with("modulepath:");
+            if uri.contains("://") && !local {
+                return true;
+            }
+            let Ok(base_path) = self.local_file_path(&from, &uri) else {
+                return false;
+            };
+            let Ok(base) = self.parse_file(&base_path) else {
+                return false;
+            };
+            current = (
+                base.amends.clone().or_else(|| base.extends.clone()),
+                base_path,
+            );
+        }
+        false
+    }
+
+    /// Reject a module that amends or extends itself.
+    pub(super) fn check_not_self(
+        &mut self,
+        module: &Module,
+        path: &Path,
+        base_path: &Path,
+        verb: &str,
+    ) -> Result<()> {
+        let same = match (self.canonicalize_io(path), self.canonicalize_io(base_path)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => path == base_path,
+        };
+        if same {
+            return Err(Error::Eval(format!(
+                "Module `{}` cannot {verb} itself.",
+                module_display_name(module, path)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a glob import pattern to a mapping of matched module paths to
+    /// their evaluated values. Shared by `import* "glob" as Alias` declarations
+    /// and `import*("glob")` expressions.
+    ///
+    /// Keys are the matched paths relative to `path`'s directory, matching pkl.
+    /// The enclosing module is skipped: pklr evaluates matched modules eagerly,
+    /// so including it would recurse until the import depth limit.
+    ///
+    /// `requested` is the set of keys the importing code reads, when it only
+    /// reads the mapping as `Alias["key"]`. Then only those modules are
+    /// evaluated. A requested name that is not a matched key (such as `keys`
+    /// or `length`) needs the whole mapping, so every module is evaluated.
+    pub(super) fn eval_glob_import(
+        &mut self,
+        uri: &str,
+        path: &Path,
+        depth: usize,
+        requested: Option<&HashSet<Name>>,
+    ) -> Result<Value> {
+        // A malformed triple-dot URI is a syntax error, not a file pattern.
+        parse_triple_dot_path(uri)?;
+        if uri.starts_with("...") {
+            return Err(Error::Eval(
+                "Cannot combine glob imports with triple-dot module URIs.".into(),
+            ));
+        }
+        if uri.starts_with("file:") && !uri.starts_with("file:/") {
+            return Err(Error::Eval(format!(
+                "Module URI `{uri}` has invalid syntax. File URIs must have a path that starts with `/` (e.g. file:/path/to/my_module.pkl)."
+            )));
+        }
+        for scheme in ["http", "https"] {
+            if uri.starts_with(&format!("{scheme}:")) {
+                return Err(Error::Eval(format!(
+                    "Cannot expand glob pattern `{uri}` because scheme `{scheme}` is not globbable."
+                )));
+            }
+        }
+        if uri.starts_with("modulepath:") {
+            return Err(Error::Eval(format!(
+                "Cannot expand glob pattern `{uri}` because scheme `modulepath` is not globbable."
+            )));
+        }
+        // Non-local glob imports resolve to an empty mapping.
+        if uri.contains("://") {
+            return Ok(Value::Object(Arc::default(), None));
+        }
+        // Match `expand_glob`, which walks `.` for a bare entry path, so the
+        // matched paths share this prefix and the keys come out relative.
+        let base_dir = module_dir(path.parent().unwrap_or(Path::new(".")));
+        if self.allowed_modules.is_some() {
+            // Pkl checks the directory the pattern searches before any match.
+            let fixed = uri.find(['*', '?', '[', '{']).map_or(uri, |i| &uri[..i]);
+            let dir = fixed.rfind('/').map_or("", |i| &fixed[..=i]);
+            let dir_path = self.local_file_path(path, dir)?;
+            let mut dir_uri = self.module_policy_uri(&dir_path);
+            if !dir_uri.ends_with('/') {
+                dir_uri.push('/');
+            }
+            self.check_module_allowed(&dir_uri)?;
+        }
+        let matched = self.glob_io(base_dir, uri)?;
+        let matched = matched
+            .into_iter()
+            .map(|matched_path| {
+                let mut rel_key = pathdiff_or_full(&matched_path, base_dir);
+                // Keys keep the pattern's own `./` prefix.
+                if uri.starts_with("./")
+                    && !(rel_key.starts_with("./")
+                        || rel_key.starts_with("../")
+                        || rel_key.starts_with('/'))
+                {
+                    rel_key.insert_str(0, "./");
+                }
+                (matched_path, rel_key)
+            })
+            .collect::<Vec<_>>();
+        let requested = requested.filter(|requested| {
+            requested.iter().all(|key| {
+                matched
+                    .iter()
+                    .any(|(_, rel_key)| rel_key.as_str() == &**key)
+            })
+        });
+        let mut mapping = ObjectMap::default();
+        for (matched_path, rel_key) in matched {
+            if requested.is_some_and(|requested| !requested.contains(rel_key.as_str())) {
+                continue;
+            }
+            // The module itself matches too, as the placeholder of its own
+            // evaluation, when that is under way.
+            if self.same_local_path(&matched_path, path)?
+                && !self
+                    .canonicalize_io(path)
+                    .is_ok_and(|canonical| self.imports_in_flight.contains(&canonical))
+            {
+                continue;
+            }
+            // A match is checked by its own file URI, not by an earlier
+            // `modulepath:` admission of the same file.
+            self.check_file_path_allowed(&matched_path)?;
+            let val = self.eval_file_with_requested_fields(&matched_path, depth + 1, None)?;
+            mapping.insert(rel_key.into(), val);
+        }
+        Ok(Value::Object(Arc::new(mapping), None))
+    }
+
+    /// Evaluate a single `import("uri")` expression, resolving `uri` the same way
+    /// an `import "uri"` declaration in `path` would.
+    ///
+    /// `requested` narrows evaluation to the module properties the expression
+    /// actually reads, matching how an import alias used as `Alias.field` is
+    /// narrowed. `None` evaluates the whole module.
+    pub(super) fn eval_import_expr(
+        &mut self,
+        uri: &str,
+        path: &Path,
+        depth: usize,
+        requested: Option<HashSet<Name>>,
+    ) -> Result<Value> {
+        let resolved = self.resolve_relative(path, uri);
+        let uri: &str = resolved.as_deref().unwrap_or(uri);
+
+        if let Some(module_name) = uri.strip_prefix("pkl:") {
+            return self.stdlib_module(module_name, depth);
+        }
+
+        if (!uri.contains("://") && !uri.starts_with("nori:")) || uri.starts_with("file://") {
+            self.check_module_path_uri(uri)?;
+            let import_path = self.local_file_path(path, uri)?;
+            self.check_import_allowed(uri, &import_path)?;
+            if !self.path_exists_io(&import_path)? {
+                return Err(Error::ImportNotFound(import_path.display().to_string()));
+            }
+            return self.eval_file_with_requested_fields(&import_path, depth + 1, requested);
+        }
+
+        let Some((source, name)) = self.load_module_source(uri, path)? else {
+            return Err(Error::ImportNotFound(uri.to_string()));
+        };
+        // Package zips extract to a local file, so evaluate those through the
+        // shared import cache like any other local import.
+        if !name.contains("://") && !name.starts_with("nori:") {
+            return self.eval_file_with_requested_fields(Path::new(&name), depth + 1, requested);
+        }
+        let tokens = lexer::lex_named(&source, &name)?;
+        let imported = self.parse_registered(&tokens, &source, &name)?;
+        self.eval_module_with_scope(&imported, Path::new(&name), depth + 1, None, requested)
+    }
+
+    pub(super) fn same_local_path(&mut self, left: &Path, right: &Path) -> Result<bool> {
+        if left == right {
+            return Ok(true);
+        }
+        let left_key = self
+            .canonicalize_io(left)
+            .unwrap_or_else(|_| left.to_path_buf());
+        let right_key = self
+            .canonicalize_io(right)
+            .unwrap_or_else(|_| right.to_path_buf());
+        Ok(left_key == right_key)
+    }
+
+    pub(super) fn bind_deferred_inherited_imports(
+        &mut self,
+        deferred: &[(String, PathBuf)],
+        inherited_path: &Path,
+        inherited_val: &Value,
+        scope: &mut Scope,
+    ) -> Result<()> {
+        for (alias, alias_path) in deferred {
+            if self.same_local_path(alias_path, inherited_path)? {
+                self.bind_import_type_aliases(scope, alias, inherited_path, inherited_val, None);
+                scope.declare(alias, inherited_val.clone());
+                let identity = self.module_type_namespace(alias_path);
+                scope.set_module_identity(alias.clone(), identity);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A module's name as pkl reports it: the name from its `module`
+/// declaration, else its file name without the extension.
+pub(super) fn module_display_name(module: &Module, path: &Path) -> String {
+    module.name.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    })
+}
+
+#[cfg(all(test, feature = "native-io"))]
+mod requested_field_tests {
+    use std::collections::HashSet;
+
+    use super::Evaluator;
+    use crate::{Value, lexer, parser};
+
+    #[test]
+    fn inherited_late_properties_respect_requested_fields() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "pklr-requested-fields-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(
+            test_dir.join("Base.pkl"),
+            "abstract module Base\nwanted = source + 1\nextra = source + 2\nsource = 1\n",
+        )
+        .unwrap();
+        let child_path = test_dir.join("Child.pkl");
+        let source = "extends \"Base.pkl\"\nsource = 2\n";
+        std::fs::write(&child_path, source).unwrap();
+        let tokens = lexer::lex(source).unwrap();
+        let module = parser::parse(&tokens).unwrap();
+
+        let value = Evaluator::default()
+            .eval_module_with_scope(
+                &module,
+                &child_path,
+                1,
+                None,
+                Some(HashSet::from_iter([super::nm("wanted")])),
+            )
+            .unwrap();
+        let Value::Object(fields, _) = value else {
+            panic!("expected an object");
+        };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields["wanted"], Value::Int(3));
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn mapping_source_captures_import_identities() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "pklr-mapping-source-imports-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("Config.pkl"), "class Item {}\n").unwrap();
+        let main_path = test_dir.join("main.pkl");
+        std::fs::write(
+            &main_path,
+            "import \"Config.pkl\"\nresult = new Mapping { [\"item\"] = new Config.Item {} }\n",
+        )
+        .unwrap();
+
+        let value = Evaluator::default().eval_file(&main_path).unwrap();
+        let Value::Object(fields, _) = value else {
+            panic!("expected module object");
+        };
+        let Value::Object(_, Some(source)) = &fields["result"] else {
+            panic!("expected mapping object source");
+        };
+        assert!(source.scope().contains_key("Config"));
+        assert!(source.scope_module_identities().contains_key("Config"));
+
+        std::fs::remove_dir_all(test_dir).unwrap();
+    }
+}
+
+/// Whether `uri` starts with a scheme (`file:`, `https://`), so is not a
+/// relative reference.
+fn has_scheme(uri: &str) -> bool {
+    uri.split('/')
+        .next()
+        .is_some_and(|first| first.contains(':'))
+}
