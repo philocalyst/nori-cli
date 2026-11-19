@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 nori-workflow = { workspace = true }
-pklrust = "0.9.0"
+pklr = { package = "nori-pkl-runtime", path = "../../vendor/pkl-native" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sysinfo = "0.37.2"

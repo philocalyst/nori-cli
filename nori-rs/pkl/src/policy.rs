@@ -3,22 +3,25 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use crate::EvaluatorOptions;
 use nori_workflow::CommitAgent;
 use nori_workflow::CommitBatch;
 use nori_workflow::CommitRules;
 use nori_workflow::CommitStyle;
+use nori_workflow::FallbackOverride;
 use nori_workflow::Hook;
 use nori_workflow::HookEvent;
 use nori_workflow::PrRules;
+use nori_workflow::RecoveryLayer;
+use nori_workflow::RecoveryOverride;
+use nori_workflow::Route;
 use nori_workflow::Upstream;
 use nori_workflow::Workflow;
-use pklrust::EvaluatorManager;
-use pklrust::EvaluatorOptions;
-use pklrust::ModuleSource;
 use serde::Deserialize;
 use serde::Deserializer;
 
 use crate::Error;
+use crate::recovery::RecoveryLayerBlock;
 
 pub fn global_policy_path(home: &Path) -> PathBuf {
     home.join("init.pkl")
@@ -32,8 +35,10 @@ pub fn project_policy_path(cwd: &Path) -> PathBuf {
 struct Policy {
     name: Option<String>,
     max_turns: Option<i64>,
+    /// Legacy spellings of `recovery.fallback.ranked` and `recovery.fallback.chain`.
     fallback_ranked: Option<bool>,
     fallback_models: Option<Vec<String>>,
+    recovery: Option<RecoveryLayerBlock>,
     instructions: Option<Vec<String>>,
     hooks: Option<Vec<PolicyHook>>,
     commit: Option<PolicyCommit>,
@@ -125,32 +130,22 @@ pub fn load_policy_with_machine(
     if paths.is_empty() {
         return Ok(workflow);
     }
-    let mut manager = EvaluatorManager::new().map_err(|e| Error::Evaluation(e.to_string()))?;
-    let options =
-        EvaluatorOptions::preconfigured().properties(snapshot.properties().into_iter().collect());
-    let evaluator = manager
-        .new_evaluator(options)
-        .map_err(|e| Error::Evaluation(e.to_string()))?;
+    let options = EvaluatorOptions::preconfigured().properties(snapshot.properties());
     for path in paths {
-        let policy: Policy = manager
-            .evaluate_module_typed(&evaluator, ModuleSource::file(path))
-            .map_err(|e| Error::Evaluation(e.to_string()))?;
+        let policy: Policy =
+            crate::native::evaluate_path(path, &options).map_err(Error::Evaluation)?;
         policy.apply(&mut workflow)?;
     }
-    manager
-        .close_evaluator(&evaluator)
-        .map_err(|e| Error::Evaluation(e.to_string()))?;
     Ok(workflow)
 }
 
 /// Compiled value of the input-free `default.pkl` module. Custom user and
-/// project modules still run through the official Pkl evaluator. The test below
+/// project modules run through the native Rust evaluator. The test below
 /// compares this value to that module so changes cannot silently drift.
 fn builtin_policy() -> &'static Workflow {
     static BUILTIN: OnceLock<Workflow> = OnceLock::new();
     BUILTIN.get_or_init(|| Workflow {
         name: "nori-default".to_owned(),
-        fallback_ranked: true,
         ..Workflow::default()
     })
 }
@@ -166,14 +161,38 @@ impl Policy {
             }
             workflow.max_turns = Some(turns);
         }
-        if let Some(ranked) = self.fallback_ranked {
-            workflow.fallback_ranked = ranked;
+        // The legacy fallback spellings apply first, so a `recovery` block in the same
+        // module wins over them.
+        if self.fallback_models.is_some() || self.fallback_ranked.is_some() {
+            let chain = self.fallback_models.as_ref().map(|models| {
+                models
+                    .iter()
+                    .map(|id| Route::parse_legacy(id))
+                    .collect::<Vec<_>>()
+            });
+            // A non-empty explicit list used to turn the ranked catalog off unless asked for.
+            let ranked = self.fallback_ranked.or(self
+                .fallback_models
+                .as_ref()
+                .filter(|models| !models.is_empty())
+                .map(|_| false));
+            workflow.recovery.apply(RecoveryLayer {
+                base: RecoveryOverride {
+                    fallback: FallbackOverride {
+                        chain,
+                        ranked,
+                        ..FallbackOverride::default()
+                    },
+                    ..RecoveryOverride::default()
+                },
+                ..RecoveryLayer::default()
+            });
         }
-        if let Some(models) = self.fallback_models {
-            if self.fallback_ranked.is_none() && !models.is_empty() {
-                workflow.fallback_ranked = false;
-            }
-            workflow.fallback_models = models;
+        if let Some(recovery) = self.recovery {
+            let layer = recovery
+                .to_layer()
+                .map_err(|message| Error::Invalid(format!("recovery: {message}")))?;
+            workflow.recovery.apply(layer);
         }
         if let Some(tools) = self.tools {
             let selection = workflow.tools.get_or_insert_with(Default::default);
@@ -306,8 +325,11 @@ mod tests {
         let policy = load_policy(Some(&global), Some(&project)).unwrap();
         assert_eq!(policy.name, "nori-default");
         assert_eq!(policy.max_turns, None);
-        assert!(!policy.fallback_ranked);
-        assert_eq!(policy.fallback_models, vec!["project"]);
+        assert!(!policy.recovery.base.fallback.ranked);
+        assert_eq!(
+            policy.recovery.base.fallback.chain,
+            vec![nori_workflow::Route::parse_legacy("project")]
+        );
         assert_eq!(
             policy.commit_reviewer,
             Some(CommitAgent {
@@ -415,19 +437,17 @@ mod tests {
     }
 
     #[test]
-    fn compiled_builtin_matches_the_official_pkl_module() {
-        let mut manager = EvaluatorManager::new().unwrap();
-        let evaluator = manager
-            .new_evaluator(EvaluatorOptions::preconfigured())
-            .unwrap();
-        let policy: Policy = manager
-            .evaluate_module_typed(
-                &evaluator,
-                ModuleSource::text(include_str!("../default.pkl")),
-            )
-            .unwrap();
-        manager.close_evaluator(&evaluator).unwrap();
+    fn compiled_builtin_matches_the_native_pkl_module() {
+        let policy: Policy = crate::native::evaluate(
+            include_str!("../default.pkl"),
+            &EvaluatorOptions::preconfigured(),
+        )
+        .unwrap();
+        // Start from values the module must overwrite, so a field it forgets to state fails.
         let mut evaluated = Workflow::default();
+        evaluated.recovery.base.retry.max_attempts = -1;
+        evaluated.recovery.base.fallback.ranked = false;
+        evaluated.recovery.base.fallback.prefer_headroom = false;
         policy.apply(&mut evaluated).unwrap();
         assert_eq!(builtin_policy(), &evaluated);
         let other = std::thread::spawn(builtin_policy).join().unwrap();

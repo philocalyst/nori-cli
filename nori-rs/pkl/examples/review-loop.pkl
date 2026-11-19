@@ -1,0 +1,83 @@
+/// An implementer and a reviewer in a loop until the reviewer approves.
+///
+/// The reviewer's agent can be rate limited, run out of quota or lose its model; its recovery
+/// retries the same route with a short backoff and then walks a fallback chain of other agents,
+/// while the implementer keeps the policy's defaults.
+///
+///     cargo run -p nori-conduit --example program_check -- pkl/examples/review-loop.pkl --run \
+///       --fail reviewer:3:quota_exhausted --approve reviewer:5
+amends "nori:Program"
+
+local task = "Add jittered exponential backoff to the HTTP client's retry loop"
+
+name = "review-loop"
+description = "Implement, review and fix until approved (at most four rounds)."
+
+actors {
+  ["dev"] {
+    agent = "claude-code"
+    model = "opus"
+    role = "implementation"
+    instructions = "You implement changes in small steps and answer with a summary of your diff."
+  }
+  ["reviewer"] {
+    agent = "codex"
+    role = "review"
+    instructions = "Review the dev's change. Reply APPROVED on its own line when it is correct; otherwise list the defects."
+    recovery {
+      retry {
+        max_attempts = 2
+        initial_backoff = 10.ms
+        max_backoff = 50.ms
+        jitter = 0.1
+        on = new Listing { "rate_limited"; "server_error"; "overloaded" }
+      }
+      fallback {
+        on = new Listing { "quota_exhausted"; "model_unavailable"; "capacity" }
+        chain = new Listing {
+          new { agent = "claude-code"; model = "sonnet" }
+          new { agent = "gemini"; model = "flash" }
+        }
+        ranked = false
+      }
+    }
+  }
+}
+
+budget_tokens = 400000
+
+steps {
+  new Send {
+    id = "implement"
+    to = "dev"
+    message = "Implement: \(task)"
+    bind = "patch"
+  }
+  new Loop {
+    id = "review-rounds"
+    max_iterations = 4
+    until = new Check { value = "verdict"; contains = "APPROVED" }
+    steps {
+      new Send {
+        id = "review"
+        to = "reviewer"
+        message = "Review this change:\n{{patch}}"
+        bind = "verdict"
+        timeout = 10.min
+      }
+      new When {
+        check = new Check { value = "verdict"; contains = "APPROVED"; negate = true }
+        steps {
+          new Send {
+            id = "fix"
+            to = "dev"
+            message = "The reviewer found problems. Fix them:\n{{verdict}}"
+            bind = "patch"
+          }
+        }
+      }
+    }
+  }
+}
+
+result = "patch"

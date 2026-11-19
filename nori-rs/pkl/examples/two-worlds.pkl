@@ -1,0 +1,100 @@
+/// A spike in an isolated world next to the real work.
+///
+/// The `spike` world has its own worktree and its own Nori home (settings copied from the
+/// parent's, credentials never) and a token budget. Inside it only `bash` (git and cargo) and
+/// the program's own tools exist. The experimenter lives there; the integrator
+/// lives in the session's own world. The experimenter's result crosses the boundary as a
+/// signal, so another process (a supervisor, a BEAM node) can observe or answer it through the
+/// journal's transport. A `wasm` tool is declared for a future runtime and is not called, so
+/// this program runs on builds without one.
+///
+///     cargo run -p nori-conduit --example program_check -- pkl/examples/two-worlds.pkl --run
+amends "nori:Program"
+
+import "nori:Skill" as Skill
+import "nori:Tool" as Tool
+
+name = "two-worlds"
+description = "Try a risky refactor in a sandboxed world; integrate it only when it passes."
+
+worlds {
+  ["spike"] {
+    isolation = "sandbox"
+    allowed_tools = new Listing { "bash:git"; "bash:cargo"; "lint-rules" }
+    allowed_paths = new Listing { "src"; "tests" }
+    budget_tokens = 60000
+    home = true
+  }
+}
+
+skills {
+  new Skill.SkillSpec {
+    name = "minimal-diff"
+    description = "Keep experiments small and tested."
+    instructions = new Listing { "Keep every change under src/ minimal and run the tests before you report." }
+    allowed_tools = new Listing { "bash" }
+  }
+}
+
+tools {
+  new Tool.WasmTool {
+    name = "lint-rules"
+    description = "Check a diff against the project's custom lint rules."
+    read_only = true
+    file = "tools/lint_rules.wasm"
+    export = "check"
+    args_schema = #"{"type":"object","required":["diff"],"properties":{"diff":{"type":"string"}}}"#
+    grants = new Listing {
+      new Tool.Grant { capability = "fs_read"; scope = new Listing { "src" } }
+    }
+    timeout = 5.s
+    memory_mib = 32
+  }
+}
+
+actors {
+  ["experimenter"] {
+    agent = "codex"
+    role = "implementation"
+    world = "spike"
+    isolation = "sandbox"
+    skills = new Listing { "minimal-diff" }
+    // Its Nori `bash` may run only git and cargo, and only touch these paths.
+    sandbox {
+      allowed_tools = new Listing { "bash:git"; "bash:cargo" }
+      allowed_paths = new Listing { "src"; "tests" }
+    }
+    instructions = "You are in a throwaway sandbox. Try the refactor and report what broke."
+  }
+  ["integrator"] {
+    agent = "claude-code"
+    role = "implementation"
+    instructions = "You land changes in the real tree, carefully."
+  }
+}
+
+steps {
+  new Within {
+    id = "spike"
+    world = "spike"
+    steps {
+      new Send {
+        id = "try-refactor"
+        to = "experimenter"
+        message = "Extract the retry policy into its own module and run the tests."
+        bind = "spike_report"
+        timeout = 20.min
+      }
+      new Emit { topic = "spike.finished"; payload = "{{spike_report}}" }
+    }
+  }
+  new AwaitSignal { id = "spike-result"; topic = "spike.finished"; bind = "approved_report" }
+  new Send {
+    id = "integrate"
+    to = "integrator"
+    message = "The spike reported:\n{{approved_report}}\nIf it is sound, apply it to the real tree."
+    bind = "landed"
+  }
+}
+
+result = "landed"

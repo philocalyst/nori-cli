@@ -1,6 +1,52 @@
 // Default runtime policy. Unspecified limits remain unlimited.
 name = "nori-default"
-fallback_ranked = true
-fallback_models = List()
 // Set to an object such as new Dynamic { agent = "claude"; model = "haiku" }.
 commit_reviewer = null
+
+// What a session does when a request to its model fails.
+//
+// A failure is classified (structured ACP error data first, message text last) into one of:
+//   rate_limited, quota_exhausted, model_unavailable, capacity (alias: overloaded),
+//   server_error, network, auth, prompt_too_long
+// then:
+//   1. kind in retry.on and attempts left -> the same route is retried after a backoff
+//      (visible in the transcript, cancelled with Esc); the provider's retry-after is honoured.
+//   2. kind in fallback.on -> the session moves to the next route: `chain` in order, then (when
+//      `ranked`) every other installed route for the same model ranked with native providers
+//      first, then other models. The session header always shows the route actually running.
+//   3. otherwise the failure is shown with its cause.
+// Layers deep-merge: user policy ($NORI_HOME/init.pkl) and project policy (.nori/nori.pkl) only
+// need to state what they change. Durations are Pkl durations (`2.s`, `500.ms`, `1.min`);
+// a bare number is read as seconds.
+recovery = new Dynamic {
+  retry = new Dynamic {
+    // Retries after the first failure; 0 turns retrying off.
+    max_attempts = 4
+    // The first retry waits this long, then double, up to max_backoff.
+    initial_backoff = 2.s
+    max_backoff = 60.s
+    // Randomise each wait by plus or minus this fraction, so parallel sessions spread out.
+    jitter = 0.2
+    on = List("server_error", "capacity", "network", "rate_limited")
+  }
+  fallback = new Dynamic {
+    // Capacity errors are retried above first; falling back happens once those attempts are used.
+    on = List("quota_exhausted", "model_unavailable", "capacity")
+    // Routes to try in order, e.g. List(new Dynamic { agent = "claude-code"; model = "haiku" }).
+    chain = List()
+    // After the chain, continue with the ranked catalog of installed agents and models.
+    ranked = true
+    // Among routes to the same model (two accounts of one provider), prefer the account with the
+    // most room left in its rate limit windows, and try one known to be spent last.
+    prefer_headroom = true
+    // never | after_reset | next_session: when to go back to the route you chose.
+    return_to_primary = "next_session"
+  }
+  // Per-role overrides for delegated subagents (implementation, research, review, design, test,
+  // general), e.g. roles = new Mapping { ["review"] = new Dynamic { fallback = new Dynamic {
+  //   chain = List(new Dynamic { agent = "claude-code"; model = "haiku" }) } } }
+  roles = new Mapping {}
+  // Per-agent overrides, e.g. agents = new Mapping { ["codex"] = new Dynamic {
+  //   retry = new Dynamic { max_attempts = 2 } } }. A role override beats an agent override.
+  agents = new Mapping {}
+}

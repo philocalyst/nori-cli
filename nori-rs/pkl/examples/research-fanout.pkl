@@ -1,0 +1,59 @@
+/// Research several questions at once, racing a fast and a deep researcher per question, then
+/// synthesize.
+///
+/// Each question runs in its own iteration of `FanOut`. Inside it a `Race` asks both
+/// researchers; the first answer wins and the other turn is cancelled. A `Budget` bounds the
+/// whole fan-out, and the writer's step gets a tighter recovery than the policy's.
+///
+///     cargo run -p nori-conduit --example program_check -- pkl/examples/research-fanout.pkl --run
+amends "nori:Program"
+
+local questions = List(
+  "How do ACP agents report token usage?",
+  "Which agents support session/load?",
+  "How are model fallbacks surfaced to the user?"
+)
+
+name = "research-fanout"
+description = "Parallel research with a race per question and one synthesis."
+
+actors {
+  ["fast"] { agent = "gemini"; model = "flash"; role = "research"; instructions = "Answer in at most five sentences." }
+  ["deep"] { agent = "claude-code"; model = "opus"; role = "research"; instructions = "Answer thoroughly and cite files." }
+  ["writer"] { agent = "claude-code"; model = "sonnet"; role = "design"; instructions = "Write one coherent summary." }
+}
+
+steps {
+  new Budget {
+    id = "research-budget"
+    tokens = 150000
+    bind = "findings"
+    steps {
+      new FanOut {
+        id = "per-question"
+        over = new Listing { ...questions }
+        each = "question"
+        steps {
+          new Race {
+            id = "first-good-answer"
+            branches {
+              new Send { to = "fast"; message = "{{question}}" }
+              new Send { to = "deep"; message = "{{question}}" }
+            }
+          }
+        }
+      }
+    }
+  }
+  new Send {
+    id = "synthesize"
+    to = "writer"
+    message = "Combine these answers into one summary, noting disagreements:\n{{findings}}"
+    bind = "summary"
+    recovery {
+      retry { max_attempts = 1; initial_backoff = 10.ms; max_backoff = 20.ms }
+    }
+  }
+}
+
+result = "summary"
