@@ -1,10 +1,7 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
-assertion_line: 514
 expression: rendered
 ---
 
 
 › Ask Nori to do anything
-
- │✓ Review    ││○ Research  │

@@ -120,6 +120,10 @@ impl ChatWidget {
         &mut self,
         config_options: &[nori_protocol::acp::v1::SessionConfigOption],
     ) {
+        // A request launched before this authoritative snapshot can finish later.
+        // It must not replace the selected model with an older configuration.
+        self.acp_mode_config_generation =
+            super::session_config_mode::next_acp_mode_config_generation();
         self.adopt_agent_config(AgentConfigState::from_options(config_options));
     }
 

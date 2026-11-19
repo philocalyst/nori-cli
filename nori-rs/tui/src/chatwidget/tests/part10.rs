@@ -551,6 +551,7 @@ fn session_started_event(acp_session_id: &str) -> nori_protocol::SessionEvent {
             history_log_id: 0,
             history_entry_count: 0,
             config_options: Vec::new(),
+            swap: None,
         },
     ))
 }

@@ -30,7 +30,7 @@ mod unix_tests {
             loop {
                 match event_rx.recv().await.expect("app event channel stays open") {
                     AppEvent::ExternalCliLoginOutput { data } => {
-                        output.push_str(&data);
+                        output.push_str(&String::from_utf8_lossy(&data));
                         if output.contains(expected) {
                             return output;
                         }

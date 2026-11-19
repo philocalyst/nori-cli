@@ -145,9 +145,7 @@ impl ChatWidget {
                 )));
                 return;
             }
-            self.submit_harness_action(crate::app_event::HarnessAction::RunUserShell(
-                cmd.to_string(),
-            ));
+            self.dispatch_user_shell_command(cmd.to_string());
             return;
         }
 
@@ -225,7 +223,7 @@ impl ChatWidget {
         self.persist_prompt_history(&text);
     }
 
-    fn persist_prompt_history(&mut self, text: &str) {
+    pub(super) fn persist_prompt_history(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }

@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
-assertion_line: 451
 expression: rendered
 ---
 
@@ -27,4 +26,4 @@ I found the failure.
 
 › Ask Nori to do anything
 
- │● Count lin ││● Read a.tx │
+  ● 2 agents

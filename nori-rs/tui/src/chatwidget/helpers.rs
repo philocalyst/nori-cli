@@ -12,6 +12,15 @@ impl ChatWidget {
     }
 
     pub(crate) fn transcript_tool_at(&self, column: u16, row: u16) -> Option<String> {
+        let pos = ratatui::layout::Position::new(column, row);
+        if let Some((_, call_id)) = self
+            .active_tool_hits
+            .borrow()
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+        {
+            return Some(call_id.clone());
+        }
         self.focused_transcript.as_ref()?.tool_at(column, row)
     }
 
@@ -39,43 +48,14 @@ impl ChatWidget {
         self.focused_transcript = None;
     }
 
-    pub(crate) fn set_response_focus(&mut self, active: bool) {
-        self.response_focus.set_active(active);
-    }
-
-    pub(crate) fn set_response_focus_prompt(&mut self, sent_prompt: bool) {
-        self.response_focus.set_sent_prompt(sent_prompt);
-    }
-
-    pub(crate) fn response_focus_action_at(&self, column: u16, row: u16) -> Option<KeyEvent> {
-        if !self.response_focus.active() {
-            return None;
-        }
-        self.focused_transcript.as_ref().and_then(|transcript| {
-            transcript.action_at(column, row, self.response_focus.sent_prompt())
-        })
-    }
-
-    pub(crate) fn response_focus_viewport_height(&self, fallback: u16) -> usize {
-        let height = self
-            .focused_transcript
-            .as_ref()
-            .and_then(super::session_transcript::SessionTranscript::viewport_height)
-            // The primary projection starts below two reserved history rows and
-            // has one row of padding on each side of the transcript/composer seam.
-            .unwrap_or_else(|| {
-                self.bottom_pane_area
-                    .get()
-                    .map_or(fallback, |area| area.y)
-                    .saturating_sub(4)
-            });
-        usize::from(height.max(1))
-    }
-
-    pub(crate) fn set_response_focus_header(&mut self, header: usize) {
-        if let Some(transcript) = self.focused_transcript.as_mut() {
-            transcript.set_focus_header(header);
-        }
+    /// Tell the status line which prompt a rewind is focused on, as `(turn, of)`.
+    pub(crate) fn set_rewind_badge(&mut self, turn: Option<(usize, usize)>) {
+        self.bottom_pane.set_rewind_badge(turn.map(|(turn, of)| {
+            (
+                i64::try_from(turn).unwrap_or(i64::MAX),
+                i64::try_from(of).unwrap_or(i64::MAX),
+            )
+        }));
     }
 
     pub(crate) fn set_focused_subagent_view(
@@ -142,8 +122,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_info_message(&mut self, message: String, hint: Option<String>) {
-        self.add_to_history(history_cell::new_info_event(message, hint));
-        self.request_redraw();
+        self.push_notice_with_hint(history_cell::NoticeKind::Info, message, hint);
     }
 
     /// The agent capability view from the latest SessionCapabilitiesChanged.
@@ -213,13 +192,11 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_error_message(&mut self, message: String) {
-        self.add_to_history(history_cell::new_error_event(message));
-        self.request_redraw();
+        self.push_notice(history_cell::NoticeKind::Error, message);
     }
 
     pub(crate) fn add_warning_message(&mut self, message: String) {
-        self.add_to_history(history_cell::new_warning_event(message));
-        self.request_redraw();
+        self.push_notice(history_cell::NoticeKind::Warning, message);
     }
 
     /// Queue a plain text message to be submitted as a user turn. If no task
@@ -367,6 +344,18 @@ impl ChatWidget {
         self.bottom_pane.composer_is_empty()
     }
 
+    pub(crate) fn is_composer_in_vim_normal_mode(&self) -> bool {
+        self.bottom_pane.is_composer_in_vim_normal_mode()
+    }
+
+    pub(crate) fn is_composer_popup_active(&self) -> bool {
+        self.bottom_pane.is_composer_popup_active()
+    }
+
+    pub(crate) fn submit_user_prompt_text(&mut self, text: String) {
+        self.submit_user_message(text.into());
+    }
+
     /// True when the UI is in the regular composer state with no running task,
     /// no modal overlay (e.g. approvals or status indicator), and no composer popups.
     /// In this state Esc-Esc backtracking is enabled.
@@ -382,14 +371,6 @@ impl ChatWidget {
     /// For widget handoffs, transfer a composer draft instead.
     pub(crate) fn set_composer_text(&mut self, text: String) {
         self.bottom_pane.set_composer_text(text);
-    }
-
-    pub(crate) fn show_esc_backtrack_hint(&mut self) {
-        self.bottom_pane.show_esc_backtrack_hint();
-    }
-
-    pub(crate) fn clear_esc_backtrack_hint(&mut self) {
-        self.bottom_pane.clear_esc_backtrack_hint();
     }
 
     pub(crate) fn shutdown_harness_session(&self) {
@@ -441,6 +422,8 @@ impl ChatWidget {
             use crate::app_event::HarnessAction;
             let result = match action {
                 HarnessAction::Cancel => handle.cancel().await,
+                HarnessAction::StopSubagents => handle.stop_subagents().await,
+                HarnessAction::StopAgent => handle.stop_agent().await,
                 HarnessAction::Shutdown { child_grace } => {
                     let result = handle.shutdown_with_grace(child_grace).await;
                     if result.is_err() {
@@ -641,20 +624,6 @@ impl ChatWidget {
         self.config = config;
     }
 
-    /// Forward MCP auth statuses to the active bottom pane view.
-    pub(crate) fn update_mcp_auth_statuses(
-        &mut self,
-        statuses: &std::collections::HashMap<String, codex_rmcp_client::McpAuthStatus>,
-    ) {
-        self.bottom_pane.update_mcp_auth_statuses(statuses);
-    }
-
-    /// Forward MCP OAuth completion to the active bottom pane view.
-    pub(crate) fn handle_mcp_oauth_complete(&mut self, server_name: &str, success: bool) {
-        self.bottom_pane
-            .handle_mcp_oauth_complete(server_name, success);
-    }
-
     /// Get a reference to the session statistics tracker.
     pub(crate) fn session_stats(&self) -> &SessionStats {
         &self.session_stats
@@ -664,11 +633,9 @@ impl ChatWidget {
 
     pub(super) fn as_renderable(&self) -> RenderableItem<'_> {
         let mut flex = FlexRenderable::new();
+        self.active_tool_hits.borrow_mut().clear();
         if let Some(transcript) = &self.focused_transcript {
-            if self.focused_subagent().is_none()
-                && !self.response_focus.active()
-                && transcript.follows_live()
-            {
+            if self.focused_subagent().is_none() && transcript.follows_live() {
                 flex.push(
                     1,
                     RenderableItem::Owned(Box::new(super::owned_transcript::OwnedTranscript {
@@ -685,8 +652,22 @@ impl ChatWidget {
                 );
             }
         } else {
+            let active_call_id = self
+                .active_cell
+                .as_ref()
+                .and_then(|cell| cell.as_any().downcast_ref::<ClientToolCell>())
+                .map(|tool| tool.call_id().to_owned());
             let active_cell_renderable = if self.active_cell.is_some() {
-                RenderableItem::Borrowed(&self.active_cell).inset(Insets::tlbr(1, 0, 0, 0))
+                if let Some(call_id) = active_call_id {
+                    RenderableItem::Owned(Box::new(TrackedActiveTool {
+                        inner: &self.active_cell,
+                        call_id,
+                        hits: &self.active_tool_hits,
+                    }))
+                    .inset(Insets::tlbr(1, 0, 0, 0))
+                } else {
+                    RenderableItem::Borrowed(&self.active_cell).inset(Insets::tlbr(1, 0, 0, 0))
+                }
             } else {
                 RenderableItem::Owned(Box::new(()))
             };
@@ -705,51 +686,62 @@ impl ChatWidget {
                 );
             }
         }
-        // Pinned plan drawer: renders the latest plan state between the active
-        // cell and the bottom pane. When no plan has been received yet, the
-        // guard on `pinned_plan` being `Some` means the drawer contributes
-        // zero height.
+        // A provider's sign-in program, live, right above the prompt.
+        if let Some(terminal) = &self.login_terminal {
+            flex.push(0, RenderableItem::Borrowed(terminal));
+        }
+        // Live subagent cards render directly in the chat stream (never below the prompt bar).
+        if self.focused_subagent.is_none() && self.subagents.has_running() {
+            flex.push(
+                0,
+                RenderableItem::Owned(Box::new(subagents::InChatSubagents {
+                    tree: &self.subagents,
+                    focused: self.focused_subagent,
+                    now: Instant::now(),
+                    screen_rows: self.screen_rows.get(),
+                    hits: &self.subagent_card_hits,
+                }))
+                .inset(Insets::tlbr(1, 0, 0, 0)),
+            );
+        } else {
+            self.subagent_card_hits.borrow_mut().clear();
+        }
+        // Pinned plan drawer: renders the latest plan state between the chat stream
+        // and the bottom pane.
+        self.pinned_plan_area.set(None);
         if let Some(plan) = &self.pinned_plan {
             match self.plan_drawer_mode {
                 PlanDrawerMode::Collapsed => {
                     flex.push(
                         0,
-                        RenderableItem::Owned(Box::new(
-                            crate::pinned_plan_drawer::PinnedPlanDrawerCollapsed::new(plan),
-                        ))
+                        RenderableItem::Owned(Box::new(TrackedArea {
+                            inner: crate::pinned_plan_drawer::PinnedPlanDrawerCollapsed::new(plan),
+                            area: &self.pinned_plan_area,
+                        }))
                         .inset(Insets::tlbr(1, 0, 0, 0)),
                     );
                 }
                 PlanDrawerMode::Expanded => {
                     flex.push(
                         0,
-                        RenderableItem::Owned(Box::new(
-                            crate::pinned_plan_drawer::PinnedPlanDrawer::new(plan),
-                        ))
+                        RenderableItem::Owned(Box::new(TrackedArea {
+                            inner: crate::pinned_plan_drawer::PinnedPlanDrawer::new(plan),
+                            area: &self.pinned_plan_area,
+                        }))
                         .inset(Insets::tlbr(1, 0, 0, 0)),
                     );
                 }
                 PlanDrawerMode::Off => {}
             }
         }
+        // The composer and a view each have their own blank row above them.
         flex.push(
             0,
             RenderableItem::Owned(Box::new(super::layout_cache::PositionedBottomPane {
                 pane: &self.bottom_pane,
                 area: &self.bottom_pane_area,
-            }))
-            .inset(Insets::tlbr(1, 0, 0, 0)),
+            })),
         );
-        if self.subagents.visible_count() > 0 {
-            flex.push(
-                0,
-                RenderableItem::Owned(Box::new(subagents::SubagentStrip {
-                    tree: &self.subagents,
-                    focused: self.focused_subagent,
-                    state: &self.subagent_strip,
-                })),
-            );
-        }
         RenderableItem::Owned(Box::new(flex))
     }
 
@@ -777,15 +769,8 @@ impl ChatWidget {
     /// Recompute and write the terminal title. Schedules the next animation
     /// frame if the spinner is active.
     pub(crate) fn refresh_terminal_title(&mut self) {
-        let now = Instant::now();
-        let spinner_frame = if self.should_animate_terminal_title_spinner() {
-            Some(crate::terminal_title::spinner_frame_at(
-                self.terminal_title_animation_origin,
-                now,
-            ))
-        } else {
-            None
-        };
+        // The tab names the project, nothing more: activity shows in the prompt bar.
+        let spinner_frame: Option<&str> = None;
 
         let project = self.project_name();
         if project.is_empty() {
@@ -827,5 +812,89 @@ impl ChatWidget {
             self.refresh_terminal_title();
         }
         self.subagent_pre_draw_tick();
+        self.status_note_tick();
+    }
+
+    /// Whether the user cancelled and the agent ignored it, so that Esc now stops the agent.
+    pub(crate) fn cancel_ignored(&self) -> bool {
+        self.bottom_pane.status_note() == Some(&crate::bottom_pane::StatusNote::CancelIgnored)
+    }
+
+    /// Whether a first Esc has said that a second one stops the running subagents.
+    pub(crate) fn stop_subagents_armed(&self) -> bool {
+        matches!(
+            self.bottom_pane.status_note(),
+            Some(crate::bottom_pane::StatusNote::StopSubagents { until, .. })
+                if Instant::now() < *until
+        )
+    }
+
+    /// Say that Esc again, within two seconds, stops the running subagents.
+    pub(crate) fn arm_stop_subagents(&mut self) {
+        self.set_status_note(Some(crate::bottom_pane::StatusNote::StopSubagents {
+            count: self.running_subagents(),
+            until: Instant::now() + std::time::Duration::from_secs(2),
+        }));
+    }
+
+    /// Say something in the status line for a while.
+    pub(crate) fn set_status_note(&mut self, note: Option<crate::bottom_pane::StatusNote>) {
+        self.bottom_pane.set_status_note(note);
+        self.request_redraw();
+    }
+
+    /// Drop a note that has run out, and ask for the frame at which a countdown next changes.
+    fn status_note_tick(&mut self) {
+        let now = Instant::now();
+        let Some(note) = self.bottom_pane.status_note() else {
+            return;
+        };
+        if note.is_over(now) {
+            self.bottom_pane.set_status_note(None);
+        } else if let Some(at) = note.next_change(now) {
+            self.frame_requester
+                .schedule_frame_in(at.saturating_duration_since(now));
+        }
+    }
+}
+
+struct TrackedArea<'a, R> {
+    inner: R,
+    area: &'a std::cell::Cell<Option<ratatui::layout::Rect>>,
+}
+
+impl<R: Renderable> Renderable for TrackedArea<'_, R> {
+    fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        self.area.set(Some(area));
+        self.inner.render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.inner.desired_height(width)
+    }
+
+    fn cursor_pos(&self, area: ratatui::layout::Rect) -> Option<(u16, u16)> {
+        self.inner.cursor_pos(area)
+    }
+}
+
+struct TrackedActiveTool<'a> {
+    inner: &'a layout_cache::CachedCell,
+    call_id: String,
+    hits: &'a std::cell::RefCell<Vec<(ratatui::layout::Rect, String)>>,
+}
+
+impl Renderable for TrackedActiveTool<'_> {
+    fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        self.hits.borrow_mut().push((area, self.call_id.clone()));
+        self.inner.render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.inner.desired_height(width)
+    }
+
+    fn cursor_pos(&self, area: ratatui::layout::Rect) -> Option<(u16, u16)> {
+        self.inner.cursor_pos(area)
     }
 }

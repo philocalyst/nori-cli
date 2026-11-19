@@ -168,12 +168,6 @@ impl ChatWidget {
             // that can be stepped through.
             _ => Vec::new(),
         };
-        let mut offered = offered;
-        if kind == CycledOption::Model {
-            crate::nori::agent_config_state::sort_models(&mut offered, |(value, name)| {
-                (value.as_str(), name.as_str())
-            });
-        }
         if offered.len() < 2 {
             self.add_info_message(format!("This agent offers one {noun}."), None);
             return true;

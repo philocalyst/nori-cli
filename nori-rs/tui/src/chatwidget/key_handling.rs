@@ -15,9 +15,10 @@ impl ChatWidget {
             && self.bottom_pane.composer_is_empty()
             && !self.bottom_pane.has_active_view()
         {
-            nori_harness::refresh_agent_catalog(
+            nori_harness::refresh_agent_catalog_except(
                 std::sync::Arc::new(self.config.clone()),
                 env!("CARGO_PKG_VERSION").to_string(),
+                self.config.active_agent.clone(),
             );
         }
         match key_event {
@@ -390,6 +391,7 @@ impl ChatWidget {
                 self.add_status_output();
             }
             SlashCommand::Context => self.add_context_output(),
+            SlashCommand::Usage => self.app_event_tx.send(AppEvent::OpenUsage),
             SlashCommand::RemoteControl => {
                 self.app_event_tx.send(AppEvent::RemoteControlRequested(
                     crate::remote_control::RemoteControlRequest::EnableLocal,

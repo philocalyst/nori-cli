@@ -174,6 +174,44 @@ fn acp_streamed_answer_counts_assistant_once_when_prompt_completes() {
     assert_eq!(chat.session_stats.assistant_messages, 1);
 }
 
+#[test]
+fn answer_message_boundaries_keep_warnings_and_replies_separate() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+
+    let delta = |message_id: &str, text: &str| {
+        crate::presentation::ClientEvent::MessageDelta(crate::presentation::MessageDelta {
+            stream: crate::presentation::MessageStream::Answer,
+            message_id: Some(message_id.to_owned()),
+            delta: text.to_owned(),
+        })
+    };
+
+    // A warning is transported through ACP's answer stream, but its marker
+    // must turn it into a standalone warning cell.
+    chat.handle_client_event(delta("assistant-1", "clue."));
+    chat.handle_client_event(delta(
+        "warning",
+        &format!(
+            "{}Code Mode is unavailable",
+            nori_protocol::AGENT_WARNING_PREFIX
+        ),
+    ));
+    chat.handle_client_event(delta("assistant-2", "Nori can continue."));
+
+    // A normal change of ACP message id is a boundary as well, while chunks
+    // with one id continue to be conflated into one assistant cell.
+    chat.handle_client_event(delta("assistant-3", "hello"));
+    chat.handle_client_event(delta("assistant-3", " world"));
+    chat.flush_answer_stream_with_separator();
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("");
+    insta::assert_snapshot!(rendered);
+}
+
 /// A long-running tool keeps sending ToolCallUpdate notifications while the
 /// agent streams its answer. Those no-op snapshot updates (the tool cell was
 /// already flushed to history) must not finalize the answer stream, otherwise

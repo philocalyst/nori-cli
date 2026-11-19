@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/model_cycle.rs
-assertion_line: 390
 expression: rendered
 ---
 
@@ -13,5 +12,7 @@ expression: rendered
 │                                                                              │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-                                                        Claude Code · Big Pickle
+
 › ! for shell commands
+
+                                                        Claude Code · Big Pickle

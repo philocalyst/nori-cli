@@ -80,7 +80,9 @@ impl ChatWidget {
             active_cell: Default::default(),
             live_tail: Default::default(),
             screen_rows: std::cell::Cell::new(0),
-            subagent_strip: Default::default(),
+            subagent_card_hits: Default::default(),
+            pinned_plan_area: std::cell::Cell::new(None),
+            active_tool_hits: Default::default(),
             bottom_pane_area: std::cell::Cell::new(None),
             live_tail_has_header: false,
             subagents: subagents::SubagentTree::new(config.cwd.clone(), config.animations),
@@ -88,7 +90,6 @@ impl ChatWidget {
             main_queued_prompts: Vec::new(),
             child_queued_prompts: HashMap::new(),
             focused_transcript: None,
-            response_focus: super::response_focus::ResponseFocus::default(),
             focused_session_config: None,
             subagents_running_shown: 0,
             pending_rewind: None,
@@ -96,6 +97,7 @@ impl ChatWidget {
             turn_reached_agent: false,
             unfinished: None,
             active_user_message_id: None,
+            active_answer_message_id: None,
             config: config.clone(),
             auth_manager,
             initial_user_message: create_initial_user_message(
@@ -111,6 +113,7 @@ impl ChatWidget {
             proactive_turn_active: false,
             unpaired_prompt_error_ids: HashSet::new(),
             completed_client_tool_calls: HashSet::new(),
+            settled_client_tool_calls: HashSet::new(),
             client_event_normalizer: Default::default(),
             replay_source: None,
             replay_turn_elapsed: None,
@@ -129,6 +132,7 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             current_rollout_path: None,
             pending_client_tool_cells: HashMap::new(),
+            deferred_cells: Vec::new(),
             effective_cwd_tracker: EffectiveCwdTracker::with_initial_cwd(config.cwd),
             session_configured_received: false,
             harness_handle: spawn_result.handle,
@@ -146,9 +150,10 @@ impl ChatWidget {
             session_stats: SessionStats::new(),
             assistant_stream_seen_for_stats: false,
             login_handler: None,
+            login_terminal: None,
+            sign_in_target: None,
             login_agent_override: None,
             login_child_target: None,
-            active_resume_picker_generation: None,
             first_prompt_text,
             current_goal: None,
             session_agent_capabilities: crate::presentation::AgentCapabilitiesView::default(),
@@ -170,6 +175,7 @@ impl ChatWidget {
             pinned_plan: None,
             terminal_title_animation_origin: std::time::Instant::now(),
             last_terminal_title: None,
+            user_shell_state: Default::default(),
         };
 
         widget
@@ -227,6 +233,11 @@ impl ChatWidget {
             prepared_agent,
             analytics,
         } = common;
+        // The context use and cost of the conversation so far, from the journal, so the status
+        // line shows them before the agent says anything.
+        let restored_usage = transcript
+            .as_ref()
+            .and_then(nori_harness::transcript::Transcript::last_usage_update);
         let activating_prepared_cloud_session = cloud_mode && prepared_agent.is_some();
         let placeholder = session_placeholder();
         let session_generation = next_session_generation();
@@ -278,7 +289,9 @@ impl ChatWidget {
             active_cell: Default::default(),
             live_tail: Default::default(),
             screen_rows: std::cell::Cell::new(0),
-            subagent_strip: Default::default(),
+            subagent_card_hits: Default::default(),
+            pinned_plan_area: std::cell::Cell::new(None),
+            active_tool_hits: Default::default(),
             bottom_pane_area: std::cell::Cell::new(None),
             live_tail_has_header: false,
             subagents: subagents::SubagentTree::new(config.cwd.clone(), config.animations),
@@ -286,7 +299,6 @@ impl ChatWidget {
             main_queued_prompts: Vec::new(),
             child_queued_prompts: HashMap::new(),
             focused_transcript: None,
-            response_focus: super::response_focus::ResponseFocus::default(),
             focused_session_config: None,
             subagents_running_shown: 0,
             pending_rewind: None,
@@ -302,6 +314,7 @@ impl ChatWidget {
             ),
             initial_echo_painted: false,
             pending_echoes: Default::default(),
+            active_answer_message_id: None,
             stream_controller: None,
             stream_ending: false,
             session_generation,
@@ -309,6 +322,7 @@ impl ChatWidget {
             proactive_turn_active: false,
             unpaired_prompt_error_ids: HashSet::new(),
             completed_client_tool_calls: HashSet::new(),
+            settled_client_tool_calls: HashSet::new(),
             client_event_normalizer: Default::default(),
             replay_source: None,
             replay_turn_elapsed: None,
@@ -327,6 +341,7 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             current_rollout_path: None,
             pending_client_tool_cells: HashMap::new(),
+            deferred_cells: Vec::new(),
             effective_cwd_tracker: EffectiveCwdTracker::with_initial_cwd(config.cwd),
             session_configured_received: false,
             harness_handle: spawn_result.handle,
@@ -344,9 +359,10 @@ impl ChatWidget {
             session_stats: SessionStats::new(),
             assistant_stream_seen_for_stats: false,
             login_handler: None,
+            login_terminal: None,
+            sign_in_target: None,
             login_agent_override: None,
             login_child_target: None,
-            active_resume_picker_generation: None,
             first_prompt_text,
             current_goal: None,
             session_agent_capabilities: crate::presentation::AgentCapabilitiesView::default(),
@@ -368,6 +384,7 @@ impl ChatWidget {
             pinned_plan: None,
             terminal_title_animation_origin: std::time::Instant::now(),
             last_terminal_title: None,
+            user_shell_state: Default::default(),
         };
 
         widget
@@ -375,6 +392,18 @@ impl ChatWidget {
             .set_acp_wire_recording_enabled(acp_wire_recording_enabled);
         if activating_prepared_cloud_session {
             widget.show_connecting_status("Nori Cloud");
+        }
+        if let Some(usage) = restored_usage {
+            widget.bottom_pane.set_session_usage(Some(
+                crate::presentation::session_runtime::SessionUsageState {
+                    used_tokens: i64::try_from(usage.used).unwrap_or(i64::MAX),
+                    total_tokens: i64::try_from(usage.size).unwrap_or(i64::MAX),
+                    cost_display: usage
+                        .cost
+                        .as_ref()
+                        .map(|cost| format!("{:.2} {}", cost.amount, cost.currency)),
+                },
+            ));
         }
         widget
     }

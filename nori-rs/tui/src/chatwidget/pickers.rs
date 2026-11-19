@@ -1,12 +1,10 @@
 use super::*;
 
-static RESUME_PICKER_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
 impl ChatWidget {
     pub(crate) fn open_providers_popup(&mut self) {
-        self.bottom_pane
-            .show_selection_view(crate::nori::agent_picker::provider_picker_params());
+        self.app_event_tx.send(AppEvent::ShowChoicePicker(Box::new(
+            crate::nori::providers_panel::spec(&self.config.nori_home, &self.config.active_agent),
+        )));
     }
 
     pub(crate) fn open_agent_recovery_popup(&mut self, error: &str) {
@@ -28,32 +26,6 @@ impl ChatWidget {
         self.bottom_pane.replace_selection_view(params);
     }
 
-    pub(crate) fn show_reference_session_picker(
-        &mut self,
-        sessions: Vec<crate::nori::reference_session_picker::ReferenceSession>,
-        target: crate::subagent_switcher::Target,
-    ) {
-        self.bottom_pane
-            .show_component_picker(crate::nori::reference_session_picker::picker(
-                sessions, target,
-            ));
-    }
-
-    pub(crate) fn update_reference_session_preview(
-        &mut self,
-        project_id: &str,
-        session_id: &str,
-        agent: &str,
-        preview: &str,
-    ) {
-        self.bottom_pane.update_selection_item(
-            &format!("reference:{project_id}:{session_id}"),
-            session_id.to_owned(),
-            Some(preview.to_owned()),
-            format!("{agent} {project_id} {session_id} {preview}"),
-        );
-    }
-
     /// Show a selection view in the bottom pane.
     pub(crate) fn show_selection_view(&mut self, params: SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
@@ -69,28 +41,11 @@ impl ChatWidget {
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             match crate::nori::reference_session_picker::load(&nori_home, &cwd).await {
-                Ok(sessions) => {
-                    tx.send(AppEvent::ShowReferenceSessionPicker {
-                        sessions: sessions.clone(),
-                        target,
-                    });
-                    let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-                    for item in sessions {
-                        let session = item.session;
-                        let preview = loader
-                            .load_first_user_preview(&session.project_id, &session.session_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "First message unavailable".to_owned());
-                        tx.send(AppEvent::ReferenceSessionPreview {
-                            project_id: session.project_id,
-                            session_id: session.session_id,
-                            agent: item.agent.unwrap_or_else(|| "Unknown agent".to_owned()),
-                            preview,
-                        });
-                    }
-                }
+                Ok(sessions) => tx.send(AppEvent::ShowReferenceSessionPicker {
+                    sessions,
+                    nori_home,
+                    target,
+                }),
                 Err(error) => tx.send(AppEvent::InsertHistoryCell(Box::new(
                     crate::history_cell::new_error_event(format!(
                         "Failed to load sessions: {error}"
@@ -110,10 +65,13 @@ impl ChatWidget {
 
         let nori_home_for_event = nori_home.clone();
         tokio::spawn(async move {
-            match crate::nori::viewonly_session_picker::load_sessions_with_preview(&nori_home, &cwd)
-                .await
-            {
-                Ok(sessions) => {
+            let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
+            match loader.find_session_metadata_for_cwd(&cwd).await {
+                Ok(metadata) => {
+                    let sessions: Vec<crate::resume_picker::SessionPickerInfo> = metadata
+                        .into_iter()
+                        .map(crate::resume_picker::SessionPickerInfo::from)
+                        .collect();
                     if sessions.is_empty() {
                         tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
                             crate::history_cell::new_error_event(
@@ -161,8 +119,9 @@ impl ChatWidget {
                     // An empty list still opens the picker: the pinned
                     // "Start a new session" row is the entry point.
                     Ok(sessions) => {
-                        tx.send(crate::app_event::AppEvent::ShowAcpResumeSessionPicker {
+                        tx.send(crate::app_event::AppEvent::ShowHelixAcpResumePicker {
                             sessions,
+                            cancel_candidate_on_dismiss: false,
                         });
                     }
                     Err(e) => {
@@ -185,8 +144,6 @@ impl ChatWidget {
         let cwd = self.config.cwd.clone();
         let tx = self.app_event_tx.clone();
         let model = self.config.active_agent.clone();
-        let generation =
-            RESUME_PICKER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tracing::info!(
             target: "nori_resume",
@@ -239,9 +196,8 @@ impl ChatWidget {
                         )));
                     } else {
                         tx.send(crate::app_event::AppEvent::ShowResumeSessionPicker {
-                            sessions: sessions.clone(),
+                            sessions,
                             nori_home: nori_home_for_event,
-                            generation,
                         });
                         tracing::info!(
                             target: "nori_resume",
@@ -249,7 +205,6 @@ impl ChatWidget {
                             elapsed_ms = task_started.elapsed().as_millis(),
                             "sent ShowResumeSessionPicker event",
                         );
-                        spawn_resume_summary_task(tx.clone(), nori_home, sessions, generation);
                     }
                 }
                 Err(e) => {
@@ -270,66 +225,17 @@ impl ChatWidget {
         });
     }
 
-    pub(crate) fn show_resume_session_picker(
-        &mut self,
-        params: crate::bottom_pane::ComponentPickerParams,
-        generation: u64,
-    ) {
-        self.active_resume_picker_generation = Some(generation);
-        self.bottom_pane.show_component_picker(params);
-    }
-
     /// Show the resume picker populated from the agent's ACP `session/list`.
     pub(crate) fn show_acp_resume_session_picker(
         &mut self,
         sessions: Vec<nori_protocol::acp::v1::SessionInfo>,
         cancel_candidate_on_dismiss: bool,
     ) {
-        let mut params =
-            crate::nori::resume_session_picker::acp_resume_session_component_picker_params(
+        self.app_event_tx
+            .send(crate::app_event::AppEvent::ShowHelixAcpResumePicker {
                 sessions,
-            );
-        if cancel_candidate_on_dismiss {
-            params.on_dismiss = Some(Box::new(|tx| {
-                tx.send(crate::app_event::AppEvent::CancelAgentCandidate);
-            }));
-        }
-        self.bottom_pane.show_component_picker(params);
-    }
-
-    pub(crate) fn update_resume_session_picker_item(
-        &mut self,
-        generation: u64,
-        session_id: &str,
-        started_at: &str,
-        first_message_preview: Option<&str>,
-        user_turn_count: Option<usize>,
-    ) {
-        if self.active_resume_picker_generation != Some(generation) {
-            tracing::info!(
-                target: "nori_resume",
-                phase = "resume_session_summary.stale",
-                generation,
-                session_id,
-                "ignored stale resume session summary update",
-            );
-            return;
-        }
-
-        if user_turn_count == Some(0) {
-            self.bottom_pane.remove_selection_item(session_id);
-            return;
-        }
-
-        let (name, description, search_value) =
-            crate::nori::resume_session_picker::resume_session_item_update(
-                session_id,
-                started_at,
-                first_message_preview,
-                user_turn_count,
-            );
-        self.bottom_pane
-            .update_selection_item(session_id, name, description, search_value);
+                cancel_candidate_on_dismiss,
+            });
     }
 
     /// Open the Nori CLI settings popup, optionally selecting `focus`'s row.
@@ -423,11 +329,13 @@ impl ChatWidget {
 
     /// Open the loop count sub-picker.
     pub(crate) fn open_loop_count_picker(&mut self, current: Option<i32>) {
-        let view = crate::nori::loop_count_picker::LoopCountPickerView::new(
-            current,
-            self.app_event_tx.clone(),
-        );
-        self.bottom_pane.show_view(Box::new(view));
+        self.show_choice(crate::nori::loop_count_picker::loop_count_choices(current));
+    }
+
+    /// Show a list of choices described as data, as an overlay.
+    pub(crate) fn show_choice(&mut self, spec: crate::choice_picker::ChoiceSpec) {
+        self.app_event_tx
+            .send(AppEvent::ShowChoicePicker(Box::new(spec)));
     }
 
     /// Open the footer segments picker popup.
@@ -503,11 +411,7 @@ impl ChatWidget {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let view = crate::nori::mcp_server_picker::McpServerPickerView::new(
-            &servers,
-            self.app_event_tx.clone(),
-        );
-        self.bottom_pane.show_view(Box::new(view));
+        self.show_choice(crate::nori::mcp_server_picker::mcp_choices(&servers));
         self.app_event_tx
             .send(crate::app_event::AppEvent::ComputeMcpAuthStatuses);
     }
@@ -519,6 +423,11 @@ impl ChatWidget {
             self.app_event_tx.clone(),
         );
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    /// The keymap the `?` list is made from.
+    pub(crate) fn set_keymap(&mut self, keymap: nori_config::Keymap) {
+        self.bottom_pane.set_keymap(keymap);
     }
 
     /// Update the hotkey configuration used by the textarea for editing bindings.
@@ -620,14 +529,14 @@ impl ChatWidget {
                 let on_dismiss: SelectionAction = Box::new(|tx| {
                     tx.send(AppEvent::SkillsetPickerDismissed);
                 });
-                let params = crate::nori::skillset_picker::skillset_picker_params(
+                let spec = crate::nori::skillset_picker::skillset_choices(
                     names,
                     install_dir,
                     Some(on_dismiss),
                     is_per_session,
                     auto_worktree_off,
                 );
-                self.bottom_pane.show_selection_view(params);
+                self.show_choice(spec);
             }
             (_, Some(error)) => {
                 self.add_error_message(error);
@@ -776,7 +685,7 @@ impl ChatWidget {
     /// Show that choosing a model needs a session, with no agent to read options from yet.
     pub(crate) fn open_model_without_session_popup(&mut self) {
         let mut params = crate::nori::unified_model_picker::params(
-            &self.config.nori_home,
+            &self.config,
             None,
             None,
             crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
@@ -854,7 +763,7 @@ impl ChatWidget {
             )
         {
             let params = crate::nori::unified_model_picker::params(
-                &self.config.nori_home,
+                &self.config,
                 Some(&self.config.active_agent),
                 Some(&option),
                 origin,
@@ -968,47 +877,4 @@ impl ChatWidget {
             );
         }
     }
-}
-
-fn spawn_resume_summary_task(
-    tx: AppEventSender,
-    nori_home: std::path::PathBuf,
-    sessions: Vec<crate::nori::viewonly_session_picker::SessionPickerInfo>,
-    generation: u64,
-) {
-    tokio::spawn(async move {
-        let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-        let mut previews = std::collections::HashMap::new();
-
-        for session in &sessions {
-            let preview = loader
-                .load_first_user_preview(&session.project_id, &session.session_id)
-                .await
-                .ok()
-                .flatten();
-            previews.insert(session.session_id.clone(), preview.clone());
-            tx.send(crate::app_event::AppEvent::ResumeSessionSummaryReady {
-                generation,
-                session_id: session.session_id.clone(),
-                started_at: session.started_at.clone(),
-                first_message_preview: preview,
-                user_turn_count: None,
-            });
-        }
-
-        for session in sessions {
-            let user_turn_count = loader
-                .count_user_turns(&session.project_id, &session.session_id)
-                .await
-                .ok();
-            let preview = previews.remove(&session.session_id).flatten();
-            tx.send(crate::app_event::AppEvent::ResumeSessionSummaryReady {
-                generation,
-                session_id: session.session_id,
-                started_at: session.started_at,
-                first_message_preview: preview,
-                user_turn_count,
-            });
-        }
-    });
 }

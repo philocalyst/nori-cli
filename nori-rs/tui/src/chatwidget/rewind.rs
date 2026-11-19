@@ -124,7 +124,6 @@ fn item(
         selected_description: None,
         is_current: false,
         actions: vec![action],
-        on_highlight: None,
         dismiss_on_select: true,
         search_value: None,
         is_header: false,

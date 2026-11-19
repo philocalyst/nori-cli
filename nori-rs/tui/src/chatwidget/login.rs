@@ -4,6 +4,11 @@ use std::path::Path;
 
 impl ChatWidget {
     pub(super) fn handle_explicit_login(&mut self, agent_name: &str) {
+        if self.focused_subagent.is_none() {
+            // Signed in through the agent itself, so the account's own home gets the login.
+            self.sign_in(agent_name);
+            return;
+        }
         self.login_child_target = self.focused_subagent;
         self.handle_login_command_with_agent(agent_name);
         if self.login_handler.is_none() {
@@ -51,7 +56,7 @@ impl ChatWidget {
         }
         self.login_child_target = None;
         let agent_name = self.login_target_agent().to_string();
-        self.handle_login_command_with_agent(&agent_name);
+        self.sign_in(&agent_name);
     }
 
     pub(super) fn login_target_agent(&self) -> &str {
@@ -101,13 +106,7 @@ impl ChatWidget {
                         let agent_display_name = agent.display_name().to_string();
                         handler.start_external_cli(agent_display_name.clone());
 
-                        self.add_login_message(
-                            format!(
-                                "Starting authentication for {agent_display_name}...\n\nThe {agent_display_name} login process will run in-app.",
-                            ),
-                            Some("Press Esc to cancel".to_string()),
-                        );
-
+                        // The sign-in panel above the prompt says what is happening.
                         self.start_external_cli_login_flow(
                             handler,
                             command,
@@ -139,6 +138,12 @@ impl ChatWidget {
             CLIENT_ID.to_string(),
             None, // No forced workspace ID
             codex_login::AuthCredentialsStoreMode::File,
+            codex_login::AuthKeyringBackendKind::default(),
+            codex_login::AuthRouteConfig::from_http_client_factory(
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            ),
         );
 
         match run_login_server(opts) {
@@ -166,7 +171,7 @@ impl ChatWidget {
                 tokio::spawn(async move {
                     match child.block_until_done().await {
                         Ok(()) => {
-                            auth_manager.reload();
+                            auth_manager.reload().await;
                             app_event_tx.send(AppEvent::LoginComplete { success: true });
                         }
                         Err(e) => {
@@ -186,28 +191,64 @@ impl ChatWidget {
     #[cfg(feature = "login")]
     pub(super) fn start_external_cli_login_flow(
         &mut self,
+        handler: LoginHandler,
+        command: String,
+        args: Vec<String>,
+        agent_display_name: String,
+    ) {
+        self.start_external_cli_login_flow_with_env(
+            handler,
+            command,
+            args,
+            std::collections::HashMap::new(),
+            agent_display_name,
+        );
+    }
+
+    /// Run a sign-in program in the panel, with `extra_env` over Nori's own environment (an
+    /// agent's launch environment: the home of the account it signs in to).
+    pub(super) fn start_external_cli_login_flow_with_env(
+        &mut self,
         mut handler: LoginHandler,
         command: String,
         args: Vec<String>,
+        extra_env: std::collections::HashMap<String, String>,
         agent_display_name: String,
     ) {
         use std::collections::HashMap;
 
         let app_event_tx = self.app_event_tx.clone();
         let cwd = self.config.cwd.clone();
-        // Install the queue before spawning so input entered immediately is retained.
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
+        // The program draws into a panel above the prompt, on a screen wide enough that it never
+        // cuts a URL; the panel shows the URL as a link instead.
+        self.login_terminal = Some(crate::login_terminal::LoginTerminal::new(
+            agent_display_name.clone(),
+        ));
+        // Install the queue before spawning so input entered immediately is retained. It is deep
+        // enough that nothing typed or pasted is ever dropped.
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
         handler.set_pty_input_sender(input_tx);
 
         // Spawn the PTY process and stream output
         let task_handle = tokio::spawn(async move {
             // Build environment - inherit current environment
             let mut env: HashMap<String, String> = std::env::vars().collect();
+            env.extend(extra_env);
             // Ensure TERM is set for proper terminal behavior
             env.entry("TERM".to_string())
                 .or_insert_with(|| "xterm-256color".to_string());
 
-            match codex_utils_pty::spawn_pty_process(&command, &args, &cwd, &env, &None).await {
+            match codex_utils_pty::spawn_pty_process_sized(
+                &command,
+                &args,
+                &cwd,
+                &env,
+                &None,
+                crate::login_terminal::ROWS,
+                crate::login_terminal::COLS,
+            )
+            .await
+            {
                 Ok(spawned) => {
                     // Keep session alive so process keeps running
                     let session = spawned.session;
@@ -221,15 +262,7 @@ impl ChatWidget {
                         loop {
                             match output_rx.recv().await {
                                 Ok(data) => {
-                                    // Convert bytes to string, stripping invalid UTF-8
-                                    let text = String::from_utf8_lossy(&data);
-                                    // Strip ANSI escape codes using a simple regex-like approach
-                                    let stripped = strip_ansi_codes(&text);
-                                    if !stripped.is_empty() {
-                                        output_event_tx.send(AppEvent::ExternalCliLoginOutput {
-                                            data: stripped,
-                                        });
-                                    }
+                                    output_event_tx.send(AppEvent::ExternalCliLoginOutput { data });
                                 }
                                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -328,8 +361,8 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    /// Handle external CLI login output (streaming text from the PTY process)
-    pub(crate) fn handle_external_cli_login_output(&mut self, data: String) {
+    /// Bytes the sign-in program wrote: its screen, kept whole in the panel above the prompt.
+    pub(crate) fn handle_external_cli_login_output(&mut self, data: Vec<u8>) {
         if !self
             .login_handler
             .as_ref()
@@ -337,12 +370,14 @@ impl ChatWidget {
         {
             return;
         }
-        // Display the output as an info message (append to existing or create new)
         if let Some(key) = self.login_child_target {
-            self.app_event_tx
-                .send(AppEvent::ChildSessionOutput { key, text: data });
-        } else {
-            self.add_info_message(data, None);
+            let text = strip_ansi_codes(&String::from_utf8_lossy(&data));
+            if !text.is_empty() {
+                self.app_event_tx
+                    .send(AppEvent::ChildSessionOutput { key, text });
+            }
+        } else if let Some(terminal) = self.login_terminal.as_mut() {
+            terminal.feed(&data);
         }
         self.request_redraw();
     }
@@ -353,14 +388,35 @@ impl ChatWidget {
             return;
         };
         handler.cancel(); // Clear any handler state
+        // The panel goes; what the program last said is the reason a failure is given.
+        let last_words = self
+            .login_terminal
+            .take()
+            .map(|terminal| terminal.last_words(3))
+            .unwrap_or_default();
 
+        // A sign-in run through the agent is said to have worked only once the agent starts.
+        if success && let Some(target) = self.sign_in_target.clone() {
+            self.login_agent_override = None;
+            self.login_child_target = None;
+            self.verify_sign_in(target);
+            return;
+        }
+        if !success && let Some(target) = self.sign_in_target.take() {
+            let reason = (!last_words.is_empty()).then(|| last_words.join(" · "));
+            self.add_login_message(
+                format!("{} sign-in did not finish", target.display_name),
+                reason,
+            );
+            self.login_child_target = None;
+            self.request_redraw();
+            return;
+        }
         if success {
             self.login_agent_override = None;
             self.add_login_message(
-                format!(
-                    "Successfully authenticated with {agent_name}!\n\nYou can now use {agent_name}."
-                ),
-                None,
+                format!("Signed in to {agent_name}"),
+                Some("its models are in /model and /providers".to_owned()),
             );
             if agent_name == "Claude Code"
                 && nori_harness::AgentKind::from_slug(&self.config.active_agent)
@@ -370,7 +426,8 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::NewSession);
             }
         } else {
-            self.add_login_message(format!("{agent_name} login failed or was cancelled."), None);
+            let reason = (!last_words.is_empty()).then(|| last_words.join(" · "));
+            self.add_login_message(format!("{agent_name} sign-in did not finish"), reason);
         }
         self.login_child_target = None;
         self.request_redraw();

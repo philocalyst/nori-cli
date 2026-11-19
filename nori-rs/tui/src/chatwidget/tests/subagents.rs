@@ -1,7 +1,7 @@
 //! Subagent presentation, driven by wire traffic recorded from a real adapter.
 
 use super::*;
-use crate::chatwidget::subagents::SubagentBlock;
+use crate::render::renderable::Renderable;
 use nori_protocol::AcpEvent;
 use nori_protocol::NoriEvent;
 use nori_protocol::SessionEvent;
@@ -64,14 +64,27 @@ fn history_text(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Stri
 }
 
 fn block_lines(chat: &ChatWidget, width: u16) -> Vec<String> {
-    plain(
-        &SubagentBlock {
-            tree: &chat.subagents,
-            now: Instant::now(),
-            screen_rows: 0,
-        }
-        .lines(width),
-    )
+    let hits = std::cell::RefCell::new(Vec::new());
+    let block = crate::chatwidget::subagents::InChatSubagents {
+        tree: &chat.subagents,
+        focused: None,
+        now: Instant::now(),
+        screen_rows: 0,
+        hits: &hits,
+    };
+    let height = block.desired_height(width);
+    let area = ratatui::layout::Rect::new(0, 0, width, height);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    block.render(area, &mut buffer);
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect()
 }
 
 #[test]
@@ -282,7 +295,7 @@ fn legacy_subagent_block_omits_keyboard_hints() {
 }
 
 #[test]
-fn running_subagent_rows_below_composer_are_clickable() {
+fn running_subagent_cards_render_in_chat_and_are_clickable() {
     use crate::render::renderable::Renderable;
     use crate::subagent_switcher::Target;
     use ratatui::buffer::Buffer;
@@ -301,38 +314,40 @@ fn running_subagent_rows_below_composer_are_clickable() {
     for event in events[..both_running].iter().cloned() {
         chat.handle_session_event(generation, event);
     }
+    chat.pre_draw_tick();
     chat.set_screen_rows(30);
-    let area = Rect::new(0, 3, 80, chat.desired_height(80));
+    let area = Rect::new(0, 3, 110, chat.desired_height(110));
     let mut buffer = Buffer::empty(area);
     chat.render(area, &mut buffer);
-    let block = chat.subagent_strip_area().expect("strip rendered");
+    let hits = chat.subagent_card_hits.borrow().clone();
+    assert_eq!(
+        hits.len(),
+        2,
+        "two side-by-side in-chat cards on >=100 cols"
+    );
+    assert_eq!(hits[0].0.y, hits[1].0.y, "side-by-side row alignment");
+    let first = chat
+        .subagent_at(hits[0].0.x + 1, hits[0].0.y + 1)
+        .expect("first card hit");
+    let second = chat
+        .subagent_at(hits[1].0.x + 1, hits[1].0.y + 1)
+        .expect("second card hit");
+    assert_ne!(first, second);
+    // Card sits ABOVE the composer, never below it.
+    let composer_top = chat.bottom_pane_area.get().expect("composer area").y;
+    assert!(hits[0].0.bottom() <= composer_top);
     let rendered = (area.y..area.bottom())
         .map(|y| {
             (area.x..area.right())
                 .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
                 .collect::<String>()
-                .trim_end()
-                .to_owned()
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let rendered = rendered
-        .chars()
-        .map(|ch| {
-            if "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) {
-                '•'
-            } else {
-                ch
-            }
-        })
-        .collect::<String>();
-    insta::assert_snapshot!("subagents_below_composer", rendered);
-    let first = chat.subagent_at(block.x + 1, block.y).expect("first card");
-    let second = chat
-        .subagent_at(block.x + 19, block.y)
-        .expect("second card");
-    assert_ne!(first, second);
-    assert_eq!(chat.subagent_at(block.x + 1, block.y + 1), None);
+    assert!(
+        rendered.contains("● 2 agents"),
+        "statusline should show compact agent count:\n{rendered}"
+    );
     let (entries, _) = chat.subagents.entries(Instant::now());
     assert!(
         entries
@@ -344,55 +359,7 @@ fn running_subagent_rows_below_composer_are_clickable() {
             .iter()
             .any(|entry| entry.target == Target::Subagent(second))
     );
-    assert_eq!(chat.subagent_at(block.x, block.y - 1), None);
-    assert_eq!(chat.subagent_at(block.right(), block.y), None);
-}
-
-#[test]
-fn response_and_prompt_focus_keep_the_composer_in_place() {
-    use crate::render::renderable::Renderable;
-    use pretty_assertions::assert_eq;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
-    chat.set_screen_rows(20);
-    chat.set_composer_text("unfinished draft".to_owned());
-    let area = Rect::new(0, 0, 29, 20);
-    let mut buffer = Buffer::empty(area);
-    chat.render(area, &mut buffer);
-    let normal = (
-        chat.desired_height(area.width),
-        chat.cursor_pos(area).expect("composer cursor"),
-    );
-    chat.set_response_focus(true);
-    chat.render(area, &mut buffer);
-    assert_eq!(
-        (
-            chat.desired_height(area.width),
-            chat.cursor_pos(area).expect("composer cursor")
-        ),
-        normal
-    );
-    chat.set_response_focus_prompt(true);
-    chat.render(area, &mut buffer);
-    assert_eq!(
-        (
-            chat.desired_height(area.width),
-            chat.cursor_pos(area).expect("composer cursor")
-        ),
-        normal
-    );
-    chat.set_response_focus(false);
-    chat.render(area, &mut buffer);
-    assert_eq!(
-        (
-            chat.desired_height(area.width),
-            chat.cursor_pos(area).expect("composer cursor")
-        ),
-        normal
-    );
-    assert_eq!(chat.composer_text(), "unfinished draft");
+    assert_eq!(chat.subagent_at(area.x, composer_top + 1), None);
 }
 
 #[test]
@@ -445,6 +412,7 @@ fn child_login_uses_the_announced_agent_and_never_falls_back_to_main() {
             title: nori_protocol::Patch::Keep,
             description: nori_protocol::Patch::Keep,
             agent: nori_protocol::Patch::Set("unknown-child-provider".to_owned()),
+            model: nori_protocol::Patch::Keep,
             state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle),
         },
         Instant::now(),
@@ -531,8 +499,7 @@ fn narrow_child_view_keeps_prompt_and_clickable_subagent_rows() {
         })
         .collect::<String>();
     insta::assert_snapshot!("narrow_child_conversation", rendered);
-    let block = chat.subagent_strip_area().expect("subagent rows rendered");
-    assert!(chat.subagent_at(block.x + 1, block.y).is_some());
+    assert!(chat.subagent_card_hits.borrow().is_empty());
     assert!(rendered.contains('›'), "{rendered}");
 }
 
@@ -573,9 +540,8 @@ fn narrow_main_history_scroll_keeps_the_shared_prompt() {
 }
 
 #[test]
-fn narrow_strip_keeps_idle_and_completed_children_clickable() {
+fn narrow_strip_is_removed_when_all_children_finish() {
     use crate::render::renderable::Renderable;
-    use crate::subagent_switcher::SubagentKey;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
@@ -599,6 +565,7 @@ fn narrow_strip_keeps_idle_and_completed_children_clickable() {
                 parent_session_id: root.clone(),
                 session_id: acp::SessionId::new(session),
                 agent: nori_protocol::Patch::Keep,
+                model: nori_protocol::Patch::Keep,
                 title: nori_protocol::Patch::Set(title.to_owned()),
                 description: nori_protocol::Patch::Keep,
                 state: nori_protocol::Patch::Set(state),
@@ -620,15 +587,9 @@ fn narrow_strip_keeps_idle_and_completed_children_clickable() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    insta::assert_snapshot!("narrow_idle_completed_strip", rendered);
-    let block = chat.subagent_strip_area().expect("subagent strip rendered");
-    let first = chat.subagent_at(block.x + 1, block.y).expect("first card");
-    let second = chat
-        .subagent_at(block.x + 15, block.y)
-        .expect("second card");
-    assert_ne!(first, second);
-    assert!([SubagentKey(1), SubagentKey(2)].contains(&first));
-    assert!([SubagentKey(1), SubagentKey(2)].contains(&second));
+    insta::assert_snapshot!("narrow_idle_completed_no_strip", rendered);
+    assert!(chat.subagent_card_hits.borrow().is_empty());
+    assert_eq!(chat.subagent_at(1, 23), None);
     assert_eq!(chat.subagents.running_count(), 0);
 }
 
@@ -643,6 +604,7 @@ fn child_queue_updates_do_not_replace_the_main_queue() {
             parent_session_id: root,
             session_id: child.clone(),
             agent: nori_protocol::Patch::Keep,
+            model: nori_protocol::Patch::Keep,
             title: nori_protocol::Patch::Keep,
             description: nori_protocol::Patch::Keep,
             state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Running),

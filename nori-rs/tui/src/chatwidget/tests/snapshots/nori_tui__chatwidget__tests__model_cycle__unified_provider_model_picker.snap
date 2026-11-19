@@ -1,6 +1,5 @@
 ---
 source: tui/src/chatwidget/tests/model_cycle.rs
-assertion_line: 366
 expression: rendered
 ---
 
@@ -14,5 +13,7 @@ expression: rendered
 │  4. Fast                                                                     │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-                                                            Claude Code · Sonnet
+
 › ! for shell commands
+
+                                                            Claude Code · Sonnet

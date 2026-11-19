@@ -48,7 +48,7 @@ impl ChatWidget {
         self.flush_answer_stream_with_separator();
         self.pending_client_tool_cells.clear();
         self.finalize_active_cell_as_failed();
-        self.completed_client_tool_calls.clear();
+        self.settle_client_tool_calls();
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.replay_turn_elapsed = None;

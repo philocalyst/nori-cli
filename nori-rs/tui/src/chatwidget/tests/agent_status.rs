@@ -184,16 +184,14 @@ fn returned_model_and_effort_update_the_footer_quietly() {
 #[test]
 fn successful_mutations_and_snapshots_update_the_tracked_configuration() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let snapshot_in_flight = chat.acp_mode_config_generation;
 
     // The options a successful `set_session_config_option` echoes back.
     chat.sync_acp_session_config_snapshot(&claude_options("sonnet-5"));
     assert!(agent_row(&chat, DisplayMode::Compact).contains("Sonnet 5"));
 
     // A stale generation must not clobber the tracked configuration.
-    chat.handle_acp_session_config_snapshot(
-        chat.acp_mode_config_generation - 1,
-        &claude_options("opus-5"),
-    );
+    chat.handle_acp_session_config_snapshot(snapshot_in_flight, &claude_options("opus-5"));
     assert!(
         agent_row(&chat, DisplayMode::Compact).contains("Sonnet 5"),
         "a snapshot from a previous session generation is ignored"
@@ -260,6 +258,7 @@ fn session_started(config_options: Vec<acp::SessionConfigOption>) -> nori_protoc
             history_log_id: 0,
             history_entry_count: 0,
             config_options,
+            swap: None,
         },
     ))
 }

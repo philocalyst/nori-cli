@@ -76,7 +76,10 @@ impl CachedCell {
     fn with_layout<T>(&self, width: u16, read: impl FnOnce(&Layout) -> T) -> Option<T> {
         let cell = self.cell.as_ref()?;
         let mut layout = self.layout.borrow_mut();
-        if layout.as_ref().is_none_or(|layout| layout.width != width) {
+        if layout
+            .as_ref()
+            .is_none_or(|layout| layout.width != width || cell.animated())
+        {
             #[cfg(test)]
             self.layouts.set(self.layouts.get() + 1);
             *layout = Some(Layout {

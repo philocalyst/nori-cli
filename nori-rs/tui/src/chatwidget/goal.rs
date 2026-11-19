@@ -246,23 +246,28 @@ impl ChatWidget {
     }
 
     fn show_goal_summary(&mut self, goal: &nori_protocol::ThreadGoal) {
+        let chrome = crate::history_cell::chrome::Chrome::live();
+        let fact = |label: &str, value: String| {
+            Line::from(vec![
+                "  ".into(),
+                ratatui::text::Span::styled(format!("{label:<10}"), chrome.muted()),
+                ratatui::text::Span::styled(value, chrome.secondary()),
+            ])
+        };
         self.add_plain_history_lines(vec![
-            Line::from("Goal".bold()),
             Line::from(vec![
-                "Status: ".dim(),
-                goal_status_label(goal.status).into(),
+                ratatui::text::Span::styled("◈ ", chrome.violet()),
+                ratatui::text::Span::styled("Goal", chrome.strong()),
+                chrome.dot(),
+                ratatui::text::Span::styled(goal_status_label(goal.status), chrome.muted()),
             ]),
-            Line::from(vec!["Objective: ".dim(), goal.objective.clone().into()]),
+            fact("Objective", goal.objective.clone()),
+            fact("Time", format_elapsed_seconds(goal.time_used_seconds)),
+            fact("Tokens", format_si_suffix(goal.tokens_used)),
             Line::from(vec![
-                "Time used: ".dim(),
-                format_elapsed_seconds(goal.time_used_seconds).into(),
+                "  ".into(),
+                ratatui::text::Span::styled(goal_command_hint(goal.status), chrome.faint()),
             ]),
-            Line::from(vec![
-                "Tokens used: ".dim(),
-                format_si_suffix(goal.tokens_used).into(),
-            ]),
-            Line::default(),
-            Line::from(goal_command_hint(goal.status).dim()),
         ]);
     }
 }

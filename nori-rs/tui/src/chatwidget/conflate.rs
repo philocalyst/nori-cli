@@ -52,12 +52,22 @@ fn plain_text_chunk(event: &SessionEvent) -> Option<(&acp::SessionNotification, 
 
 /// Append `next` to `previous` when both are plain text chunks of one message.
 fn merge_text_chunk(previous: &mut SessionEvent, next: &SessionEvent) -> bool {
-    let Some((previous_notification, previous_is_thought, _)) = plain_text_chunk(previous) else {
+    let Some((previous_notification, previous_is_thought, previous_text)) =
+        plain_text_chunk(previous)
+    else {
         return false;
     };
     let Some((next_notification, next_is_thought, next_text)) = plain_text_chunk(next) else {
         return false;
     };
+    // A notice the adapter carried in the text stream is a unit of its own. Merged into the text
+    // around it, its marker would no longer start a chunk and the notice would be shown as part
+    // of the model's words.
+    if previous_text.contains(nori_protocol::AGENT_WARNING_PREFIX)
+        || next_text.contains(nori_protocol::AGENT_WARNING_PREFIX)
+    {
+        return false;
+    }
     let same_message = |notification: &acp::SessionNotification| match &notification.update {
         acp::SessionUpdate::AgentMessageChunk(chunk)
         | acp::SessionUpdate::AgentThoughtChunk(chunk) => chunk.message_id.clone(),

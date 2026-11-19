@@ -62,8 +62,8 @@ pub(crate) use model_cycle::ModelStep;
 pub(crate) use model_cycle::WaitingModelPresses;
 mod owned_transcript;
 mod quit_keys;
-pub(crate) mod response_focus;
 mod session_transcript;
+mod shell_completion;
 mod stream_frame;
 pub(crate) mod subagents;
 pub(crate) mod tool_projection;
@@ -84,12 +84,15 @@ mod helpers;
 mod key_handling;
 mod login;
 mod login_input;
+mod sign_in;
+pub(crate) use sign_in::SignInTarget;
 mod pickers;
 mod remote_control;
 mod replay;
-mod rewind;
+pub(crate) mod rewind;
 mod session_config_mode;
 mod user_input;
+mod user_shell_cell;
 use crate::nori::session_header::CloudSessionInfo;
 use crate::streaming::controller::StreamController;
 use codex_common::approval_presets::ApprovalPreset;
@@ -200,7 +203,9 @@ pub(crate) struct ChatWidget {
     live_tail: layout_cache::CachedCell,
     /// Rows of the terminal, so the viewport can leave room for history to flush above it.
     screen_rows: std::cell::Cell<u16>,
-    subagent_strip: subagents::StripState,
+    subagent_card_hits: std::cell::RefCell<Vec<(Rect, crate::subagent_switcher::SubagentKey)>>,
+    pinned_plan_area: std::cell::Cell<Option<Rect>>,
+    active_tool_hits: std::cell::RefCell<Vec<(Rect, String)>>,
     bottom_pane_area: std::cell::Cell<Option<ratatui::layout::Rect>>,
     /// Whether the live tail starts the message, so it carries the `• ` header.
     live_tail_has_header: bool,
@@ -210,7 +215,6 @@ pub(crate) struct ChatWidget {
     main_queued_prompts: Vec<String>,
     child_queued_prompts: HashMap<nori_protocol::acp::v1::SessionId, Vec<String>>,
     focused_transcript: Option<session_transcript::SessionTranscript>,
-    response_focus: response_focus::ResponseFocus,
     quit_keys: quit_keys::QuitKeys,
     focused_session_config: Option<crate::nori::agent_config_state::AgentConfigState>,
     /// How many running subagents the status line currently names.
@@ -223,6 +227,10 @@ pub(crate) struct ChatWidget {
     /// The last turn, when it did not finish (see `continue_turn`).
     unfinished: Option<continue_turn::Unfinished>,
     active_user_message_id: Option<String>,
+    /// ACP message id for the answer currently being streamed. A changed id
+    /// starts a new history cell even when no tool or lifecycle event separates
+    /// the two messages.
+    active_answer_message_id: Option<String>,
     config: Config,
     auth_manager: Arc<AuthManager>,
     initial_user_message: Option<UserMessage>,
@@ -240,6 +248,9 @@ pub(crate) struct ChatWidget {
     proactive_turn_active: bool,
     unpaired_prompt_error_ids: HashSet<nori_protocol::acp::v1::RequestId>,
     completed_client_tool_calls: HashSet<String>,
+    /// Calls committed in turns that have ended. An update can still arrive for one (an agent
+    /// closes a call after its turn's response), and must update its cell, not make a second.
+    settled_client_tool_calls: HashSet<String>,
     client_event_normalizer: crate::presentation::ClientEventNormalizer,
     replay_source: Option<nori_protocol::ReplaySource>,
     /// How long the replayed turn had been running, as its latest update says.
@@ -272,6 +283,9 @@ pub(crate) struct ChatWidget {
     // Buffers incomplete Execute ClientToolCells displaced from active_cell
     // by subsequent tool snapshots. Completions check here before discarding.
     pending_client_tool_cells: HashMap<String, ClientToolCell>,
+    /// Cells that arrived while an answer was streaming (a subagent that finished, a notice).
+    /// They wait for the message to be whole and are committed after it, never inside it.
+    deferred_cells: Vec<Box<dyn HistoryCell>>,
     // Tracks the effective CWD based on tool call locations for footer updates.
     effective_cwd_tracker: EffectiveCwdTracker,
     // Whether SessionConfigured has been received for this widget.
@@ -304,11 +318,14 @@ pub(crate) struct ChatWidget {
     assistant_stream_seen_for_stats: bool,
     // Login handler for /login command
     login_handler: Option<LoginHandler>,
+    /// A provider's sign-in program while it runs, drawn above the prompt.
+    login_terminal: Option<crate::login_terminal::LoginTerminal>,
+    /// The provider a sign-in through its agent is for, while it runs.
+    sign_in_target: Option<SignInTarget>,
     // Failed/selected switch target used only to route a bare /login. This
     // does not imply a pending agent switch.
     login_agent_override: Option<String>,
     login_child_target: Option<crate::subagent_switcher::SubagentKey>,
-    active_resume_picker_generation: Option<u64>,
     // The first user prompt text, preserved for /first-prompt command
     first_prompt_text: Option<String>,
     // Latest ACP-owned goal snapshot for this session.
@@ -355,6 +372,7 @@ pub(crate) struct ChatWidget {
     terminal_title_animation_origin: Instant,
     // Terminal title state: cache to avoid redundant OSC writes.
     last_terminal_title: Option<String>,
+    user_shell_state: user_shell_cell::UserShellState,
 }
 
 struct UserMessage {
@@ -405,38 +423,25 @@ impl ChatWidget {
     ) -> Option<crate::subagent_switcher::SubagentKey> {
         self.subagents.parent_for_key(key)
     }
-    #[cfg(test)]
+
     pub(crate) fn subagent_at(
         &self,
         column: u16,
         row: u16,
     ) -> Option<crate::subagent_switcher::SubagentKey> {
-        match self.subagent_strip.action_at(column, row) {
-            Some(subagents::StripAction::Focus(key)) => Some(key),
-            Some(subagents::StripAction::Previous | subagents::StripAction::Next) | None => None,
-        }
+        let pos = ratatui::layout::Position::new(column, row);
+        self.subagent_card_hits
+            .borrow()
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, key)| *key)
     }
 
-    pub(crate) fn subagent_strip_action(
-        &self,
-        column: u16,
-        row: u16,
-    ) -> Option<subagents::StripAction> {
-        self.subagent_strip.action_at(column, row)
-    }
-
-    pub(crate) fn subagent_strip_contains(&self, column: u16, row: u16) -> bool {
-        self.subagent_strip.contains(column, row)
-    }
-
-    #[cfg(test)]
-    fn subagent_strip_area(&self) -> Option<ratatui::layout::Rect> {
-        self.subagent_strip.area()
-    }
-
-    pub(crate) fn scroll_subagent_strip(&mut self, delta: isize) {
-        self.subagent_strip.scroll(delta);
-        self.request_redraw();
+    pub(crate) fn plan_drawer_contains(&self, column: u16, row: u16) -> bool {
+        let pos = ratatui::layout::Position::new(column, row);
+        self.pinned_plan_area
+            .get()
+            .is_some_and(|rect| rect.contains(pos))
     }
 
     pub(crate) fn is_chat_content_row(&self, row: u16) -> bool {
@@ -456,20 +461,17 @@ impl ChatWidget {
         self.bottom_pane.composer_cursor_style()
     }
 
-    /// Rows at the bottom of the viewport that belong to a popup or view that is open.
-    pub(crate) fn popup_rows(&self, width: u16) -> u16 {
-        self.bottom_pane.popup_rows(width)
+    /// The rows the chat keeps at rest: the composer and its status line, without any popup or
+    /// view, working indicator, running tool, streaming answer or live subagent lanes above it. Only these decide
+    /// what the conversation hands to the scrollback; everything else on top of them is
+    /// transient and clips the conversation instead, so nothing leaves the screen for good just
+    /// because something live was tall for a while.
+    pub(crate) fn resting_height(&self, width: u16) -> u16 {
+        self.bottom_pane.resting_height(width).max(1)
     }
 
     pub(crate) fn primary_composer_height(&self, width: u16) -> u16 {
-        self.bottom_pane
-            .desired_height(width)
-            .saturating_add(1)
-            .saturating_add(if self.subagents.visible_count() > 0 {
-                1
-            } else {
-                0
-            })
+        self.bottom_pane.desired_height(width).saturating_add(1)
     }
 }
 

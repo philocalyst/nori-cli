@@ -2,7 +2,6 @@
 
 use std::cell::Cell;
 
-use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
@@ -16,7 +15,6 @@ pub(crate) struct SessionTranscript {
     pub(crate) lines: Vec<Line<'static>>,
     /// Number of rows to move up from the latest output.
     pub(crate) scroll_offset: usize,
-    focus_header: Option<usize>,
     viewport: Cell<Option<(Rect, usize)>>,
     tools: Vec<super::tool_projection::ToolSpan>,
     follow_live: bool,
@@ -27,19 +25,10 @@ impl SessionTranscript {
         Self {
             lines,
             scroll_offset,
-            focus_header: None,
             viewport: Cell::new(None),
             tools: Vec::new(),
             follow_live: true,
         }
-    }
-
-    pub(crate) fn viewport_height(&self) -> Option<u16> {
-        self.viewport.get().map(|(area, _)| area.height)
-    }
-
-    pub(crate) fn set_focus_header(&mut self, header: usize) {
-        self.focus_header = Some(header);
     }
 
     pub(crate) fn set_tools(&mut self, tools: Vec<super::tool_projection::ToolSpan>) {
@@ -75,20 +64,6 @@ impl SessionTranscript {
             .or_else(|| self.tools.last())
             .map(|tool| tool.call_id.clone())
     }
-
-    pub(crate) fn action_at(&self, column: u16, row: u16, sent_prompt: bool) -> Option<KeyEvent> {
-        let (area, first) = self.viewport.get()?;
-        let header = self.focus_header?;
-        if column < area.x
-            || column >= area.right()
-            || row < area.y
-            || row >= area.bottom()
-            || first + usize::from(row - area.y) != header
-        {
-            return None;
-        }
-        super::response_focus::action_at(column - area.x, area.width, sent_prompt)
-    }
 }
 
 impl Renderable for SessionTranscript {
@@ -116,27 +91,7 @@ impl Renderable for SessionTranscript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyModifiers;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn focus_hits_follow_the_scrolled_viewport_and_ignore_clipped_header() {
-        let mut transcript =
-            SessionTranscript::new((0..12).map(|_| Line::from("row")).collect(), 2);
-        transcript.set_focus_header(7);
-        let area = Rect::new(4, 5, 20, 4);
-        transcript.render(area, &mut Buffer::empty(area));
-        assert_eq!(
-            transcript.action_at(7, 6, false),
-            Some(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL))
-        );
-        assert_eq!(transcript.action_at(7, 5, false), None);
-        assert_eq!(transcript.action_at(3, 6, false), None);
-        transcript.scroll_offset = 0;
-        transcript.render(area, &mut Buffer::empty(area));
-        assert_eq!(transcript.action_at(7, 6, false), None);
-    }
 
     #[test]
     fn tool_hits_follow_viewport_scroll_and_clipping() {
