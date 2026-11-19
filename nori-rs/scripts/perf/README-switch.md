@@ -16,6 +16,7 @@ Every prompt was "Reply with just OK". Medians and p90 are over 5 runs unless no
 - `acp_switch_probe.py`: stdlib JSON-RPC client over `nori exec --acp --agent AGENT`
   stdio. Times `initialize`, `session/new`, and the first `agent_message_chunk` after
   `session/prompt`. Also attempts a second `session/new` on the same connection.
+- `agent_smoke.py`: the benchmark probe for any agent (see "Agent smoke" below).
 - `tui_second_session_probe.py`: pty driver for the TUI (prompt, `/new`, prompt). Unfinished;
   see "Not measured".
 
@@ -170,3 +171,52 @@ captured. The log has no timing lines for them.
    driver passes run on every spawn. The raw CLI floor (about 1.0 s to initialize, about 2.1 s
    to first text) is mostly the CLI, not Nori. Lazy MCP startup or fewer hooks would cut every
    spawn. Evidence: the raw floor table, and the MCP handshake timing in finding 5.
+
+## Agent smoke (`agent_smoke.py`)
+
+One agent, end to end, repeatable and machine-readable: it starts a fresh agent per run
+(`nori agent serve AGENT`, or `--via facade` for `nori exec --acp --agent AGENT`, which is how
+agents that are not built in, such as `antigravity`, are reached), then `initialize`,
+`session/new`, optionally `session/set_config_option` for the model, and one prompt. It uses the
+accounts the agent is already logged in to and never reads credentials. Stdlib only.
+
+```sh
+cd nori-rs
+python3 -I scripts/perf/agent_smoke.py --nori $PWD/target/debug/nori --agent claude --model haiku --runs 5
+python3 -I scripts/perf/agent_smoke.py --nori $PWD/target/debug/nori --agent codex --model gpt-6-luna --runs 5 --json
+python3 -I scripts/perf/agent_smoke.py --nori $PWD/target/debug/nori --agent opencode \
+  --model opencode-go/deepseek-v4.1-flash --runs 5
+python3 -I scripts/perf/agent_smoke.py --nori $PWD/target/debug/nori --agent antigravity --via facade --no-prompt
+```
+
+Options: `--nori`, `--agent`, `--model` (selected with `session/set_config_option` after
+`session/new`), `--runs N`, `--json`, `--prompt` (default "Reply with just OK"), `--no-prompt`
+(stop after `session/new`), `--via serve|facade`, `--option K=V` (passed to `agent serve`),
+`--home` (NORI_HOME; default a fresh temp dir), `--timeout` (seconds per request, default 120).
+
+Per run, in milliseconds: `initialize_ms`, `session_new_ms`, `set_model_ms` (with `--model`),
+`first_chunk_ms` (prompt to first `agent_message_chunk`), `prompt_done_ms`; plus `stop_reason`,
+`reply`, `agent_info`, `capabilities`, and `usage`: `present` (any `_meta.nori` report arrived on a
+`usage_update` or `session_info_update`), `valid` (every report satisfies the contract in
+`docs/usage.md`: token fields are non-negative integers, `tokensScope` is `session` when present,
+rate-limit windows have `id` and `label`, `usedPercent` in 0..100, `resetsAt` RFC 3339,
+`windowMinutes` a positive integer), `problems`, `reports`, and `last`, the final report
+verbatim. A failed run has `error` (and `stderr_tail`) and no timings after the failure.
+
+Without `--json` it prints a table and a median/p90 summary per timing. With `--json` stdout is
+exactly one object, keys sorted, so it can be compared run to run:
+
+```json
+{"schema": 1, "agent": "claude", "model": "haiku", "via": "serve", "prompt": "Reply with just OK",
+ "runs": [{"error": null, "initialize_ms": 33, "session_new_ms": 1, "set_model_ms": 658,
+           "first_chunk_ms": 1959, "prompt_done_ms": 1973, "stop_reason": "end_turn",
+           "reply": "OK", "usage": {"present": true, "valid": true, "problems": [], "reports": 2,
+                                    "last": {"sessionUpdate": "usage_update", "...": "..."}}}],
+ "summary": {"runs": 5, "ok": 5, "usage_valid": 5,
+             "initialize_ms": {"n": 5, "median": 33, "p90": 3682}, "...": "..."}}
+```
+
+`summary.<timing>` is `null` when no run produced it. The exit status is 0 when every run
+completed and, unless `--no-prompt`, its usage meta was valid; 1 otherwise. The first run of a
+process can be far slower than the rest (cold binary and CLI start): compare medians.
+
