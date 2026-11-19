@@ -7,9 +7,12 @@ use serde::Deserialize;
 use serde::Serialize;
 
 pub use nori_protocol::CommandAvailability;
+pub use nori_protocol::MessageStream;
 pub use nori_protocol::ThreadGoal;
 
+pub mod message_assembly;
 pub mod session_runtime;
+pub mod turn;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
@@ -19,6 +22,9 @@ pub enum ClientEvent {
     MessageDelta(MessageDelta),
     PlanSnapshot(PlanSnapshot),
     SessionPhaseChanged(session_runtime::SessionPhaseView),
+    /// A turn ended with tool calls the agent never finished. The session closes each of them
+    /// as failed so nothing keeps showing as running.
+    ToolsInterrupted(ToolsInterrupted),
     PromptCompleted(PromptCompleted),
     LoadCompleted,
     QueueChanged(QueueChanged),
@@ -34,7 +40,40 @@ pub enum ClientEvent {
     Warning(WarningInfo),
 }
 
-/// A warning emitted by the session runtime (e.g. out-of-phase content).
+/// Tool calls closed because the turn that owned them ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ToolsInterrupted {
+    pub call_ids: Vec<String>,
+    pub reason: InterruptReason,
+}
+
+/// Why a turn left tool calls unfinished. Published in the closing update's `_meta.nori`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptReason {
+    /// The user cancelled the turn.
+    Cancelled,
+    /// The request failed or Nori ended it after the agent ignored a cancel.
+    Failed,
+    /// The agent finished the turn without ever reporting a result for the call.
+    TurnEnded,
+    /// The connection to the agent was lost.
+    ConnectionLost,
+}
+
+impl InterruptReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::TurnEnded => "turn_ended",
+            Self::ConnectionLost => "connection_lost",
+        }
+    }
+}
+
+/// A warning emitted by the session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct WarningInfo {
@@ -52,11 +91,16 @@ pub enum TurnFailure {
     Retryable,
     /// A persistent failure that a retry cannot fix.
     Fatal,
+    /// The agent did not stop after `session/cancel`, so Nori ended the request itself.
+    CancelIgnored,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PromptCompleted {
+    /// The request this completion belongs to. Absent in legacy transcript entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<acp::RequestId>,
     pub stop_reason: acp::StopReason,
     pub last_agent_message: Option<String>,
     /// `Some` when the turn ended in a failure; `None` for a clean completion
@@ -186,14 +230,6 @@ pub enum ReplayEntry {
 pub struct MessageDelta {
     pub stream: MessageStream,
     pub delta: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageStream {
-    User,
-    Answer,
-    Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
