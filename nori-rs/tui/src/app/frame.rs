@@ -1,6 +1,8 @@
-//! Batching of queued events into a single frame.
+//! Batching of queued events into a single frame, and drawing it.
 
 use super::*;
+use crate::stage::StageView;
+use crate::subagent_switcher::Target;
 
 impl App {
     /// Handle a terminal event. A draw first applies every app event that is already queued and
@@ -39,18 +41,70 @@ impl App {
         Ok(true)
     }
 
-    /// Clear-screen binding: hide everything above the prompt, leaving scrollback alone.
+    /// Draw one frame: the conversation on the stage, and under it the bottom block.
+    pub(super) fn draw_frame(&mut self, tui: &mut tui::Tui) -> Result<bool> {
+        self.validate_focus(tui);
+        let projected =
+            self.session_view.main_scrolling() || self.session_view.focused() != Target::Main;
+        // The conversation is the terminal's text: its wheel scrolls the scrollback and its
+        // selection copies, so the mouse is never captured over it. Only a transient panel (a
+        // popup, a picker, a child's conversation) takes the mouse, for as long as it is open.
+        let _ = tui.set_mouse_capture(
+            projected || self.overlay.is_some() || self.chat_widget.has_active_overlay_or_popup(),
+        );
+        tui.set_cursor_style(self.chat_widget.composer_cursor_style())?;
+        self.chat_widget.pre_draw_tick();
+        self.update_focused_session_view(tui)?;
+        self.chat_widget.maybe_post_pending_notification(tui);
+        if self
+            .chat_widget
+            .handle_paste_burst_tick(tui.frame_requester())
+        {
+            return Ok(true);
+        }
+        let screen = tui.terminal.size()?;
+        self.chat_widget.set_screen_rows(screen.height);
+        let (height, popup_rows) = if projected {
+            // A child's conversation, or the main one scrolled back, is a panel under the
+            // conversation, never the whole screen.
+            let panel = tui::panel_height(screen.height);
+            (panel, panel)
+        } else {
+            let height = self
+                .chat_widget
+                .desired_height(screen.width)
+                .min(screen.height);
+            let resting = self.chat_widget.resting_height(screen.width).min(height);
+            (height, height - resting)
+        };
+        let focus = self.focus_view();
+        let shown = self.stage_cell_count();
+        let view = StageView::new(&self.transcript_cells[..shown], focus.as_ref());
+        let chat_widget = &self.chat_widget;
+        tui.draw_stage(&view, height, popup_rows, |frame| {
+            chat_widget.render(frame.area(), frame.buffer);
+            if let Some((x, y)) = chat_widget.cursor_pos(frame.area()) {
+                frame.set_cursor_position((x, y));
+            }
+        })?;
+        Ok(true)
+    }
+
+    /// How many cells of the conversation the stage shows: a history still being replayed is not
+    /// on the stage until it has finished.
+    pub(super) fn stage_cell_count(&self) -> usize {
+        self.replay_painted_from
+            .map_or(self.transcript_cells.len(), |(start, _)| {
+                start.min(self.transcript_cells.len())
+            })
+    }
+
+    /// Clear-screen binding: push everything above the prompt into primary scrollback.
     pub(super) fn repaint_screen(&mut self, tui: &mut tui::Tui) {
         // Remember the transcript boundary so a resize/focus redraw can distinguish the exact
         // clear-screen state from a later turn or a switched/backtracked session.
         self.hidden_transcript_len =
             Some(i64::try_from(self.transcript_cells.len()).unwrap_or(i64::MAX));
-        if tui.is_alt_screen_active() {
-            // A pager overlay draws the whole screen every frame; forgetting what the terminal
-            // shows is all it takes.
-            tui.request_full_repaint();
-        } else {
-            tui.request_clear_screen();
-        }
+        tui.request_clear_screen();
     }
 }

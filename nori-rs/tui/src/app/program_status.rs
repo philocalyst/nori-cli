@@ -218,12 +218,21 @@ impl ProgramStatus {
                 self.tool_update(notification);
             }
             SessionEvent::Nori(NoriEvent::SessionPhaseChanged(phase)) => match phase {
-                SessionPhase::Loading { .. } | SessionPhase::Prompting { .. } => {
+                SessionPhase::Loading { .. }
+                | SessionPhase::Prompting { .. }
+                | SessionPhase::Agent {
+                    cancelling: false, ..
+                } => {
                     if !self.requests.values().any(String::is_empty) {
                         self.publish("", Record::new("working"));
                     }
                 }
-                SessionPhase::Cancelling { .. } => self.idle(),
+                SessionPhase::Cancelling { .. }
+                | SessionPhase::Agent {
+                    cancelling: true, ..
+                } => {
+                    self.idle();
+                }
                 SessionPhase::Idle => {
                     if !matches!(
                         self.records.get("").map(|r| r.state),
@@ -444,6 +453,7 @@ mod tests {
                     parent_session_id: parent.into(),
                     session_id: child.into(),
                     agent: Patch::Keep,
+                    model: Patch::Keep,
                     title: Patch::Set(child.into()),
                     description: Patch::Keep,
                     state: Patch::Set(SubagentState::Running),
@@ -491,6 +501,7 @@ mod tests {
                 parent_session_id: "child".into(),
                 session_id: "grandchild".into(),
                 agent: Patch::Keep,
+                model: Patch::Keep,
                 title: Patch::Keep,
                 description: Patch::Keep,
                 state: Patch::Set(SubagentState::Running),
@@ -510,6 +521,7 @@ mod tests {
                 parent_session_id: "root".into(),
                 session_id: "child".into(),
                 agent: Patch::Keep,
+                model: Patch::Keep,
                 title: Patch::Keep,
                 description: Patch::Keep,
                 state: Patch::Set(SubagentState::Ended(SubagentOutcome::Closed)),
@@ -528,6 +540,7 @@ mod tests {
                 history_log_id: 0,
                 history_entry_count: 0,
                 config_options: Vec::new(),
+                swap: None,
             },
         )));
         assert_eq!(status.records[""].kind, Some("auth"));
@@ -554,6 +567,7 @@ mod tests {
                     parent_session_id: parent.into(),
                     session_id: format!("child{index}").into(),
                     agent: Patch::Keep,
+                    model: Patch::Keep,
                     title: Patch::Keep,
                     description: Patch::Keep,
                     state: Patch::Set(SubagentState::Running),

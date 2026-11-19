@@ -14,14 +14,13 @@ use nori_config::SandboxPolicy;
 
 pub(crate) type SessionGeneration = i64;
 
-#[derive(Debug, Clone)]
-pub(crate) struct ConversationPathResponseEvent {
-    pub(crate) conversation_id: nori_harness::ConversationId,
-}
-
 #[derive(Debug)]
 pub(crate) enum HarnessAction {
     Cancel,
+    /// Stop the subagents the agent started; cancelling a turn never does.
+    StopSubagents,
+    /// Tear the agent's connection down: it ignored a cancel. The session stays resumable.
+    StopAgent,
     Shutdown {
         child_grace: std::time::Duration,
     },
@@ -201,6 +200,18 @@ pub(crate) enum AppEvent {
         cell: std::sync::Arc<dyn HistoryCell>,
         result: Result<(), String>,
     },
+    /// The edit journal answered: what restoring the files of the focused prompt would undo.
+    FocusSnapshotsLoaded {
+        generation: SessionGeneration,
+        snapshots: Vec<nori_harness::UndoSnapshot>,
+    },
+    /// The files of a rewind are restored (or could not be): the conversation forks next.
+    RewindFilesRestored {
+        generation: SessionGeneration,
+        cell_index: usize,
+        after: ForkAfter,
+        result: Result<(), String>,
+    },
     ChildHistoryReady {
         request_id: i64,
         key: crate::subagent_switcher::SubagentKey,
@@ -282,9 +293,6 @@ pub(crate) enum AppEvent {
     /// Re-open the approval presets popup.
     OpenApprovalsPopup,
 
-    /// Forwarded conversation history snapshot from the current conversation.
-    ConversationHistory(ConversationPathResponseEvent),
-
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
 
@@ -302,22 +310,6 @@ pub(crate) enum AppEvent {
 
     /// Abandon the prepared candidate while keeping the active session.
     CancelAgentCandidate,
-
-    /// The agent picker's cursor came to rest on an agent: warm it in the background once the
-    /// cursor has stayed a moment, so that choosing it finds it ready.
-    HighlightAgentCandidate {
-        agent_name: String,
-        display_name: String,
-    },
-
-    /// The highlight outlasted the pause: start warming the agent.
-    WarmAgentCandidate {
-        agent_name: String,
-        display_name: String,
-    },
-
-    /// The picker closed without a choice: drop an agent warmed for it.
-    DiscardWarmAgentCandidate,
 
     /// Agent failed to spawn (ACP or HTTP backend). Show error and prompt user
     /// to select a different agent.
@@ -446,10 +438,37 @@ pub(crate) enum AppEvent {
         success: bool,
     },
 
+    /// How an agent offers to sign in, or why it could not be asked.
+    SignInMethods {
+        target: crate::chatwidget::SignInTarget,
+        methods: Result<Vec<nori_acp_host::sign_in::SignInMethod>, String>,
+    },
+    /// Sign in with one of the ways an agent offered.
+    SignInWith {
+        target: crate::chatwidget::SignInTarget,
+        method: nori_acp_host::sign_in::SignInMethod,
+    },
+    /// Whether a sign-in took: a fresh agent could open a session, or why not.
+    SignInVerified {
+        target: crate::chatwidget::SignInTarget,
+        result: Result<(), String>,
+    },
+    /// Create the account `name` of `provider`, then sign it in.
+    AddAccount {
+        provider: &'static nori_config::ProviderAccounts,
+        name: String,
+    },
+    /// An account was created (its agent's slug), or why not.
+    AccountAdded {
+        provider: &'static nori_config::ProviderAccounts,
+        name: String,
+        result: Result<String, String>,
+    },
+
     /// Output from external CLI login process (e.g., gemini login)
     ExternalCliLoginOutput {
-        /// Raw output string from the CLI (ANSI codes stripped)
-        data: String,
+        /// The bytes the CLI wrote to its terminal, escape sequences and all.
+        data: Vec<u8>,
     },
 
     /// External CLI login process completed
@@ -519,9 +538,6 @@ pub(crate) enum AppEvent {
 
     /// Set the TUI pinned plan drawer config setting.
     SetConfigPinnedPlanDrawer(bool),
-
-    /// Set width-resize transcript reflow.
-    SetConfigResizeReflow(bool),
 
     /// Set ACP wire JSONL recording for future ACP child subprocesses.
     SetConfigAcpWireRecording(bool),
@@ -614,9 +630,11 @@ pub(crate) enum AppEvent {
         result: Result<String, String>,
     },
 
-    /// Show searchable past conversations for insertion into the draft.
+    /// Show searchable past conversations for insertion into the draft; each session comes
+    /// with the agent that recorded it.
     ShowReferenceSessionPicker {
-        sessions: Vec<crate::nori::reference_session_picker::ReferenceSession>,
+        sessions: Vec<(crate::resume_picker::SessionPickerInfo, Option<String>)>,
+        nori_home: PathBuf,
         target: crate::subagent_switcher::Target,
     },
 
@@ -628,14 +646,6 @@ pub(crate) enum AppEvent {
         target: crate::subagent_switcher::Target,
     },
 
-    /// Update a past conversation preview in the open picker.
-    ReferenceSessionPreview {
-        project_id: String,
-        session_id: String,
-        agent: String,
-        preview: String,
-    },
-
     /// Insert a selected conversation reference at the draft cursor.
     InsertSessionReference {
         text: String,
@@ -645,7 +655,7 @@ pub(crate) enum AppEvent {
     /// Show the viewonly session picker with loaded sessions.
     ShowViewonlySessionPicker {
         /// The loaded session metadata for the picker
-        sessions: Vec<crate::nori::viewonly_session_picker::SessionPickerInfo>,
+        sessions: Vec<crate::resume_picker::SessionPickerInfo>,
         /// The NORI_HOME path for loading transcripts
         nori_home: PathBuf,
     },
@@ -666,28 +676,13 @@ pub(crate) enum AppEvent {
         entries: Vec<crate::viewonly_transcript::ViewonlyEntry>,
     },
 
-    /// Show the resume session picker with loaded sessions.
+    /// Show the resume session picker over the transcripts of this `NORI_HOME`. The picker
+    /// fills its rows and searches full text from the on-disk index by itself.
     ShowResumeSessionPicker {
         /// The loaded session metadata for the picker
-        sessions: Vec<crate::nori::viewonly_session_picker::SessionPickerInfo>,
+        sessions: Vec<crate::resume_picker::SessionPickerInfo>,
         /// The NORI_HOME path
         nori_home: PathBuf,
-        /// Monotonic generation for ignoring stale lazy summary updates.
-        generation: u64,
-    },
-
-    /// Update one row in the active resume picker after lazy transcript scanning.
-    ResumeSessionSummaryReady {
-        /// Monotonic generation for ignoring stale lazy summary updates.
-        generation: u64,
-        /// Session identifier to update.
-        session_id: String,
-        /// Session start timestamp for rebuilding the row name.
-        started_at: String,
-        /// Preview of the first user message, if discovered.
-        first_message_preview: Option<String>,
-        /// Exact number of user turns, once known.
-        user_turn_count: Option<usize>,
     },
 
     /// Resume a previous session via ACP session/load or client-side replay.
@@ -707,9 +702,9 @@ pub(crate) enum AppEvent {
 
     /// Show the resume session picker sourced from the live agent's ACP
     /// `session/list` rather than the local transcript store.
-    ShowAcpResumeSessionPicker {
-        /// Schema-native session records reported by the agent.
+    ShowHelixAcpResumePicker {
         sessions: Vec<nori_protocol::acp::v1::SessionInfo>,
+        cancel_candidate_on_dismiss: bool,
     },
 
     /// Resume a session reported by the agent's `session/list`, via
@@ -779,6 +774,12 @@ pub(crate) enum AppEvent {
     /// Open the fork picker modal showing previous user messages.
     OpenForkPicker,
 
+    // usage: open the `/usage` overlay.
+    OpenUsage,
+
+    /// Show a list of choices described as data.
+    ShowChoicePicker(Box<crate::choice_picker::ChoiceSpec>),
+
     /// Branch the conversation at its current head via ACP `session/fork`,
     /// swapping the active session to the forked one.
     BranchFromCurrent,
@@ -814,6 +815,27 @@ pub(crate) enum AppEvent {
         /// The text of the selected message, to prefill the composer.
         prefill: String,
     },
+    /// Open the panel of the conversation's actors (its subagents).
+    OpenActorPanel,
+    /// Tab in the shell-command composer: complete `text` at byte `cursor`.
+    ShellComplete {
+        text: String,
+        cursor: usize,
+    },
+    /// The shell's answer to a [`AppEvent::ShellComplete`] for `text`.
+    ShellCompleted {
+        text: String,
+        candidates: Vec<nori_bash::CompletionCandidate>,
+    },
+}
+
+/// What becomes of the prompt a conversation was forked before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ForkAfter {
+    /// It goes back into the composer, to be edited.
+    Prefill(String),
+    /// It is sent at once, as it was edited in place.
+    Submit(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

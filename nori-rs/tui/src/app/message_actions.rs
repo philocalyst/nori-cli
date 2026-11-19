@@ -180,7 +180,7 @@ mod tests {
             Arc::new(AgentMessageCell::new(vec![Line::from("final")], false));
         let mut cells = vec![first, continuation.clone()];
 
-        let (_, consolidated) = crate::transcript_reflow::consolidate_agent_message_cells(
+        let (_, consolidated) = crate::transcript_cells::consolidate_agent_message_cells(
             &mut cells,
             "first\nfinal".to_owned(),
             std::path::Path::new("/work"),

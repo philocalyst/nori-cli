@@ -60,9 +60,22 @@ impl App {
     }
 
     /// Open the list of the main session and every subagent.
-    pub(super) fn open_subagent_switcher(&mut self, tui: &mut tui::Tui) {
+    pub(super) fn open_actor_panel(&mut self, tui: &mut tui::Tui) {
         let roster = self.subagent_roster();
-        let overlay = SubagentOverlay::switcher(&roster, self.switcher_binding());
+        let transcript_id = self.active_transcript_id.clone();
+        let overlay = if self.subagent_switcher_transcript == transcript_id {
+            self.subagent_switcher_state.take().map_or_else(
+                || SubagentOverlay::switcher(&roster, self.switcher_binding()),
+                |mut overlay| {
+                    overlay.update(&roster, Rect::default());
+                    *overlay
+                },
+            )
+        } else {
+            self.subagent_switcher_state = None;
+            self.subagent_switcher_transcript = transcript_id;
+            SubagentOverlay::switcher(&roster, self.switcher_binding())
+        };
         self.show_subagent_overlay(tui, overlay);
     }
 
@@ -94,7 +107,7 @@ impl App {
     }
 
     /// The tail of the root conversation: its last cells, as the transcript overlay shows them.
-    fn main_body(&self, query: BodyQuery, revision: i64, now: Instant) -> Body {
+    fn main_body(&self, query: BodyQuery, revision: i64) -> Body {
         let mut tail = Tail::new(query.rows);
         for cell in self.transcript_cells.iter().rev() {
             if tail.is_full() {
@@ -106,7 +119,6 @@ impl App {
             query,
             revision,
             lines: tail.finish(),
-            built_at: now,
         }
     }
 
@@ -125,8 +137,8 @@ impl App {
             return Ok(());
         };
         let body = match query.target {
-            Target::Main => Some(self.main_body(query, roster.main.revision, now)),
-            Target::Subagent(_) => self.chat_widget.subagent_body(query, now),
+            Target::Main => Some(self.main_body(query, roster.main.revision)),
+            Target::Subagent(_) => self.chat_widget.subagent_body(query),
         };
         if let Some(body) = body
             && let Some(Overlay::Subagents(overlay)) = &mut self.overlay
@@ -166,19 +178,22 @@ impl App {
                 self.close_subagent_switcher(tui);
                 self.focus_session_view(tui, Target::Subagent(subagent));
             }
+            // lens: actions on an actor keep the panel open (see `app/lens.rs`).
+            action @ (Transition::Message { .. } | Transition::Cancel(_)) => {
+                self.run_actor_action(tui, action);
+            }
         }
         Ok(())
     }
 
     fn close_subagent_switcher(&mut self, tui: &mut tui::Tui) {
-        self.overlay = None;
+        if let Some(Overlay::Subagents(overlay)) = self.overlay.take() {
+            self.subagent_switcher_state = Some(overlay);
+            self.subagent_switcher_transcript = self.active_transcript_id.clone();
+        } else {
+            self.overlay = None;
+        }
         let _ = tui.set_mouse_capture(false);
         tui.request_full_repaint();
-        if self.session_view.focused() == Target::Main
-            && !self.session_view.main_scrolling()
-            && !self.deferred_history_lines.is_empty()
-        {
-            tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
-        }
     }
 }

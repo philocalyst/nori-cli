@@ -464,6 +464,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::print_stdout)]
     #[test]
     fn warm_large_history_reports_visible_window_latency() {
         let mut cache = TranscriptWindow::default();

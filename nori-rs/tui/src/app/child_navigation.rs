@@ -61,10 +61,10 @@ impl super::App {
             );
             return;
         };
-        self.backtrack.child_focus_sequence += 1;
-        let request_id = self.backtrack.child_focus_sequence;
+        self.child_focus_sequence += 1;
+        let request_id = self.child_focus_sequence;
         if focus_responses {
-            self.backtrack.pending_child_focus = Some(PendingChildFocus {
+            self.pending_child_focus = Some(PendingChildFocus {
                 key,
                 session_id: session_id.clone(),
                 generation: self.chat_widget.session_generation(),
@@ -72,7 +72,7 @@ impl super::App {
                 keys: Vec::new(),
             });
         } else {
-            self.backtrack.pending_child_focus = None;
+            self.pending_child_focus = None;
         }
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
@@ -107,7 +107,7 @@ impl super::App {
             boundaries,
         });
         if focus_responses {
-            self.begin_response_focus(tui, cells);
+            self.begin_focus(tui, cells, false);
             return;
         }
         let _ = tui.set_mouse_capture(true);

@@ -24,12 +24,10 @@ pub(crate) struct SessionView {
     controlled_handles: HashMap<SubagentKey, nori_harness::runtime::HarnessHandle>,
     child_output: HashMap<SubagentKey, String>,
     main_scrolling: bool,
-    tool_detail: bool,
     drag_row: Option<u16>,
-    strip_drag: Option<(u16, Option<SubagentKey>, bool)>,
+    strip_drag: Option<(u16, u16, Option<SubagentKey>, bool)>,
     expanded_tools: HashMap<Target, HashSet<String>>,
     windows: HashMap<Target, super::transcript_window::TranscriptWindow>,
-    response_saved: Option<(Target, usize, bool)>,
     controlled_configs: HashMap<SubagentKey, AgentConfigState>,
     controls_loaded: HashSet<SubagentKey>,
     controls_revision: HashMap<SubagentKey, i64>,
@@ -47,12 +45,10 @@ impl Default for SessionView {
             controlled_handles: HashMap::new(),
             child_output: HashMap::new(),
             main_scrolling: false,
-            tool_detail: false,
             drag_row: None,
             strip_drag: None,
             expanded_tools: HashMap::new(),
             windows: HashMap::new(),
-            response_saved: None,
             controlled_configs: HashMap::new(),
             controls_loaded: HashSet::new(),
             controls_revision: HashMap::new(),
@@ -62,15 +58,7 @@ impl Default for SessionView {
 }
 
 impl SessionView {
-    pub(crate) fn tool_detail(&self) -> bool {
-        self.tool_detail
-    }
-
-    pub(crate) fn close_tool_detail(&mut self) {
-        self.tool_detail = false;
-        self.main_scrolling = false;
-        self.scroll_offsets.insert(Target::Main, 0);
-    }
+    /// The tool calls shown expanded in `target`'s view, if any are.
     pub(super) fn invalidate_main_transcript_cell(&mut self, index: usize) {
         if let Some(window) = self.windows.get_mut(&Target::Main) {
             window.invalidate(index);
@@ -213,28 +201,38 @@ impl SessionView {
         self.drag_row = None;
     }
 
-    pub(crate) fn start_strip_drag(&mut self, column: u16, key: Option<SubagentKey>) {
-        self.strip_drag = Some((column, key, false));
+    pub(crate) fn start_strip_drag(&mut self, column: u16, row: u16, key: Option<SubagentKey>) {
+        self.strip_drag = Some((column, row, key, false));
     }
 
-    pub(crate) fn strip_drag(&mut self, column: u16) -> isize {
-        let Some((previous, _, dragged)) = self.strip_drag.as_mut() else {
+    pub(crate) fn strip_drag(&mut self, column: u16, row: u16) -> isize {
+        let Some((previous_column, previous_row, _, dragged)) = self.strip_drag.as_mut() else {
             return 0;
         };
-        let delta = isize::try_from(column).unwrap_or(isize::MAX)
-            - isize::try_from(*previous).unwrap_or(isize::MAX);
-        if delta.abs() < 3 {
+        let column_delta = isize::try_from(column).unwrap_or(isize::MAX)
+            - isize::try_from(*previous_column).unwrap_or(isize::MAX);
+        let row_delta = isize::try_from(row).unwrap_or(isize::MAX)
+            - isize::try_from(*previous_row).unwrap_or(isize::MAX);
+        if column_delta.abs() < 3 && row_delta.abs() < 3 {
             return 0;
         }
-        *previous = column;
+        *previous_column = column;
+        *previous_row = row;
         *dragged = true;
-        -delta.signum()
+        if row_delta.abs() >= 3 {
+            return 0;
+        }
+        -column_delta.signum()
     }
 
     pub(crate) fn end_strip_drag(&mut self) -> Option<SubagentKey> {
         self.strip_drag
             .take()
-            .and_then(|(_, key, dragged)| if dragged { None } else { key })
+            .and_then(|(_, _, key, dragged)| if dragged { None } else { key })
+    }
+
+    pub(crate) fn cancel_strip_drag(&mut self) {
+        self.strip_drag = None;
     }
 
     pub(crate) fn is_strip_dragging(&self) -> bool {
@@ -296,79 +294,37 @@ impl SessionView {
     }
 }
 
+/// The id the stage gives an expandable card: its place in the conversation.
+pub(crate) const CARD_PREFIX: &str = "cell:";
+
 impl super::App {
+    /// Expand or collapse the newest expandable card of the conversation, in place.
     pub(crate) fn open_latest_main_tool(&mut self, tui: &mut tui::Tui) {
-        let Some((index, tool)) =
-            self.transcript_cells
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(index, cell)| {
-                    cell.as_any()
-                        .downcast_ref::<crate::client_tool_cell::ClientToolCell>()
-                        .map(|tool| (index, tool))
-                })
+        let Some(index) = self
+            .transcript_cells
+            .iter()
+            .rposition(|cell| cell.expansion().is_some())
         else {
             return;
         };
-        let width = tui.terminal.last_known_screen_size.width;
-        let height = self
-            .chat_widget
-            .response_focus_viewport_height(tui.terminal.last_known_screen_size.height);
-        let suffix = self.transcript_cells[index + 1..]
-            .iter()
-            .map(|cell| {
-                cell.display_lines(width)
-                    .len()
-                    .saturating_add(usize::from(!cell.is_stream_continuation()))
-            })
-            .sum::<usize>();
-        let offset = suffix.saturating_add(tool.expanded_lines(width).len().saturating_sub(height));
-        let id = tool.call_id().to_owned();
-        self.session_view
-            .expanded_tools
-            .entry(Target::Main)
-            .or_default()
-            .insert(id);
-        self.session_view
-            .scroll_offsets
-            .insert(Target::Main, offset);
-        self.session_view.main_scrolling = true;
-        self.session_view.tool_detail = true;
-        tui.frame_requester().schedule_frame();
+        self.toggle_tool(tui, format!("{CARD_PREFIX}{index}"));
     }
     pub(crate) fn toggle_tool(&mut self, tui: &mut tui::Tui, call_id: String) {
+        // A card on the stage is the cell itself: it holds its own expansion.
+        if let Some(index) = call_id.strip_prefix(CARD_PREFIX)
+            && let Some(cell) = index
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| self.transcript_cells.get(index))
+        {
+            cell.set_expanded(!cell.expansion().unwrap_or(false));
+            tui.frame_requester().schedule_frame();
+            return;
+        }
         let target = self.session_view.focused();
         let expanded = self.session_view.expanded_tools.entry(target).or_default();
         if !expanded.remove(&call_id) {
             expanded.insert(call_id);
-        }
-        tui.frame_requester().schedule_frame();
-    }
-
-    pub(crate) fn focus_response_view(&mut self, tui: &mut tui::Tui, offset: usize) {
-        let target = self.session_view.focused();
-        if self.session_view.response_saved.is_none() {
-            self.session_view.response_saved = Some((
-                target,
-                self.session_view.scroll_offset(),
-                self.session_view.main_scrolling,
-            ));
-        }
-        self.session_view.scroll_offsets.insert(target, offset);
-        tui.frame_requester().schedule_frame();
-    }
-
-    pub(crate) fn end_response_view(&mut self, tui: &mut tui::Tui) {
-        let Some((target, offset, _)) = self.session_view.response_saved.take() else {
-            return;
-        };
-        self.session_view.scroll_offsets.insert(target, offset);
-        if self.session_view.focused() == Target::Main
-            && self.overlay.is_none()
-            && !self.deferred_history_lines.is_empty()
-        {
-            tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
         }
         tui.frame_requester().schedule_frame();
     }
@@ -381,6 +337,7 @@ impl super::App {
             return;
         }
         self.session_view.scroll(lines);
+        self.session_view.main_scrolling = self.session_view.scroll_offset() > 0;
         tui.frame_requester().schedule_frame();
     }
 
@@ -396,14 +353,9 @@ impl super::App {
         if target == displayed {
             return;
         }
-        self.backtrack.pending_child_focus = None;
-        if self.session_view.tool_detail() {
-            self.session_view.close_tool_detail();
-        }
+        self.pending_child_focus = None;
         self.tool_gesture.cancel();
-        self.end_response_view(tui);
-        self.backtrack.response_focus = None;
-        self.chat_widget.set_response_focus(false);
+        self.close_focus(tui);
         if target == roster.resolve(displayed) {
             self.session_view.focus(target);
             if let Target::Subagent(key) = target {
@@ -426,9 +378,10 @@ impl super::App {
             self.chat_widget.restore_composer_draft(draft);
         }
         match target {
-            Target::Main => self
-                .chat_widget
-                .set_focused_subagent_view(None, Vec::new(), 0),
+            Target::Main => {
+                self.chat_widget
+                    .set_focused_subagent_view(None, Vec::new(), 0);
+            }
             Target::Subagent(key) => self.chat_widget.set_focused_subagent_view(
                 Some(key),
                 Vec::new(),
@@ -452,12 +405,6 @@ impl super::App {
                 );
                 self.request_subagent_controls(key);
             }
-        }
-        if target == Target::Main
-            && self.overlay.is_none()
-            && !self.deferred_history_lines.is_empty()
-        {
-            tui.insert_history_lines(std::mem::take(&mut self.deferred_history_lines));
         }
         tui.frame_requester().schedule_frame();
     }
@@ -506,61 +453,21 @@ impl super::App {
         tui: &mut tui::Tui,
     ) -> color_eyre::eyre::Result<()> {
         let target = self.session_view.focused();
-        if let Some(focus) = self.backtrack.response_focus.as_ref() {
-            let width = tui.terminal.size()?.width;
-            let (lines, _, header) = focus.rendered(width);
+        if let Target::Subagent(key) = target
+            && let Some(rendered) = self.focus_child_rows(tui.terminal.size()?.width)
+        {
             self.session_view
-                .clamp_scroll(lines.len().saturating_sub(1));
-            match target {
-                Target::Main => self
-                    .chat_widget
-                    .set_main_history_view(lines, self.session_view.scroll_offset()),
-                Target::Subagent(key) => self.chat_widget.set_focused_subagent_view(
-                    Some(key),
-                    lines,
-                    self.session_view.scroll_offset(),
-                ),
-            }
-            self.chat_widget.set_response_focus_header(header);
+                .clamp_scroll(rendered.lines.len().saturating_sub(1));
+            self.chat_widget.set_focused_subagent_view(
+                Some(key),
+                rendered.lines,
+                self.session_view.scroll_offset(),
+            );
             return Ok(());
         }
-        if target == Target::Main
-            && !self.session_view.main_scrolling
-            && !self.native_history.cells().is_empty()
-        {
-            let size = tui.terminal.size()?;
-            let cells = self.native_history.cells();
-            let source = cells.back().map_or_else(
-                || super::transcript_window::Version::Metadata(String::new()),
-                |cell| super::transcript_window::Version::Main(cell.clone()),
-            );
-            let expanded = self.session_view.expanded_tools.entry(target).or_default();
-            let window = self.session_view.windows.entry(target).or_default().render(
-                cells.len(),
-                size.width,
-                usize::from(size.height),
-                0,
-                source,
-                expanded,
-                |index| {
-                    cells
-                        .get(index)
-                        .map(|cell| super::transcript_window::Version::Main(cell.clone()))
-                },
-                |index| {
-                    cells.get(index).map(|cell| {
-                        let mut projection =
-                            crate::chatwidget::tool_projection::ToolProjection::default();
-                        projection.push_main(cell.as_ref(), size.width, expanded);
-                        (projection, cell.is_stream_continuation())
-                    })
-                },
-            );
-            self.chat_widget
-                .set_main_history_view(window.projection.lines, 0);
-            self.chat_widget.set_transcript_follow_live(true);
-            self.chat_widget
-                .set_transcript_tools(window.projection.spans);
+        if target == Target::Main && !self.session_view.main_scrolling {
+            // The conversation is the stage's: nothing is projected over it.
+            self.chat_widget.clear_main_history_view();
             return Ok(());
         }
         if target == Target::Main && self.session_view.main_scrolling {
@@ -743,11 +650,28 @@ mod tests {
     #[test]
     fn strip_swipe_scrolls_without_activating_a_pill() {
         let mut view = SessionView::default();
-        view.start_strip_drag(15, Some(SubagentKey(4)));
-        assert_eq!(view.strip_drag(10), 1);
+        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
+        assert_eq!(view.strip_drag(10, 2), 1);
         assert_eq!(view.end_strip_drag(), None);
-        view.start_strip_drag(1, Some(SubagentKey(3)));
+        view.start_strip_drag(1, 2, Some(SubagentKey(3)));
         assert_eq!(view.end_strip_drag(), Some(SubagentKey(3)));
+    }
+
+    #[test]
+    fn vertical_strip_drag_cancels_click_without_scrolling() {
+        let mut view = SessionView::default();
+        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
+        assert_eq!(view.strip_drag(15, 8), 0);
+        assert_eq!(view.end_strip_drag(), None);
+    }
+
+    #[test]
+    fn cancelling_strip_drag_discards_pending_click() {
+        let mut view = SessionView::default();
+        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
+        view.cancel_strip_drag();
+        assert!(!view.is_strip_dragging());
+        assert_eq!(view.end_strip_drag(), None);
     }
 
     fn roster(now: Instant) -> Roster {
@@ -759,6 +683,7 @@ mod tests {
             model: None,
             status: Status::Running,
             detail: None,
+            transcript_text: String::new(),
             elapsed: Duration::ZERO,
             ended_ago: None,
             tool_count: 0,

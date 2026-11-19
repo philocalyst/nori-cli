@@ -1,4 +1,3 @@
-use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
@@ -17,9 +16,6 @@ use crate::update_action::UpdateAction;
 use codex_ansi_escape::ansi_escape_line;
 use codex_login::AuthManager;
 use color_eyre::eyre::Result;
-use crossterm::event::KeyCode;
-use crossterm::event::KeyEvent;
-use crossterm::event::KeyEventKind;
 use nori_config::AskForApproval;
 use nori_config::NoriConfig;
 use nori_config::NoriConfigEdits as ConfigEditsBuilder;
@@ -35,10 +31,7 @@ use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
 
 pub(crate) mod child_navigation;
-mod native_history_output;
-mod native_history_queue;
 mod program_status;
-pub(crate) mod response_focus;
 
 #[cfg(not(debug_assertions))]
 use crate::history_cell::UpdateAvailableHistoryCell;
@@ -101,7 +94,6 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
-    native_history: native_history_queue::NativeHistoryQueue,
     /// Canonical journal identity, independent of the provider session binding.
     pub(crate) active_transcript_id: Option<String>,
     pub(crate) response_boundaries: Vec<(
@@ -114,18 +106,23 @@ pub(crate) struct App {
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
+    /// The subagent picker survives a close so reopening keeps its query and selection.
+    /// It is scoped to the canonical transcript and discarded for a new root session.
+    subagent_switcher_state: Option<Box<crate::subagent_switcher::SubagentOverlay>>,
+    subagent_switcher_transcript: Option<String>,
     pub(crate) session_view: session_view::SessionView,
     tool_gesture: tool_gesture::ToolGesture,
-    pub(crate) deferred_history_lines: Vec<Line<'static>>,
-    has_emitted_history_lines: bool,
     /// Where the cells of the history being replayed start in `transcript_cells`, while it is.
     replay_painted_from: Option<(usize, nori_protocol::ReplaySource)>,
-    pub(crate) transcript_reflow: crate::transcript_reflow::TranscriptReflowState,
 
     pub(crate) enhanced_keys_supported: bool,
 
-    // Esc-backtracking state grouped
-    pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+    /// The prompt a rewind is focused on, if any.
+    pub(crate) focus: Option<focus::Focus>,
+    /// A child's journal was asked for so that its prompts can be focused; keys typed meanwhile
+    /// wait here.
+    pub(crate) pending_child_focus: Option<child_navigation::PendingChildFocus>,
+    pub(crate) child_focus_sequence: i64,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
 
@@ -152,23 +149,9 @@ pub(crate) struct App {
     pending_candidate_model: Option<(String, String)>,
     model_route_fallback: Option<model_routes::ModelRouteFallback>,
     next_model_route_token: i64,
-    selected_model_routes: Vec<crate::nori::unified_model_picker::ModelRoute>,
-    native_preference_attempted: std::collections::HashSet<String>,
-    native_preference_waiting_for_prompt: bool,
-    native_preference_session: Option<(
-        crate::app_event::SessionGeneration,
-        nori_protocol::acp::v1::SessionId,
-    )>,
-    native_preference_session_ready: bool,
-    native_preference_in_progress: bool,
     manual_model_handoff: Option<session_setup::ManualModelHandoff>,
-    fallback: Option<fallback::Fallback>,
-    exhausted_providers: std::collections::HashSet<String>,
-    suppressed_fallback_errors: std::collections::HashSet<nori_protocol::acp::v1::RequestId>,
     /// Model presses made before the agent listed its models; they apply when it does.
     waiting_model_presses: crate::chatwidget::WaitingModelPresses,
-    /// The pause between the agent picker's cursor settling on a row and that agent warming.
-    warm_candidate_pause: Option<tokio::task::AbortHandle>,
     /// Whether the welcome card for the current conversation has already been
     /// written, ahead of the session that conversation will run on.
     welcome_card_written: bool,
@@ -231,15 +214,11 @@ enum CandidateAgent {
         generation: crate::app_event::SessionGeneration,
         agent_name: String,
         abort: tokio::task::AbortHandle,
-        /// Warming for a highlighted picker row: nothing is chosen yet, so nothing follows its
-        /// readiness.
-        speculative: bool,
     },
     Prepared {
         agent_name: String,
         display_name: String,
         agent: Box<nori_harness::runtime::PreparedAgent>,
-        speculative: bool,
     },
     Activating {
         agent_name: String,
@@ -258,19 +237,24 @@ struct SystemInfoRefreshRequest {
 
 mod commit_changes;
 mod config_persistence;
-mod event_handling;
-mod fallback;
+mod events;
+mod exit;
+pub(crate) mod focus;
 mod frame;
 mod history_replay;
+mod input;
+mod lens;
 mod message_actions;
 pub(crate) mod model_routes;
+mod overlay;
 mod reference_session;
-mod resize_reflow;
+pub(crate) mod rewind;
 mod session_setup;
 mod session_view;
 mod subagent_overlay;
 mod tool_gesture;
 mod tool_history;
+mod transcript;
 mod transcript_window;
 
 impl App {
@@ -370,19 +354,19 @@ impl App {
             file_search,
             enhanced_keys_supported,
             transcript_cells: Vec::new(),
-            native_history: Default::default(),
             response_boundaries: Vec::new(),
             active_transcript_id: None,
             hidden_transcript_len: None,
             overlay: None,
+            subagent_switcher_state: None,
+            subagent_switcher_transcript: None,
             session_view: Default::default(),
             tool_gesture: Default::default(),
             program_status: Default::default(),
-            deferred_history_lines: Vec::new(),
-            has_emitted_history_lines: false,
             replay_painted_from: None,
-            transcript_reflow: Default::default(),
-            backtrack: BacktrackState::default(),
+            focus: None,
+            pending_child_focus: None,
+            child_focus_sequence: 0,
             pending_update_action: None,
             skip_world_writable_scan_once: false,
             prepared_agent: None,
@@ -393,17 +377,7 @@ impl App {
             pending_candidate_model: None,
             model_route_fallback: None,
             next_model_route_token: 0,
-            selected_model_routes: Vec::new(),
-            native_preference_attempted: Default::default(),
-            native_preference_waiting_for_prompt: false,
-            native_preference_session: None,
-            native_preference_session_ready: false,
-            native_preference_in_progress: false,
             manual_model_handoff: None,
-            fallback: None,
-            exhausted_providers: Default::default(),
-            suppressed_fallback_errors: Default::default(),
-            warm_candidate_pause: None,
             waiting_model_presses: Default::default(),
             welcome_card_written: false,
             session_card_shown: false,
@@ -441,6 +415,7 @@ impl App {
         // Propagate initial hotkey config to the textarea so editing bindings
         // (ctrl+a, ctrl+e, etc.) respect user overrides from config.toml.
         app.chat_widget.set_hotkey_config(app.hotkey_config.clone());
+        app.chat_widget.set_keymap(app.config.keymap.clone());
         app.chat_widget.update_approval_mode_label();
         // Propagate initial vim mode setting.
         app.chat_widget.set_vim_mode(app.vim_mode);
@@ -646,6 +621,7 @@ impl App {
         self.chat_widget.update_approval_mode_label();
         self.chat_widget
             .set_hotkey_config(self.hotkey_config.clone());
+        self.chat_widget.set_keymap(self.config.keymap.clone());
         self.chat_widget.set_vim_mode(self.vim_mode);
         self.chat_widget.set_kakoune_mode(self.config.kakoune_mode);
         self.chat_widget.set_plan_drawer_mode(self.plan_drawer_mode);

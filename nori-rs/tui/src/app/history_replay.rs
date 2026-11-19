@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use ratatui::style::Stylize;
+
 use super::App;
 use crate::client_tool_cell::ClientToolCell;
 use crate::history_cell::HistoryCell;
@@ -27,6 +29,9 @@ fn finish_interrupted_tools(
     }
 }
 
+/// The rows of a resumed history the terminal is given at least.
+const REPLAY_ROWS: usize = 2000;
+
 impl App {
     pub(super) fn paint_replayed_history(&mut self, tui: &mut tui::Tui) {
         let Some((start, source)) = self.replay_painted_from.take() else {
@@ -34,12 +39,33 @@ impl App {
         };
         let start = start.min(self.transcript_cells.len());
         finish_interrupted_tools(&mut self.transcript_cells[start..], source, self.cloud_mode);
-        let replayed = self.transcript_cells[start..].to_vec();
-        let mut ready = Vec::new();
-        for cell in replayed {
-            ready.extend(self.native_history.push(cell));
+        // The replayed cells are on the stage from the next frame on, typed into the screen
+        // (and scrolled into the scrollback) in order. A long history brings only its last
+        // screens: rendering every cell of it would hold up the resume for nothing the terminal
+        // keeps, so the cells before them are left to the transcript view.
+        if let Ok(screen) = tui.terminal.size() {
+            let budget = usize::from(screen.height)
+                .saturating_mul(12)
+                .max(REPLAY_ROWS);
+            let mut rows = 0usize;
+            let mut keep = self.transcript_cells.len();
+            while keep > start && rows < budget {
+                keep -= 1;
+                rows += self.transcript_cells[keep]
+                    .display_lines(screen.width)
+                    .len()
+                    + 1;
+            }
+            if keep > start {
+                let left_out = keep - start;
+                let note = ratatui::text::Line::from(vec![
+                    "↑ ".dim(),
+                    format!("{left_out} earlier entries of this conversation").dim(),
+                    " · Ctrl+T shows the whole transcript".dim(),
+                ]);
+                let _ = tui.start_stage_at(keep, note);
+            }
         }
-        self.emit_native_history_cells(tui, ready);
         tui.frame_requester().schedule_frame();
     }
 }

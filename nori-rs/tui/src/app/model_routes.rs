@@ -1,4 +1,7 @@
-//! Try equivalent model routes in order when authentication or quota rejects one.
+//! The user's model choice: the routes of the chosen model, tried in order until one starts.
+//!
+//! Which routes exist and how they rank is the harness's (`nori_harness::recovery`). Moving a
+//! session after a failure is the harness's too; the app only sees the route change.
 use std::collections::VecDeque;
 
 use super::App;
@@ -24,16 +27,28 @@ impl ModelRouteFallback {
     }
 }
 
+/// Whether a route that failed to start should give way to the next one: the agent is missing,
+/// not signed in, unreachable, out of usage, lacks the model or has no capacity.
 pub(crate) fn eligible_error(error: &anyhow::Error) -> bool {
+    use nori_acp_host::FailureClass;
+    let structured = error
+        .chain()
+        .any(<dyn std::error::Error>::is::<nori_protocol::acp::v1::Error>);
     error.chain().any(|cause| {
         cause
-            .downcast_ref::<nori_protocol::acp::v1::Error>()
-            .is_some_and(|error| matches!(i32::from(error.code), -32000 | -32010))
-            || cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             || cause.is::<super::session_setup::AgentPreparationTimeout>()
-    }) || nori_acp_host::is_subscription_exhausted(error)
+    }) || structured
+        && matches!(
+            nori_acp_host::classify_failure(error).class,
+            FailureClass::Auth
+                | FailureClass::Network
+                | FailureClass::QuotaExhausted { .. }
+                | FailureClass::ModelUnavailable
+                | FailureClass::Capacity
+                | FailureClass::ExecutableNotFound
+        )
 }
 
 pub(super) fn eligible_acp_error(error: &nori_protocol::acp::v1::Error) -> bool {
@@ -44,42 +59,6 @@ pub(super) fn eligible_acp_error(error: &nori_protocol::acp::v1::Error) -> bool 
 }
 
 impl App {
-    pub(super) async fn prefer_native_current_model(&mut self) {
-        if !self.native_preference_session_ready
-            || self.native_preference_waiting_for_prompt
-            || self.chat_widget.is_task_running()
-            || self.fallback.is_some()
-            || self.manual_model_handoff.is_some()
-            || self.model_route_fallback.is_some()
-            || self.candidate_agent.is_some()
-        {
-            return;
-        }
-        let Some(journal) = self.active_transcript_id.clone() else {
-            return;
-        };
-        if self.native_preference_attempted.contains(&journal) {
-            return;
-        }
-        let options = self.chat_widget.agent_config().raw_options();
-        let Some(option) = options.iter().find(|option| {
-            option.category == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
-        }) else {
-            return;
-        };
-        let Some((name, routes)) = crate::nori::unified_model_picker::preferred_current_routes(
-            &self.config.nori_home,
-            &self.config.active_agent,
-            option,
-        ) else {
-            return;
-        };
-        self.native_preference_attempted.insert(journal);
-        self.select_model_routes(routes, name, ConfigPickerOrigin::Direct)
-            .await;
-        self.native_preference_in_progress = self.model_route_fallback.is_some();
-    }
-
     pub(super) fn stale_model_route_token(&self, token: Option<i64>) -> bool {
         token.is_some_and(|token| {
             self.model_route_fallback
@@ -90,37 +69,20 @@ impl App {
 
     pub(super) async fn select_model_routes(
         &mut self,
-        mut routes: Vec<ModelRoute>,
+        routes: Vec<ModelRoute>,
         name: String,
         origin: ConfigPickerOrigin,
     ) {
-        self.native_preference_in_progress = false;
         if self.model_route_fallback.is_some() || self.manual_model_handoff.is_some() {
             self.discard_candidate();
         }
         self.manual_model_handoff = None;
-        if origin == ConfigPickerOrigin::Direct {
-            routes.retain(|route| {
-                let agent = match route {
-                    ModelRoute::Session { agent_name, .. }
-                    | ModelRoute::Agent { agent_name, .. } => agent_name,
-                };
-                !self.exhausted_providers.contains(agent)
-                    || matches!(route, ModelRoute::Session { .. }) && agent == "opencode"
-            });
-            if routes.is_empty() {
-                self.model_route_fallback = None;
-                self.app_event_tx.send(AppEvent::ShowToast(
-                    "No available route for this model".to_owned(),
-                ));
-                return;
-            }
-        }
-        if origin == ConfigPickerOrigin::Direct {
-            self.selected_model_routes = routes.clone();
-        }
         let mut remaining = VecDeque::from(routes);
         let Some(current) = remaining.pop_front() else {
+            self.model_route_fallback = None;
+            self.app_event_tx.send(AppEvent::ShowToast(
+                "No available route for this model".to_owned(),
+            ));
             return;
         };
         self.next_model_route_token = self.next_model_route_token.saturating_add(1);
@@ -237,6 +199,12 @@ mod tests {
             nori_protocol::acp::v1::Error::internal_error()
                 .data(serde_json::json!({"code":"insufficient_quota"})),
         );
+        assert!(eligible_error(&quota));
+        let quota = anyhow::Error::new(
+            nori_protocol::acp::v1::Error::new(-32003, "Mock provider quota exhausted")
+                .data(serde_json::json!({"code":"insufficient_quota"})),
+        )
+        .context("Failed to set ACP session config option");
         assert!(eligible_error(&quota));
         assert!(!eligible_error(&anyhow::anyhow!("quota or auth failed")));
     }

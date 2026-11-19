@@ -1,9 +1,6 @@
 use super::*;
 
 const AGENT_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-/// How long the agent picker's cursor stays on a row before that agent starts warming.
-const WARM_CANDIDATE_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
-
 #[derive(Debug)]
 pub(super) struct AgentPreparationTimeout;
 
@@ -161,8 +158,7 @@ impl App {
         display_name: String,
         model: String,
     ) {
-        if self.fallback.is_none()
-            && self.manual_model_handoff.is_none()
+        if self.manual_model_handoff.is_none()
             && let Some(handle) = self.chat_widget.harness_handle()
         {
             if self.chat_widget.is_task_running() {
@@ -216,64 +212,25 @@ impl App {
                 effort,
             });
         }
-        self.cancel_warm_pause();
-        // Activation refreshes context and recorder even for a warmed connection.
-        match self.candidate_agent.as_mut() {
-            Some(CandidateAgent::Preparing {
-                agent_name: warm,
-                speculative,
-                ..
-            }) if *warm == agent_name && *speculative => {
-                *speculative = false;
-                self.pending_candidate_model = Some((agent_name, model));
-                return;
-            }
-            Some(CandidateAgent::Prepared {
-                agent_name: warm,
-                speculative,
-                ..
-            }) if *warm == agent_name && *speculative => {
-                *speculative = false;
-                self.pending_candidate_model = Some((agent_name, model));
-                self.app_event_tx.send(AppEvent::NewSession);
-                return;
-            }
-            _ => {}
-        }
         self.discard_candidate();
         self.pending_candidate_model = Some((agent_name.clone(), model));
-        self.start_candidate_preparation(agent_name, display_name, false);
+        self.start_candidate_preparation(agent_name, display_name);
     }
 
-    fn start_candidate_preparation(
-        &mut self,
-        agent_name: String,
-        display_name: String,
-        speculative: bool,
-    ) {
+    fn start_candidate_preparation(&mut self, agent_name: String, display_name: String) {
         let generation = crate::chatwidget::agent::next_session_generation();
         let initial_context = self
-            .fallback
+            .manual_model_handoff
             .as_ref()
-            .and_then(|fallback| fallback.context.clone())
-            .or_else(|| {
-                self.manual_model_handoff
-                    .as_ref()
-                    .map(|handoff| handoff.context.clone())
-            });
+            .map(|handoff| handoff.context.clone());
         let mut spec = crate::chatwidget::agent::agent_prepare_spec(
             self.config_for_agent(&agent_name),
             initial_context,
         );
         spec.handoff = self
-            .fallback
+            .manual_model_handoff
             .as_ref()
-            .and_then(|fallback| fallback.recorder.clone())
-            .or_else(|| {
-                self.manual_model_handoff
-                    .as_ref()
-                    .map(|handoff| handoff.recorder.clone())
-            });
+            .map(|handoff| handoff.recorder.clone());
         let tx = self.app_event_tx.clone();
         let prepared_agent_name = agent_name.clone();
         let task = tokio::spawn(async move {
@@ -291,7 +248,6 @@ impl App {
             generation,
             agent_name: prepared_agent_name,
             abort: task.abort_handle(),
-            speculative,
         });
     }
 
@@ -319,71 +275,6 @@ impl App {
         }
     }
 
-    /// The agent picker's cursor rests on `agent_name`: warm it once it has stayed a moment.
-    pub(crate) fn highlight_agent_candidate(&mut self, agent_name: String, display_name: String) {
-        self.cancel_warm_pause();
-        let tx = self.app_event_tx.clone();
-        let pause = tokio::spawn(async move {
-            tokio::time::sleep(WARM_CANDIDATE_PAUSE).await;
-            tx.send(AppEvent::WarmAgentCandidate {
-                agent_name,
-                display_name,
-            });
-        });
-        self.warm_candidate_pause = Some(pause.abort_handle());
-    }
-
-    pub(crate) fn warm_agent_candidate(&mut self, agent_name: String, display_name: String) {
-        match &self.candidate_agent {
-            None => {}
-            Some(
-                CandidateAgent::Preparing {
-                    agent_name: warm,
-                    speculative: true,
-                    ..
-                }
-                | CandidateAgent::Prepared {
-                    agent_name: warm,
-                    speculative: true,
-                    ..
-                },
-            ) => {
-                if *warm == agent_name {
-                    return;
-                }
-            }
-            // A switch the user already chose is under way.
-            Some(_) => return,
-        }
-        self.drop_candidate();
-        self.start_candidate_preparation(agent_name, display_name, true);
-    }
-
-    /// The picker closed without a choice: nothing warmed for it is wanted.
-    pub(crate) fn discard_warm_candidate(&mut self) {
-        self.cancel_warm_pause();
-        if matches!(
-            self.candidate_agent,
-            Some(
-                CandidateAgent::Preparing {
-                    speculative: true,
-                    ..
-                } | CandidateAgent::Prepared {
-                    speculative: true,
-                    ..
-                }
-            )
-        ) {
-            self.drop_candidate();
-        }
-    }
-
-    fn cancel_warm_pause(&mut self) {
-        if let Some(pause) = self.warm_candidate_pause.take() {
-            pause.abort();
-        }
-    }
-
     pub(crate) fn cancel_primary_agent_preparation(&mut self) {
         if let Some(preparation) = self.primary_agent_preparation.take() {
             preparation.abort.abort();
@@ -392,7 +283,6 @@ impl App {
 
     pub(crate) fn discard_candidate(&mut self) {
         self.pending_candidate_model = None;
-        self.cancel_warm_pause();
         self.drop_candidate();
         self.chat_widget.set_login_agent_override(None);
     }
