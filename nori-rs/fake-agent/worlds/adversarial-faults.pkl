@@ -1,0 +1,252 @@
+/// Every way the agent in this world can misbehave, one prompt keyword each. Send the keyword
+/// and watch what the client and the harness do with it.
+///
+///   drop         the turn runs, the prompt response never reaches the client
+///   twice        the prompt is answered twice (the second claims `max_tokens`)
+///   stale        an extra response for a request id that was never asked (then, on a later
+///                prompt, for the previous one)
+///   detach       the turn ends and the agent keeps streaming text, tools and a permission
+///   hang         the agent never answers and ignores `session/cancel`
+///   ignore       the agent ignores `session/cancel` and finishes its long turn anyway
+///   crash        the connection dies mid-turn (exit code 137)
+///   noise        lines that are not JSON-RPC, and an update for a session nobody opened
+///   interleave   updates for a second session arrive in the middle of this one's
+///   disorder     tool updates out of order: end before start, duplicate start, update after
+///                end, a contradicting end, a call that never ends
+///   huge         several megabytes of text and tool output
+///   refuse, max  stop reasons `refusal` and `max_tokens`
+///   quota, capacity, ratelimit, server, network, auth, toolong   structured errors
+///
+/// The other agents of this world fail to start in the ways agents do:
+/// `sluggish` takes seconds to initialize and to open a session, `locked` wants authentication,
+/// `broken` fails every `session/new`.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/adversarial-faults.pkl "drop"
+amends "nori:World"
+
+name = "adversarial-faults"
+description = "Dropped, repeated and stale responses; work after the turn; hangs, crashes, noise, disorder, huge output."
+default_agent = "chaos"
+
+local edit = new ToolSpec {
+  title = "Edit src/main.rs"
+  tool_kind = "edit"
+  locations { new Location { path = "src/main.rs" } }
+  content { new DiffContent { path = "src/main.rs"; old_text = "fn main() {}\n"; new_text = "fn main() {\n    run();\n}\n" } }
+}
+
+agents {
+  ["chaos"] {
+    title = "Chaos"
+    capabilities = new Capabilities { fork = true }
+    models { new Model { id = "chaos-1"; context_window = 100000 } }
+    scenes {
+      new Scene {
+        name = "drop"
+        on = new Matching { pattern = "^drop" }
+        steps {
+          new Say { text = "Answering, but the response will be lost on the wire." }
+          new DropResponse {}
+        }
+      }
+      new Scene {
+        name = "twice"
+        on = new Matching { pattern = "^twice" }
+        steps {
+          new Say { text = "This prompt is answered twice." }
+          new RespondTwice { gap = 40.ms; second_stop_reason = "max_tokens" }
+        }
+      }
+      new Scene {
+        name = "stale"
+        on = new Matching { pattern = "^stale" }
+        steps {
+          new Say { text = "A stale response follows this turn's response." }
+          new StaleResponse { id = "unknown"; gap = 30.ms }
+        }
+      }
+      new Scene {
+        name = "detach"
+        on = new Matching { pattern = "^detach" }
+        steps {
+          new Say { text = "Done. (It is not.)" }
+          new Detach {
+            after = 1.s
+            steps {
+              new Say { text = "\nStill here, after end_turn. Let me edit one more file.\n" }
+              new Permission { tool = edit; timeout = 1.min }
+              new Say { text = "That is the last thing I'll do.\n" }
+            }
+          }
+        }
+      }
+      new Scene {
+        name = "hang"
+        on = new Matching { pattern = "^hang" }
+        steps {
+          new Say { text = "Starting..." }
+          new Hang {}
+        }
+      }
+      new Scene {
+        name = "ignore"
+        on = new Matching { pattern = "^ignore" }
+        cancel = new CancelPolicy { mode = "ignore" }
+        steps {
+          new Say { text = "A long turn that does not look at the clock of the user.\n" }
+          new Tool { title = "sleep 30"; tool_kind = "execute"; input = new Dynamic { command = "sleep 30" }; duration = 30.s }
+          new Say { text = "Finished, whatever you asked in between." }
+        }
+      }
+      new Scene {
+        name = "crash"
+        on = new Matching { pattern = "^crash" }
+        steps {
+          new Say { text = "About to run out of memory." }
+          new Tool { title = "Edit src/big.rs"; tool_kind = "edit"; status = "in_progress"; disorder = "never_ends" }
+          new Crash { exit_code = 137; message = "fake-agent: killed (out of memory)" }
+        }
+      }
+      new Scene {
+        name = "noise"
+        on = new Matching { pattern = "^noise" }
+        steps {
+          new WireNoise { line = "this is not json" }
+          new WireNoise { line = "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"nobody\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"for a session nobody opened\"}}}}" }
+          new RawUpdate { update = new Dynamic { sessionUpdate = "no_such_update_kind"; anything = 1 } }
+          new Say { text = "Noise sent; this text is real." }
+        }
+      }
+      new Scene {
+        name = "interleave"
+        on = new Matching { pattern = "^interleave" }
+        steps {
+          new Par {
+            lanes {
+              new Listing {
+                new Say { text = "A1 "; chunk = new Chunking { size = 0 } }
+                new Wait { duration = 100.ms }
+                new Say { text = "A2 "; chunk = new Chunking { size = 0 } }
+                new Wait { duration = 100.ms }
+                new Say { text = "A3\n"; chunk = new Chunking { size = 0 } }
+              }
+              new Listing {
+                new Wait { duration = 50.ms }
+                new Lane {
+                  session = "ghost-session"
+                  steps { new Say { text = "B1 (a session that does not exist) "; chunk = new Chunking { size = 0 } } }
+                }
+                new Wait { duration = 100.ms }
+                new Lane {
+                  session = "ghost-session"
+                  steps { new Say { text = "B2"; chunk = new Chunking { size = 0 } } }
+                }
+              }
+            }
+          }
+        }
+      }
+      new Scene {
+        name = "disorder"
+        on = new Matching { pattern = "^disorder" }
+        steps {
+          new Say { text = "Five tool calls, each with its updates in the wrong order.\n" }
+          new Tool { id = "d1"; title = "end before start"; tool_kind = "read"; disorder = "end_before_start" }
+          new Tool { id = "d2"; title = "duplicate start"; tool_kind = "read"; disorder = "duplicate_start"; duration = 50.ms }
+          new Tool { id = "d3"; title = "update after end"; tool_kind = "read"; disorder = "update_after_end"; duration = 50.ms }
+          new Tool { id = "d4"; title = "contradictory end"; tool_kind = "read"; disorder = "contradictory_end"; duration = 50.ms }
+          new Tool { id = "d5"; title = "never ends"; tool_kind = "read"; disorder = "never_ends" }
+          new ToolUpdate { id = "never-announced"; status = "completed"; title = "update for a call nobody announced" }
+        }
+      }
+      new Scene {
+        name = "huge"
+        on = new Matching { pattern = "^huge" }
+        steps {
+          new Say { text = "Here is the whole log.\n" }
+          new Tool {
+            title = "cat build.log"
+            tool_kind = "execute"
+            input = new Dynamic { command = "cat build.log" }
+            stdout = new Generated { unit = "[{{n}}] warning: unused variable `value_{{n}}` in module::function_{{n}} at src/generated/file_{{n}}.rs:{{n}}"; times = 40000; separator = "\n" }
+            exit_code = 0
+            duration = 1.s
+          }
+          new Say {
+            text = new Generated { unit = "Line {{n}}: the quick brown fox jumps over the lazy dog."; times = 60000; separator = "\n" }
+            chunk = new Chunking { size = 2000; unit = "chars" }
+          }
+        }
+      }
+      new Scene {
+        name = "refuse"
+        on = new Matching { pattern = "^refuse" }
+        steps { new Say { text = "I can't help with that." }; new Stop { reason = "refusal" } }
+      }
+      new Scene {
+        name = "max"
+        on = new Matching { pattern = "^max" }
+        steps { new Say { text = "This answer is cut short because" }; new Stop { reason = "max_tokens" } }
+      }
+      new Scene {
+        name = "quota"
+        on = new Matching { pattern = "^quota" }
+        steps { new Fail { failure = "quota"; resets_in = 90.min } }
+      }
+      new Scene {
+        name = "capacity"
+        on = new Matching { pattern = "^capacity" }
+        steps { new Fail { failure = "capacity" } }
+      }
+      new Scene {
+        name = "ratelimit"
+        on = new Matching { pattern = "^ratelimit" }
+        steps { new Fail { failure = "rate_limited"; retry_after = 7 } }
+      }
+      new Scene {
+        name = "server"
+        on = new Matching { pattern = "^server" }
+        steps { new Say { text = "Working on it..." }; new Fail { failure = "server_error" } }
+      }
+      new Scene {
+        name = "network"
+        on = new Matching { pattern = "^network" }
+        steps { new Fail { failure = "network" } }
+      }
+      new Scene {
+        name = "auth"
+        on = new Matching { pattern = "^auth" }
+        steps { new Fail { failure = "auth" } }
+      }
+      new Scene {
+        name = "toolong"
+        on = new Matching { pattern = "^toolong" }
+        steps { new Fail { failure = "prompt_too_long" } }
+      }
+      new Scene {
+        name = "fallthrough"
+        steps {
+          new Say { text = "Say one of: drop, twice, stale, detach, hang, ignore, crash, noise, interleave, disorder, huge, refuse, max, quota, capacity, ratelimit, server, network, auth, toolong." }
+        }
+      }
+    }
+  }
+  ["sluggish"] {
+    title = "Sluggish"
+    startup = new Startup { initialize_delay = 4.s; new_session_delay = 3.s }
+    models { new Model { id = "slow-1" } }
+    scenes { new Scene { steps { new Say { text = "Finally." } } } }
+  }
+  ["locked"] {
+    title = "Locked"
+    startup = new Startup { requires_auth = true }
+    models { new Model { id = "locked-1" } }
+    scenes { new Scene { steps { new Say { text = "You are signed in." } } } }
+  }
+  ["broken"] {
+    title = "Broken"
+    startup = new Startup { new_session_error = new ErrorSpec { failure = "server_error"; detail = "the session service returned 500" } }
+    models { new Model { id = "broken-1" } }
+    scenes { new Scene { steps { new Say { text = "unreachable" } } } }
+  }
+}

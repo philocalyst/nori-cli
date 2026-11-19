@@ -1,0 +1,122 @@
+/// The "Carbon" bug, as an agent that misbehaves in exactly the way that exposed it: an agent
+/// that keeps asking to retry an edit it was refused, after its turn ended and after the user
+/// cancelled it. A harness that answers `Cancelled` to any permission request that arrives
+/// while it has no running prompt turns this agent into a multi-hour loop of failed edits;
+/// the right behavior is to hand every request to the user, and to say that the agent is
+/// working on its own.
+///
+/// Prompts:
+///   "refuse"  the agent asks for an edit, is denied, ends its turn, and keeps asking.
+///   "cancel"  the agent starts a long edit run; the user cancels; it ignores the cancel and
+///             keeps asking for permission (the replay of the original incident).
+///   anything else: a calm answer.
+///
+///     scripts/rex-scenario fake-agent/worlds/carbon-replay.pkl --session "$REX_SESSION" --tab
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/carbon-replay.pkl "refuse"
+amends "nori:World"
+
+name = "carbon-replay"
+description = "An agent that asks for permission after its turn ended, and after being cancelled."
+default_agent = "carbon"
+
+local edit = new ToolSpec {
+  title = "Edit src/render.rs"
+  tool_kind = "edit"
+  locations { new Location { path = "src/render.rs"; line = 140 } }
+  content {
+    new DiffContent {
+      path = "src/render.rs"
+      old_text = "    let width = area.width;\n    draw(frame, width);\n"
+      new_text = "    let width = area.width.saturating_sub(2);\n    draw(frame, width);\n"
+    }
+  }
+  duration = 300.ms
+}
+
+agents {
+  ["carbon"] {
+    title = "Carbon"
+    models { new Model { id = "carbon-1"; name = "Carbon 1"; context_window = 128000 } }
+    scenes {
+      // After the turn ended: the agent goes on asking.
+      new Scene {
+        name = "refused-then-detached"
+        on = new Matching { pattern = "(?i)refuse" }
+        steps {
+          new Say { text = "I'll fix the off-by-two in the renderer.\n" }
+          new Permission {
+            tool = edit
+            expect = "deny"
+            on_deny {
+              new Say { text = "The edit was refused, so I'll stop here.\n" }
+              // The turn ends with the next line... and the agent does not mean it.
+              new Detach {
+                after = 3.s
+                steps {
+                  new Repeat {
+                    times = 6
+                    every = 4.s
+                    steps {
+                      new Permission {
+                        tool = edit
+                        expect = "deny"
+                        timeout = 30.s
+                        on_timeout {
+                          new Say { text = "(still waiting for permission to edit src/render.rs)\n" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // After the cancel: the agent does not notice, then keeps retrying.
+      new Scene {
+        name = "cancelled-and-ignoring-it"
+        on = new Matching { pattern = "(?i)cancel" }
+        cancel = new CancelPolicy {
+          mode = "honor"
+          after = 1.s
+          detach_then = true
+          then {
+            new Say { text = "(cancelled? I'll try that edit once more)\n" }
+            new Repeat {
+              times = 8
+              every = 5.s
+              steps {
+                new Permission {
+                  tool = edit
+                  timeout = 30.s
+                }
+              }
+            }
+          }
+        }
+        steps {
+          new Say { text = "Working through the render fixes. This takes a while.\n" }
+          new Tool {
+            title = "cargo build"
+            tool_kind = "execute"
+            input = new Dynamic { command = "cargo build" }
+            progress {
+              new Progress { after = 2.s; stdout = "   Compiling renderer v0.1.0\n" }
+              new Progress { after = 8.s; stdout = "   Compiling ui v0.4.2\n" }
+            }
+            duration = 20.s
+          }
+          new Say { text = "Build is slow today.\n" }
+          new Wait { duration = 2.min }
+        }
+      }
+      new Scene {
+        name = "calm"
+        steps {
+          new Say { text = "Nothing misbehaves here. Say \"refuse\" or \"cancel\" to replay the incident." }
+        }
+      }
+    }
+  }
+}

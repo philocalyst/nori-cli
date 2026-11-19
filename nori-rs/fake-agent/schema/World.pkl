@@ -1,0 +1,556 @@
+/// A world of fake agents: what each does for each prompt it is asked.
+///
+/// A world is data. Evaluating it produces the script `nori-fake-agent` plays; nothing here runs.
+/// Each agent has `scenes`; a scene says which prompts it answers (`on`) and what the agent does
+/// (`steps`). The first scene that matches answers the prompt.
+///
+///     amends "nori:World"
+///     name = "hello"
+///     default_agent = "main"
+///     agents {
+///       ["main"] {
+///         models { new Model { id = "fake-1" } }
+///         scenes {
+///           new Scene {
+///             steps {
+///               new Say { text = "Hello from a world." }
+///               new Tool { title = "Read a.txt"; tool_kind = "read"; locations { new Location { path = "a.txt" } } }
+///             }
+///           }
+///         }
+///       }
+///     }
+///
+/// Durations are Pkl durations (`250.ms`, `2.min`). Text may use `{{prompt}}`, `{{index}}`,
+/// `{{session}}`, `{{agent}}`, `{{model}}`, `{{now}}`, `{{i}}` inside a `Repeat`, and anything a
+/// `bind` named (`{{task.task_id}}`); a name that is not bound stays as written and is reported
+/// as a divergence.
+open module nori.World
+
+typealias ToolKind = "read"|"edit"|"delete"|"move"|"search"|"execute"|"think"|"fetch"|"switch_mode"|"other"
+typealias ToolStatus = "pending"|"in_progress"|"completed"|"failed"
+typealias Outcome = "completed"|"failed"
+typealias OptionKind = "allow_once"|"allow_always"|"reject_once"|"reject_always"
+typealias Answer = "allow"|"deny"|"cancelled"|"timeout"
+typealias StopReason = "end_turn"|"max_tokens"|"max_turn_requests"|"refusal"|"cancelled"
+typealias Priority = "high"|"medium"|"low"
+typealias PlanStatus = "pending"|"in_progress"|"completed"
+typealias ErrorClass = "quota"|"model_unavailable"|"model_placeholder"|"capacity"|"rate_limited"|"server_error"|"network"|"auth"|"prompt_too_long"|"session_not_found"|"internal"|"raw"
+typealias Disorder = "none"|"end_before_start"|"duplicate_start"|"update_after_end"|"contradictory_end"|"never_ends"
+typealias TurnPolicy = "exclusive"|"steerable"|"replace"
+typealias Unscripted = "echo"|"fail"|"hang"
+typealias CancelMode = "honor"|"ignore"|"hang"
+typealias ChunkUnit = "chars"|"words"|"lines"
+typealias SubagentEnd = "running"|"idle"|"completed"|"failed"|"cancelled"|"closed"
+typealias StaleId = "previous"|"unknown"
+
+/// A huge text without writing it down: `unit` repeated `times` times (`{{n}}` is the count).
+class Generated {
+  unit: String
+  times: Int
+  separator: String = ""
+}
+
+typealias Text = String|Generated
+
+class Chunking {
+  /// Units per chunk; 0 sends one chunk.
+  size: Int = 24
+  unit: ChunkUnit = "chars"
+  /// Pause after every chunk but the last.
+  every: Duration = 0.s
+}
+
+class Location {
+  path: String
+  line: Int?
+}
+
+// ---------------------------------------------------------------- tool content
+
+abstract class Content { abstract kind: String }
+
+class TextContent extends Content {
+  kind = "text"
+  text: Text
+}
+
+/// A file change with real old and new text. Leave `old_text` out to create the file.
+class DiffContent extends Content {
+  kind = "diff"
+  path: String
+  old_text: String?
+  new_text: String
+}
+
+class TerminalContent extends Content {
+  kind = "terminal"
+  terminal_id: String
+}
+
+/// One streamed update of a running tool.
+class Progress {
+  after: Duration = 0.s
+  status: ToolStatus?
+  title: String?
+  content: Listing<Content>?
+  /// Appended to the standard output shown so far.
+  stdout: Text?
+  output: Any?
+}
+
+/// A tool call: announced, streamed, ended. The fields of a `Tool` step and of a permission's tool.
+open class ToolSpec {
+  /// Generated when absent.
+  id: String?
+  title: String = ""
+  tool_kind: ToolKind = "other"
+  locations: Listing<Location> = new Listing {}
+  /// `raw_input`. For a single-diff edit, derived from the diff when absent.
+  input: Any?
+  /// The announcement's status; `pending` is followed by `in_progress`.
+  status: ToolStatus = "pending"
+  content: Listing<Content> = new Listing {}
+  progress: Listing<Progress> = new Listing {}
+  /// Content of the terminal update; defaults to `content`.
+  result: Listing<Content>?
+  output: Any?
+  stdout: Text?
+  stderr: Text?
+  exit_code: Int?
+  /// Time from announcement to the terminal update.
+  duration: Duration = 0.s
+  outcome: Outcome = "completed"
+  meta: Any?
+  /// Name of a host tool this call is, so Nori renders it as one.
+  host_tool: String?
+  /// Break the order of updates, to see what the client does.
+  disorder: Disorder = "none"
+}
+
+class Option {
+  id: String
+  name: String
+  kind: OptionKind
+}
+
+// ---------------------------------------------------------------------- steps
+
+abstract class Step { abstract kind: String }
+
+/// Stream a chunk of the answer.
+class Say extends Step {
+  kind = "say"
+  text: Text = ""
+  chunk: Chunking = new Chunking {}
+}
+
+/// Stream reasoning.
+class Think extends Step {
+  kind = "think"
+  text: Text = ""
+  chunk: Chunking = new Chunking {}
+}
+
+class Wait extends Step {
+  kind = "wait"
+  duration: Duration
+}
+
+/// A complete tool call.
+class Tool extends ToolSpec {
+  kind = "tool"
+}
+
+/// Announce a call and leave it open.
+class ToolStart extends Step {
+  kind = "tool_start"
+  id: String
+  title: String = ""
+  tool_kind: ToolKind = "other"
+  locations: Listing<Location> = new Listing {}
+  input: Any?
+  status: ToolStatus = "pending"
+  content: Listing<Content> = new Listing {}
+  meta: Any?
+}
+
+/// Update any call id: announced or not, open or ended.
+class ToolUpdate extends Step {
+  kind = "tool_update"
+  id: String
+  status: ToolStatus?
+  title: String?
+  content: Listing<Content>?
+  locations: Listing<Location>?
+  output: Any?
+  meta: Any?
+}
+
+/// Ask permission, then run the tool when allowed. The branches say what the agent does next.
+class Permission extends Step {
+  kind = "permission"
+  tool: ToolSpec
+  /// Defaults to Allow, Always allow, Deny.
+  options: Listing<Option> = new Listing {}
+  /// The answer the script was written for; another one is reported as a divergence.
+  expect: Answer?
+  timeout: Duration?
+  run_when_allowed: Boolean = true
+  on_allow: Listing<Any> = new Listing {}
+  on_deny: Listing<Any> = new Listing {}
+  on_cancelled: Listing<Any> = new Listing {}
+  on_timeout: Listing<Any> = new Listing {}
+}
+
+class PlanEntry {
+  content: String
+  priority: Priority = "medium"
+  status: PlanStatus = "pending"
+}
+
+/// The complete plan; each replaces the one before.
+class Plan extends Step {
+  kind = "plan"
+  entries: Listing<PlanEntry>
+}
+
+class Tokens {
+  input: Int = 0
+  output: Int = 0
+  cache_read: Int = 0
+  cache_write: Int = 0
+  reasoning: Int = 0
+}
+
+class RateLimit {
+  id: String
+  label: String
+  used_percent: Number?
+  /// Relative to the world's clock when the step runs.
+  resets_in: Duration?
+  /// RFC 3339; wins over `resets_in`.
+  resets_at: String?
+  window_minutes: Int?
+}
+
+/// Usage in the `_meta.nori` shape. With `context_used` and a context size it is an ACP
+/// `usage_update`; without, it rides a `session_info_update`.
+class Usage extends Step {
+  kind = "usage"
+  context_used: Int?
+  context_size: Int?
+  model: String?
+  account: String?
+  tokens: Tokens?
+  session_total: Boolean = false
+  rate_limits: Listing<RateLimit> = new Listing {}
+}
+
+class SessionInfo extends Step {
+  kind = "session_info"
+  title: String?
+  meta: Any?
+}
+
+/// Nori's status hint: `working` declares an agent turn, `idle` ends it.
+class Status extends Step {
+  kind = "status"
+  state: "working"|"idle"
+}
+
+class Mode extends Step {
+  kind = "mode"
+  id: String
+}
+
+/// Call any host tool as a tool card. `bind` names the result for later steps.
+class HostTool extends Step {
+  kind = "host_tool"
+  name: String
+  arguments: Any = new Dynamic {}
+  id: String?
+  title: String?
+  bind: String?
+  expect_error: Boolean = false
+}
+
+/// `delegate_task`: Nori starts the child; its scripted agent answers the task.
+class Delegate extends Step {
+  kind = "delegate"
+  task: Text
+  agent: String?
+  model: String?
+  title: String?
+  alias: String?
+  role: String?
+  mode: String?
+  isolation: String?
+  bind: String?
+}
+
+/// `task_send`: a message to any actor by alias, `actor://alias`, session id or `task-N`.
+class Send extends Step {
+  kind = "send"
+  to: String
+  message: Text
+  steer: Boolean = false
+  mode: String?
+  bind: String?
+}
+
+/// A structured ACP error in the fields Nori's recovery reads.
+open class ErrorSpec {
+  failure: ErrorClass = "internal"
+  detail: String?
+  status: Int?
+  retry_after: Int?
+  resets_at: String?
+  resets_in: Duration?
+  /// JSON-RPC code, for `raw`.
+  code: Int?
+  message: String?
+  data: Any?
+}
+
+/// Fail the turn with an error.
+class Fail extends ErrorSpec {
+  kind = "error"
+}
+
+class Stop extends Step {
+  kind = "stop"
+  reason: StopReason = "end_turn"
+}
+
+// --------------------------------------------------------------------- faults
+
+/// Never answer the prompt, never speak again, ignore `session/cancel`.
+class Hang extends Step { kind = "hang" }
+
+/// Run the turn to its end and let the prompt response vanish on the wire.
+class DropResponse extends Step { kind = "drop_response" }
+
+/// Answer the prompt twice.
+class RespondTwice extends Step {
+  kind = "respond_twice"
+  gap: Duration = 0.s
+  second_stop_reason: StopReason?
+}
+
+/// Answer a request id that was already answered (`previous`) or never asked (`unknown`).
+class StaleResponse extends Step {
+  kind = "stale_response"
+  id: StaleId = "previous"
+  gap: Duration = 0.s
+}
+
+/// Answer the prompt now and keep working: `steps` run after the turn has ended.
+class Detach extends Step {
+  kind = "detach"
+  after: Duration = 0.s
+  steps: Listing<Any>
+}
+
+/// Close the connection abruptly. A served process exits with `exit_code`.
+class Crash extends Step {
+  kind = "crash"
+  exit_code: Int = 1
+  message: String?
+  /// How a served process dies: `exit` with `exit_code` (0 included), or `sigkill`.
+  mode: "exit"|"sigkill" = "exit"
+}
+
+/// Put a line on the wire that is not what ACP says.
+class WireNoise extends Step {
+  kind = "wire_noise"
+  line: String
+  /// End the line. Without it the line is a partial one.
+  newline: Boolean = true
+}
+
+/// Close standard output while the process lives on.
+class CloseStdout extends Step {
+  kind = "close_stdout"
+}
+
+/// Write to the client no faster than this, as a full pipe does.
+class Throttle extends Step {
+  kind = "throttle"
+  bytes_per_second: Int
+}
+
+/// Write lines to the standard error of a served process, faster than anyone reads them.
+class StderrFlood extends Step {
+  kind = "stderr_flood"
+  lines: Int = 1000
+  bytes_per_line: Int = 200
+}
+
+/// Send any `session/update` payload verbatim.
+class RawUpdate extends Step {
+  kind = "raw_update"
+  update: Any
+  lane: String?
+}
+
+// ---------------------------------------------------------------- composition
+
+/// Lanes at once; their updates interleave in the order of the clock.
+class Par extends Step {
+  kind = "par"
+  lanes: Listing<Listing<Any>>
+}
+
+/// Steps on another session: `self`, `previous`, `first`, `newest`, or a session id.
+class Lane extends Step {
+  kind = "lane"
+  session: String
+  steps: Listing<Any>
+}
+
+/// A child session the agent reports itself (as Claude does), with its own activity.
+class Subagent extends Step {
+  kind = "subagent"
+  id: String?
+  title: String
+  description: String?
+  model: String?
+  /// What the parent told the child.
+  prompt: Text?
+  steps: Listing<Any> = new Listing {}
+  ends: SubagentEnd = "idle"
+  reason: String?
+}
+
+/// A `session_message` between two sessions, delivered on the recipient's.
+class PeerMessage extends Step {
+  kind = "peer_message"
+  from: String = "self"
+  to: String = "self"
+  text: Text
+  id: String?
+}
+
+class Repeat extends Step {
+  kind = "repeat"
+  times: Int
+  every: Duration = 0.s
+  steps: Listing<Any>
+}
+
+// ------------------------------------------------------------- scenes, agents
+
+abstract class Match { abstract kind: String }
+
+/// Every prompt.
+class Always extends Match { kind = "always" }
+
+/// The `index`th prompt (0-based) of the session, or of every session of the agent.
+class Nth extends Match {
+  kind = "nth"
+  index: Int
+  per_agent: Boolean = false
+}
+
+/// Prompts whose text matches the regular expression.
+class Matching extends Match {
+  kind = "matching"
+  pattern: String
+}
+
+class CancelPolicy {
+  mode: CancelMode = "honor"
+  /// How long the agent takes to notice.
+  after: Duration = 0.s
+  /// Steps the agent runs once it has noticed.
+  then: Listing<Any> = new Listing {}
+  /// Run `then` after answering, so the agent keeps talking to a client that thinks it stopped.
+  detach_then: Boolean = false
+}
+
+class Scene {
+  name: String?
+  on: Match = new Always {}
+  /// Only while the session's model is this one.
+  model: String?
+  cancel: CancelPolicy = new CancelPolicy {}
+  steps: Listing<Any> = new Listing {}
+}
+
+class Model {
+  id: String
+  name: String?
+  description: String?
+  context_window: Int?
+}
+
+class ModeDef {
+  id: String
+  name: String?
+  description: String?
+}
+
+class Command {
+  name: String
+  description: String = ""
+  hint: String?
+}
+
+class Capabilities {
+  image: Boolean = false
+  embedded_context: Boolean = false
+  load: Boolean = true
+  resume: Boolean = true
+  fork: Boolean = false
+  list: Boolean = true
+  close: Boolean = true
+  delete_sessions: Boolean = false
+  additional_directories: Boolean = false
+  mcp_http: Boolean = false
+  /// Takes Nori's host tools (only when Nori runs it in its own process).
+  host_tools: Boolean = true
+}
+
+class Startup {
+  initialize_delay: Duration = 0.s
+  new_session_delay: Duration = 0.s
+  initialize_error: ErrorSpec?
+  new_session_error: ErrorSpec?
+  requires_auth: Boolean = false
+}
+
+class Agent {
+  /// Filled from the mapping key.
+  slug: String = ""
+  title: String?
+  version: String = "0.1.0"
+  /// The first model is the default unless `default_model` says otherwise.
+  models: Listing<Model> = new Listing {}
+  default_model: String?
+  modes: Listing<ModeDef> = new Listing {}
+  default_mode: String?
+  /// Reasoning-effort values; the first is the default.
+  efforts: Listing<String> = new Listing {}
+  commands: Listing<Command> = new Listing {}
+  capabilities: Capabilities = new Capabilities {}
+  turn_policy: TurnPolicy = "exclusive"
+  /// The account quota belongs to, reported with usage.
+  account: String?
+  startup: Startup = new Startup {}
+  unscripted: Unscripted = "echo"
+  /// The first scene whose `on` and `model` match answers the prompt.
+  scenes: Listing<Scene> = new Listing {}
+}
+
+name: String
+description: String = ""
+/// Virtual time zero, RFC 3339 UTC.
+start: String = "2026-11-18T12:00:00Z"
+/// How time passes when a person watches the world: `real` (the default) or a speed such as `x30`.
+clock: String?
+/// Required when there are several agents: a mapping's order is not a choice anyone made.
+default_agent: String?
+/// Pkl source for the session's `$NORI_HOME/init.pkl` (the recovery policy this world is about).
+policy: String?
+agents: Mapping<String, Agent>

@@ -1,0 +1,101 @@
+/// A failing route, then a spent one, then one that works, with no network.
+///
+///   fake-claude  / fake-opus-5      the model id was never filled in: 404, `MODEL_PLACEHOLDER`
+///   fake-codex   / fake-gpt-5       the five-hour window is spent: quota, resets in 2h05
+///   fake-gemini  / fake-gemini-3    answers
+///
+/// The world's `policy` is the recovery configuration Nori reads from `$NORI_HOME/init.pkl`:
+/// no retries, and this fallback chain. Send any prompt: the session moves along the chain,
+/// each step shown as a route change, and the answer comes from the last agent. The next prompt
+/// goes straight to `fake-gemini` when the policy says the session stays there.
+///
+///     scripts/rex-scenario fake-agent/worlds/quota-fallback.pkl --session "$REX_SESSION" --tab
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/quota-fallback.pkl "summarize the repo"
+amends "nori:World"
+
+name = "quota-fallback"
+description = "model 404 -> quota exhausted -> fallback, through Nori's recovery policy."
+default_agent = "fake-claude"
+
+policy = """
+  recovery = new Dynamic {
+    retry = new Dynamic { max_attempts = 0 }
+    fallback = new Dynamic {
+      on = List("quota_exhausted", "model_unavailable", "capacity")
+      chain = List(
+        new Dynamic { agent = "fake-codex"; model = "fake-gpt-5" },
+        new Dynamic { agent = "fake-gemini"; model = "fake-gemini-3" }
+      )
+      ranked = false
+      return_to_primary = "never"
+    }
+  }
+  """
+
+agents {
+  ["fake-claude"] {
+    title = "Fake Claude"
+    models {
+      new Model { id = "fake-opus-5"; name = "Fake Opus 5"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "placeholder"
+        steps {
+          new Fail {
+            failure = "model_placeholder"
+            detail = "Model MODEL_PLACEHOLDER was not found (404): the model id in this route was never filled in."
+          }
+        }
+      }
+    }
+  }
+  ["fake-codex"] {
+    title = "Fake Codex"
+    models {
+      new Model { id = "fake-gpt-5"; name = "Fake GPT 5"; context_window = 400000 }
+    }
+    scenes {
+      new Scene {
+        name = "spent"
+        steps {
+          new Usage {
+            tokens = new Tokens { input = 12000; output = 0 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 100.0; resets_in = 2.h + 5.min; window_minutes = 300 }
+            }
+          }
+          new Fail {
+            failure = "quota"
+            detail = "You've hit your usage limit for the five-hour window. It resets in 2 hours 5 minutes."
+            resets_in = 2.h + 5.min
+          }
+        }
+      }
+    }
+  }
+  ["fake-gemini"] {
+    title = "Fake Gemini"
+    models {
+      new Model { id = "fake-gemini-3"; name = "Fake Gemini 3"; context_window = 1000000 }
+    }
+    scenes {
+      new Scene {
+        name = "answers"
+        steps {
+          new Say {
+            text = "This answer comes from fake-gemini, the third route. The first two failed before saying anything: 404 for a placeholder model, then a spent quota."
+            chunk = new Chunking { size = 5; unit = "words"; every = 20.ms }
+          }
+          new Usage {
+            context_used = 2100
+            tokens = new Tokens { input = 1800; output = 210 }
+            rate_limits {
+              new RateLimit { id = "daily"; label = "1d"; used_percent = 8.0; resets_at = "2026-11-19T00:00:00Z"; window_minutes = 1440 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,319 @@
+/// One conversation that shows everything a chat can contain: reasoning, a plan that advances,
+/// a batch of reads, a search, two edits that ask permission (one split diff each), a failing
+/// test run and a passing one with streamed output, usage with rate limits, and a long
+/// markdown answer.
+///
+///     scripts/rex-scenario fake-agent/worlds/comprehensive-chat.pkl --session "$REX_SESSION" --tab
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/comprehensive-chat.pkl "trim input"
+///
+/// Answer permission requests in the TUI; the script expects Allow and says so when it is not.
+amends "nori:World"
+
+name = "comprehensive-chat"
+description = "Reads, a split diff, bash with output, a plan, usage, and a long markdown answer."
+default_agent = "fake"
+
+local libBefore = """
+  use crate::config::Config;
+  use crate::error::Error;
+
+  /// Parse a configuration document.
+  pub fn parse(input: &str) -> Result<Config, Error> {
+      let value: toml::Value = toml::from_str(input)?;
+      Config::from_value(value)
+  }
+
+  pub fn parse_file(path: &Path) -> Result<Config, Error> {
+      let text = std::fs::read_to_string(path)?;
+      parse(&text)
+  }
+  """
+
+local libAfter = """
+  use crate::config::Config;
+  use crate::error::Error;
+
+  /// Parse a configuration document. Surrounding whitespace is ignored, so a file that
+  /// ends without a newline and one that ends with three parse the same way.
+  pub fn parse(input: &str) -> Result<Config, Error> {
+      let value: toml::Value = toml::from_str(input.trim())?;
+      Config::from_value(value)
+  }
+
+  pub fn parse_file(path: &Path) -> Result<Config, Error> {
+      let text = std::fs::read_to_string(path)?;
+      parse(&text)
+  }
+  """
+
+local configBefore = """
+  impl Config {
+      pub fn from_value(value: toml::Value) -> Result<Self, Error> {
+          let table = value.as_table().ok_or(Error::NotATable)?;
+          Ok(Self { name: read_name(table)?, retries: 3 })
+      }
+  }
+  """
+
+local configAfter = """
+  impl Config {
+      pub fn from_value(value: toml::Value) -> Result<Self, Error> {
+          let table = value.as_table().ok_or(Error::NotATable)?;
+          Ok(Self {
+              name: read_name(table)?,
+              retries: read_retries(table)?.unwrap_or(DEFAULT_RETRIES),
+          })
+      }
+  }
+  """
+
+local answer = """
+  ## What changed
+
+  `parse` now trims its input before handing it to the TOML parser, and `Config::from_value`
+  reads `retries` from the document instead of hard-coding `3`.
+
+  - **`src/lib.rs`**: `toml::from_str(input.trim())`. A trailing blank line no longer fails with
+    `unexpected eof`.
+  - **`src/config.rs`**: `retries` is read from the table and falls back to `DEFAULT_RETRIES`.
+
+  ## How I checked it
+
+  The first run failed in `parse_rejects_negative_retries` because the new code accepted `-1`.
+  I made `read_retries` return `Error::BadRetries` for negative values; the second run passed
+  all 14 tests.
+
+  | Test                         | Before | After |
+  | ---------------------------- | ------ | ----- |
+  | `parse_trims_trailing_blank` | fail   | pass  |
+  | `parse_rejects_negative`     | n/a    | pass  |
+  | the other 12                 | pass   | pass  |
+
+  ```rust
+  assert_eq!(parse("name = \\"x\\"\\n\\n\\n")?.name, "x");
+  ```
+
+  ## Worth knowing
+
+  1. `parse_file` still reads the whole file; very large configs are not a concern here.
+  2. `Config` has no `Default`, so callers that want one must go through `parse("")`.
+
+  Nothing else in the workspace calls `from_value` directly, so no other crate needed changes.
+  """
+
+agents {
+  ["fake"] {
+    title = "Fake Claude"
+    account = "fake@example.test"
+    models {
+      new Model { id = "fake-opus"; name = "Fake Opus 5"; description = "Deliberate"; context_window = 200000 }
+      new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; description = "Balanced"; context_window = 200000 }
+      new Model { id = "fake-haiku"; name = "Fake Haiku 5"; description = "Fast"; context_window = 200000 }
+    }
+    modes {
+      new ModeDef { id = "default"; name = "Default"; description = "Ask before changing files" }
+      new ModeDef { id = "plan"; name = "Plan"; description = "Plan, do not edit" }
+      new ModeDef { id = "accept-edits"; name = "Accept edits" }
+    }
+    efforts { "medium"; "low"; "high" }
+    commands {
+      new Command { name = "review"; description = "Review the working tree"; hint = "optional focus" }
+      new Command { name = "compact"; description = "Summarize the conversation so far" }
+    }
+    scenes {
+      new Scene {
+        name = "trim-and-test"
+        on = new Matching { pattern = "(?i)trim|parse|input" }
+        steps {
+          new Think {
+            text = "The user wants `parse` to tolerate surrounding whitespace. I should read the parser and its caller before changing anything, and check whether a test already covers a trailing newline."
+            chunk = new Chunking { size = 6; unit = "words"; every = 25.ms }
+          }
+          new Say {
+            text = "I'll read the parser and its callers first, then make the change and run the tests.\n\n"
+            chunk = new Chunking { size = 4; unit = "words"; every = 20.ms }
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Read the parser, its config type and the existing tests"; status = "in_progress"; priority = "high" }
+              new PlanEntry { content = "Trim the input in `parse`"; priority = "high" }
+              new PlanEntry { content = "Read `retries` from the document"; priority = "medium" }
+              new PlanEntry { content = "Run the tests and fix what fails"; priority = "high" }
+            }
+          }
+          // Five reads at once: the client groups them.
+          new Par {
+            lanes {
+              new Listing {
+                new Tool {
+                  title = "Read src/lib.rs"; tool_kind = "read"; duration = 180.ms
+                  locations { new Location { path = "src/lib.rs"; line = 1 } }
+                  output = new Dynamic { lines = 14 }
+                  content { new TextContent { text = libBefore } }
+                }
+              }
+              new Listing {
+                new Tool {
+                  title = "Read src/config.rs"; tool_kind = "read"; duration = 240.ms
+                  locations { new Location { path = "src/config.rs" } }
+                  output = new Dynamic { lines = 48 }
+                }
+              }
+              new Listing {
+                new Tool {
+                  title = "Read tests/parse.rs"; tool_kind = "read"; duration = 120.ms
+                  locations { new Location { path = "tests/parse.rs" } }
+                  output = new Dynamic { lines = 96 }
+                }
+              }
+              new Listing {
+                new Tool {
+                  title = "Read Cargo.toml"; tool_kind = "read"; duration = 60.ms
+                  locations { new Location { path = "Cargo.toml" } }
+                  output = new Dynamic { lines = 22 }
+                }
+              }
+              new Listing {
+                new Tool {
+                  title = "Read README.md"; tool_kind = "read"; duration = 90.ms
+                  locations { new Location { path = "README.md" } }
+                  output = new Dynamic { lines = 140 }
+                }
+              }
+            }
+          }
+          new Tool {
+            title = "Search for `from_value`"
+            tool_kind = "search"
+            input = new Dynamic { pattern = "from_value"; path = "." }
+            duration = 300.ms
+            stdout = "src/lib.rs:5\nsrc/config.rs:2\ntests/parse.rs:31\n"
+            output = new Dynamic { count = 3 }
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Read the parser, its config type and the existing tests"; status = "completed"; priority = "high" }
+              new PlanEntry { content = "Trim the input in `parse`"; status = "in_progress"; priority = "high" }
+              new PlanEntry { content = "Read `retries` from the document"; priority = "medium" }
+              new PlanEntry { content = "Run the tests and fix what fails"; priority = "high" }
+            }
+          }
+          new Say {
+            text = "`parse` hands the raw text to the TOML parser, so a trailing blank line is an `unexpected eof`. Trimming fixes it. `retries` is also hard-coded to `3`, which I'll read from the document while I'm here.\n\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 15.ms }
+          }
+          new Permission {
+            tool = new ToolSpec {
+              title = "Edit src/lib.rs"
+              tool_kind = "edit"
+              locations { new Location { path = "src/lib.rs"; line = 5 } }
+              content { new DiffContent { path = "src/lib.rs"; old_text = libBefore; new_text = libAfter } }
+              duration = 150.ms
+            }
+            expect = "allow"
+            on_deny {
+              new Say { text = "Understood, I won't touch `src/lib.rs`. Tell me how you'd like to handle trailing whitespace instead." }
+              new Stop {}
+            }
+          }
+          new Permission {
+            tool = new ToolSpec {
+              title = "Edit src/config.rs"
+              tool_kind = "edit"
+              locations { new Location { path = "src/config.rs"; line = 12 } }
+              content { new DiffContent { path = "src/config.rs"; old_text = configBefore; new_text = configAfter } }
+              duration = 150.ms
+            }
+            expect = "allow"
+            on_deny {
+              new Say { text = "Skipping the `retries` change; only the trimming went in." }
+            }
+          }
+          new Tool {
+            title = "cargo test -p parser"
+            tool_kind = "execute"
+            input = new Dynamic { command = "cargo test -p parser" }
+            progress {
+              new Progress { after = 400.ms; stdout = "   Compiling parser v0.3.1 (/work/parser)\n" }
+              new Progress { after = 900.ms; stdout = "    Finished `test` profile in 1.21s\n     Running unittests src/lib.rs\n\nrunning 14 tests\n" }
+              new Progress { after = 300.ms; stdout = "test parse_accepts_minimal ... ok\ntest parse_trims_trailing_blank ... ok\ntest parse_rejects_negative_retries ... FAILED\n" }
+            }
+            stdout = "\nfailures:\n\n---- parse_rejects_negative_retries stdout ----\nthread 'parse_rejects_negative_retries' panicked at tests/parse.rs:44:5:\nassertion failed: parse(\"retries = -1\").is_err()\n\ntest result: FAILED. 13 passed; 1 failed; 0 ignored\n"
+            exit_code = 101
+            outcome = "failed"
+            duration = 200.ms
+          }
+          new Say {
+            text = "One failure: a negative `retries` is accepted. I'll reject it explicitly.\n\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 15.ms }
+          }
+          new Permission {
+            tool = new ToolSpec {
+              title = "Edit src/config.rs"
+              tool_kind = "edit"
+              locations { new Location { path = "src/config.rs"; line = 31 } }
+              content {
+                new DiffContent {
+                  path = "src/config.rs"
+                  old_text = "fn read_retries(table: &Table) -> Result<Option<i64>, Error> {\n    Ok(table.get(\"retries\").and_then(|v| v.as_integer()))\n}\n"
+                  new_text = "fn read_retries(table: &Table) -> Result<Option<i64>, Error> {\n    match table.get(\"retries\").and_then(|v| v.as_integer()) {\n        Some(n) if n < 0 => Err(Error::BadRetries(n)),\n        other => Ok(other),\n    }\n}\n"
+                }
+              }
+              duration = 100.ms
+            }
+            expect = "allow"
+          }
+          new Tool {
+            title = "cargo test -p parser"
+            tool_kind = "execute"
+            input = new Dynamic { command = "cargo test -p parser" }
+            progress {
+              new Progress { after = 500.ms; stdout = "   Compiling parser v0.3.1 (/work/parser)\n    Finished `test` profile in 0.94s\n\nrunning 14 tests\n" }
+            }
+            stdout = "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured\n"
+            exit_code = 0
+            duration = 400.ms
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Read the parser, its config type and the existing tests"; status = "completed"; priority = "high" }
+              new PlanEntry { content = "Trim the input in `parse`"; status = "completed"; priority = "high" }
+              new PlanEntry { content = "Read `retries` from the document"; status = "completed"; priority = "medium" }
+              new PlanEntry { content = "Run the tests and fix what fails"; status = "completed"; priority = "high" }
+            }
+          }
+          new Say {
+            text = answer
+            chunk = new Chunking { size = 3; unit = "words"; every = 12.ms }
+          }
+          new Usage {
+            context_used = 38500
+            tokens = new Tokens { input = 31200; output = 4100; cache_read = 22000; cache_write = 3100 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 23.0; resets_in = 3.h + 12.min; window_minutes = 300 }
+              new RateLimit { id = "seven_day"; label = "7d"; used_percent = 9.0; resets_in = 4.d; window_minutes = 10080 }
+            }
+          }
+          new SessionInfo { title = "Trim input in parse()" }
+        }
+      }
+      // Every other prompt.
+      new Scene {
+        name = "anything"
+        steps {
+          new Say {
+            text = "Here is a short answer to “{{prompt}}”. Ask me to **trim the parser input** to see the whole show: reads, a split diff, a failing test, and a long markdown summary."
+            chunk = new Chunking { size = 4; unit = "words"; every = 20.ms }
+          }
+          new Usage {
+            context_used = 1200
+            tokens = new Tokens { input = 900; output = 120 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 23.0; resets_in = 3.h + 10.min; window_minutes = 300 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

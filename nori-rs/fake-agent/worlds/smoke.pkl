@@ -1,0 +1,24 @@
+amends "nori:World"
+
+name = "smoke"
+description = "The smallest world that says something."
+default_agent = "main"
+
+agents {
+  ["main"] {
+    models { new Model { id = "fake-1"; name = "Fake One"; context_window = 200000 } }
+    scenes {
+      new Scene {
+        steps {
+          new Say { text = "Hello from a world. You said: {{prompt}}" }
+          new Tool {
+            title = "Read a.txt"
+            tool_kind = "read"
+            locations { new Location { path = "a.txt" } }
+            duration = 200.ms
+          }
+        }
+      }
+    }
+  }
+}

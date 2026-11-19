@@ -1,0 +1,97 @@
+/// Faults only a separate process can produce. Serve this world over stdio
+/// (`nori agent serve fake --world <file>`) and send one keyword per prompt:
+///
+///   exit0      the process exits with code 0 in the middle of the turn
+///   exit3      it exits with code 3
+///   sigkill    it is killed by SIGKILL: no exit code, no goodbye
+///   closeout   it closes its standard output and lives on
+///   flood      it writes megabytes to standard error faster than anyone reads
+///   slow       its output drains through a slow pipe (backpressure), a lot of it
+///   partial    it writes half a JSON line and exits
+///
+/// In-process agents have no stderr, pid or pipe of their own, so those steps report a
+/// divergence there; `exit0`, `exit3`, `closeout`, `slow` and `partial` behave as closely as they can.
+amends "nori:World"
+
+name = "process-faults"
+description = "Process exit, SIGKILL, closed stdout, stderr flood, slow drain, a partial line."
+default_agent = "proc"
+
+agents {
+  ["proc"] {
+    title = "Proc"
+    models { new Model { id = "proc-1"; context_window = 100000 } }
+    scenes {
+      new Scene {
+        name = "exit0"
+        on = new Matching { pattern = "^exit0" }
+        steps {
+          new Say { text = "Working, then leaving cleanly." }
+          new Tool { title = "Edit src/a.rs"; tool_kind = "edit"; status = "in_progress"; disorder = "never_ends" }
+          new Crash { exit_code = 0; message = "proc: exiting with code 0" }
+        }
+      }
+      new Scene {
+        name = "exit3"
+        on = new Matching { pattern = "^exit3" }
+        steps {
+          new Say { text = "Working, then failing." }
+          new Tool { title = "Edit src/a.rs"; tool_kind = "edit"; status = "in_progress"; disorder = "never_ends" }
+          new Crash { exit_code = 3; message = "proc: fatal error, exiting with code 3" }
+        }
+      }
+      new Scene {
+        name = "sigkill"
+        on = new Matching { pattern = "^sigkill" }
+        steps {
+          new Say { text = "About to be killed." }
+          new Tool { title = "Edit src/a.rs"; tool_kind = "edit"; status = "in_progress"; disorder = "never_ends" }
+          new Crash { mode = "sigkill" }
+        }
+      }
+      new Scene {
+        name = "closeout"
+        on = new Matching { pattern = "^closeout" }
+        steps {
+          new Say { text = "Closing my standard output." }
+          new Tool { title = "Edit src/a.rs"; tool_kind = "edit"; status = "in_progress"; disorder = "never_ends" }
+          new CloseStdout {}
+          new Say { text = "This is never read." }
+          new Wait { duration = 10.min }
+        }
+      }
+      new Scene {
+        name = "flood"
+        on = new Matching { pattern = "^flood" }
+        steps {
+          new Say { text = "Flooding standard error. " }
+          new StderrFlood { lines = 30000; bytes_per_line = 300 }
+          new Say { text = "Survived the flood." }
+        }
+      }
+      new Scene {
+        name = "slow"
+        on = new Matching { pattern = "^slow" }
+        steps {
+          new Throttle { bytes_per_second = 300000 }
+          new Say { text = "Slow pipe begins.\n" }
+          new Say {
+            text = new Generated { unit = "Line {{n}}: the quick brown fox jumps over the lazy dog."; times = 8000; separator = "\n" }
+            chunk = new Chunking { size = 2000; unit = "chars" }
+          }
+          new Say { text = "\nEND of slow output." }
+        }
+      }
+      new Scene {
+        name = "partial"
+        on = new Matching { pattern = "^partial" }
+        steps {
+          new Say { text = "Half a line is coming." }
+          new WireNoise { line = "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"x\",\"update\":{\"sessionUpdate\":\"agent_mess"; newline = false }
+          new Crash { exit_code = 1; message = "proc: killed while writing" }
+        }
+      }
+      new Scene { steps { new Say { text = "Say one of: exit0, exit3, sigkill, closeout, flood, slow, partial." } } }
+    }
+  }
+}

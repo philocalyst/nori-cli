@@ -1,0 +1,72 @@
+/// Subagents the way Claude reports them: the agent itself announces child sessions
+/// (`subagent_update`), delivers their updates on the same connection under the child's session id,
+/// and says when they go idle. Nori's orchestrator is not involved; this is what a provider's own
+/// task tool looks like on the wire. Two siblings run in parallel lanes, one has a child of its
+/// own, and they exchange a `session_message`.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/provider-subagents.pkl "audit it"
+amends "nori:World"
+
+name = "provider-subagents"
+description = "Provider-reported subagents: parallel siblings, a grandchild, and a message between siblings."
+default_agent = "claude-like"
+
+agents {
+  ["claude-like"] {
+    title = "Claude-like"
+    models { new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 } }
+    scenes {
+      new Scene {
+        steps {
+          new Say { text = "I'll run two reviewers at once.\n\n"; chunk = new Chunking { size = 4; unit = "words"; every = 20.ms } }
+          new Par {
+            lanes {
+              new Listing {
+                new Subagent {
+                  id = "agent-auth"
+                  title = "general-purpose"
+                  description = "Audit auth middleware"
+                  model = "anthropic/fake-sonnet"
+                  prompt = "Audit the auth middleware for clock-skew problems."
+                  steps {
+                    new Tool { title = "Read src/auth/middleware.rs"; tool_kind = "read"; duration = 150.ms; locations { new Location { path = "src/auth/middleware.rs" } } }
+                    new Subagent {
+                      id = "agent-token"
+                      title = "Explore"
+                      description = "Check token expiry"
+                      prompt = "Read token.rs and say how expiry is compared."
+                      steps {
+                        new Tool { title = "Read src/auth/token.rs"; tool_kind = "read"; duration = 200.ms; locations { new Location { path = "src/auth/token.rs"; line = 88 } } }
+                        new Say { text = "Expiry is compared with Instant::now() and no skew allowance." }
+                      }
+                    }
+                    new PeerMessage { from = "agent-auth"; to = "agent-config"; text = "FYI: token expiry has no skew guard." }
+                    new Say { text = "The token check is the bug: no skew allowance (token.rs:88)." }
+                  }
+                }
+              }
+              new Listing {
+                new Wait { duration = 100.ms }
+                new Subagent {
+                  id = "agent-config"
+                  title = "general-purpose"
+                  description = "Trace config loader callers"
+                  model = "anthropic/fake-haiku"
+                  prompt = "Find every caller of ConfigLoader."
+                  steps {
+                    new Tool { title = "Search for ConfigLoader"; tool_kind = "search"; duration = 250.ms; stdout = "src/server.rs:19\nsrc/cli.rs:62\n" }
+                    new Say { text = "Two callers, neither passes a clock." }
+                  }
+                }
+              }
+            }
+          }
+          new Say {
+            text = "\nBoth reviewers are done: the skew guard is missing in `token.rs`, and neither config caller passes a clock.\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 15.ms }
+          }
+        }
+      }
+    }
+  }
+}

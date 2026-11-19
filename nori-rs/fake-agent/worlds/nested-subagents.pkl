@@ -1,0 +1,187 @@
+/// A tree three levels deep, scripted entirely through Nori's own delegation tools:
+///
+///     lead
+///     ├─ auth      (reviewer)   delegates to two scouts at once
+///     │  ├─ token-scout   (scout)
+///     │  └─ session-scout (scout)
+///     └─ config    (reviewer)   exchanges peer messages with `auth`
+///
+/// Nothing here is faked at the protocol level: `delegate_task` and `task_send` are the real
+/// host tools, so the harness starts real child sessions on these same fake agents, relays
+/// their updates under the parent, surfaces the ✉ messages, and wakes each parent with its
+/// children's results.
+///
+///     scripts/rex-scenario fake-agent/worlds/nested-subagents.pkl --session "$REX_SESSION" --tab
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/nested-subagents.pkl "audit the auth and config code"
+amends "nori:World"
+
+name = "nested-subagents"
+description = "Three levels of delegation, parallel lanes, and peer messages between siblings."
+default_agent = "lead"
+
+local model = new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models { model }
+    scenes {
+      // The completion wake: a child's result reaches the lead as a new turn.
+      new Scene {
+        name = "wake"
+        on = new Matching { pattern = "delegated_task_results" }
+        steps {
+          new Think { text = "A reviewer reported. I should fold it into the audit and say what is still running." }
+          new Say {
+            text = "A reviewer reported back; I've added it to the audit. The auth reviewer's scouts found the missing clock-skew guard, and the config loader's three callers never pass a clock, so the two findings agree.\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 15.ms }
+          }
+        }
+      }
+      new Scene {
+        name = "audit"
+        steps {
+          new Say {
+            text = "I'll split the audit in two and have a reviewer on each half.\n\n"
+            chunk = new Chunking { size = 4; unit = "words"; every = 20.ms }
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Audit the auth middleware"; status = "in_progress"; priority = "high" }
+              new PlanEntry { content = "Trace the config loader's callers"; status = "in_progress"; priority = "high" }
+              new PlanEntry { content = "Reconcile the findings"; priority = "medium" }
+            }
+          }
+          new Delegate {
+            title = "Audit auth middleware"
+            agent = "reviewer"
+            alias = "auth"
+            role = "review"
+            task = "[auth] Audit the auth middleware under src/auth for clock-skew and expiry problems. You may delegate narrow checks to scouts. Tell the `config` reviewer anything that affects the config loader. Report findings with file and line."
+            bind = "auth_task"
+          }
+          new Delegate {
+            title = "Trace config loader callers"
+            agent = "reviewer"
+            alias = "config"
+            role = "review"
+            task = "[config] Find every caller of the config loader and say whether each passes a clock. Answer the `auth` reviewer if it messages you. Report findings with file and line."
+            bind = "config_task"
+          }
+          new Say {
+            text = "Both reviewers are working. I'll summarize when they report.\n"
+            chunk = new Chunking { size = 6; unit = "words"; every = 15.ms }
+          }
+        }
+      }
+    }
+  }
+
+  ["reviewer"] {
+    title = "Reviewer"
+    models { model }
+    scenes {
+      // A peer message to the config reviewer.
+      new Scene {
+        name = "config-hears-auth"
+        on = new Matching { pattern = "FYI from auth" }
+        steps {
+          new Say { text = "Noted. Checking whether the loader's callers pass a clock.\n" }
+          new Tool {
+            title = "Search for `ConfigLoader::load`"; tool_kind = "search"; duration = 250.ms
+            stdout = "src/server.rs:19\nsrc/cli.rs:62\nsrc/test_util.rs:8\n"
+          }
+          new Say { text = "None of the three callers passes a clock, so the loader inherits whatever the auth layer does.\n" }
+        }
+      }
+      // The auth reviewer's own wake, once both scouts have reported.
+      new Scene {
+        name = "auth-wake"
+        on = new Matching { pattern = "delegated_task_results" }
+        steps {
+          new Say {
+            text = "Both scouts reported.\n\n**Findings**\n- `token_expiry` compares against `Instant::now()` with no skew allowance (src/auth/token.rs:88).\n- The session store honors TTLs correctly (src/auth/session.rs:41).\n\nThe first one is the bug.\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 12.ms }
+          }
+        }
+      }
+      new Scene {
+        name = "auth"
+        on = new Matching { pattern = "\\[auth\\]" }
+        steps {
+          new Say { text = "Reading the middleware, then handing the two narrow checks to scouts.\n\n" }
+          new Tool {
+            title = "Read src/auth/middleware.rs"; tool_kind = "read"; duration = 200.ms
+            locations { new Location { path = "src/auth/middleware.rs" } }
+          }
+          new Delegate {
+            title = "Check token expiry"
+            agent = "scout"
+            alias = "token-scout"
+            role = "research"
+            task = "[scout-token] Read src/auth/token.rs and say whether expiry is compared with any clock-skew allowance."
+          }
+          new Delegate {
+            title = "Check session store TTLs"
+            agent = "scout"
+            alias = "session-scout"
+            role = "research"
+            task = "[scout-session] Read src/auth/session.rs and say whether session TTLs are enforced on read."
+          }
+          new Send {
+            to = "config"
+            message = "FYI from auth: token expiry has no clock-skew guard. Does anything in the config loader pass a clock?"
+          }
+          new Say { text = "Scouts are out and I've told `config`. I'll report when they answer.\n" }
+        }
+      }
+      new Scene {
+        name = "config"
+        on = new Matching { pattern = "\\[config\\]" }
+        steps {
+          new Say { text = "Searching for callers.\n\n" }
+          new Tool {
+            title = "Search for `ConfigLoader`"; tool_kind = "search"; duration = 300.ms
+            stdout = "src/server.rs:19\nsrc/cli.rs:62\nsrc/test_util.rs:8\n"
+          }
+          new Tool {
+            title = "Read src/server.rs"; tool_kind = "read"; duration = 150.ms
+            locations { new Location { path = "src/server.rs"; line = 19 } }
+          }
+          new Say {
+            text = "Three callers: `server.rs:19`, `cli.rs:62` and `test_util.rs:8`. None passes a clock.\n"
+            chunk = new Chunking { size = 6; unit = "words"; every = 10.ms }
+          }
+        }
+      }
+    }
+  }
+
+  ["scout"] {
+    title = "Scout"
+    models { model }
+    scenes {
+      new Scene {
+        name = "token"
+        on = new Matching { pattern = "scout-token" }
+        steps {
+          new Tool {
+            title = "Read src/auth/token.rs"; tool_kind = "read"; duration = 180.ms
+            locations { new Location { path = "src/auth/token.rs"; line = 88 } }
+          }
+          new Say { text = "`token_expiry` (token.rs:88) compares `exp` with `Instant::now()` directly: no skew allowance." }
+        }
+      }
+      new Scene {
+        name = "session"
+        steps {
+          new Tool {
+            title = "Read src/auth/session.rs"; tool_kind = "read"; duration = 220.ms
+            locations { new Location { path = "src/auth/session.rs"; line = 41 } }
+          }
+          new Say { text = "Session TTLs are checked on every read (session.rs:41). No issue." }
+        }
+      }
+    }
+  }
+}

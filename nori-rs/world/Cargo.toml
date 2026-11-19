@@ -1,0 +1,29 @@
+[package]
+name = "nori-world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The driver for integration tests and live demos: boots the real harness against a world of
+# fake agents and records everything that happens. A crate of its own (not a feature of
+# `nori-harness`) so the harness stays free of test support, the fake agent stays free of the
+# harness, and tests of any crate can depend on it.
+[dependencies]
+anyhow = { workspace = true }
+nori-acp-host = { workspace = true }
+nori-config = { workspace = true }
+nori-fake-agent = { workspace = true }
+nori-harness = { workspace = true }
+nori-protocol = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tui-pty-e2e = { path = "../tui-pty-e2e" }

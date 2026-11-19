@@ -1,0 +1,154 @@
+/// Two Claude accounts, a Codex account and a gateway, each reporting its own quota.
+///
+///   claude-code  Claude, primary account     5h window spent after its first answer
+///   claude2      Claude, secondary account   5h window 12% used
+///   codex        Codex                       5h 12% used, weekly 93%
+///   opencode     a gateway: routes `anthropic/...`, `openai/...` and `opencode-go/...` models
+///
+/// Run each agent once against one `NORI_HOME` so the usage log has every account's windows,
+/// then look at `/usage` (accounts side by side, "Claude: 2 accounts") and `/model` (the account
+/// with room first, with a meter). Ask `claude-code` again with "again" and it fails on its
+/// spent window: the session moves to `claude2`, the other Claude account, before any other
+/// provider, and the route change says which account.
+///
+/// The usage log is in real time and the windows reset on the world's clock, so a world whose
+/// `start` is long past reports windows that already refilled. Set `start` to now first:
+///
+///     sed "s/^name = /start = \"$(date -u +%FT%TZ)\"\nname = /" fake-agent/worlds/multi-account.pkl > /tmp/multi.pkl
+///     for agent in claude2 codex opencode claude-code; do
+///       nori --world /tmp/multi.pkl --agent $agent
+///     done
+amends "nori:World"
+
+name = "multi-account"
+description = "Several accounts of one provider, a gateway, and routing that prefers the account with room."
+default_agent = "claude-code"
+
+policy = """
+  recovery = new Dynamic {
+    retry = new Dynamic { max_attempts = 0 }
+    fallback = new Dynamic {
+      on = List("quota_exhausted", "model_unavailable", "capacity")
+      chain = List()
+      ranked = true
+      prefer_headroom = true
+      return_to_primary = "never"
+    }
+  }
+  """
+
+agents {
+  ["claude-code"] {
+    title = "Claude"
+    models {
+      new Model { id = "claude-opus-5-5"; name = "Opus 5.5"; context_window = 200000 }
+      new Model { id = "claude-sonnet-5-5"; name = "Sonnet 5.5"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "spent"
+        on = new Matching { pattern = "again" }
+        steps {
+          new Usage {
+            tokens = new Tokens { input = 4000; output = 0 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 100.0; resets_in = 1.h + 40.min; window_minutes = 300 }
+            }
+          }
+          new Fail {
+            failure = "quota"
+            detail = "You've hit your usage limit for the five-hour window. It resets in 1 hour 40 minutes."
+            resets_in = 1.h + 40.min
+          }
+        }
+      }
+      new Scene {
+        name = "answers"
+        steps {
+          new Say { text = "Primary Claude account. You said: {{prompt}}" }
+          new Usage {
+            context_used = 24000
+            tokens = new Tokens { input = 21000; output = 3400; cache_read = 180000; cache_write = 9000 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 100.0; resets_in = 1.h + 40.min; window_minutes = 300 }
+              new RateLimit { id = "weekly"; label = "week"; used_percent = 78.0; resets_in = 3.d; window_minutes = 10080 }
+            }
+          }
+        }
+      }
+    }
+  }
+  ["claude2"] {
+    title = "Claude 2"
+    models {
+      new Model { id = "claude-opus-5-5"; name = "Opus 5.5"; context_window = 200000 }
+      new Model { id = "claude-sonnet-5-5"; name = "Sonnet 5.5"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "answers"
+        steps {
+          new Say {
+            text = "Secondary Claude account. You said: {{prompt}}"
+            chunk = new Chunking { size = 4; unit = "words"; every = 20.ms }
+          }
+          new Usage {
+            context_used = 9000
+            tokens = new Tokens { input = 8000; output = 1200; cache_read = 61000; cache_write = 3000 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 12.0; resets_in = 3.h + 40.min; window_minutes = 300 }
+              new RateLimit { id = "weekly"; label = "week"; used_percent = 22.0; resets_in = 4.d + 12.h; window_minutes = 10080 }
+            }
+          }
+        }
+      }
+    }
+  }
+  ["codex"] {
+    title = "Codex"
+    models {
+      new Model { id = "gpt-6"; name = "GPT-6"; context_window = 400000 }
+    }
+    scenes {
+      new Scene {
+        name = "answers"
+        steps {
+          new Say { text = "Codex. You said: {{prompt}}" }
+          new Usage {
+            context_used = 12000
+            tokens = new Tokens { input = 14000; output = 2100; cache_read = 52000 }
+            rate_limits {
+              new RateLimit { id = "five_hour"; label = "5h"; used_percent = 12.0; resets_in = 4.h + 40.min; window_minutes = 300 }
+              new RateLimit { id = "weekly"; label = "week"; used_percent = 93.0; resets_in = 4.d + 12.h; window_minutes = 10080 }
+            }
+          }
+        }
+      }
+    }
+  }
+  ["opencode"] {
+    title = "OpenCode"
+    models {
+      new Model { id = "anthropic/claude-opus-5-5"; name = "anthropic/Claude Opus 5.5"; context_window = 200000 }
+      new Model { id = "openai/gpt-6"; name = "openai/GPT-6"; context_window = 400000 }
+      new Model { id = "opencode-go/deepseek-v4"; name = "opencode-go/DeepSeek V4"; context_window = 128000 }
+    }
+    scenes {
+      new Scene {
+        name = "answers"
+        steps {
+          new Say { text = "Gateway. You said: {{prompt}}" }
+          new Usage {
+            context_used = 6000
+            model = "anthropic/claude-opus-5-5"
+            tokens = new Tokens { input = 5000; output = 800; cache_read = 20000 }
+          }
+          new Usage {
+            model = "opencode-go/deepseek-v4"
+            tokens = new Tokens { input = 9000; output = 1500 }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/rex-scenario SCENARIO [--session ID] [--block ID] [--split DIRECTION] [--ratio N] [--tab] [--clock MODE]
+
+SCENARIO is one of: practice, subagents, child, program-status, a path to a JSONL wire fixture
+(played by the mock agent), or a path to a world file (*.pkl, *.json: fake agents that script
+the whole conversation, see docs/fake-worlds.md; `nori-rs/fake-agent/worlds/` has the showcase
+worlds).
+--clock MODE sets how a world's time passes: `real`, a speed such as `x30` (thirty times faster),
+or `virtual` (instant). The default is what the world asks for (`real` unless it says otherwise).
+Set NORI_BIN and MOCK_ACP_AGENT_BIN to use non-default builds. A debug nori approves every
+request; set NORI_TEST_REQUIRE_APPROVAL=1 to have a world's permission requests asked.
+EOF
+}
+
+scenario=${1:-}
+shift || true
+if [[ $scenario == --help || $scenario == -h ]]; then
+  usage
+  exit 0
+fi
+session=${REX_SESSION:-}
+block=${REX_BLOCK:-}
+direction=right
+ratio=50
+tab=0
+clock=${NORI_WORLD_CLOCK:-}
+while (($#)); do
+  case "$1" in
+    --session|-s) session=${2:?missing session}; shift 2 ;;
+    --block|-b) block=${2:?missing block}; shift 2 ;;
+    --split) direction=${2:?missing split direction}; shift 2 ;;
+    --ratio) ratio=${2:?missing ratio}; shift 2 ;;
+    --tab) tab=1; shift ;;
+    --clock) clock=${2:?missing clock mode}; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+[[ -n $scenario && -n $session ]] || { usage >&2; exit 2; }
+((tab)) || [[ -n $block ]] || { echo "--block is required unless --tab is used" >&2; exit 2; }
+case "$direction" in right|left|above|below) ;; *) echo "invalid --split" >&2; exit 2 ;; esac
+[[ $ratio =~ ^[0-9]+$ && $ratio -ge 1 && $ratio -le 99 ]] || { echo "invalid --ratio" >&2; exit 2; }
+
+repo_dir=$(cd "$(dirname "$0")/.." && pwd -P)
+nori_bin=${NORI_BIN:-$repo_dir/nori-rs/target/debug/nori}
+mock_bin=${MOCK_ACP_AGENT_BIN:-$repo_dir/nori-rs/target/debug/mock_acp_agent}
+world=
+case "$scenario" in
+  practice) fixture=$repo_dir/nori-rs/mock-acp-agent/fixtures/nori_practice_scrollback.jsonl ;;
+  subagents) fixture=$repo_dir/nori-rs/mock-acp-agent/fixtures/claude_subagents.jsonl ;;
+  child) fixture=$repo_dir/nori-rs/mock-acp-agent/fixtures/opencode_child_wire.jsonl ;;
+  program-status) fixture=$repo_dir/nori-rs/tui-pty-e2e/tests/fixtures/program_status_nested.jsonl ;;
+  *.pkl|*.json) world=$(cd "$(dirname "$scenario")" && pwd -P)/$(basename "$scenario"); fixture=$world ;;
+  *) fixture=$scenario ;;
+esac
+[[ -x $nori_bin ]] || { echo "missing executable: $nori_bin (build nori first)" >&2; exit 1; }
+if [[ -z $world ]]; then
+  [[ -x $mock_bin ]] || { echo "missing executable: $mock_bin (build mock-acp-agent first)" >&2; exit 1; }
+fi
+[[ -f $fixture ]] || { echo "missing fixture: $fixture" >&2; exit 1; }
+
+scenario_home=$(mktemp -d "${TMPDIR:-/tmp}/nori-scenario.XXXXXX")
+cwd=$(pwd -P)
+if [[ -n $world ]]; then
+  # A world defines its own agents and nothing real is offered or started, so the config only has
+  # to trust this directory. The world's recovery policy, if it has one, becomes init.pkl.
+  printf '[projects."%s"]\ntrust_level = "trusted"\n' "$cwd" > "$scenario_home/config.toml"
+  label="world:$(basename "$world" | sed 's/\.[^.]*$//')"
+  printf 'Launching %s (clock: %s). Home: %s\n' "$label" "${clock:-as the world says}" "$scenario_home" >&2
+  world_cmd=(env NORI_HOME="$scenario_home" CODEX_HOME="$scenario_home")
+  [[ -z $clock ]] || world_cmd+=(NORI_WORLD_CLOCK="$clock")
+  # A debug nori approves every request; this makes it ask, so permission cards can be seen.
+  [[ -z ${NORI_TEST_REQUIRE_APPROVAL:-} ]] || world_cmd+=(NORI_TEST_REQUIRE_APPROVAL=1)
+  world_cmd+=("$nori_bin" --world "$world" --skip-trust-directory)
+  if ((tab)); then
+    rex window new -s "$session" "$label" --keep-open --json --cwd "$cwd" -- "${world_cmd[@]}"
+  else
+    rex split -s "$session" -b "$block" --split "$direction" --ratio "$ratio" \
+      --label "$label" --keep-open --json --cwd "$cwd" -- "${world_cmd[@]}"
+  fi
+  exit 0
+fi
+
+cat > "$scenario_home/config.toml" <<EOF
+agent = "mock-scenario"
+
+[projects."$cwd"]
+trust_level = "trusted"
+
+[[agents]]
+name = "Mock Scenario"
+slug = "mock-scenario"
+
+[agents.distribution.local]
+command = "$mock_bin"
+args = []
+
+# Fixture tabs must not warm real provider processes or run their startup hooks.
+[[agents]]
+name = "Claude (disabled in fixture)"
+slug = "claude-code"
+[agents.distribution.local]
+command = "/usr/bin/false"
+
+[[agents]]
+name = "Codex (disabled in fixture)"
+slug = "codex"
+[agents.distribution.local]
+command = "/usr/bin/false"
+
+[[agents]]
+name = "OpenCode (disabled in fixture)"
+slug = "opencode"
+[agents.distribution.local]
+command = "/usr/bin/false"
+EOF
+
+label="scenario:$(basename "$fixture" .jsonl)"
+printf 'Launching %s in a %s split (%s%%). Config: %s\n' "$label" "$direction" "$ratio" "$scenario_home/config.toml" >&2
+if ((tab)); then
+  rex window new -s "$session" "$label" --keep-open --json --cwd "$cwd" -- \
+    env NORI_HOME="$scenario_home" CODEX_HOME="$scenario_home" MOCK_AGENT_WIRE_REPLAY="$fixture" \
+      MOCK_AGENT_REPLAY_SCALE="${MOCK_AGENT_REPLAY_SCALE:-0}" "$nori_bin" \
+      --agent mock-scenario --skip-trust-directory
+else
+  rex split -s "$session" -b "$block" --split "$direction" --ratio "$ratio" \
+    --label "$label" --keep-open --json --cwd "$cwd" -- \
+    env NORI_HOME="$scenario_home" CODEX_HOME="$scenario_home" MOCK_AGENT_WIRE_REPLAY="$fixture" \
+      MOCK_AGENT_REPLAY_SCALE="${MOCK_AGENT_REPLAY_SCALE:-0}" "$nori_bin" \
+      --agent mock-scenario --skip-trust-directory
+fi

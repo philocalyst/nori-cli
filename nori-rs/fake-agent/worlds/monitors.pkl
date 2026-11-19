@@ -1,0 +1,158 @@
+/// Monitors: an agent arms background watchers, ends its turn, and is woken by what they see.
+///
+///   * `build`: a `command` monitor on a script that prints progress and then fails. The agent
+///     ends its turn; the failure wakes it.
+///   * `peer`: an `actor` monitor on a peer that is working on a task of its own.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/monitors.pkl "build it"
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/monitors.pkl "watch the peer"
+amends "nori:World"
+
+name = "monitors"
+description = "A monitor on a failing build script, and a monitor on a peer actor."
+default_agent = "lead"
+
+local model = new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models { model }
+    scenes {
+      // Events reach the agent as a new turn, whose prompt is the `<monitor_events>` message.
+      new Scene {
+        name = "woken"
+        on = new Matching { pattern = "monitor_events" }
+        steps {
+          new Say { text = "A monitor woke me. Echoing what it said:\n{{prompt}}\n" }
+        }
+      }
+      // A delegated task's result is a wake too; the monitor is what this world is about.
+      new Scene {
+        name = "task result"
+        on = new Matching { pattern = "delegated_task_results" }
+        steps { new Say { text = "The worker reported.\n" } }
+      }
+      new Scene {
+        name = "list"
+        on = new Matching { pattern = "(?i)list" }
+        steps {
+          new HostTool { name = "monitor_list"; title = "List monitors" }
+          new Say { text = "Listed.\n" }
+        }
+      }
+      new Scene {
+        name = "long"
+        on = new Matching { pattern = "(?i)long" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch the long job"
+            arguments = new Dynamic {
+              ["label"] = "long-job"
+              ["source"] = "command"
+              ["command"] = "echo started; sleep 20; echo done"
+              ["timeout_seconds"] = 60
+            }
+          }
+          new Say { text = "Armed the long job.\n" }
+        }
+      }
+      new Scene {
+        name = "flood"
+        on = new Matching { pattern = "(?i)flood" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch a noisy job"
+            arguments = new Dynamic {
+              ["label"] = "noisy"
+              ["source"] = "command"
+              ["command"] = "for i in $(seq 1 3000); do echo line $i; sleep 0.002; done"
+              ["batch_ms"] = 0
+              ["max_events"] = 6
+              ["timeout_seconds"] = 60
+            }
+          }
+          new Say { text = "Armed the noisy job.\n" }
+        }
+      }
+      new Scene {
+        name = "expire"
+        on = new Matching { pattern = "(?i)expire" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch a silent job"
+            arguments = new Dynamic {
+              ["label"] = "silent"
+              ["source"] = "command"
+              ["command"] = "echo warming up; sleep 30; echo ready"
+              ["until"] = "ready"
+              ["timeout_seconds"] = 1
+            }
+          }
+          new Say { text = "Armed the silent job.\n" }
+        }
+      }
+      new Scene {
+        name = "peer"
+        on = new Matching { pattern = "(?i)peer" }
+        steps {
+          new Delegate {
+            title = "Prepare the release notes"
+            agent = "worker"
+            alias = "worker"
+            task = "Prepare the release notes."
+            bind = "task"
+          }
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch worker"
+            arguments = new Dynamic {
+              ["label"] = "worker"
+              ["source"] = "actor"
+              ["actor"] = "worker"
+              ["track"] = new Listing { "state" }
+              ["timeout_seconds"] = 60
+            }
+            bind = "monitor"
+          }
+          new Say { text = "Watching the worker; ending my turn.\n" }
+        }
+      }
+      new Scene {
+        name = "build"
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch the build"
+            arguments = new Dynamic {
+              ["label"] = "build"
+              ["source"] = "command"
+              ["command"] = "echo 'compiling core'; sleep 0.4; echo 'compiling cli'; sleep 0.4; echo 'error[E0308]: mismatched types' >&2; echo 'error[E0308]: mismatched types'; exit 2"
+              ["fail_on"] = new Listing { "error\\[E" }
+              ["timeout_seconds"] = 60
+            }
+            bind = "monitor"
+          }
+          new Say { text = "The build is running in a monitor ({{monitor.monitor}}); ending my turn.\n" }
+        }
+      }
+    }
+  }
+
+  ["worker"] {
+    title = "Worker"
+    models { model }
+    scenes {
+      new Scene {
+        steps {
+          new Say { text = "Working on it.\n" }
+          new Wait { duration = 1.s }
+          new Say { text = "Release notes are ready.\n" }
+        }
+      }
+    }
+  }
+}

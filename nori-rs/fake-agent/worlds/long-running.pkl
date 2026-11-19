@@ -1,0 +1,148 @@
+/// A single turn that takes thirty-seven minutes of the world's time: a migration that touches
+/// forty files, with a test run every few steps, usage and rate limits climbing the whole way,
+/// the context filling up, and one permission request near the middle.
+///
+/// The driver plays it on the virtual clock, so the whole turn takes a moment; `nori --world`
+/// watches it at thirty times real speed (`clock = "x30"` below; `NORI_WORLD_CLOCK=real` to see it
+/// in real time, `virtual` to skip to the end).
+///
+///     scripts/rex-scenario fake-agent/worlds/long-running.pkl --session "$REX_SESSION" --tab
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/long-running.pkl "migrate to the new client"
+amends "nori:World"
+
+name = "long-running"
+description = "Thirty-seven minutes of work: tools, climbing usage and rate limits, a filling context."
+default_agent = "fake"
+// Watched at thirty times real speed: the thirty-seven minutes take about seventy seconds.
+clock = "x30"
+
+local total = 36
+local files = List(
+  "src/client.rs", "src/retry.rs", "src/pool.rs", "src/auth.rs", "src/cache.rs", "src/stream.rs",
+  "src/metrics.rs", "src/config.rs", "src/error.rs", "src/telemetry.rs", "src/proxy.rs", "src/tls.rs"
+)
+
+agents {
+  ["fake"] {
+    title = "Fake Fable"
+    account = "long@example.test"
+    models {
+      new Model { id = "fake-fable"; name = "Fake Fable 5.2"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "migration"
+        steps {
+          new Status { state = "working" }
+          new SessionInfo { title = "Migrate to the v2 client" }
+          new Say {
+            text = "This is a wide change: every call site of the v1 client has to move to the v2 builder. I'll work through the modules in dependency order and run the suite every few files.\n\n"
+            chunk = new Chunking { size = 5; unit = "words"; every = 30.ms }
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Port `client`, `retry` and `pool` to the v2 builder"; status = "in_progress"; priority = "high" }
+              new PlanEntry { content = "Port `auth`, `cache`, `stream`"; priority = "high" }
+              new PlanEntry { content = "Port the remaining modules"; priority = "medium" }
+              new PlanEntry { content = "Run the full suite and fix regressions"; priority = "high" }
+            }
+          }
+          for (i in IntSeq(1, total)) {
+            new Wait { duration = 55.s }
+            when (i % 6 == 0) {
+              new Tool {
+                title = "cargo test --workspace"
+                tool_kind = "execute"
+                input = new Dynamic { command = "cargo test --workspace" }
+                progress {
+                  new Progress { after = 6.s; stdout = "   Compiling v2-client v0.9.\(i) (/work)\n" }
+                  new Progress { after = 9.s; stdout = "     Running 212 tests\n" }
+                }
+                stdout = "test result: ok. 212 passed; 0 failed\n"
+                exit_code = 0
+                duration = 20.s
+              }
+            }
+            when (i % 6 != 0 && i % 2 == 0) {
+              new Tool {
+                title = "Edit \(files[i % 12])"
+                tool_kind = "edit"
+                locations { new Location { path = files[i % 12]; line = 10 + i } }
+                content {
+                  new DiffContent {
+                    path = files[i % 12]
+                    old_text = "let client = Client::builder().retries(\(i)).build();\n"
+                    new_text = "let client = ClientV2::builder().retry(Retry::fixed(\(i))).build()?;\n"
+                  }
+                }
+                duration = 4.s
+              }
+            }
+            when (i % 6 != 0 && i % 2 == 1) {
+              new Tool {
+                title = "Read \(files[i % 12])"
+                tool_kind = "read"
+                locations { new Location { path = files[i % 12] } }
+                duration = 3.s
+              }
+            }
+            when (i % 4 == 0) {
+              new Say {
+                text = "\(i) of \(total) steps done; \(files[i % 12]) ported.\n"
+                chunk = new Chunking { size = 0 }
+              }
+            }
+            when (i == 18) {
+              new Plan {
+                entries {
+                  new PlanEntry { content = "Port `client`, `retry` and `pool` to the v2 builder"; status = "completed"; priority = "high" }
+                  new PlanEntry { content = "Port `auth`, `cache`, `stream`"; status = "completed"; priority = "high" }
+                  new PlanEntry { content = "Port the remaining modules"; status = "in_progress"; priority = "medium" }
+                  new PlanEntry { content = "Run the full suite and fix regressions"; priority = "high" }
+                }
+              }
+              // The one destructive step asks first.
+              new Permission {
+                tool = new ToolSpec {
+                  title = "Delete src/legacy_client.rs"
+                  tool_kind = "delete"
+                  locations { new Location { path = "src/legacy_client.rs" } }
+                  duration = 1.s
+                }
+                expect = "allow"
+                timeout = 10.min
+                on_timeout {
+                  new Say { text = "Nobody answered the delete request, so I'm leaving `src/legacy_client.rs` in place and moving on.\n" }
+                }
+                on_deny {
+                  new Say { text = "Keeping `src/legacy_client.rs`. I'll note it as the last remaining v1 user.\n" }
+                }
+              }
+            }
+            new Usage {
+              context_used = 20000 + i * 4100
+              tokens = new Tokens { input = 4800 + i * 90; output = 700 + i * 12; cache_read = 3200 + i * 140; cache_write = 220 }
+              rate_limits {
+                new RateLimit { id = "five_hour"; label = "5h"; used_percent = 41.0 + i * 0.9; resets_at = "2026-11-18T15:30:00Z"; window_minutes = 300 }
+                new RateLimit { id = "seven_day"; label = "7d"; used_percent = 18.0 + i * 0.12; resets_at = "2026-11-22T00:00:00Z"; window_minutes = 10080 }
+              }
+            }
+          }
+          new Plan {
+            entries {
+              new PlanEntry { content = "Port `client`, `retry` and `pool` to the v2 builder"; status = "completed"; priority = "high" }
+              new PlanEntry { content = "Port `auth`, `cache`, `stream`"; status = "completed"; priority = "high" }
+              new PlanEntry { content = "Port the remaining modules"; status = "completed"; priority = "medium" }
+              new PlanEntry { content = "Run the full suite and fix regressions"; status = "completed"; priority = "high" }
+            }
+          }
+          new Say {
+            text = "The migration is done: all 40 call sites use the v2 builder and the suite passes (212 tests). The only v1 leftover is `src/legacy_client.rs`, which I did not delete.\n"
+            chunk = new Chunking { size = 6; unit = "words"; every = 20.ms }
+          }
+          new Status { state = "idle" }
+        }
+      }
+    }
+  }
+}

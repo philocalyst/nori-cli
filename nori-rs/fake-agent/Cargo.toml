@@ -1,0 +1,31 @@
+[package]
+name = "nori-fake-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# A scriptable, deterministic fake ACP agent built on the in-process agent kit. A "world" is a
+# declarative script (Pkl or JSON) that says what each fake agent does for each prompt, including
+# the adversarial faults real agents commit. It depends on the kit and on the Pkl evaluator, and
+# on neither the harness nor any real agent, so anything that wants a fake chat can link it.
+[dependencies]
+nori-acp-kit = { workspace = true }
+nori-host-tools = { workspace = true }
+nori-pkl = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true, features = ["std", "alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-std", "rt-multi-thread"] }
