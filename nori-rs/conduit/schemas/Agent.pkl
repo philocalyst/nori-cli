@@ -1,0 +1,35 @@
+/// Canonical Nori agent and actor schema.
+///
+/// An *actor* is any addressable agent session a program starts: an ACP agent, optionally a
+/// model, a role, standing instructions, the tools it may use and where it runs.
+open module nori.Agent
+
+import "nori:Recovery" as Recovery
+import "nori:Workspace" as Workspace
+
+typealias Isolation = "shared"|"worktree"|"sandbox"
+
+class Actor {
+  /// The agent slug, as in Nori's agent configuration (`claude-code`, `codex`, ...).
+  agent: String(!isEmpty)
+  model: String(!isEmpty)?
+  /// The role whose recovery policy and instructions apply (`review`, `research`, ...).
+  role: String(!isEmpty)?
+  /// Other settings of the agent, by setting id (for example reasoning effort).
+  options: Mapping<String, String>
+  /// Standing instructions: the first brief the actor receives.
+  instructions: String?
+  /// Nori host tools the actor is given (`bash`, `git_status`, `delegate_task`, ...); empty
+  /// leaves the session's tool policy as it is. Anything else the agent has of its own stays.
+  tools: Listing<String>
+  /// Names of program `skills` the actor uses: each adds its instructions and tools.
+  skills: Listing<String>
+  /// Narrows the tools and paths the actor's Nori `bash` and host tools may use, below the
+  /// sandbox of the world it lives in.
+  sandbox: Workspace.SandboxPolicy?
+  /// Overrides the program's and the policy's recovery for work sent to this actor.
+  recovery: Recovery.Block?
+  isolation: Isolation = "shared"
+  /// A program `worlds` entry the actor lives in; unset means the program's own world.
+  world: String(!isEmpty)?
+}

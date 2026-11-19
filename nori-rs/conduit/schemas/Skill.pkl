@@ -1,0 +1,14 @@
+/// Canonical Nori Skill specification schema.
+open module nori.Skill
+
+import "nori:Tool" as Tool
+
+class SkillSpec {
+  name: String(!isEmpty)
+  description: String = ""
+  instructions: Listing<String>
+  allowed_tools: Listing<String>
+  required_tools: Listing<Tool.ToolSpec>
+}
+
+skills: Listing<SkillSpec>

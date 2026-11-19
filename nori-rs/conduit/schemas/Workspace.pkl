@@ -1,0 +1,10 @@
+/// What a sandboxed scope may do. Empty lists restrict nothing.
+open module nori.Workspace
+
+class SandboxPolicy {
+  /// Tool names the scope may call. `bash:git` allows only the `git` command through `bash`;
+  /// `*` allows every tool.
+  allowed_tools: Listing<String>
+  /// Paths the scope's commands may touch, relative to the working directory.
+  allowed_paths: Listing<String>
+}

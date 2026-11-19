@@ -1,0 +1,48 @@
+/// Snapshot of a program run, rewritten as the run progresses (`state.pkl` beside the
+/// journal). It is plain Pkl data: reload it with `amends "nori:Run"` to inspect what a run
+/// did, or to hand its state to another world. The journal (`journal.jsonl`) is the
+/// authoritative history; the snapshot is its latest projection.
+open module nori.Run
+
+class ActorState {
+  agent: String
+  model: String?
+  /// The host's identity for the actor's session.
+  session: String
+  /// Turns of work the run has handed the actor.
+  turns: Int(this >= 0) = 0
+  /// Routes the actor was moved to by recovery, in order, as `agent` or `agent · model`.
+  fallbacks: Listing<String>
+}
+
+class WorldState {
+  isolation: "shared"|"worktree"|"sandbox"
+  root: String
+  home: String?
+}
+
+class PendingInterrupt {
+  id: String(!isEmpty)
+  prompt: String
+}
+
+run: String(!isEmpty)
+program: String(!isEmpty)
+/// The program file, when it came from one.
+source: String?
+status: "running"|"finished"|"failed"|"cancelled"
+/// The last envelope sequence number written to the journal.
+seq: Int(this >= 0)
+tokens: Int(this >= 0) = 0
+tool_calls: Int(this >= 0) = 0
+/// Facts pinned and checkpoints taken by the run.
+pins: Listing<String>
+checkpoints: Listing<String>
+/// Interrupts waiting for a person's answer.
+pending_interrupts: Listing<PendingInterrupt>
+actors: Mapping<String, ActorState>
+worlds: Mapping<String, WorldState>
+/// The latest value of every binding, as text.
+bindings: Mapping<String, String>
+result: String?
+error: String?

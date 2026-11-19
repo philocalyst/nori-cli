@@ -1,0 +1,56 @@
+/// Canonical recovery shape shared by policy files (`recovery { ... }` in default.pkl,
+/// init.pkl and nori.pkl) and by programs (program, actor and step `recovery`).
+///
+/// Every field of a `Block` is optional: an unset field inherits the layer below it
+/// (built-in default, user policy, project policy, program, actor, step). A failure is
+/// classified into a `FailureKind`; the engine retries the same route while the kind is in
+/// `retry.on`, moves along `fallback.chain` while it is in `fallback.on`, and otherwise
+/// surfaces the failure with its cause.
+open module nori.Recovery
+
+typealias FailureKind = "rate_limited"|"quota_exhausted"|"model_unavailable"|"capacity"|"overloaded"|"server_error"|"network"|"auth"|"prompt_too_long"|"executable_not_found"|"initialization"|"session_not_found"|"session_not_resumable"|"no_active_session"|"session_already_active"|"unknown"
+
+typealias ReturnToPrimary = "never"|"after_reset"|"next_session"
+
+/// A place work can run. An unset `agent` means "the agent already running"; an unset
+/// `model` means "that agent's own default".
+class Route {
+  agent: String(!isEmpty)?
+  model: String(!isEmpty)?
+  /// Extra select settings applied on the route, by setting id (for example reasoning effort).
+  options: Mapping<String, String>
+}
+
+class Retry {
+  /// Retries after the first failure; `0` never retries.
+  max_attempts: Int(this >= 0)?
+  initial_backoff: Duration?
+  max_backoff: Duration?
+  /// Fraction of each delay that is randomised: `0.2` is plus or minus 20 percent.
+  jitter: Float(this >= 0.0 && this <= 1.0)?
+  on: Listing<FailureKind>?
+}
+
+class Fallback {
+  on: Listing<FailureKind>?
+  /// Routes to move to, in order, before anything ranked.
+  chain: Listing<Route>?
+  /// After the chain, continue with the ranked catalog of every installed agent's models.
+  ranked: Boolean?
+  /// Among routes to the same model, try the account with the most room in its rate limit windows
+  /// first, and an account known to be spent last. Default `true`.
+  prefer_headroom: Boolean?
+  return_to_primary: ReturnToPrimary?
+}
+
+open class Block {
+  retry: Retry?
+  fallback: Fallback?
+}
+
+/// One policy source's whole recovery section: the session-wide block plus per-role and
+/// per-agent overrides of the same shape.
+class Layer extends Block {
+  roles: Mapping<String, Block>
+  agents: Mapping<String, Block>
+}

@@ -1,0 +1,52 @@
+/// Canonical Nori Tool specification schema.
+///
+/// A tool is declared once and invoked by name from programs (`Call` steps) and agents.
+/// `host` tools are provided by the harness (bash, git, delegation, ...). `wasm` tools are
+/// sandboxed WebAssembly modules: they declare the exported function, a JSON Schema for the
+/// arguments and the capabilities the module may use, and run in an isolated runtime that
+/// grants nothing else. Declaring a `wasm` tool is always valid; whether a given build can
+/// run it is reported at load time, never by a silent no-op.
+open module nori.Tool
+
+typealias Capability = "fs_read"|"fs_write"|"net"|"env"|"clock"|"random"|"actors"
+
+class ToolParam {
+  name: String(!isEmpty)
+  ty: String = "String"
+  required: Boolean = true
+  description: String = ""
+}
+
+/// What a sandboxed module may do. `scope` narrows the capability: paths for `fs_*`,
+/// hostnames for `net`, variable names for `env`, actor aliases for `actors`.
+class Grant {
+  capability: Capability
+  scope: Listing<String>
+}
+
+open class ToolSpec {
+  kind: "host"|"wasm" = "host"
+  name: String(!isEmpty)
+  description: String = ""
+  params: Listing<ToolParam>
+  read_only: Boolean = false
+  cost_tokens: Int(this >= 0) = 1
+}
+
+/// A custom tool implemented as a WebAssembly module.
+class WasmTool extends ToolSpec {
+  kind = "wasm"
+  /// Path of the `.wasm` module file, relative to the program file.
+  file: String(!isEmpty)
+  /// The exported function called with the JSON-encoded arguments.
+  export: String(!isEmpty) = "call"
+  /// JSON Schema (as JSON text) validated against the arguments before the call.
+  args_schema: String(!isEmpty)
+  grants: Listing<Grant>
+  /// Wall-clock limit for one call.
+  timeout: Duration = 30.s
+  /// Linear memory limit in MiB.
+  memory_mib: Int(this > 0) = 64
+}
+
+tools: Listing<ToolSpec>

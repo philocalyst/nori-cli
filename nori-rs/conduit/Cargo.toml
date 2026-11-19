@@ -1,0 +1,26 @@
+[package]
+name = "nori-conduit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true, features = ["std", "alloc"] }
+nori-bash = { workspace = true }
+nori-conversation = { workspace = true }
+nori-pkl = { workspace = true }
+nori-workflow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "net", "io-util"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

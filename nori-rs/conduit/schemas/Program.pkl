@@ -1,0 +1,258 @@
+/// Canonical Nori Program schema: a declarative multi-actor program.
+///
+/// A program declares *actors* (agent sessions it starts and addresses by alias) and a tree
+/// of typed *steps*. Evaluating the module only produces data; the conduit runtime validates
+/// it, compiles it to an op graph and runs it through one host, journaling every step.
+///
+///     amends "nori:Program"
+///     name = "review-loop"
+///     actors { ["dev"] { agent = "claude-code" }; ["reviewer"] { agent = "codex" } }
+///     steps {
+///       new Send { to = "dev"; message = "Implement the change"; bind = "patch" }
+///       new Send { to = "reviewer"; message = "Review: {{patch}}"; bind = "review" }
+///     }
+///
+/// Text fields of steps may reference earlier results with `{{binding}}`; fan-out steps also
+/// bind their `each` name. A binding that does not exist when the step runs is an error.
+open module nori.Program
+
+import "nori:Agent" as Agent
+import "nori:Recovery" as Recovery
+import "nori:Skill" as Skill
+import "nori:Tool" as Tool
+
+/// A world a program, or part of one, runs in: its own worktree and optionally its own
+/// Nori home scope, with narrower tools, paths and token budget than the program.
+class World {
+  isolation: Agent.Isolation = "sandbox"
+  allowed_tools: Listing<String>
+  allowed_paths: Listing<String>
+  budget_tokens: Int(this > 0)?
+  /// Give the world its own NORI_HOME under the run directory: configuration is copied from
+  /// the parent's, sessions and journals are the world's own, credentials are never copied.
+  home: Boolean = false
+}
+
+/// A condition over a binding. Exactly one of `contains`, `equals` and `starts_with` is set.
+/// Inside a `Guard`, the binding `output` is the guarded steps' last value.
+class Check {
+  value: String(!isEmpty)
+  contains: String?
+  equals: String?
+  starts_with: String?
+  negate: Boolean = false
+}
+
+abstract class Step {
+  abstract kind: String
+  /// Names the step in the journal and in errors.
+  id: String(!isEmpty)?
+  /// Names the step's value for later steps (`{{name}}`) and checks. On a `Send` that does
+  /// not await its reply, it names the receipt for a later `Await`.
+  bind: String(!isEmpty)?
+  /// Overrides actor, program and policy recovery for this step (same shape as policy).
+  recovery: Recovery.Block?
+  timeout: Duration?
+}
+
+/// Queue a prompt in the session that runs the program.
+class Prompt extends Step {
+  kind = "prompt"
+  text: String(!isEmpty)
+}
+
+/// Apply an advertised ACP configuration option to the session that runs the program.
+class Config extends Step {
+  kind = "config"
+  key: String(!isEmpty)
+  value: String(!isEmpty)
+}
+
+/// Start an actor now. A `Send` to a declared actor starts it on first use.
+class Spawn extends Step {
+  kind = "spawn"
+  actor: String(!isEmpty)
+}
+
+/// Send a message to an actor. With `await_reply` the step finishes with the actor's reply;
+/// without it the step finishes when the message is queued, and `bind` names a receipt for
+/// a later `Await`.
+class Send extends Step {
+  kind = "send"
+  to: String(!isEmpty)
+  message: String(!isEmpty)
+  await_reply: Boolean = true
+  delivery: "queue"|"steer" = "queue"
+}
+
+/// Wait for the reply to an earlier `Send` that did not await it.
+class Await extends Step {
+  kind = "await"
+  receipt: String(!isEmpty)
+}
+
+/// Call a host tool or a tool the program declares in `tools`.
+class Call extends Step {
+  kind = "call"
+  tool: String(!isEmpty)
+  args: Dynamic
+}
+
+/// Run an external process. Explicit and never implied by anything else.
+class Unsafe extends Step {
+  kind = "unsafe"
+  program: String(!isEmpty)
+  args: Listing<String>
+  cwd: String?
+}
+
+class SelectContext extends Step {
+  kind = "select_context"
+  start: Int(this >= 1)
+  end: Int(this >= 1)
+}
+
+class Fork extends Step {
+  kind = "fork"
+  /// `self` forks from this conversation's journal.
+  actor: String(!isEmpty)
+  start: Int(this >= 1)
+  end: Int(this >= 1)
+}
+
+class Rewind extends Step {
+  kind = "rewind"
+  head: Int(this >= 1)?
+}
+
+/// Run steps in order; the value is the last step's.
+class Sequence extends Step {
+  kind = "sequence"
+  steps: Listing<Step>
+}
+
+/// Run every branch at once and finish when all have; fails if any does. The value is the
+/// list of branch values.
+class Par extends Step {
+  kind = "par"
+  branches: Listing<Step>
+}
+
+/// Run every branch at once; the first to succeed wins and the others are cancelled.
+class Race extends Step {
+  kind = "race"
+  branches: Listing<Step>
+}
+
+/// Run `steps` once per item, all at once, binding the item as `each`. The value is the
+/// list of the runs' values.
+class FanOut extends Step {
+  kind = "fan_out"
+  over: Listing<String>(!isEmpty)
+  each: String(!isEmpty) = "item"
+  steps: Listing<Step>
+}
+
+/// Repeat `steps` until `until` holds, at most `max_iterations` times. Reaching the limit
+/// without `until` holding is a failure.
+class Loop extends Step {
+  kind = "loop"
+  max_iterations: Int(this >= 1)
+  until: Check?
+  steps: Listing<Step>
+}
+
+class When extends Step {
+  kind = "when"
+  check: Check
+  steps: Listing<Step>
+  otherwise: Listing<Step>
+}
+
+/// Check before (`pre`) or after (`post`) the steps; run them again up to `max_attempts`
+/// times while the check fails, with `feedback` bound as `feedback`.
+class Guard extends Step {
+  kind = "guard"
+  phase: "pre"|"post" = "post"
+  check: Check
+  feedback: String(!isEmpty)
+  max_attempts: Int(this >= 1) = 3
+  on_exhausted: "fail"|"skip" = "fail"
+  steps: Listing<Step>
+}
+
+class Budget extends Step {
+  kind = "budget"
+  tokens: Int(this > 0)
+  steps: Listing<Step>
+}
+
+/// Run steps inside one of the program's `worlds`.
+class Within extends Step {
+  kind = "within"
+  world: String(!isEmpty)
+  steps: Listing<Step>
+}
+
+/// Run steps again, as a whole, when they fail in a way the step's resolved recovery retries
+/// or falls back from.
+class Retry extends Step {
+  kind = "retry"
+  steps: Listing<Step>
+}
+
+/// Run `steps`; if they fail, run `fallback` instead.
+class Recover extends Step {
+  kind = "recover"
+  steps: Listing<Step>
+  fallback: Listing<Step>
+}
+
+class Emit extends Step {
+  kind = "emit"
+  topic: String(!isEmpty)
+  payload: String
+}
+
+class AwaitSignal extends Step {
+  kind = "await_signal"
+  topic: String(!isEmpty)
+}
+
+/// Suspend until a person answers, then bind the answer.
+class Interrupt extends Step {
+  kind = "interrupt"
+  prompt: String(!isEmpty)
+}
+
+class Delay extends Step {
+  kind = "delay"
+  duration: Duration
+}
+
+class Pin extends Step {
+  kind = "pin"
+  fact: String(!isEmpty)
+}
+
+class Checkpoint extends Step {
+  kind = "checkpoint"
+  name: String(!isEmpty)
+}
+
+name: String(!isEmpty)
+description: String = ""
+actors: Mapping<String, Agent.Actor>
+worlds: Mapping<String, World>
+/// The world the whole program runs in; unset means the session's own.
+world: World?
+/// Skills actors can use by name.
+skills: Listing<Skill.SkillSpec>
+/// Programs may call these tools by name; `wasm` tools run in the sandboxed tool runtime.
+tools: Listing<Tool.ToolSpec>
+/// Program-wide recovery overrides, applied over policy and under actor and step overrides.
+recovery: Recovery.Block?
+budget_tokens: Int(this > 0)?
+steps: Listing<Step>
+/// The binding returned as the program's result; unset returns the last step's value.
+result: String(!isEmpty)?
