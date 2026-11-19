@@ -2,6 +2,8 @@
 //!
 //! Nothing here knows about Scheme: the harness applies these values directly.
 
+use crate::recovery::RecoveryPolicy;
+
 /// How an agent session should behave: its autonomy, the prompts Nori sends at
 /// session events, and the commit and pull-request rules the agent follows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -15,10 +17,8 @@ pub struct Workflow {
     pub commit: Option<CommitRules>,
     /// Agent that reviews changed work and proposes commit messages without committing.
     pub commit_reviewer: Option<CommitAgent>,
-    /// Ordered model IDs to try when the selected model exhausts its subscription usage.
-    pub fallback_models: Vec<String>,
-    /// Select fallback models from the ranked, advertised provider catalog.
-    pub fallback_ranked: bool,
+    /// How a failed request is retried and which routes a session falls back to.
+    pub recovery: RecoveryPolicy,
     pub pr: Option<PrRules>,
     /// Free-form standing instructions, rendered verbatim.
     pub instructions: Vec<String>,

@@ -1,13 +1,13 @@
 use super::*;
 use crate::model::Hook;
+use crate::recovery::RecoveryPolicy;
 use pretty_assertions::assert_eq;
 
 fn land() -> Workflow {
     Workflow {
         name: "land".to_string(),
         commit_reviewer: None,
-        fallback_models: Vec::new(),
-        fallback_ranked: false,
+        recovery: RecoveryPolicy::default(),
         tools: None,
         max_turns: Some(3),
         hooks: vec![
