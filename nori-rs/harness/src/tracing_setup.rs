@@ -17,13 +17,16 @@ use tracing_subscriber::util::SubscriberInitExt;
 ///
 /// - Debug builds: `debug` for Nori, with third-party ACP wire/logging targets
 ///   held at `warn` so JSON-RPC frames and launch arguments cannot enter the
-///   default daily log. `RUST_LOG` still overrides this policy explicitly.
+///   default daily log. Libraries that narrate every step of their work are held at `warn`
+///   too: the shell parser (`parse`, `tokenize`, `expansion` dump a syntax tree per command, over
+///   half of a day's log), HTTP/2 frames, and the Codex telemetry events (`codex_otel`,
+///   `feedback_tags`, `codex_code_mode`). `RUST_LOG` still overrides this policy explicitly.
 /// - Release builds: `warn,nori_tui=info,acp=info` (warn default, info for TUI/ACP)
 ///
 /// Note: This can be overridden by setting the RUST_LOG environment variable.
 fn default_log_level() -> &'static str {
     if cfg!(debug_assertions) {
-        "debug,agent_client_protocol=warn,claude=warn,claude_acp=warn,rmcp=warn,rmcp_client=warn,codex_rmcp_client=warn"
+        "debug,agent_client_protocol=warn,claude=warn,claude_acp=warn,rmcp=warn,rmcp_client=warn,codex_rmcp_client=warn,parse=warn,tokenize=warn,expansion=warn,h2=warn,hyper=warn,hyper_util=warn,tower=warn,codex_otel=warn,feedback_tags=warn,codex_code_mode=warn,code_mode=warn"
     } else {
         "warn,nori_tui=info,acp=info"
     }

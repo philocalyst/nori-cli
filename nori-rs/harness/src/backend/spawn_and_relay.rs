@@ -539,7 +539,8 @@ impl AcpBackend {
                             // usage: the root session's usage and session-info updates.
                             usage_tap.observe_root(&backend.session_id().await.to_string(), &update);
                             relay_seq += 1;
-                            debug!(
+                            // One per streamed chunk: trace, so a long reply is not a long log.
+                            tracing::trace!(
                                 target: "acp_event_flow",
                                 relay_seq,
                                 relay_source = "transport_event_rx",

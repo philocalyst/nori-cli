@@ -46,7 +46,8 @@ impl AcpBackend {
             let active_before = driver.active_request_id();
             let queue_len_before = driver.queue_len();
             let actions = driver.apply(event);
-            debug!(
+            // One per streamed chunk: trace, so a long reply is not a long log.
+            tracing::trace!(
                 target: "acp_event_flow",
                 event_kind,
                 phase_before,
@@ -219,7 +220,8 @@ impl AcpBackend {
                 );
             }
             _ => {
-                debug!(
+                // One per streamed chunk: trace, so a long reply is not a long log.
+                tracing::trace!(
                     target: "acp_event_flow",
                     client_event = client_event_kind(&client_event),
                     "Forwarding client event from ACP backend"

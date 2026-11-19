@@ -122,6 +122,10 @@ pub fn enhance_agent_error(
     error: anyhow::Error,
     config: &crate::registry::AcpAgentConfig,
 ) -> anyhow::Error {
+    // An agent whose server is not running says so in full; the install hint would be wrong.
+    if let Some(reason) = nori_acp_host::agent_not_running(&error) {
+        return anyhow::anyhow!(reason);
+    }
     let details = classify_failure(&error);
     // An agent-supplied `error.data.detail` (e.g. the exact login command for
     // this deployment) is more precise than the registry's static auth hint.
