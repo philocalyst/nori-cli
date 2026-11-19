@@ -24,8 +24,6 @@
         _system: pkgs:
         let
           nori = pkgs.callPackage ./nori-rs {
-            pkl = pkgs.pkl;
-            java = pkgs.temurin-bin-25;
             opencode = pkgs.opencode;
           };
         in
@@ -57,11 +55,6 @@
           };
           adapters = import ./nix/adapters.nix { inherit pkgs; };
           lib = pkgs.lib;
-          pklRuntime = (pkgs.callPackage ./nori-rs {
-            pkl = pkgs.pkl;
-            java = pkgs.temurin-bin-25;
-            opencode = pkgs.opencode;
-          }).passthru.pklRuntime;
           evaluated = lib.evalModules {
             specialArgs = { inherit pkgs; };
             modules = [
@@ -120,18 +113,6 @@
           failed = lib.filter (a: !a.assertion) evaluated.config.assertions;
         in
         {
-          pkl-runtime = pkgs.runCommand "nori-pkl-runtime-check" {
-            nativeBuildInputs = [ pklRuntime ];
-          } ''
-            printf 'x = 1\n' > test.pkl
-            export _JAVA_OPTIONS='-Dawt.useSystemAAFontSettings=on -Dswing.aatext=true'
-            pkl eval test.pkl >eval.out 2>eval.err
-            test "$(cat eval.out)" = 'x = 1'
-            test ! -s eval.err
-            pkl server </dev/null >server.out 2>server.err
-            test ! -s server.err
-            mkdir -p $out
-          '';
           adapters = pkgs.linkFarm "nori-adapters" {
             claude = adapters.claude { name = "nori-claude-acp"; };
             codex = adapters.codex {
@@ -142,7 +123,7 @@
             opencode = adapters.opencode { name = "nori-opencode-acp"; };
             claude-native = adapters.claudeNative {
               name = "nori-claude-native-acp";
-              package = pkgs.writeShellScriptBin "claude-code-acp-rs" "";
+              package = pkgs.writeShellScriptBin "nori" "";
             };
           };
           module =

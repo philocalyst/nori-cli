@@ -48,9 +48,9 @@ in
       exec ${lib.escapeShellArg executable} "$@" acp
     '';
 
-  # Claude Code through the native Rust adapter (claude-code-acp-rs): no Node, and it starts in
-  # about 20 ms. `package` provides bin/claude-code-acp-rs. As with `claude`, `executable` is how
-  # an account is chosen, through its own launcher.
+  # Claude Code through the Rust driver built into Nori, served as its own ACP process by
+  # `nori agent serve claude`: no Node, and it starts in about 20 ms. `package` is the Nori package.
+  # As with `claude`, `executable` is how an account is chosen, through its own launcher.
   claudeNative =
     {
       name,
@@ -59,7 +59,7 @@ in
     }:
     pkgs.writeShellScriptBin name ''
       export CLAUDE_CODE_EXECUTABLE=${lib.escapeShellArg executable}
-      exec ${lib.getExe' package "claude-code-acp-rs"} "$@"
+      exec ${lib.getExe package} agent serve claude "$@"
     '';
 
   # OpenCode speaks ACP itself through `opencode acp`; the wrapper only pins which binary runs.

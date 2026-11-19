@@ -51,7 +51,7 @@ let
       adapters.claudeNative (
         {
           inherit name;
-          package = agent.adapter.package;
+          package = if agent.adapter.package != null then agent.adapter.package else cfg.package;
         }
         // lib.optionalAttrs (executable != null) { inherit executable; }
       )
@@ -100,8 +100,12 @@ let
     cfg.settings // { agents = lib.mapAttrsToList agentEntry cfg.agents; }
   );
 
+  # A NORI_HOME the caller already set wins, so an isolated run (a scratch home, a second account)
+  # is not silently redirected to the configured one.
   wrapped = pkgs.writeShellScriptBin "nori" ''
-    export NORI_HOME=${lib.escapeShellArg cfg.home}
+    if [ -z "''${NORI_HOME:-}" ]; then
+      export NORI_HOME=${lib.escapeShellArg cfg.home}
+    fi
     exec ${lib.getExe cfg.package} ${lib.optionalString cfg.bypassApprovals "--dangerously-bypass-approvals-and-sandbox "}"$@"
   '';
 
@@ -191,7 +195,7 @@ let
           package = mkOption {
             type = types.nullOr types.package;
             default = null;
-            description = "The package providing bin/claude-code-acp-rs, for the `claude-native` adapter.";
+            description = "The Nori package whose `nori agent serve claude` the `claude-native` adapter runs. Defaults to `programs.nori.package`.";
           };
           codexHome = mkOption {
             type = types.nullOr types.str;
@@ -268,10 +272,6 @@ in
     assertions = lib.mapAttrsToList (slug: agent: {
       assertion = agent.command != null || agent.adapter.kind != null || agent.native != null;
       message = "programs.nori.agents.${slug} needs a `command`, an `adapter.kind` or `native`.";
-    }) cfg.agents
-    ++ lib.mapAttrsToList (slug: agent: {
-      assertion = agent.adapter.kind != "claude-native" || agent.adapter.package != null;
-      message = "programs.nori.agents.${slug}.adapter.package is required for the claude-native adapter.";
     }) cfg.agents
     ++ lib.mapAttrsToList (slug: agent: {
       assertion = agent.adapter.kind != "codex" || agent.adapter.codexHome != null;
