@@ -99,6 +99,8 @@ pub struct PermissionHandler {
     strategy: Arc<dyn PermissionModeStrategy>,
     /// Shared permission checker from settings (shared with hook)
     checker: Option<Arc<RwLock<PermissionChecker>>>,
+    /// The login's plans directory (`<config dir>/plans`): the one place plan mode may write.
+    plans_dir: PathBuf,
 }
 
 impl fmt::Debug for PermissionHandler {
@@ -107,6 +109,7 @@ impl fmt::Debug for PermissionHandler {
             .field("mode", &self.mode)
             .field("strategy", &"<strategy>")
             .field("checker", &self.checker)
+            .field("plans_dir", &self.plans_dir)
             .finish()
     }
 }
@@ -117,6 +120,9 @@ impl Default for PermissionHandler {
             mode: PermissionMode::Default,
             strategy: Arc::new(DefaultModeStrategy),
             checker: None,
+            plans_dir: crate::utils::claude_config_dir(&Default::default())
+                .map(|dir| dir.join("plans"))
+                .unwrap_or_default(),
         }
     }
 }
@@ -125,20 +131,28 @@ impl PermissionHandler {
     /// Create with settings-based checker
     ///
     /// Uses Default mode (standard behavior with permission prompts).
-    pub fn with_checker(checker: Arc<RwLock<PermissionChecker>>) -> Self {
+    pub fn with_checker(checker: Arc<RwLock<PermissionChecker>>, plans_dir: PathBuf) -> Self {
         Self {
             mode: PermissionMode::Default,
             strategy: Arc::new(DefaultModeStrategy),
             checker: Some(checker),
+            plans_dir,
         }
     }
 
+    /// The login's plans directory.
+    pub fn plans_dir(&self) -> &Path {
+        &self.plans_dir
+    }
+
     /// Create strategy for a given mode
-    fn create_strategy(mode: PermissionMode) -> Arc<dyn PermissionModeStrategy> {
+    fn create_strategy(mode: PermissionMode, plans_dir: &Path) -> Arc<dyn PermissionModeStrategy> {
         match mode {
             PermissionMode::Default => Arc::new(DefaultModeStrategy),
             PermissionMode::AcceptEdits => Arc::new(AcceptEditsModeStrategy),
-            PermissionMode::Plan => Arc::new(PlanModeStrategy),
+            PermissionMode::Plan => Arc::new(PlanModeStrategy {
+                plans_dir: plans_dir.to_path_buf(),
+            }),
             PermissionMode::DontAsk => Arc::new(DontAskModeStrategy),
             PermissionMode::BypassPermissions => Arc::new(BypassPermissionsModeStrategy),
         }
@@ -152,7 +166,7 @@ impl PermissionHandler {
     /// Set permission mode
     pub fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
-        self.strategy = Self::create_strategy(mode);
+        self.strategy = Self::create_strategy(mode, &self.plans_dir);
     }
 
     /// Check permission for a tool with full context

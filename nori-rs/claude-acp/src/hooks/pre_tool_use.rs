@@ -156,7 +156,10 @@ pub fn create_pre_tool_use_hook(
                     }
 
                     // Get current permission mode
-                    let mode = permission.read().await.mode();
+                    let (mode, plans_dir) = {
+                        let permission = permission.read().await;
+                        (permission.mode(), permission.plans_dir().to_path_buf())
+                    };
 
                     // BypassPermissions and AcceptEdits modes allow everything
                     // (AcceptEdits behaves like BypassPermissions for root compatibility)
@@ -250,7 +253,7 @@ pub fn create_pre_tool_use_hook(
                                     .get("file_path")
                                     .or_else(|| tool_input.get("path"))
                                     .and_then(|v| v.as_str())
-                                    .map(is_plans_directory_path)
+                                    .map(|path| is_plans_directory_path(path, &plans_dir))
                                     .unwrap_or(false)
                             } else {
                                 // Bash is never allowed in Plan mode

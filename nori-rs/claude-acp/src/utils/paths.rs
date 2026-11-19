@@ -1,9 +1,28 @@
 //! Path utility functions
 
+use std::collections::BTreeMap;
 use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
-/// Check if a file path is within the Claude plans directory (~/.claude/plans/)
+/// The directory Claude Code keeps one login's settings, plans and sessions in: `CLAUDE_CONFIG_DIR`
+/// from the agent's own environment (an account's home), then from the process, then
+/// `~/.claude`. Every in-process Claude agent shares the process, so an account's own
+/// environment decides first.
+pub fn claude_config_dir(environment: &BTreeMap<String, String>) -> Option<PathBuf> {
+    environment
+        .get("CLAUDE_CONFIG_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+}
+
+/// Check if a file path is within a login's plans directory (`<config dir>/plans/`)
 ///
 /// This function handles:
 /// - Absolute paths: /Users/soddy/.claude/plans/plan.md
@@ -13,18 +32,19 @@ use std::path::Path;
 /// # Arguments
 ///
 /// * `path_str` - The file path to check
+/// * `plans_dir` - The login's plans directory (`<config dir>/plans`)
 ///
 /// # Returns
 ///
-/// * `true` if the path is within ~/.claude/plans/
+/// * `true` if the path is within `plans_dir`
 /// * `false` otherwise
-pub fn is_plans_directory_path(path_str: &str) -> bool {
+pub fn is_plans_directory_path(path_str: &str, plans_dir: &Path) -> bool {
     let Some(home) = dirs::home_dir() else {
         tracing::warn!("Could not determine home directory for plans path check");
         return false;
     };
 
-    let plans_dir = home.join(".claude").join("plans");
+    let plans_dir = plans_dir.to_path_buf();
 
     let normalized_input = if let Some(rest) = path_str.strip_prefix("~/") {
         home.join(rest)

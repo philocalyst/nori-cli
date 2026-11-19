@@ -147,15 +147,6 @@ impl QueryFull {
         }
     }
 
-    /// Create a new isolated Query (alias for new() for backward compatibility)
-    ///
-    /// This is an alias for `new()` since all QueryFull instances are now isolated.
-    /// Kept for backward compatibility with existing code.
-    #[deprecated(note = "Use QueryFull::new() instead - all instances are now isolated")]
-    pub fn new_isolated(transport: Box<dyn Transport>) -> Result<Self> {
-        Ok(Self::new(transport))
-    }
-
     /// Check if this QueryFull is still active
     ///
     /// In isolated mode, this checks if the message_tx channel is still open.

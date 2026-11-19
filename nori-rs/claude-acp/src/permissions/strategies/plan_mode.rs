@@ -1,7 +1,7 @@
 //! Plan mode strategy
 //!
 //! This strategy provides read-only access with an exception for writing to
-//! the ~/.claude/plans/ directory. This is used during planning phases where
+//! the login's plans directory (`<config dir>/plans/`, `~/.claude/plans/` by default). This is used during planning phases where
 //! the user should be able to explore and write plans, but not make changes
 //! to the codebase.
 
@@ -12,7 +12,10 @@ use serde_json::Value;
 
 /// Strategy for Plan mode - read-only with exceptions for plan files
 #[derive(Debug)]
-pub struct PlanModeStrategy;
+pub struct PlanModeStrategy {
+    /// The login's plans directory: the one place plan mode may write.
+    pub plans_dir: std::path::PathBuf,
+}
 
 impl PermissionModeStrategy for PlanModeStrategy {
     fn should_auto_approve(&self, tool_name: &str, _tool_input: &Value) -> bool {
@@ -36,7 +39,7 @@ impl PermissionModeStrategy for PlanModeStrategy {
                 .and_then(|v| v.as_str());
 
             if let Some(path) = file_path
-                && is_plans_directory_path(path)
+                && is_plans_directory_path(path, &self.plans_dir)
             {
                 return None; // Allow plan file writes
             }

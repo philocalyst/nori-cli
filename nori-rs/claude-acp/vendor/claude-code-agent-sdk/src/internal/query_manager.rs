@@ -305,45 +305,6 @@ impl QueryManager {
         Ok(query_id)
     }
 
-    /// Remove a query (cleanup)
-    ///
-    /// # Arguments
-    ///
-    /// * `query_id` - The query identifier
-    ///
-    /// # Returns
-    ///
-    /// Ok if successfully removed, error if not found
-    pub fn remove_query(&self, query_id: &str) -> Result<()> {
-        self.queries
-            .remove(query_id)
-            .ok_or_else(|| ClaudeError::InvalidConfig(format!("Query not found: {}", query_id)))?;
-        info!(query_id = %query_id, "Removed query");
-        Ok(())
-    }
-
-    /// Get active query count
-    ///
-    /// # Returns
-    ///
-    /// The number of currently active queries
-    pub fn active_count(&self) -> usize {
-        self.queries.len()
-    }
-
-    /// Check if a query exists
-    ///
-    /// # Arguments
-    ///
-    /// * `query_id` - The query identifier
-    ///
-    /// # Returns
-    ///
-    /// true if the query exists, false otherwise
-    pub fn contains_query(&self, query_id: &str) -> bool {
-        self.queries.contains_key(query_id)
-    }
-
     /// Start cleanup task to remove stale queries
     ///
     /// This runs a background task that periodically cleans up inactive queries
