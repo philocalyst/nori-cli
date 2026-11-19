@@ -194,6 +194,64 @@ impl VT100Backend {
         self.recording.take().unwrap_or_default()
     }
 
+    /// Resize the way terminals that keep the cursor on screen do: when the screen gets shorter
+    /// the rows at the top that the cursor would be pushed off by go into the scrollback; when it
+    /// gets taller rows come back from the scrollback at the top (the cursor moves down with
+    /// them), and any other row is blank. With `pull` false the terminal never pulls rows back:
+    /// a taller screen only adds blank rows at the bottom. Rows are cut to the new width, never
+    /// re-wrapped, which is what Nori's rows (they are never soft-wrapped) get from a reflowing
+    /// terminal too.
+    pub fn resize(&mut self, cols: u16, rows: u16, pull: bool) {
+        let (old_rows, old_cols) = self.vt100().screen().size();
+        let (cursor_row, cursor_col) = self.vt100().screen().cursor_position();
+        let keep = old_cols.min(cols);
+        let mut lines: Vec<Vec<u8>> = self.vt100().screen().rows_formatted(0, keep).collect();
+        let mut texts: Vec<String> = self.vt100().screen().rows(0, keep).collect();
+        let mut cursor_row = usize::from(cursor_row);
+        let rows_wanted = usize::from(rows);
+        if rows < old_rows {
+            let shift = (cursor_row + 1).saturating_sub(rows_wanted);
+            let pushed: Vec<Vec<u8>> = lines.drain(..shift.min(texts.len())).collect();
+            let pushed_texts = texts.drain(..shift.min(texts.len()));
+            if let Some(scrollback) = self.scrollback.as_mut() {
+                for (text, bytes) in pushed_texts.zip(pushed) {
+                    scrollback.rows.push((text, bytes));
+                }
+            }
+            cursor_row -= shift;
+        } else if rows > old_rows && pull {
+            let pull = usize::from(rows - old_rows).min(
+                self.scrollback
+                    .as_ref()
+                    .map_or(0, |scrollback| scrollback.rows.len()),
+            );
+            if let Some(scrollback) = self.scrollback.as_mut() {
+                let at = scrollback.rows.len() - pull;
+                let (pulled_texts, pulled): (Vec<String>, Vec<Vec<u8>>) =
+                    scrollback.rows.drain(at..).unzip();
+                texts.splice(0..0, pulled_texts);
+                lines.splice(0..0, pulled);
+            }
+            cursor_row += pull;
+        }
+        lines.truncate(rows_wanted);
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        for (row, bytes) in lines.iter().enumerate() {
+            parser.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            parser.process(bytes);
+        }
+        let cursor_col = cursor_col.min(cols.saturating_sub(1));
+        parser.process(
+            format!(
+                "\x1b[{};{}H",
+                cursor_row.min(rows_wanted.saturating_sub(1)) + 1,
+                cursor_col + 1
+            )
+            .as_bytes(),
+        );
+        *self.vt100_mut() = parser;
+    }
+
     pub fn vt100_mut(&mut self) -> &mut vt100::Parser {
         self.crossterm_backend.writer_mut()
     }
@@ -280,7 +338,9 @@ impl Backend for VT100Backend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(self.vt100().screen().cursor_position().into())
+        // vt100 says (row, column); a position is (x, y).
+        let (row, column) = self.vt100().screen().cursor_position();
+        Ok(Position::new(column, row))
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {

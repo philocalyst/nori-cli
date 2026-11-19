@@ -45,8 +45,6 @@ use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 
-use crate::written_history::WrittenHistory;
-
 pub(crate) const fn crossterm_color(color: Color) -> CrosstermColor {
     match color {
         Color::Reset => CrosstermColor::Reset,
@@ -155,9 +153,6 @@ where
     /// The terminal may no longer show the previous buffer, so the next frame repaints every row
     /// instead of only the rows that changed.
     repaint_all: bool,
-    /// The history this terminal wrote directly above the viewport. What of it is still on
-    /// screen is the part of the screen above the viewport that Nori owns.
-    pub(crate) written_history: WrittenHistory,
 }
 
 impl<B> Drop for Terminal<B>
@@ -194,7 +189,6 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             repaint_all: true,
-            written_history: WrittenHistory::default(),
         })
     }
 
@@ -298,59 +292,34 @@ where
     where
         F: FnOnce(&mut Frame),
     {
-        self.try_draw(|frame| {
-            render_callback(frame);
-            io::Result::Ok(())
-        })
+        self.draw_in(self.viewport_area, None, render_callback)
     }
 
-    /// Tries to draw a single frame to the terminal.
+    /// Draws a frame whose widgets see `area` (inside the viewport) as their frame. The cursor is
+    /// shown where the frame puts it; without one it is hidden and left at `park`, so the row it
+    /// is on is known to whoever must find the screen again after a resize.
     ///
-    /// Returns [`Result::Ok`] containing a [`CompletedFrame`] if successful, otherwise
-    /// [`Result::Err`] containing the [`std::io::Error`] that caused the failure.
-    ///
-    /// This is the equivalent of [`Terminal::draw`] but the render callback is a function or
-    /// closure that returns a `Result` instead of nothing.
-    ///
-    /// Applications should call `try_draw` or [`draw`] in a loop to continuously render the
-    /// terminal. These methods are the main entry points for drawing to the terminal.
-    ///
-    /// [`draw`]: Terminal::draw
-    ///
-    /// This method will:
-    ///
-    /// - autoresize the terminal if necessary
-    /// - call the render callback, passing it a [`Frame`] reference to render to
-    /// - flush the current internal state by copying the current buffer to the backend
-    /// - move the cursor to the last known position if it was set during the rendering closure
-    /// - return a [`CompletedFrame`] with the current buffer and the area of the terminal
-    ///
-    /// The render callback passed to `try_draw` can return any [`Result`] with an error type that
-    /// can be converted into an [`std::io::Error`] using the [`Into`] trait. This makes it possible
-    /// to use the `?` operator to propagate errors that occur during rendering. If the render
-    /// callback returns an error, the error will be returned from `try_draw` as an
-    /// [`std::io::Error`] and the terminal will not be updated.
-    ///
-    /// The [`CompletedFrame`] returned by this method can be useful for debugging or testing
-    /// purposes, but it is often not used in regular applicationss.
-    ///
-    /// The render callback should fully render the entire frame when called, including areas that
-    /// are unchanged from the previous frame. This is because each frame is compared to the
-    /// previous frame to determine what has changed, and only the changes are written to the
-    /// terminal. If the render function does not fully render the frame, the terminal will not be
-    /// in a consistent state.
-    pub fn try_draw<F, E>(&mut self, render_callback: F) -> io::Result<()>
+    /// The render callback should fully render the entire viewport when called, including areas
+    /// that are unchanged from the previous frame, because each frame is compared with the
+    /// previous one and only the differences are written.
+    pub fn draw_in<F>(
+        &mut self,
+        area: Rect,
+        park: Option<Position>,
+        render_callback: F,
+    ) -> io::Result<()>
     where
-        F: FnOnce(&mut Frame) -> Result<(), E>,
-        E: Into<io::Error>,
+        F: FnOnce(&mut Frame),
     {
         // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
         // and the terminal (if growing), which may OOB.
         self.autoresize()?;
 
+        crate::hyperlink::begin_frame();
         let mut frame = self.get_frame();
+        frame.viewport_area = area;
 
-        render_callback(&mut frame).map_err(Into::into)?;
+        render_callback(&mut frame);
 
         // We can't change the cursor position right away because we have to flush the frame to
         // stdout first. But we also can't keep the frame around, since it holds a &mut to
@@ -361,7 +330,12 @@ where
         self.flush()?;
 
         match cursor_position {
-            None => self.hide_cursor()?,
+            None => {
+                self.hide_cursor()?;
+                if let Some(park) = park {
+                    self.set_cursor_position(park)?;
+                }
+            }
             Some(position) => {
                 self.show_cursor()?;
                 self.set_cursor_position(position)?;
@@ -405,12 +379,6 @@ where
         Ok(())
     }
 
-    /// Rows of history above the viewport that this terminal wrote and that are still on screen.
-    pub(crate) fn owned_history_rows(&self) -> usize {
-        self.written_history
-            .owned_rows(self.viewport_area.top(), self.viewport_area.width)
-    }
-
     /// The terminal no longer shows what the previous frame drew: the next frame repaints
     /// every row.
     pub(crate) fn invalidate(&mut self) {
@@ -423,27 +391,39 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
+        // Row by row: erasing "from the cursor down" at the top of the screen is read by some
+        // terminals (tmux) as clearing the screen, and they push it into the scrollback.
+        for row in self.viewport_area.top()..self.viewport_area.bottom() {
+            self.backend.set_cursor_position(Position::new(0, row))?;
+            self.backend.clear_region(ClearType::CurrentLine)?;
+        }
         self.backend
             .set_cursor_position(self.viewport_area.as_position())?;
-        self.backend.clear_region(ClearType::AfterCursor)?;
         // Reset the back buffer to make sure the next update will redraw everything.
         self.previous_buffer_mut().reset();
         self.repaint_all = true;
         Ok(())
     }
 
-    /// Clear the visible screen and native scrollback before transcript replay.
-    pub fn clear_scrollback_and_visible_screen_for_reflow(&mut self) -> io::Result<()> {
-        if self.viewport_area.is_empty() {
-            return Ok(());
+    /// The screen scrolled up and the viewport is now `area`: what the previous frame drew is
+    /// still on screen, moved up by `lost` rows of the viewport (the rows that passed its top),
+    /// with blank rows where the screen scrolled in.
+    pub(crate) fn scroll_viewport(&mut self, area: Rect, lost: u16) {
+        let width = usize::from(self.viewport_area.width);
+        let old_height = usize::from(self.viewport_area.height);
+        let previous = std::mem::take(&mut self.previous_buffer_mut().content);
+        let repaint_all = self.repaint_all;
+        self.set_viewport_area(area);
+        // `set_viewport_area` asked for every row to be repainted; the rows that moved are known.
+        self.repaint_all = repaint_all;
+        let lost = usize::from(lost);
+        if width == usize::from(area.width) && lost < old_height {
+            let kept = (old_height - lost).min(usize::from(area.height));
+            let target = &mut self.previous_buffer_mut().content;
+            target[..kept * width].clone_from_slice(&previous[lost * width..(lost + kept) * width]);
+        } else {
+            self.repaint_all = true;
         }
-        write!(self.backend, "\x1b[2J\x1b[H\x1b[3J")?;
-        Write::flush(&mut self.backend)?;
-        self.last_known_cursor_pos = Position { x: 0, y: 0 };
-        self.previous_buffer_mut().reset();
-        self.repaint_all = true;
-        self.written_history.clear();
-        Ok(())
     }
 
     /// Clears the inactive buffer and swaps it with the current buffer
@@ -465,6 +445,10 @@ use unicode_width::UnicodeWidthStr;
 trait DiffSink {
     fn put(&mut self, x: u16, y: u16, cell: &Cell) -> io::Result<()>;
     fn clear_to_end(&mut self, x: u16, y: u16, bg: Color) -> io::Result<()>;
+    /// The hyperlink the cells put next belong to (`None`: none).
+    fn link(&mut self, _target: Option<&str>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Display width of one buffer cell's symbol. Nearly every cell is a single ASCII character, which
@@ -522,8 +506,10 @@ fn diff_buffers(
 
         if last_nonblank_column + 1 < row.len() {
             let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+            sink.link(None)?;
             sink.clear_to_end(x, y, bg)?;
         }
+        let links = crate::hyperlink::buffer_row_links(b, y);
 
         // Cells invalidated by drawing/replacing preceding multi-width characters:
         let mut invalidated: usize = 0;
@@ -532,11 +518,16 @@ fn diff_buffers(
         let mut to_skip: usize = 0;
         for (column, (current, previous)) in row.iter().zip(previous_row.iter()).enumerate() {
             if !matches!(current.diff_option, CellDiffOption::Skip)
-                && (current != previous || invalidated > 0)
+                && (repaint_all || current != previous || invalidated > 0)
                 && to_skip == 0
                 && column <= last_nonblank_column
             {
                 let (x, y) = a.pos_of(row_start + column);
+                let link = links
+                    .iter()
+                    .find(|link| link.columns.contains(&x))
+                    .map(|link| link.target.as_str());
+                sink.link(link)?;
                 sink.put(x, y, current)?;
                 last_put = Some(Position { x, y });
             }
@@ -547,6 +538,7 @@ fn diff_buffers(
             let affected_width = std::cmp::max(current_width, symbol_width(previous.symbol()));
             invalidated = std::cmp::max(affected_width, invalidated).saturating_sub(1);
         }
+        sink.link(None)?;
     }
     Ok(last_put)
 }
@@ -559,6 +551,8 @@ struct TerminalSink<'w, W: Write> {
     bg: Color,
     modifier: Modifier,
     last_pos: Option<Position>,
+    /// The hyperlink open for the cells being written.
+    link: Option<String>,
 }
 
 impl<'w, W: Write> TerminalSink<'w, W> {
@@ -569,6 +563,7 @@ impl<'w, W: Write> TerminalSink<'w, W> {
             bg: Color::Reset,
             modifier: Modifier::empty(),
             last_pos: None,
+            link: None,
         }
     }
 
@@ -582,7 +577,8 @@ impl<'w, W: Write> TerminalSink<'w, W> {
     }
 
     /// Reset colors and attributes, as the end of a frame requires.
-    fn finish(self) -> io::Result<()> {
+    fn finish(mut self) -> io::Result<()> {
+        self.link(None)?;
         queue!(
             self.writer,
             SetForegroundColor(crossterm::style::Color::Reset),
@@ -593,6 +589,15 @@ impl<'w, W: Write> TerminalSink<'w, W> {
 }
 
 impl<W: Write> DiffSink for TerminalSink<'_, W> {
+    fn link(&mut self, target: Option<&str>) -> io::Result<()> {
+        if self.link.as_deref() == target {
+            return Ok(());
+        }
+        queue!(self.writer, Print(crate::hyperlink::osc8(target)))?;
+        self.link = target.map(str::to_owned);
+        Ok(())
+    }
+
     fn put(&mut self, x: u16, y: u16, cell: &Cell) -> io::Result<()> {
         self.move_to(x, y)?;
         if cell.modifier != self.modifier {
@@ -704,9 +709,7 @@ impl ModifierDiff {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use ratatui::backend::WindowSize;
     use ratatui::buffer::Cell;
-    use ratatui::layout::Rect;
     use ratatui::style::Style;
 
     #[test]
@@ -714,98 +717,6 @@ mod tests {
         assert_eq!(crossterm_color(Color::Red), CrosstermColor::DarkRed);
         assert_eq!(crossterm_color(Color::LightBlue), CrosstermColor::Blue);
         assert_eq!(crossterm_color(Color::Reset), CrosstermColor::Reset);
-    }
-
-    struct RecordingBackend {
-        inner: crate::test_backend::VT100Backend,
-        bytes: Vec<u8>,
-    }
-
-    impl RecordingBackend {
-        fn new(width: u16, height: u16) -> Self {
-            Self {
-                inner: crate::test_backend::VT100Backend::new(width, height),
-                bytes: Vec::new(),
-            }
-        }
-    }
-
-    impl Write for RecordingBackend {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.bytes.extend_from_slice(buffer);
-            self.inner.write(buffer)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Write::flush(&mut self.inner)
-        }
-    }
-
-    impl Backend for RecordingBackend {
-        type Error = io::Error;
-
-        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-        where
-            I: Iterator<Item = (u16, u16, &'a Cell)>,
-        {
-            self.inner.draw(content)
-        }
-
-        fn hide_cursor(&mut self) -> io::Result<()> {
-            self.inner.hide_cursor()
-        }
-
-        fn show_cursor(&mut self) -> io::Result<()> {
-            self.inner.show_cursor()
-        }
-
-        fn get_cursor_position(&mut self) -> io::Result<Position> {
-            self.inner.get_cursor_position()
-        }
-
-        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-            self.inner.set_cursor_position(position)
-        }
-
-        fn clear(&mut self) -> io::Result<()> {
-            self.inner.clear()
-        }
-
-        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
-            self.inner.clear_region(clear_type)
-        }
-
-        fn append_lines(&mut self, line_count: u16) -> io::Result<()> {
-            self.inner.append_lines(line_count)
-        }
-
-        fn scroll_region_up(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> io::Result<()> {
-            self.inner.scroll_region_up(region, line_count)
-        }
-
-        fn scroll_region_down(
-            &mut self,
-            region: std::ops::Range<u16>,
-            line_count: u16,
-        ) -> io::Result<()> {
-            self.inner.scroll_region_down(region, line_count)
-        }
-
-        fn size(&self) -> io::Result<Size> {
-            self.inner.size()
-        }
-
-        fn window_size(&mut self) -> io::Result<WindowSize> {
-            self.inner.window_size()
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Backend::flush(&mut self.inner)
-        }
     }
 
     #[derive(Debug)]
@@ -877,29 +788,6 @@ mod tests {
             "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
         );
     }
-
-    #[test]
-    fn resize_reflow_clears_screen_then_homes_then_purges_before_history() {
-        let backend = RecordingBackend::new(80, 24);
-        let mut terminal = Terminal::with_options(backend).expect("terminal");
-        terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
-
-        terminal
-            .clear_scrollback_and_visible_screen_for_reflow()
-            .expect("clear terminal");
-        crate::insert_history::insert_history_lines(
-            &mut terminal,
-            &[ratatui::text::Line::from("history after clear")],
-        )
-        .expect("insert history");
-
-        let output = String::from_utf8_lossy(&terminal.backend().bytes);
-        let clear = output
-            .find("\x1b[2J\x1b[H\x1b[3J")
-            .expect("ordered resize-reflow clear sequence");
-        let history = output.find("history after clear").expect("history bytes");
-        assert!(clear < history);
-    }
 }
 
 #[cfg(test)]
@@ -960,5 +848,13 @@ mod row_skip_tests {
         frame.set_string(0, 0, "x", Style::default());
         let (_, clears) = diff(&frame.clone(), &frame, true);
         assert_eq!(clears, 2);
+    }
+
+    #[test]
+    fn repaint_all_writes_interior_blanks_over_unknown_terminal_contents() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut frame = Buffer::empty(area);
+        frame.set_string(0, 0, "a b", Style::default());
+        assert_eq!(diff(&frame, &frame, true), (3, 1));
     }
 }

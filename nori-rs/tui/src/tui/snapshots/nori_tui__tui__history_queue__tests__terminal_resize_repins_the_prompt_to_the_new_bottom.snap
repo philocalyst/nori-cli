@@ -2,19 +2,19 @@
 source: tui/src/tui/history_queue.rs
 expression: expanded
 ---
-
-
-
-
-
-
-
-
-
-
-
-
 $ nori
 shell output
+
+
+
+
+
+
+
+
+
+
+
+
 > prompt
 footer

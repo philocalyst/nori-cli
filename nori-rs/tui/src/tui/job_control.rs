@@ -3,7 +3,6 @@ use std::io::stdout;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering;
 
@@ -51,7 +50,7 @@ impl SuspendContext {
     /// Capture how to resume, stash cursor position, and temporarily yield during SIGTSTP.
     ///
     /// Record the inline resume position and yield to the shell.
-    pub(crate) fn suspend(&self, _alt_screen_active: &Arc<AtomicBool>) -> Result<()> {
+    pub(crate) fn suspend(&self) -> Result<()> {
         self.set_resume_action(ResumeAction::RealignInline);
         let y = self.suspend_cursor_y.load(Ordering::Relaxed);
         let _ = execute!(
@@ -70,7 +69,6 @@ impl SuspendContext {
     pub(crate) fn prepare_resume_action(
         &self,
         terminal: &mut Terminal,
-        _alt_saved_viewport: &mut Option<Rect>,
     ) -> Option<PreparedResumeAction> {
         let action = self.take_resume_action()?;
         match action {
@@ -132,9 +130,6 @@ impl PreparedResumeAction {
         match self {
             PreparedResumeAction::RealignViewport(area) => {
                 terminal.set_viewport_area(area);
-                // The shell wrote to the screen while Nori was suspended, so the rows above the
-                // viewport are no longer the ones Nori wrote.
-                terminal.written_history.clear();
             }
         }
         Ok(())

@@ -1,24 +1,16 @@
 //! Brief, unobtrusive messages in the top right of the screen.
 //!
-//! A toast is drawn over the right end of the topmost rows Nori itself wrote above the prompt,
-//! so what it covers can always be written back from Nori's record of those rows. It is drawn
-//! again after every frame while it lives, and when it ends the next frame repaints the rows,
-//! which erases it. Nothing is added to the history, and nothing is drawn where Nori has not
-//! written (the shell's rows above it), so a toast never leaves a mark behind.
+//! A toast is a few cells drawn into the frame over the right end of the topmost rows of the
+//! region. It is drawn again by every frame while it lives, and when it ends the next frame no
+//! longer draws it, which erases it. Nothing is added to the conversation.
 
-use std::io;
-use std::io::Write;
 use std::time::Duration;
 use std::time::Instant;
 
-use crossterm::cursor::MoveTo;
-use crossterm::cursor::RestorePosition;
-use crossterm::cursor::SavePosition;
-use crossterm::queue;
-use crossterm::style::Attribute;
-use crossterm::style::Print;
-use crossterm::style::SetAttribute;
-use crossterm::style::SetForegroundColor;
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
 /// How long a toast stays.
@@ -88,19 +80,10 @@ fn label(text: &str) -> String {
     format!(" {sparkle} {shown} ")
 }
 
-/// Queue drawing every toast, newest last, from `first_row` down over `rows` rows, flush against
-/// the right edge of a `width`-column screen. The cursor is left where it was.
-pub(crate) fn draw(
-    writer: &mut impl Write,
-    toasts: &Toasts,
-    first_row: u16,
-    rows: u16,
-    width: u16,
-) -> io::Result<()> {
-    if toasts.items.is_empty() || rows == 0 {
-        return Ok(());
-    }
-    queue!(writer, SavePosition)?;
+/// Draw every toast into `buffer`, newest last, from `first_row` of it down over up to `rows`
+/// rows, flush against the right edge.
+pub(crate) fn draw(buffer: &mut Buffer, toasts: &Toasts, first_row: u16, rows: u16) {
+    let area = buffer.area;
     for (index, toast) in toasts
         .items
         .iter()
@@ -108,19 +91,22 @@ pub(crate) fn draw(
         .take(usize::from(rows))
         .enumerate()
     {
+        let y = area.y + first_row + u16::try_from(index).unwrap_or(0);
+        if y >= area.bottom() {
+            break;
+        }
         let text = label(&toast.text);
-        let columns = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(width);
-        let column = width.saturating_sub(columns.saturating_add(1));
-        queue!(
-            writer,
-            MoveTo(column, first_row + u16::try_from(index).unwrap_or(0)),
-            SetAttribute(Attribute::Reverse),
-            SetForegroundColor(crossterm::style::Color::Cyan),
-            Print(text),
-            SetAttribute(Attribute::Reset),
-        )?;
+        let columns = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(area.width);
+        let x = area.right().saturating_sub(columns.saturating_add(1));
+        buffer.set_string(
+            x,
+            y,
+            text,
+            Style::new()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED),
+        );
     }
-    queue!(writer, RestorePosition)
 }
 
 #[cfg(test)]
@@ -168,30 +154,28 @@ mod tests {
     }
 
     #[test]
-    fn drawing_goes_to_the_right_edge_and_puts_the_cursor_back() {
+    fn drawing_goes_to_the_right_edge() {
         let mut toasts = Toasts::default();
         toasts.push("hi".into(), Instant::now());
-        let mut bytes = Vec::new();
-        draw(&mut bytes, &toasts, 4, 2, 80).expect("draw");
-        let text = String::from_utf8(bytes).expect("utf8");
-        assert!(
-            text.starts_with("\u{1b}7"),
-            "saves the cursor first: {text:?}"
-        );
-        assert!(text.ends_with("\u{1b}8"), "puts it back last: {text:?}");
-        assert!(text.contains("hi"));
-        // " ✦ hi " is six columns; flush right leaves one column of margin: column 73 (1-based 74).
-        assert!(text.contains("\u{1b}[5;74H"), "{text:?}");
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 6));
+        draw(&mut buffer, &toasts, 4, 2);
+        let row: String = (0..80)
+            .map(|x| buffer[(x, 4)].symbol().to_owned())
+            .collect();
+        // " ✦ hi " is six columns; flush right leaves one column of margin.
+        assert_eq!(row.trim_end().chars().count(), 79);
+        assert!(row.contains("hi"));
     }
 
     #[test]
     fn nothing_is_drawn_without_toasts_or_rows() {
-        let mut bytes = Vec::new();
-        draw(&mut bytes, &Toasts::default(), 0, 3, 80).expect("draw");
-        assert!(bytes.is_empty());
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 3));
+        let blank = buffer.clone();
+        draw(&mut buffer, &Toasts::default(), 0, 3);
+        assert_eq!(buffer, blank);
         let mut toasts = Toasts::default();
         toasts.push("x".into(), Instant::now());
-        draw(&mut bytes, &toasts, 0, 0, 80).expect("draw");
-        assert!(bytes.is_empty());
+        draw(&mut buffer, &toasts, 0, 0);
+        assert_eq!(buffer, blank);
     }
 }

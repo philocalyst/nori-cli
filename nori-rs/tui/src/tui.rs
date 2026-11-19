@@ -29,22 +29,21 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::queue;
 use ratatui::crossterm::terminal::disable_raw_mode;
 use ratatui::crossterm::terminal::enable_raw_mode;
-use ratatui::layout::Offset;
-use ratatui::text::Line;
 use tokio::select;
 use tokio_stream::Stream;
 
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::frame_writer::FrameWriter;
+use crate::stage::StageView;
 #[cfg(unix)]
 use crate::tui::job_control::SUSPEND_KEY;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
 
-mod history_queue;
 #[cfg(unix)]
 mod job_control;
+pub(crate) mod present;
 mod repaint;
 mod toast;
 
@@ -83,7 +82,7 @@ pub fn restore() -> Result<()> {
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     execute!(stdout(), DisableBracketedPaste)?;
     let _ = execute!(stdout(), DisableFocusChange);
-    // Captured only while the transcript overlay is open, which an exit may cut short.
+    // Captured only while an inline interactive view requests mouse events.
     let _ = execute!(stdout(), crossterm::event::DisableMouseCapture);
     disable_raw_mode()?;
     let _ = execute!(
@@ -160,25 +159,37 @@ pub struct Tui {
     frame_schedule_tx: tokio::sync::mpsc::UnboundedSender<Instant>,
     draw_tx: tokio::sync::broadcast::Sender<()>,
     pub(crate) terminal: Terminal,
-    history: history_queue::HistoryQueue,
-    /// Toasts on screen, and whether the last frame drew them (so the next must erase them).
-    toasts: toast::Toasts,
-    toasts_drawn: bool,
-    /// The next draw repaints the whole (alternate) screen.
-    full_repaint: bool,
+    presenter: present::Presenter,
     /// Any resize can damage terminal contents, even if a burst ends at the original size.
-    resize_pending: Arc<AtomicBool>,
+    resize_signal: Arc<present::ResizeSignal>,
     /// Whether a frame was drawn yet, for the startup trace.
     first_frame_drawn: bool,
-    alt_saved_viewport: Option<ratatui::layout::Rect>,
     #[cfg(unix)]
     suspend_context: SuspendContext,
-    // True when overlay alt-screen UI is active
-    alt_screen_active: Arc<AtomicBool>,
     // True when terminal/tab is focused; updated internally from crossterm events
     terminal_focused: Arc<AtomicBool>,
     enhanced_keys_supported: bool,
     mouse_capture: bool,
+    cursor_style: Option<crossterm::cursor::SetCursorStyle>,
+    /// The conversation an open overlay is drawn under: it stays on screen above the panel.
+    backdrop: Backdrop,
+}
+
+/// The conversation as the app last handed it over, for frames that an overlay draws.
+#[derive(Default)]
+struct Backdrop {
+    cells: Vec<Arc<dyn crate::history_cell::HistoryCell>>,
+}
+
+/// How many rows a panel (a picker, the actor panel, a child's conversation, `/usage`) takes from
+/// the bottom of a screen of `screen_height` rows. A panel never takes the whole screen when the
+/// screen has room for the conversation too: what is above it stays where it is.
+pub(crate) fn panel_height(screen_height: u16) -> u16 {
+    if screen_height <= 16 {
+        screen_height
+    } else {
+        (screen_height * 3 / 5).max(14)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -231,20 +242,23 @@ impl Tui {
             frame_schedule_tx,
             draw_tx,
             terminal,
-            history: history_queue::HistoryQueue::default(),
-            toasts: toast::Toasts::default(),
-            toasts_drawn: false,
-            full_repaint: false,
-            resize_pending: Arc::new(AtomicBool::new(false)),
+            presenter: present::Presenter::default(),
+            resize_signal: Arc::new(present::ResizeSignal::default()),
             first_frame_drawn: false,
-            alt_saved_viewport: None,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
-            alt_screen_active: Arc::new(AtomicBool::new(false)),
             terminal_focused: Arc::new(AtomicBool::new(true)),
             enhanced_keys_supported,
             mouse_capture: false,
+            cursor_style: None,
+            backdrop: Backdrop::default(),
         }
+    }
+
+    /// The conversation an overlay's frames show above it.
+    pub(crate) fn set_backdrop(&mut self, cells: &[Arc<dyn crate::history_cell::HistoryCell>]) {
+        self.backdrop.cells.clear();
+        self.backdrop.cells.extend_from_slice(cells);
     }
 
     pub fn frame_requester(&self) -> FrameRequester {
@@ -274,13 +288,11 @@ impl Tui {
         let mut crossterm_events = crossterm::event::EventStream::new();
         let mut draw_rx = self.draw_tx.subscribe();
         let resize_frame = self.frame_requester();
-        let resize_pending = self.resize_pending.clone();
+        let resize_signal = self.resize_signal.clone();
 
         // State for tracking how we should resume from ^Z suspend.
         #[cfg(unix)]
         let suspend_context = self.suspend_context.clone();
-        #[cfg(unix)]
-        let alt_screen_active = self.alt_screen_active.clone();
 
         let terminal_focused = self.terminal_focused.clone();
         let event_stream = async_stream::stream! {
@@ -290,6 +302,7 @@ impl Tui {
             let palette_refresh = tokio::time::sleep(crate::terminal_palette::REFRESH_DELAY);
             tokio::pin!(palette_refresh);
             let mut palette_refreshed = false;
+            let mut cursor_reports = true;
             loop {
                 select! {
                     () = &mut palette_refresh, if !palette_refreshed => {
@@ -303,7 +316,7 @@ impl Tui {
                             Event::Key(key_event) => {
                                 #[cfg(unix)]
                                 if SUSPEND_KEY.is_press(key_event) {
-                                    let _ = suspend_context.suspend(&alt_screen_active);
+                                    let _ = suspend_context.suspend();
                                     // We continue here after resume.
                                     yield TuiEvent::Draw;
                                     continue;
@@ -312,7 +325,16 @@ impl Tui {
                             }
                             Event::Resize(_, _) => {
                                 // The scheduler coalesces bursts; draw reads the latest PTY size.
-                                resize_pending.store(true, Ordering::Relaxed);
+                                // Where the terminal left the cursor says how it moved the screen;
+                                // it can only be asked here, between reads of the input. A terminal
+                                // that does not answer is not asked again.
+                                let report = if cursor_reports {
+                                    present::CursorReport::query()
+                                } else {
+                                    None
+                                };
+                                cursor_reports = report.is_some();
+                                resize_signal.note(report);
                                 resize_frame.schedule_frame();
                             }
                             Event::Paste(pasted) => {
@@ -356,9 +378,14 @@ impl Tui {
         &mut self,
         style: crossterm::cursor::SetCursorStyle,
     ) -> Result<()> {
+        if self.cursor_style == Some(style) {
+            return Ok(());
+        }
         self.terminal.backend_mut().writer_mut().begin_frame();
         queue!(self.terminal.backend_mut(), style)?;
-        self.terminal.backend_mut().writer_mut().end_frame()
+        self.terminal.backend_mut().writer_mut().end_frame()?;
+        self.cursor_style = Some(style);
+        Ok(())
     }
 
     /// Report clicks and the wheel as [`TuiEvent::Mouse`] while `capture` is set. The terminal
@@ -384,113 +411,113 @@ impl Tui {
         Ok(())
     }
 
-    pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
-        self.history.push(lines);
-        self.frame_requester().schedule_frame();
-    }
-
-    pub(crate) fn has_pending_history(&self) -> bool {
-        self.history.has_pending_lines()
-    }
-
-    pub(crate) fn pending_history_line_count(&self) -> usize {
-        self.history.pending_line_count()
-    }
-
-    /// Draw a transient view over primary-screen history without scrolling it away.
-    pub fn draw_overlay(
-        &mut self,
-        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
-    ) -> Result<()> {
-        let height = self.terminal.size()?.height.saturating_sub(2).max(1);
-        let base = self
-            .history
-            .base_height(self.terminal.viewport_area.height)
-            .max(1)
-            .min(height);
-        self.draw(height, height.saturating_sub(base), draw_fn)
-    }
-
-    pub(crate) fn clear_pending_history_lines(&mut self) {
-        self.history.clear();
-    }
-
-    /// Whether Ctrl+L has hidden the transcript above the inline prompt. Resize reflow must
-    /// preserve this user-visible state instead of replaying the transcript into the viewport.
-    pub(crate) fn transcript_is_hidden(&self) -> bool {
-        self.history.above_hidden()
-    }
-
-    pub(crate) fn is_alt_screen_active(&self) -> bool {
-        self.alt_screen_active.load(Ordering::Relaxed)
-    }
-
     /// Show `text` as a toast in the top right for a few seconds.
     pub(crate) fn show_toast(&mut self, text: String) {
-        self.toasts.push(text, Instant::now());
+        self.presenter.toasts.push(text, Instant::now());
         let frames = self.frame_requester();
         frames.schedule_frame();
         // One more frame when it is time for it to go, to erase it.
         frames.schedule_frame_in(toast::TOAST_LIFETIME + Duration::from_millis(50));
     }
 
+    /// Start the stage at `cell` of the conversation and type `note` where it begins, saying what
+    /// was left out above it.
+    pub(crate) fn start_stage_at(
+        &mut self,
+        cell: usize,
+        note: ratatui::text::Line<'static>,
+    ) -> Result<()> {
+        self.presenter.stage.start_at(cell);
+        let screen = self.terminal.size()?;
+        let top = self.terminal.viewport_area.y;
+        let backend = self.terminal.backend_mut();
+        backend.writer_mut().begin_frame();
+        crate::stage::write::type_rows(backend, &[note], top, screen.width)?;
+        let top = if top + 1 < screen.height {
+            top + 1
+        } else {
+            crate::stage::write::scroll_screen_up(backend, screen.height, 1)?;
+            top
+        };
+        self.terminal.backend_mut().writer_mut().end_frame()?;
+        self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+            0,
+            top,
+            screen.width,
+            screen.height - top,
+        ));
+        self.terminal.invalidate();
+        self.frame_requester().schedule_frame();
+        Ok(())
+    }
+
+    /// The conversation lost every cell from `len` on.
+    pub(crate) fn stage_truncated(&mut self, len: usize) {
+        self.presenter.stage.truncated(len);
+        self.frame_requester().schedule_frame();
+    }
+
+    /// The cells of `range` became `new_len` cells.
+    pub(crate) fn stage_replaced(&mut self, range: std::ops::Range<usize>, new_len: usize) {
+        self.presenter.stage.replaced(range, new_len);
+        self.frame_requester().schedule_frame();
+    }
+
+    /// The expandable card (a tool, a peer message) nearest the composer on screen.
+    pub(crate) fn last_card(&self) -> Option<usize> {
+        self.presenter.stage.last_card()
+    }
+
+    /// The expandable card drawn at `row` of the screen.
+    pub(crate) fn card_at(&self, row: u16) -> Option<usize> {
+        self.presenter.stage.card_at(row)
+    }
+
+    /// Draw a screen that is not the conversation (onboarding, a prompt): `draw_fn` gets the rows
+    /// the region has, up to `height`.
     pub fn draw(
         &mut self,
         height: u16,
         popup_rows: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
-        let resize_event = self.resize_pending.swap(false, Ordering::Relaxed);
-        if resize_event {
-            self.terminal.invalidate();
-            self.history.note_projection_resize();
-        }
+        self.draw_stage(&StageView::empty(), height, popup_rows, draw_fn)
+    }
+
+    /// Draw a panel (a picker, the pager, the actor panel) at the bottom of the screen, under the
+    /// conversation. The panel is transient: it clips the conversation from the top instead of
+    /// pushing it into the scrollback, so closing it leaves the screen as it was.
+    pub fn draw_overlay(
+        &mut self,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        let height = panel_height(self.terminal.size()?.height);
+        let cells = std::mem::take(&mut self.backdrop.cells);
+        let result = self.draw_stage(&StageView::new(&cells, None), height, height, draw_fn);
+        self.backdrop.cells = cells;
+        result
+    }
+
+    /// Draw the conversation (`view`) with a bottom block of `height` rows, of which `popup_rows`
+    /// are a popup. `draw_fn` draws the block in the area its frame has.
+    pub fn draw_stage(
+        &mut self,
+        view: &StageView<'_>,
+        height: u16,
+        popup_rows: u16,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        let (resize_event, cursor_report) = self.resize_signal.take();
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
         #[cfg(unix)]
         let mut prepared_resume = self
             .suspend_context
-            .prepare_resume_action(&mut self.terminal, &mut self.alt_saved_viewport);
-
-        // Precompute any viewport updates that need a cursor-position query before entering
-        // the synchronized update, to avoid racing with the event reader.
-        let mut pending_viewport_area: Option<ratatui::layout::Rect> = None;
-        {
-            let terminal = &mut self.terminal;
-            let screen_size = terminal.size()?;
-            let last_known_screen_size = terminal.last_known_screen_size;
-            let resized = screen_size != last_known_screen_size;
-            if resize_event && !resized {
-                // A burst can end at its original size after the terminal has already
-                // discarded clipped rows. Restore the visible history and viewport.
-                self.history.request_repaint();
-            }
-            if resized {
-                self.history.note_resize();
-            }
-            let alt_screen = self.alt_screen_active.load(Ordering::Relaxed);
-            if alt_screen {
-                // Alternate-screen views own the whole canvas, including rows and columns added
-                // after entry. Terminal::autoresize only updates its size metadata.
-                let area = ratatui::layout::Rect::new(0, 0, screen_size.width, screen_size.height);
-                if terminal.viewport_area != area {
-                    pending_viewport_area = Some(area);
-                }
-            } else if resized && let Ok(cursor_pos) = terminal.get_cursor_position() {
-                let last_known_cursor_pos = terminal.last_known_cursor_pos;
-                // If we resized AND the cursor moved, we adjust the viewport area to keep the
-                // cursor in the same position. This is a heuristic that seems to work well
-                // at least in iTerm2.
-                if cursor_pos.y != last_known_cursor_pos.y {
-                    let cursor_delta = cursor_pos.y as i32 - last_known_cursor_pos.y as i32;
-                    let new_viewport_area = terminal.viewport_area.offset(Offset {
-                        x: 0,
-                        y: cursor_delta,
-                    });
-                    pending_viewport_area = Some(new_viewport_area);
-                }
-            }
-        }
+            .prepare_resume_action(&mut self.terminal);
+        // A resize is dealt with before the synchronized update: the screen is found again, and
+        // nothing of the frame is drawn on a screen that moved.
+        self.presenter
+            .note_screen(&mut self.terminal, resize_event, cursor_report)?;
 
         // The whole frame, including the synchronized-update markers, is collected and written
         // with one syscall. The markers are closed and the buffer is sent on the error path too,
@@ -498,12 +525,12 @@ impl Tui {
         self.terminal.backend_mut().writer_mut().begin_frame();
         let _ = queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate);
         let result = self.draw_frame(
+            view,
             height,
             popup_rows,
             draw_fn,
             #[cfg(unix)]
             prepared_resume.take(),
-            pending_viewport_area,
         );
         let _ = queue!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         let sent = self.terminal.backend_mut().writer_mut().end_frame();
@@ -516,88 +543,42 @@ impl Tui {
 
     fn draw_frame(
         &mut self,
+        view: &StageView<'_>,
         height: u16,
         popup_rows: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
         #[cfg(unix)] prepared_resume: Option<job_control::PreparedResumeAction>,
-        mut pending_viewport_area: Option<ratatui::layout::Rect>,
     ) -> Result<()> {
-        if std::mem::take(&mut self.full_repaint) {
-            self.terminal.clear()?;
+        if self.presenter.full_repaint {
+            self.cursor_style = None;
         }
         #[cfg(unix)]
         if let Some(prepared) = prepared_resume {
             prepared.apply(&mut self.terminal)?;
+            // What was drawn is above the shell's own output now: it is history, not tail.
+            self.presenter.stage.release_tail();
+            self.cursor_style = None;
         }
-        let terminal = &mut self.terminal;
-        if let Some(new_area) = pending_viewport_area.take() {
-            terminal.set_viewport_area(new_area);
-            terminal.clear()?;
-        }
-
-        // Toasts are drawn over rows Nori wrote, so whatever frame comes next first writes those
-        // rows back: it erases the toasts, and keeps new history from scrolling their marks up.
-        let toasts_expired = self.toasts.expire(Instant::now());
-        if self.toasts_drawn || toasts_expired {
-            if self.alt_screen_active.load(Ordering::Relaxed) {
-                self.terminal.invalidate();
-            } else {
-                self.history.request_repaint();
-            }
-        }
-        let terminal = &mut self.terminal;
-        if !self.alt_screen_active.load(Ordering::Relaxed)
-            && self
-                .history
-                .write_frame_with_popup(terminal, height, popup_rows)?
-        {
-            self.frame_requester().schedule_frame();
-        }
-        let terminal = &mut self.terminal;
-
-        // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
+        self.presenter
+            .present(&mut self.terminal, view, height, popup_rows, draw_fn)?;
         #[cfg(unix)]
-        {
-            let area = terminal.viewport_area;
-            let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
-                self.alt_saved_viewport
-                    .map(|r| r.bottom().saturating_sub(1))
-                    .unwrap_or_else(|| area.bottom().saturating_sub(1))
-            } else {
-                area.bottom().saturating_sub(1)
-            };
-            self.suspend_context.set_cursor_y(inline_area_bottom);
-        }
-
-        terminal.draw(|frame| {
-            draw_fn(frame);
-        })?;
-
-        let alt_screen = self.alt_screen_active.load(Ordering::Relaxed);
-        let history_rows = u16::try_from(terminal.owned_history_rows()).unwrap_or(u16::MAX);
-        let over_viewport = alt_screen || history_rows == 0;
-        let rows = if over_viewport {
-            terminal.viewport_area.height
-        } else {
-            history_rows
-        };
-        let first_row = if over_viewport {
-            terminal.viewport_area.top()
-        } else {
-            terminal.viewport_area.top().saturating_sub(rows)
-        };
-        let width = terminal.viewport_area.width;
-        self.toasts_drawn = !self.toasts.is_empty() && rows > 0;
-        if self.toasts_drawn {
-            toast::draw(
-                self.terminal.backend_mut(),
-                &self.toasts,
-                first_row,
-                rows,
-                width,
-            )?;
-        }
+        self.suspend_context.set_cursor_y(
+            self.presenter
+                .block_top()
+                .saturating_add(height)
+                .saturating_sub(1),
+        );
         Ok(())
+    }
+
+    /// Leave the screen for the shell: the bottom block is erased and the cursor goes to where it
+    /// began, under the last row of the conversation. The conversation stays where it is.
+    pub(crate) fn finish_screen(&mut self) -> Result<()> {
+        let backend = self.terminal.backend_mut();
+        backend.writer_mut().begin_frame();
+        let result = self.presenter.finish(&mut self.terminal);
+        self.terminal.backend_mut().writer_mut().end_frame()?;
+        result
     }
 }
 
