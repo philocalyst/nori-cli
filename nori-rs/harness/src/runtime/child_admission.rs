@@ -99,7 +99,6 @@ impl ChildAdmissions {
 
 #[cfg(test)]
 mod tests {
-    #![expect(clippy::expect_used, reason = "test channel assertions")]
     use super::AdmissionMailboxes;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;

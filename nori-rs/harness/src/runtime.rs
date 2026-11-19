@@ -30,6 +30,7 @@ use crate::session_event_fanout::SessionEventFanout;
 use crate::transcript::Transcript;
 mod child_admission;
 mod child_control;
+mod handoff;
 pub(crate) mod program;
 mod prompt_queue;
 use nori_protocol::AcpEvent;
@@ -130,6 +131,23 @@ enum HarnessCommand {
     },
     CancelRequest {
         request_id: acp::v1::RequestId,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// What the session still has in flight.
+    PendingWork {
+        response_tx: oneshot::Sender<crate::backend::PendingWork>,
+    },
+    /// Drop a queued prompt, or one restored from the previous session, by its id.
+    DropQueued {
+        event_id: String,
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Tear down the agent's connection; the session ends and can be resumed.
+    StopAgent {
+        response_tx: oneshot::Sender<anyhow::Result<()>>,
+    },
+    /// Stop every task the session's agents delegated. Cancelling a turn never does this.
+    StopSubagents {
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
     AddHistory {
@@ -311,8 +329,8 @@ impl std::fmt::Debug for HarnessHandle {
 }
 
 impl HarnessHandle {
-    /// Evaluate and execute a Pkl conversation program through the harness
-    /// command pipeline. Commands are durably recorded before their effects.
+    /// Load and run a `nori:Program` Pkl module through the harness. Its source and outcome are
+    /// recorded in the conversation journal and every step in the run's own journal.
     pub async fn execute_conversation_program(
         &self,
         source: String,
@@ -325,7 +343,7 @@ impl HarnessHandle {
         .await
     }
 
-    /// Read and execute a Pkl conversation program from a local file.
+    /// Read and run a `nori:Program` module from a local file.
     pub async fn execute_conversation_program_path(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -522,6 +540,42 @@ impl HarnessHandle {
 
     pub async fn cancel(&self) -> anyhow::Result<()> {
         self.request(|response_tx| HarnessCommand::Cancel { response_tx })
+            .await
+    }
+
+    /// What the session still has in flight: a turn, queued prompts, delegated tasks, results
+    /// owed, mail queued. A frontend that must not finish early waits until none is left.
+    pub async fn pending_work(&self) -> anyhow::Result<crate::backend::PendingWork> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(HarnessCommand::PendingWork { response_tx })
+            .map_err(|_| anyhow::anyhow!("ACP agent command channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP agent stopped before reporting its pending work"))
+    }
+
+    /// Drop a queued prompt, or one restored from the previous session, by its id.
+    pub async fn drop_queued(&self, event_id: String) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::DropQueued {
+            event_id,
+            response_tx,
+        })
+        .await
+    }
+
+    /// Stop a runaway agent by tearing down its connection. The open turn ends as if the
+    /// connection had died, and the session ends as `ConnectionLost` so it can be resumed.
+    pub async fn stop_agent(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::StopAgent { response_tx })
+            .await
+    }
+
+    /// Stop every subagent the session's agents started. Cancelling a turn never does this: the
+    /// children are independent of the parent's turn, and only this command, a lane's stop or
+    /// `task_cancel` ends them.
+    pub async fn stop_subagents(&self) -> anyhow::Result<()> {
+        self.request(|response_tx| HarnessCommand::StopSubagents { response_tx })
             .await
     }
 
@@ -1149,6 +1203,9 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         // Single ACP backend channel for both control-plane and normalized
         // session-domain events.
         let (backend_event_tx, mut backend_event_rx) = mpsc::channel(32);
+        // Every backend this session ever has reports here, so a replacement agent's events
+        // join the same ordered stream.
+        let handoff_events = backend_event_tx.clone();
 
         let connect = async move {
             let agent = match source {
@@ -1316,6 +1373,8 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         // Hold the shared recorder cell (not a one-time clone) so a branch-at-head
         // fork swap redirects recording to the new transcript; otherwise post-fork
         // events would keep landing in the frozen parent transcript.
+        // The recorder cell of whichever backend runs now: a replacement agent brings its own.
+        let recorder_cell = Arc::new(std::sync::Mutex::new(backend.transcript_recorder_cell()));
         let transcript_recorder_cell = backend.transcript_recorder_cell();
         let recording_enabled = Arc::new(std::sync::atomic::AtomicBool::new(!backend.is_handoff()));
         if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
@@ -1327,10 +1386,13 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 }
             }
         }
-        let command_recorder_cell = Arc::clone(&transcript_recorder_cell);
+        let command_recorder_cell = Arc::clone(&recorder_cell);
         let command_recording_enabled = Arc::clone(&recording_enabled);
         backend.bind_program_runtime();
-        let backend_for_agent = Arc::clone(&backend);
+        let (handoff_tx, mut handoff_rx) =
+            unbounded_channel::<crate::recovery::handoff::HandoffRequest>();
+        backend.bind_handoff(handoff_tx.clone());
+        let mut backend_for_agent = Arc::clone(&backend);
         let mut prompt_queue = PromptQueue::start(Arc::clone(&backend));
         let mut child_admissions = child_admission::ChildAdmissions::default();
         let event_fanout = event_tx.clone();
@@ -1338,9 +1400,30 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
             loop {
                 let cmd = match pending_commands.pop_front() {
                     Some(command) => command,
-                    None => match agent_cmd_rx.recv().await {
-                        Some(command) => command,
-                        None => break,
+                    None => tokio::select! {
+                        request = handoff_rx.recv() => {
+                            if let Some(request) = request {
+                                handoff::run(
+                                    handoff::Live {
+                                        backend: &mut backend_for_agent,
+                                        prompt_queue: &mut prompt_queue,
+                                        requests: &handoff_tx,
+                                        events: &handoff_events,
+                                        fanout: &event_fanout,
+                                        recorder_cell: &command_recorder_cell,
+                                    },
+                                    request,
+                                    &mut agent_cmd_rx,
+                                    &mut pending_commands,
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                        command = agent_cmd_rx.recv() => match command {
+                            Some(command) => command,
+                            None => break,
+                        },
                     },
                 };
                 let (command_name, command_payload) = match &cmd {
@@ -1374,6 +1457,13 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                             .to_string(),
                     ),
                     HarnessCommand::Cancel { .. } => ("cancel", "{}".to_owned()),
+                    HarnessCommand::PendingWork { .. } => ("pending-work", "{}".to_owned()),
+                    HarnessCommand::StopAgent { .. } => ("stop-agent", "{}".to_owned()),
+                    HarnessCommand::StopSubagents { .. } => ("stop-subagents", "{}".to_owned()),
+                    HarnessCommand::DropQueued { event_id, .. } => (
+                        "drop-queued",
+                        serde_json::json!({"event_id": event_id}).to_string(),
+                    ),
                     HarnessCommand::CancelRequest { request_id, .. } => (
                         "cancel-request",
                         serde_json::json!({"request_id": request_id}).to_string(),
@@ -1480,7 +1570,8 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                             | HarnessCommand::RecordHandoffAttempt { .. }
                             | HarnessCommand::CurrentSessionId { .. }
                     )
-                    && let Some(recorder) = command_recorder_cell.read().await.clone()
+                    && let Some(recorder) =
+                        current_cell(&command_recorder_cell).read().await.clone()
                     && let Err(error) = recorder.record_command(command_name, command_payload).await
                 {
                     tracing::error!(%error, "failed to record harness command");
@@ -1531,7 +1622,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         response_tx,
                     } => {
                         let backend = Arc::clone(&backend_for_agent);
-                        let recorder = Arc::clone(&command_recorder_cell);
+                        let recorder = current_cell(&command_recorder_cell);
                         tokio::spawn(async move {
                             let result =
                                 program::execute_source(&source, path, &backend, &recorder).await;
@@ -1544,6 +1635,29 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         admission,
                         response_tx,
                     } => {
+                        // The turn boundary is where a session goes back to the route the
+                        // user chose, once the policy says it may.
+                        if backend_for_agent.is_between_turns().await
+                            && !prompt_queue.is_busy().await
+                            && let Some(request) = backend_for_agent
+                                .restore_primary(crate::backend::RestoreAt::TurnBoundary)
+                                .await
+                        {
+                            handoff::run(
+                                handoff::Live {
+                                    backend: &mut backend_for_agent,
+                                    prompt_queue: &mut prompt_queue,
+                                    requests: &handoff_tx,
+                                    events: &handoff_events,
+                                    fanout: &event_fanout,
+                                    recorder_cell: &command_recorder_cell,
+                                },
+                                request,
+                                &mut agent_cmd_rx,
+                                &mut pending_commands,
+                            )
+                            .await;
+                        }
                         prompt_queue
                             .enqueue(content, meta, admission, response_tx)
                             .await;
@@ -1584,6 +1698,22 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     } => {
                         let _ =
                             response_tx.send(backend_for_agent.cancel_request(request_id).await);
+                    }
+                    HarnessCommand::PendingWork { response_tx } => {
+                        let _ = response_tx.send(backend_for_agent.pending_work().await);
+                    }
+                    HarnessCommand::DropQueued {
+                        event_id,
+                        response_tx,
+                    } => {
+                        let _ = response_tx.send(backend_for_agent.drop_queued(event_id).await);
+                    }
+                    HarnessCommand::StopSubagents { response_tx } => {
+                        let _ = response_tx.send(backend_for_agent.stop_subagents().await);
+                    }
+                    HarnessCommand::StopAgent { response_tx } => {
+                        prompt_queue.cancel_pending().await;
+                        let _ = response_tx.send(backend_for_agent.stop_agent().await);
                     }
                     HarnessCommand::AddHistory { text, response_tx } => {
                         let _ = response_tx.send(backend_for_agent.add_history(text).await);
@@ -1712,7 +1842,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         entries,
                         response_tx,
                     } => {
-                        let recorder = command_recorder_cell.read().await.clone();
+                        let recorder = current_cell(&command_recorder_cell).read().await.clone();
                         let result = match recorder {
                             Some(recorder) => recorder
                                 .record_fork_source(session_id, start, end, context, entries)
@@ -1731,7 +1861,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         payload,
                         response_tx,
                     } => {
-                        let recorder = command_recorder_cell.read().await.clone();
+                        let recorder = current_cell(&command_recorder_cell).read().await.clone();
                         let result = match recorder {
                             Some(recorder) => recorder
                                 .record_command("handoff-attempt", payload)
@@ -1742,7 +1872,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         let _ = response_tx.send(result);
                     }
                     HarnessCommand::RecordBackendBound { response_tx } => {
-                        let recorder = command_recorder_cell.read().await.clone();
+                        let recorder = current_cell(&command_recorder_cell).read().await.clone();
                         let result = match recorder {
                             Some(recorder) => {
                                 let payload = serde_json::json!({"agent": backend_for_agent.agent_name(), "acp_session_id": backend_for_agent.session_id().await}).to_string();
@@ -1760,7 +1890,10 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         let _ = response_tx.send(result);
                     }
                     HarnessCommand::ConversationRecorder { response_tx } => {
-                        let _ = response_tx.send(Ok(command_recorder_cell.read().await.clone()));
+                        let _ = response_tx.send(Ok(current_cell(&command_recorder_cell)
+                            .read()
+                            .await
+                            .clone()));
                     }
                     HarnessCommand::RewindAndRebind {
                         session_id,
@@ -1872,30 +2005,17 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 SessionEvent::Nori(NoriEvent::ReplayFinished) => std::mem::take(&mut replaying),
                 _ => replaying,
             };
-            let is_assistant_chunk = matches!(
-                &event,
-                SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                    acp::v1::AgentNotification::SessionNotification(notification)
-                )) if matches!(notification.update, acp::v1::SessionUpdate::AgentMessageChunk(_))
-            );
-            let flush_response = matches!(
-                &event,
-                SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                    acp::v1::AgentNotification::SessionNotification(notification)
-                )) if matches!(notification.update,
-                    acp::v1::SessionUpdate::AgentThoughtChunk(_)
-                    | acp::v1::SessionUpdate::UserMessageChunk(_)
-                    | acp::v1::SessionUpdate::ToolCall(_))
-            ) || matches!(
-                &event,
-                SessionEvent::Acp(nori_protocol::AcpEvent::Request { .. })
-                    | SessionEvent::Acp(nori_protocol::AcpEvent::Response {
-                        response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
-                        ..
-                    })
-                    | SessionEvent::Nori(NoriEvent::ContextCompacted(_))
-                    | SessionEvent::Nori(NoriEvent::SessionEnded(_))
-            );
+            // The turn assembles messages by the same definition: see `nori_protocol::message_flow`.
+            let flow = nori_protocol::message_flow(&event);
+            let is_assistant_chunk =
+                flow == nori_protocol::MessageFlow::Chunk(nori_protocol::MessageStream::Answer);
+            let flush_response = match flow {
+                nori_protocol::MessageFlow::Boundary => true,
+                nori_protocol::MessageFlow::Chunk(stream) => {
+                    stream != nori_protocol::MessageStream::Answer
+                }
+                nori_protocol::MessageFlow::Transparent => false,
+            };
             if flush_response && let Some((transcript_id, start, end)) = response_boundary.take() {
                 let marker = nori_protocol::ConversationResponseBoundary {
                     transcript_id,
@@ -1912,7 +2032,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 }
             }
             if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
-                && let Some(recorder) = transcript_recorder_cell.read().await.clone()
+                && let Some(recorder) = current_cell(&recorder_cell).read().await.clone()
                 && !(in_replay && recorder.continues_recorded_session())
             {
                 match recorder.record_received_event(&event).await {
@@ -1929,7 +2049,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
             let evidence = observe_context_event(&context_timeline, &event).await;
             // A transcript that already holds the history being replayed does not record it again.
             if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
-                && let Some(recorder) = transcript_recorder_cell.read().await.clone()
+                && let Some(recorder) = current_cell(&recorder_cell).read().await.clone()
                 && !(in_replay && recorder.continues_recorded_session())
             {
                 match recorder.record_session_event(&evidence).await {
@@ -1952,7 +2072,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                 break;
             }
         }
-        if let Some(recorder) = transcript_recorder_cell.write().await.take() {
+        if let Some(recorder) = current_cell(&recorder_cell).write().await.take() {
             let result = if Arc::strong_count(&recorder) == 1 {
                 recorder.shutdown().await
             } else {
@@ -1968,6 +2088,19 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         handle,
         events: event_rx,
     }
+}
+
+/// The recorder cell of the backend the session runs on now.
+fn current_cell(
+    cell: &std::sync::Mutex<
+        Arc<tokio::sync::RwLock<Option<Arc<crate::transcript::TranscriptRecorder>>>>,
+    >,
+) -> Arc<tokio::sync::RwLock<Option<Arc<crate::transcript::TranscriptRecorder>>>> {
+    Arc::clone(
+        &cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 async fn observe_context_event(

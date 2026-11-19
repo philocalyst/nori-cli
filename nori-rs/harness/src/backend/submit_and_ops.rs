@@ -1,57 +1,6 @@
 use super::*;
 
 impl AcpBackend {
-    pub(crate) async fn send_subagent_message(
-        &self,
-        session_id: acp::SessionId,
-        text: String,
-    ) -> Result<()> {
-        self.send_subagent_content(
-            session_id,
-            vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-        )
-        .await
-    }
-
-    pub(crate) async fn spawn_conversation_agent(
-        &self,
-        actor: String,
-        agent: String,
-    ) -> anyhow::Result<String> {
-        self.orchestrator
-            .spawn_program_actor(actor, agent)
-            .await
-            .map_err(anyhow::Error::msg)
-    }
-
-    pub(crate) async fn send_subagent_content(
-        &self,
-        session_id: acp::SessionId,
-        content: Vec<acp::ContentBlock>,
-    ) -> Result<()> {
-        let _child_gate = self.native_children.control_gate(&session_id).await;
-        let generation = self.orchestrator.admission_generation();
-        let _admission = self.program_effects.read().await;
-        anyhow::ensure!(
-            generation == self.orchestrator.admission_generation(),
-            "The conversation was rewound before the child message started"
-        );
-        if self.orchestrator.owns_view(&session_id).await {
-            self.orchestrator
-                .send_user_content_message_locked(session_id, content)
-                .await
-                .map_err(anyhow::Error::msg)
-        } else if self.native_children.owns(&session_id).await {
-            self.native_children.enqueue(&session_id, content).await
-        } else if let Some(next) = self.orchestrator.descendant_next_hop(&session_id).await {
-            next.handle
-                .send_subagent_content(next.session_id, content)
-                .await
-        } else {
-            Err(anyhow::anyhow!("Unknown child session"))
-        }
-    }
-
     pub(crate) async fn fork_history(
         &self,
         context: String,
@@ -98,14 +47,22 @@ impl AcpBackend {
     }
 
     pub(crate) async fn cancel(&self) -> Result<()> {
-        // Stopping a session stops the tasks it delegated.
-        self.orchestrator.stop().await;
+        // A cancel ends the turn and nothing else: delegated actors are independent and run on,
+        // and their results arrive at the next boundary, whether or not a turn is open. Stopping
+        // them is its own command (`stop_subagents`); stopping the agent and quitting stop them
+        // as well.
         self.session_event_tx
             .send(session_runtime_driver::SessionRuntimeInput::Reducer(
                 session_reducer::InboundEvent::CancelSubmit,
             ))
             .await
             .map_err(|_| anyhow::anyhow!("session runtime closed"))
+    }
+
+    /// Stop every task the session's agents delegated, on the user's explicit request.
+    pub(crate) async fn stop_subagents(&self) -> Result<()> {
+        self.orchestrator.stop().await;
+        Ok(())
     }
 
     pub(crate) async fn cancel_request(&self, request_id: acp::RequestId) -> Result<()> {
@@ -117,8 +74,37 @@ impl AcpBackend {
             .map_err(|_| anyhow::anyhow!("session runtime closed"))
     }
 
+    /// Stop a runaway agent: tear down its connection. Whatever turn is open ends exactly as if
+    /// the connection had died (its requests answered as cancelled, its unfinished tool calls
+    /// closed, the turn failed), the delegated tasks stop, and the session ends as
+    /// `ConnectionLost`, so it can be resumed from its journal.
+    pub(crate) async fn stop_agent(&self) -> Result<()> {
+        self.orchestrator.stop().await;
+        self.connection_lost().await;
+        self.teardown(true, Some(std::time::Duration::from_secs(2)))
+            .await;
+        let _ = self
+            .backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(
+                nori_protocol::NoriEvent::SessionEnded(nori_protocol::SessionEnded {
+                    reason: nori_protocol::SessionEndReason::ConnectionLost,
+                    message: Some(format!(
+                        "You stopped {}. Resume this session to continue the conversation.",
+                        self.agent_name
+                    )),
+                }),
+            )))
+            .await;
+        Ok(())
+    }
+
     pub(crate) async fn shutdown(&self, child_grace: std::time::Duration) -> Result<()> {
         self.orchestrator.shutdown().await;
+        // A turn still open when the user quits ends as the connection's loss would end it: its
+        // unfinished tool calls are closed and the idle phase published, in the stream and the
+        // journal, before the session ends. Bounded: shutdown never waits on a stuck actor.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.connection_lost()).await;
         self.teardown(true, Some(child_grace)).await;
         let _ = self
             .backend_event_tx
@@ -130,6 +116,13 @@ impl AcpBackend {
             )))
             .await;
         Ok(())
+    }
+
+    /// Stop this backend because the runtime replaced it with another agent's: the same as
+    /// shutting down, but the conversation goes on, so the session does not end.
+    pub(crate) async fn retire(&self, child_grace: std::time::Duration) {
+        self.orchestrator.shutdown().await;
+        self.teardown(true, Some(child_grace)).await;
     }
 
     pub(super) async fn teardown(
@@ -264,11 +257,18 @@ impl AcpBackend {
 
     pub(crate) async fn run_user_shell(&self, command: String) -> Result<()> {
         let backend_event_tx = self.backend_event_tx.clone();
+        let session_cell = Arc::clone(&self.user_bash_session);
         let cwd = self.cwd.clone();
         let operation_id = generate_id();
         tokio::spawn(async move {
-            user_shell::run_user_shell_command(&backend_event_tx, &operation_id, &cwd, command)
-                .await;
+            user_shell::run_user_shell_command(
+                &backend_event_tx,
+                &session_cell,
+                &operation_id,
+                &cwd,
+                command,
+            )
+            .await;
         });
         Ok(())
     }
@@ -284,19 +284,31 @@ impl AcpBackend {
         request_id: acp::RequestId,
         response: Result<acp::ClientResponse, acp::Error>,
     ) -> Result<()> {
-        let mut pending = self.pending_approvals.lock().await;
-        let Some(index) = pending
-            .iter()
-            .position(|pending| pending.request.request_id == request_id)
-        else {
-            anyhow::bail!("no delegated ACP request is pending for {request_id}");
+        let pending = {
+            let mut pending = self.pending_approvals.lock().await;
+            let Some(index) = pending
+                .iter()
+                .position(|pending| pending.request.request_id == request_id)
+            else {
+                anyhow::bail!("no delegated ACP request is pending for {request_id}");
+            };
+            pending.remove(index)
         };
-        let pending = pending.remove(index);
-        pending
+        let sent = pending
             .request
             .response_tx
             .send(response)
-            .map_err(|_| anyhow::anyhow!("ACP request responder closed"))
+            .map_err(|_| anyhow::anyhow!("ACP request responder closed"));
+        // The agent is no longer waiting on this: the ledger stops holding its turn open for it.
+        let _ = self
+            .session_event_tx
+            .send(session_runtime_driver::SessionRuntimeInput::Reducer(
+                session_reducer::InboundEvent::RequestAnswered {
+                    request_id: request_id.to_string(),
+                },
+            ))
+            .await;
+        sent
     }
 
     pub(crate) async fn submit_prompt(

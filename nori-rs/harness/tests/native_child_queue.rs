@@ -445,13 +445,16 @@ async fn native_child_controls_are_ordered_and_target_the_child() {
         .send_subagent_content(child.clone(), content("after restart"))
         .await
         .expect("restored public child remains controllable");
+    let restored_prompts = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>()
+    };
     let entries = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let entries: Vec<serde_json::Value> = std::fs::read_to_string(&log)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
+            let entries = restored_prompts();
             if entries.iter().any(|entry| {
                 entry["text"].as_str().is_some_and(|text| {
                     text.ends_with("after restart") && !text.ends_with("fork after restart")
@@ -463,7 +466,13 @@ async fn native_child_controls_are_ordered_and_target_the_child() {
         }
     })
     .await
-    .expect("restored provider receives prompt");
+    .unwrap_or_else(|error| {
+        let events = std::iter::from_fn(|| resumed.events.try_recv().ok()).collect::<Vec<_>>();
+        panic!(
+            "restored provider receives prompt: {error}; prompts: {:#?}; events: {events:#?}",
+            restored_prompts()
+        )
+    });
     let provider_prompt = entries
         .iter()
         .find(|entry| {
@@ -676,6 +685,7 @@ async fn transcript_child_is_controllable_without_provider_reannouncement() {
             parent_session_id: acp::v1::SessionId::new("loaded-parent"),
             session_id: acp::v1::SessionId::new("historic-child"),
             agent: Patch::Keep,
+            model: Patch::Keep,
             title: Patch::Set("Historical child".into()),
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Running),

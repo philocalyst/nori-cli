@@ -1,32 +1,41 @@
+//! The driver that owns a session's [`SessionRuntime`] and the actor that serializes everything
+//! that touches it.
+
 use super::*;
 
 use crate::normalized::ClientEvent;
 use crate::normalized::ClientEventNormalizer;
 use crate::normalized::session_runtime::QueuedPrompt;
-use crate::normalized::session_runtime::QueuedPromptKind;
-use crate::normalized::session_runtime::SessionPhase;
+use crate::normalized::session_runtime::SessionPhaseView;
 use crate::normalized::session_runtime::SessionRuntime;
+use crate::normalized::turn::Turn;
+use crate::normalized::turn::TurnOwner;
 
+use super::session_reducer::AgentTurnEnded;
 use super::session_reducer::InboundEvent;
 use super::session_reducer::SideEffect;
+use super::session_reducer::Wake;
 use super::session_reducer::reduce;
+
+pub(crate) use super::session_reducer::CompletedTurn;
+
+tokio::task_local! {
+    /// Set inside the runtime actor: the ledger's only writer must not wait on itself.
+    pub(super) static IN_RUNTIME_ACTOR: ();
+}
 
 pub(crate) struct SessionDriver {
     runtime: SessionRuntime,
     normalizer: ClientEventNormalizer,
 }
 
-pub(crate) struct CompletedTurn {
-    pub prompt: QueuedPrompt,
-    pub stop_reason: nori_protocol::acp::v1::StopReason,
-    pub last_agent_message: Option<String>,
-}
-
 pub(crate) enum SessionRuntimeInput {
     Reducer(InboundEvent),
-    GuardedContinuation {
-        generation: i64,
-        event: InboundEvent,
+    /// A prompt nobody typed asks to start; see [`AcpBackend::offer_prompt`].
+    Offer {
+        generation: Option<i64>,
+        prompt: Box<QueuedPrompt>,
+        admitted: tokio::sync::oneshot::Sender<bool>,
     },
     Barrier {
         response_tx: tokio::sync::oneshot::Sender<()>,
@@ -36,35 +45,16 @@ pub(crate) enum SessionRuntimeInput {
         pending_request: Box<PendingApprovalRequest>,
         current_policy: AskForApproval,
     },
+    /// A wake-up the reducer scheduled has come due.
+    Wake(Wake),
 }
 
 pub(crate) struct ReducerActions {
     pub events: Vec<ClientEvent>,
     pub side_effects: Vec<SideEffect>,
     pub completed_turn: Option<CompletedTurn>,
-}
-
-fn client_event_kind(event: &ClientEvent) -> &'static str {
-    match event {
-        ClientEvent::SessionUpdateInfo(_) => "session_update_info",
-        ClientEvent::SessionConfigUpdate(_) => "session_config_update",
-        ClientEvent::SessionModeChanged(_) => "session_mode_changed",
-        ClientEvent::SessionCapabilitiesChanged(_) => "session_capabilities_changed",
-        ClientEvent::SessionPhaseChanged(_) => "session_phase_changed",
-        ClientEvent::QueueChanged(_) => "queue_changed",
-        ClientEvent::MessageDelta(_) => "message_delta",
-        ClientEvent::PromptCompleted(_) => "prompt_completed",
-        ClientEvent::ToolSnapshot(_) => "tool_snapshot",
-        ClientEvent::ApprovalRequest(_) => "approval_request",
-        ClientEvent::AgentCommandsUpdate(_) => "agent_commands_update",
-        ClientEvent::PlanSnapshot(_) => "plan_snapshot",
-        ClientEvent::LoadCompleted => "load_completed",
-        ClientEvent::ContextCompacted(_) => "context_compacted",
-        ClientEvent::Warning(_) => "warning",
-        ClientEvent::ReplayEntry(_) => "replay_entry",
-        ClientEvent::ThreadGoalUpdated(_) => "thread_goal_updated",
-        ClientEvent::ThreadGoalCleared => "thread_goal_cleared",
-    }
+    pub agent_ended: Option<AgentTurnEnded>,
+    pub queue_ops: Vec<super::session_reducer::QueueOp>,
 }
 
 impl SessionDriver {
@@ -76,60 +66,80 @@ impl SessionDriver {
     }
 
     pub(crate) fn apply(&mut self, event: InboundEvent) -> ReducerActions {
-        let completed_prompt = matches!(
-            &event,
-            InboundEvent::PromptResponse { .. } | InboundEvent::PromptFailed { .. }
-        )
-        .then(|| {
-            self.runtime
-                .active
-                .as_ref()
-                .and_then(|active| active.prompt.clone())
-        })
-        .flatten();
         let out = reduce(&mut self.runtime, event, &mut self.normalizer);
-        let completed_turn = completed_prompt.and_then(|prompt| {
-            out.events.iter().find_map(|event| match event {
-                ClientEvent::PromptCompleted(completed) => Some(CompletedTurn {
-                    prompt: prompt.clone(),
-                    stop_reason: completed.stop_reason,
-                    last_agent_message: completed.last_agent_message.clone(),
-                }),
-                _ => None,
-            })
-        });
-
         ReducerActions {
             events: out.events,
             side_effects: out.side_effects,
-            completed_turn,
+            completed_turn: out.completed,
+            agent_ended: out.agent_ended,
+            queue_ops: out.queue_ops,
         }
     }
 
     pub(crate) fn active_request_id(&self) -> Option<String> {
-        self.runtime
-            .active
-            .as_ref()
-            .map(|active| active.request_id.to_string())
+        self.active_wire_request_id()
+            .map(|request_id| request_id.to_string())
     }
 
+    /// The request that owns the open turn, if a request does.
     pub(crate) fn active_wire_request_id(&self) -> Option<nori_protocol::acp::v1::RequestId> {
         self.runtime
-            .active
+            .turn
             .as_ref()
-            .map(|active| active.request_id.clone())
+            .and_then(|turn| turn.request_id().cloned())
     }
 
     pub(crate) fn phase_label(&self) -> &'static str {
-        session_reducer::session_phase_label(&self.runtime.phase)
+        self.runtime.phase_view().label()
     }
 
     pub(crate) fn queue_len(&self) -> usize {
         self.runtime.queue.len()
     }
 
+    /// A turn is open, whoever owns it, prompts are waiting to start, or a session swap is in
+    /// flight.
     pub(crate) fn prompt_is_busy(&self) -> bool {
-        self.runtime.phase != SessionPhase::Idle || !self.runtime.queue.is_empty()
+        self.runtime.phase_view() != SessionPhaseView::Idle
+            || !self.runtime.queue.is_empty()
+            || self.runtime.fenced
+    }
+
+    /// The ledger sequence number of the local turn, if the open turn is one.
+    pub(crate) fn local_turn_seq(&self) -> Option<i64> {
+        self.runtime
+            .turn
+            .as_ref()
+            .filter(|turn| matches!(turn.owner, TurnOwner::Local { .. }))
+            .map(|turn| turn.seq)
+    }
+
+    /// A turn of any owner is open.
+    pub(crate) fn has_open_turn(&self) -> bool {
+        self.runtime.turn.is_some()
+    }
+
+    /// A session swap holds the fence.
+    pub(crate) fn is_fenced(&self) -> bool {
+        self.runtime.fenced
+    }
+
+    /// Stop prompts from starting while the session is swapped, if no turn is open. What is
+    /// queued stays queued and starts when the fence is released. The check and the fence are
+    /// one step under the driver's lock, which every change to the ledger also takes. Release
+    /// with [`InboundEvent::ReleaseFence`].
+    pub(crate) fn try_fence(&mut self) -> bool {
+        let free = self.runtime.turn.is_none() && !self.runtime.fenced;
+        self.runtime.fenced |= free;
+        free
+    }
+
+    /// The prompt of the local turn, if the open turn is one.
+    pub(crate) fn local_prompt(&self) -> Option<&QueuedPrompt> {
+        match self.runtime.turn.as_ref().map(|turn| &turn.owner) {
+            Some(TurnOwner::Local { prompt, .. }) => Some(prompt),
+            Some(TurnOwner::Replay { .. } | TurnOwner::Agent { .. }) | None => None,
+        }
     }
 
     pub(crate) fn owns_active_prompt_echo(&self, chunk: &acp::ContentChunk) -> bool {
@@ -142,52 +152,32 @@ impl SessionDriver {
             return false;
         };
 
-        matches!(self.runtime.phase, SessionPhase::Prompt { .. })
-            && self
-                .runtime
-                .active
+        self.local_prompt().is_some_and(|prompt| {
+            prompt
+                .prompt_meta
                 .as_ref()
-                .and_then(|active| active.prompt.as_ref())
-                .is_some_and(|prompt| {
-                    prompt
-                        .prompt_meta
-                        .as_ref()
-                        .and_then(|meta| meta.get(nori_protocol::PROMPT_ECHO_ID_META_KEY))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(owner_event_id)
-                        && prompt.content.contains(&chunk.content)
-                })
+                .and_then(|meta| meta.get(nori_protocol::PROMPT_ECHO_ID_META_KEY))
+                .and_then(serde_json::Value::as_str)
+                == Some(owner_event_id)
+                && prompt.content.contains(&chunk.content)
+        })
     }
 
     /// Whether the connected agent currently advertises a slash command with
     /// the given name.
     pub(crate) fn advertises_command(&self, name: &str) -> bool {
         self.runtime
-            .persisted
             .available_commands
             .iter()
             .any(|command| command.name == name)
     }
 
+    /// The phase published to clients.
     pub(crate) fn public_phase(&self) -> nori_protocol::SessionPhase {
-        match &self.runtime.phase {
-            SessionPhase::Idle => nori_protocol::SessionPhase::Idle,
-            SessionPhase::Loading { request_id } => nori_protocol::SessionPhase::Loading {
-                request_id: request_id.clone(),
-            },
-            SessionPhase::Prompt {
-                request_id,
-                cancelling: false,
-            } => nori_protocol::SessionPhase::Prompting {
-                request_id: request_id.clone(),
-            },
-            SessionPhase::Prompt {
-                request_id,
-                cancelling: true,
-            } => nori_protocol::SessionPhase::Cancelling {
-                request_id: request_id.clone(),
-            },
-        }
+        self.runtime
+            .turn
+            .as_ref()
+            .map_or(nori_protocol::SessionPhase::Idle, Turn::phase)
     }
 }
 
@@ -197,965 +187,69 @@ impl Default for SessionDriver {
     }
 }
 
-const CANCEL_WARNING_SECS: u64 = 3;
-const CANCEL_FORCE_SECS: u64 = 10;
-
 impl AcpBackend {
-    pub(super) async fn apply_session_event(&self, event: InboundEvent) {
-        let generation = self.orchestrator.admission_generation();
-        let event_kind = session_reducer::inbound_event_kind(&event);
-        let actions = {
-            let mut driver = self.session_driver.lock().await;
-            let phase_before = driver.phase_label();
-            let active_before = driver.active_request_id();
-            let queue_len_before = driver.queue_len();
-            let actions = driver.apply(event);
-            debug!(
-                target: "acp_event_flow",
-                event_kind,
-                phase_before,
-                active_request_id_before = active_before.as_deref().unwrap_or("<none>"),
-                queue_len_before,
-                phase_after = driver.phase_label(),
-                active_request_id_after = driver.active_request_id().as_deref().unwrap_or("<none>"),
-                queue_len_after = driver.queue_len(),
-                client_events = actions.events.len(),
-                side_effects = actions.side_effects.len(),
-                "Applied reducer event in serialized session runtime"
-            );
-            actions
-        };
-        let is_prompt_terminal = actions.completed_turn.is_some();
-        if is_prompt_terminal {
-            if let Some(abort) = self.cancel_timeout_abort.lock().await.take() {
-                abort.abort();
-            }
-            *self.prompt_task_abort.lock().await = None;
-        }
-        self.dispatch_reducer_actions(actions, generation).await;
-        if is_prompt_terminal {
-            self.maybe_start_idle_timer().await;
-        }
-    }
-
-    pub(super) async fn handle_permission_request(
-        &self,
-        pending_request: Box<PendingApprovalRequest>,
-        current_policy: AskForApproval,
-    ) {
-        if let acp::AgentRequest::ExtMethodRequest(request) = &pending_request.request.request
-            && request.method.as_ref() == "_nori/request_user_input"
-        {
-            let key = serde_json::from_str::<serde_json::Value>(request.params.get())
-                .ok()
-                .and_then(|params| super::user_question::question_key(&params));
-            if let Some(key) = key
-                && self.withdrawn_questions.lock().await.remove(&key)
-            {
-                let _ = pending_request
-                    .request
-                    .response_tx
-                    .send(Err(acp::Error::internal_error()));
+    /// The agent is gone: end whatever turn is open and wait until the ledger has done so, so
+    /// nothing is torn down under it.
+    pub(super) async fn connection_lost(&self) {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        for input in [
+            SessionRuntimeInput::Reducer(InboundEvent::ConnectionLost),
+            SessionRuntimeInput::Barrier { response_tx },
+        ] {
+            if self.session_event_tx.send(input).await.is_err() {
                 return;
             }
-            let event = nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Request {
-                request_id: pending_request.request.request_id.clone(),
-                request: pending_request.request.request.clone(),
-            });
-            self.pending_approvals.lock().await.push(*pending_request);
-            let _ = self
-                .backend_event_tx
-                .send(BackendEvent::Public(event))
-                .await;
-            return;
         }
-        let acp::AgentRequest::RequestPermissionRequest(permission) =
-            &pending_request.request.request
-        else {
-            let _ = pending_request
-                .request
-                .response_tx
-                .send(Err(acp::Error::method_not_found()));
-            return;
-        };
-        let request_id = pending_request.request.request_id.to_string();
-        let call_id = permission.tool_call.tool_call_id.to_string();
-        let (actions, permission_is_valid) = {
-            let mut driver = self.session_driver.lock().await;
-            let actions = driver.apply(InboundEvent::PermissionRequest {
-                request_id,
-                call_id: call_id.clone(),
-            });
-            let permission_is_valid = matches!(
-                driver.runtime.phase,
-                crate::normalized::session_runtime::SessionPhase::Prompt { .. }
-            );
-            (actions, permission_is_valid)
-        };
-        self.dispatch_reducer_actions(actions, self.orchestrator.admission_generation())
-            .await;
-
-        if !permission_is_valid {
-            let _ = pending_request.request.response_tx.send(Ok(
-                acp::ClientResponse::RequestPermissionResponse(
-                    acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Cancelled),
-                ),
-            ));
-            return;
-        }
-
-        if current_policy == AskForApproval::Never {
-            debug!(
-                target: "acp_event_flow",
-                call_id = %call_id,
-                "Auto-approving request (approval_policy=Never)"
-            );
-            let outcome = permission
-                .options
-                .iter()
-                .find(|option| {
-                    matches!(
-                        option.kind,
-                        acp::PermissionOptionKind::AllowOnce
-                            | acp::PermissionOptionKind::AllowAlways
-                    )
-                })
-                .map(|option| {
-                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                        option.option_id.clone(),
-                    ))
-                })
-                .unwrap_or(acp::RequestPermissionOutcome::Cancelled);
-            let _ = pending_request.request.response_tx.send(Ok(
-                acp::ClientResponse::RequestPermissionResponse(
-                    acp::RequestPermissionResponse::new(outcome),
-                ),
-            ));
-            return;
-        }
-
-        let _ = self
-            .backend_event_tx
-            .send(BackendEvent::Public(nori_protocol::SessionEvent::Acp(
-                nori_protocol::AcpEvent::Request {
-                    request_id: pending_request.request.request_id.clone(),
-                    request: pending_request.request.request.clone(),
-                },
-            )))
-            .await;
-
-        let command_for_notification = permission
-            .tool_call
-            .fields
-            .title
-            .clone()
-            .unwrap_or_else(|| "tool request".to_string());
-        self.pending_approvals.lock().await.push(*pending_request);
-        self.user_notifier
-            .notify(&crate::UserNotification::AwaitingApproval {
-                call_id,
-                command: command_for_notification,
-                cwd: self.cwd.display().to_string(),
-            });
+        let _ = response_rx.await;
     }
 
-    async fn dispatch_reducer_actions(&self, actions: ReducerActions, generation: i64) {
-        let completed_prompt = actions.completed_turn.is_some();
-        match actions.completed_turn.as_ref().map(|turn| turn.prompt.kind) {
-            // Summarize-and-swap compaction defers `PromptCompleted` until after
-            // the session swap, so the new session is active before the UI sees
-            // completion. Native compaction (below) does no swap and flows like
-            // an ordinary turn, emitting its divider after completion.
-            Some(QueuedPromptKind::Compact) => {
-                let mut completion_event = None;
-                let mut non_completion_events = Vec::new();
-                for event in actions.events {
-                    match event {
-                        ClientEvent::PromptCompleted(_) => {
-                            completion_event = Some(event);
-                        }
-                        other => non_completion_events.push(other),
-                    }
-                }
-                self.forward_client_events(&non_completion_events).await;
-                if let Some(completed_turn) = actions.completed_turn {
-                    self.handle_completed_turn(&completed_turn, generation)
-                        .await;
-                }
-                if let Some(event) = completion_event {
-                    self.forward_client_event(event).await;
-                }
-            }
-            _ => {
-                self.forward_client_events(&actions.events).await;
-                if let Some(completed_turn) = actions.completed_turn {
-                    self.handle_completed_turn(&completed_turn, generation)
-                        .await;
-                }
-            }
-        }
-
-        if completed_prompt {
-            self.forward_observer_turn_status("idle").await;
-        }
-
-        for side_effect in actions.side_effects {
-            self.execute_side_effect(side_effect).await;
-        }
-    }
-
-    async fn forward_client_events(&self, client_events: &[ClientEvent]) {
-        for client_event in client_events {
-            self.forward_client_event(client_event.clone()).await;
-        }
-    }
-
-    async fn forward_observer_turn_status(&self, status: &str) {
-        let mut meta = serde_json::Map::new();
-        meta.insert("nori".to_string(), serde_json::json!({ "status": status }));
-        let notification = acp::SessionNotification::new(
-            self.session_id.read().await.clone(),
-            acp::SessionUpdate::SessionInfoUpdate(acp::SessionInfoUpdate::new().meta(meta)),
-        );
-        let _ = self
-            .backend_event_tx
-            .send(BackendEvent::Public(SessionEvent::Acp(
-                nori_protocol::AcpEvent::Notification(acp::AgentNotification::SessionNotification(
-                    notification,
-                )),
-            )))
-            .await;
-    }
-
-    pub(super) async fn forward_client_event(&self, client_event: ClientEvent) {
-        match &client_event {
-            ClientEvent::SessionPhaseChanged(phase) => {
-                debug!(
-                    target: "acp_event_flow",
-                    client_event = client_event_kind(&client_event),
-                    ?phase,
-                    "Forwarding client event from ACP backend"
-                );
-            }
-            ClientEvent::PromptCompleted(completed) => {
-                debug!(
-                    target: "acp_event_flow",
-                    client_event = client_event_kind(&client_event),
-                    stop_reason = ?completed.stop_reason,
-                    has_last_agent_message = completed
-                        .last_agent_message
-                        .as_ref()
-                        .is_some_and(|message| !message.is_empty()),
-                    "Forwarding client event from ACP backend"
-                );
-            }
-            _ => {
-                debug!(
-                    target: "acp_event_flow",
-                    client_event = client_event_kind(&client_event),
-                    "Forwarding client event from ACP backend"
-                );
-            }
-        }
-        if let ClientEvent::ToolSnapshot(snapshot) = &client_event {
-            self.edit_journal.record(snapshot, &self.cwd, None);
-        }
-        let goal_event = self
-            .thread_goal_update_from_client_event(&client_event)
-            .await;
-        let public_event = match &client_event {
-            ClientEvent::SessionPhaseChanged(phase) => {
-                let phase = if matches!(
-                    phase,
-                    crate::normalized::session_runtime::SessionPhaseView::Idle
-                ) {
-                    nori_protocol::SessionPhase::Idle
-                } else {
-                    self.session_driver.lock().await.public_phase()
-                };
-                Some(nori_protocol::NoriEvent::SessionPhaseChanged(phase))
-            }
-            ClientEvent::QueueChanged(queue) => Some(nori_protocol::NoriEvent::QueueChanged(
-                nori_protocol::QueueSnapshot {
-                    prompts: queue.prompts.clone(),
-                },
-            )),
-            ClientEvent::ContextCompacted(compacted) => Some(
-                nori_protocol::NoriEvent::ContextCompacted(nori_protocol::ContextCompactedEvent {
-                    summary: compacted.summary.clone(),
-                }),
-            ),
-            ClientEvent::SessionCapabilitiesChanged(capabilities) => {
-                Some(nori_protocol::NoriEvent::CapabilitiesChanged(
-                    public_nori_capabilities(capabilities.clone()),
-                ))
-            }
-            ClientEvent::ThreadGoalUpdated(update) => Some(nori_protocol::NoriEvent::GoalChanged(
-                Some(update.goal.clone()),
-            )),
-            ClientEvent::ThreadGoalCleared => Some(nori_protocol::NoriEvent::GoalChanged(None)),
-            ClientEvent::Warning(warning) => {
-                Some(nori_protocol::NoriEvent::Notice(nori_protocol::Notice {
-                    message: warning.message.clone(),
-                }))
-            }
-            _ => None,
-        };
-        if let Some(event) = public_event {
-            let _ = self
-                .backend_event_tx
-                .send(BackendEvent::Public(SessionEvent::Nori(event)))
-                .await;
-        }
-        if let Some(goal_event) = goal_event
-            && let ClientEvent::ThreadGoalUpdated(update) = goal_event
-        {
-            let _ = self
-                .backend_event_tx
-                .send(BackendEvent::Public(SessionEvent::Nori(
-                    nori_protocol::NoriEvent::GoalChanged(Some(update.goal)),
-                )))
-                .await;
-        }
-    }
-
-    async fn handle_completed_turn(&self, completed_turn: &CompletedTurn, generation: i64) {
-        match completed_turn.prompt.kind {
-            QueuedPromptKind::User
-            | QueuedPromptKind::GoalContinuation
-            | QueuedPromptKind::TaskResults
-            | QueuedPromptKind::WorkflowHook => {
-                if let Some(last_agent_message) = &completed_turn.last_agent_message
-                    && !last_agent_message.is_empty()
-                    && !self.post_agent_response_hooks.is_empty()
-                {
-                    let env_vars = HashMap::from([
-                        (
-                            "NORI_HOOK_EVENT".to_string(),
-                            "post_agent_response".to_string(),
-                        ),
-                        (
-                            "NORI_HOOK_RESPONSE_TEXT".to_string(),
-                            last_agent_message.clone(),
-                        ),
-                    ]);
-                    let results = crate::hooks::execute_hooks_with_env(
-                        &self.post_agent_response_hooks,
-                        self.script_timeout,
-                        &env_vars,
-                    )
-                    .await;
-                    route_hook_results(&results, &self.backend_event_tx, None).await;
-                }
-
-                if let Some(last_agent_message) = &completed_turn.last_agent_message
-                    && !last_agent_message.is_empty()
-                    && !self.async_post_agent_response_hooks.is_empty()
-                {
-                    let env_vars = HashMap::from([
-                        (
-                            "NORI_HOOK_EVENT".to_string(),
-                            "post_agent_response".to_string(),
-                        ),
-                        (
-                            "NORI_HOOK_RESPONSE_TEXT".to_string(),
-                            last_agent_message.clone(),
-                        ),
-                    ]);
-                    let _ = crate::hooks::execute_hooks_fire_and_forget(
-                        self.async_post_agent_response_hooks.clone(),
-                        self.script_timeout,
-                        env_vars,
-                    );
-                }
-
-                if completed_turn.prompt.kind == QueuedPromptKind::User {
-                    if let Some(display_text) = &completed_turn.prompt.display_text
-                        && !self.post_user_prompt_hooks.is_empty()
-                    {
-                        let env_vars = HashMap::from([
-                            (
-                                "NORI_HOOK_EVENT".to_string(),
-                                "post_user_prompt".to_string(),
-                            ),
-                            ("NORI_HOOK_PROMPT_TEXT".to_string(), display_text.clone()),
-                        ]);
-                        let results = crate::hooks::execute_hooks_with_env(
-                            &self.post_user_prompt_hooks,
-                            self.script_timeout,
-                            &env_vars,
-                        )
-                        .await;
-                        route_hook_results(
-                            &results,
-                            &self.backend_event_tx,
-                            Some(&self.pending_hook_context),
-                        )
-                        .await;
-                    }
-
-                    if let Some(display_text) = &completed_turn.prompt.display_text
-                        && !self.async_post_user_prompt_hooks.is_empty()
-                    {
-                        let env_vars = HashMap::from([
-                            (
-                                "NORI_HOOK_EVENT".to_string(),
-                                "post_user_prompt".to_string(),
-                            ),
-                            ("NORI_HOOK_PROMPT_TEXT".to_string(), display_text.clone()),
-                        ]);
-                        let _ = crate::hooks::execute_hooks_fire_and_forget(
-                            self.async_post_user_prompt_hooks.clone(),
-                            self.script_timeout,
-                            env_vars,
-                        );
-                    }
-                }
-
-                // The workflow's follow-up comes first; the goal continues once it is done.
-                self.maybe_submit_workflow_hook(completed_turn, generation)
-                    .await;
-                self.maybe_submit_goal_continuation(completed_turn, generation)
-                    .await;
-            }
-            QueuedPromptKind::Compact => {
-                self.finish_compaction(completed_turn).await;
-            }
-            QueuedPromptKind::NativeCompact => {
-                // Native compaction is an ordinary in-session turn: no session
-                // swap and no summary re-injection. Emit the divider only.
-                self.forward_client_event(ClientEvent::ContextCompacted(
-                    crate::normalized::ContextCompacted { summary: None },
-                ))
-                .await;
-            }
-        }
-        // Results that arrived while the turn ran are handed over now, unless the turn queued
-        // another.
-        // Delivery waits for the runtime queue to admit its hidden prompt, so it must not wait
-        // on that same queue from inside the runtime actor.
+    /// Spawn the actor that applies every input to the session runtime one at a time. Nothing
+    /// else mutates the runtime, so the ledger is the single arbiter of what owns the session.
+    pub(super) fn spawn_runtime_actor(
+        &self,
+        mut inputs: mpsc::Receiver<SessionRuntimeInput>,
+    ) -> tokio::task::AbortHandle {
         let backend = self.clone();
-        tokio::spawn(async move { backend.deliver_task_results_if_idle().await });
-        self.maybe_watch_ci(generation).await;
-        self.deliver_ci_if_idle().await;
-    }
-
-    async fn maybe_submit_goal_continuation(
-        &self,
-        completed_turn: &CompletedTurn,
-        generation: i64,
-    ) {
-        if completed_turn.stop_reason != nori_protocol::acp::v1::StopReason::EndTurn {
-            return;
-        }
-
-        // The agent's native goal loop owns continuation while the
-        // `_session/goal` extension drives this goal.
-        if self.thread_goal_state.lock().await.ext_driven() {
-            return;
-        }
-
-        // Safety invariant: a hidden continuation may only chain after another
-        // hidden continuation once we have observed the agent actually connect to
-        // the `nori-client` MCP endpoint (`goal.connected`). Until then the agent
-        // has no way to mark the goal complete/blocked, so unbounded
-        // continuation-to-continuation chaining would loop forever. A user turn may
-        // always start one continuation; only continuation-to-continuation chaining
-        // requires the completion tool to be reachable.
-        let can_chain_continuation = self
-            .goal_mcp_connected
-            .load(std::sync::atomic::Ordering::Relaxed);
-        match completed_turn.prompt.kind {
-            QueuedPromptKind::User
-            | QueuedPromptKind::TaskResults
-            | QueuedPromptKind::WorkflowHook => {}
-            QueuedPromptKind::GoalContinuation if can_chain_continuation => {}
-            QueuedPromptKind::GoalContinuation
-            | QueuedPromptKind::Compact
-            | QueuedPromptKind::NativeCompact => return,
-        }
-
-        self.submit_goal_continuation_if_idle(generation).await;
-    }
-
-    pub(super) async fn submit_goal_continuation_if_idle(&self, generation: i64) {
-        if self.thread_goal_state.lock().await.ext_driven() {
-            return;
-        }
-        if !self
-            .goal_mcp_http_server
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(nori_client_mcp::NoriClient::has_goal_tools)
-        {
-            return;
-        }
-
-        let can_start_continuation = {
-            let driver = self.session_driver.lock().await;
-            matches!(driver.runtime.phase, SessionPhase::Idle) && driver.runtime.queue.is_empty()
-        };
-        if !can_start_continuation {
-            debug!(
-                target: "acp_event_flow",
-                "Skipping goal continuation because the ACP runtime is not idle"
-            );
-            return;
-        }
-
-        let prompt_text = self
-            .thread_goal_state
-            .lock()
-            .await
-            .continuation_prompt(thread_goal::now_seconds());
-        let Some(prompt_text) = prompt_text else {
-            return;
-        };
-
-        let _ = self
-            .session_event_tx
-            .send(SessionRuntimeInput::GuardedContinuation {
-                generation,
-                event: session_reducer::InboundEvent::PromptSubmit(
-                    crate::normalized::session_runtime::QueuedPrompt {
-                        event_id: format!("goal-continuation-{}", uuid::Uuid::new_v4()),
-                        kind:
-                            crate::normalized::session_runtime::QueuedPromptKind::GoalContinuation,
-                        text: prompt_text.clone(),
-                        prompt_meta: None,
-                        original_content: Vec::new(),
-                        content: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt_text))],
-                        display_text: None,
-                    },
-                ),
-            })
-            .await;
-    }
-
-    async fn execute_side_effect(&self, side_effect: SideEffect) {
-        match side_effect {
-            SideEffect::SendPrompt { request_id, prompt } => {
-                if let Some(abort_handle) = self.idle_timer_abort.lock().await.take() {
-                    abort_handle.abort();
-                }
-
-                let (prompt_kind, prompt_event_id, prompt_meta, original_content, display_text) = {
-                    let driver = self.session_driver.lock().await;
-                    driver
-                        .runtime
-                        .active
-                        .as_ref()
-                        .and_then(|active| active.prompt.as_ref())
-                        .map(|prompt| {
-                            (
-                                prompt.kind,
-                                prompt.event_id.clone(),
-                                prompt.prompt_meta.clone(),
-                                prompt.original_content.clone(),
-                                prompt.display_text.clone(),
-                            )
-                        })
-                        .unwrap_or((
-                            QueuedPromptKind::User,
-                            request_id.to_string(),
-                            None,
-                            Vec::new(),
-                            None,
-                        ))
-                };
-                match prompt_kind {
-                    QueuedPromptKind::User => {
-                        self.edit_journal
-                            .begin_turn(display_text.clone().unwrap_or_default());
-                        self.workflow_turn_started().await;
+        tokio::spawn(IN_RUNTIME_ACTOR.scope((), async move {
+            while let Some(input) = inputs.recv().await {
+                match input {
+                    SessionRuntimeInput::Reducer(event) => {
+                        backend.apply_session_event(event).await;
                     }
-                    QueuedPromptKind::WorkflowHook => {
-                        self.edit_journal.begin_turn("workflow hook".to_string());
+                    SessionRuntimeInput::Offer {
+                        generation,
+                        prompt,
+                        admitted,
+                    } => {
+                        let started = backend.admit_offer(generation, *prompt).await;
+                        let _ = admitted.send(started);
                     }
-                    QueuedPromptKind::GoalContinuation => {
-                        self.edit_journal
-                            .begin_turn("goal continuation".to_string());
+                    SessionRuntimeInput::Barrier { response_tx } => {
+                        let _ = response_tx.send(());
                     }
-                    QueuedPromptKind::TaskResults => {
-                        self.edit_journal
-                            .begin_turn("delegated task results".to_string());
+                    SessionRuntimeInput::QuestionCancelled(event) => {
+                        backend.withdraw_cancelled_question(&event).await;
                     }
-                    QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {}
-                }
-                let client_request_started = self
-                    .pending_prompt_submissions
-                    .lock()
-                    .await
-                    .remove(&prompt_event_id);
-                let (prompt_phase_tx, prompt_phase_rx) = tokio::sync::watch::channel(false);
-                *self.prompt_phase_gate.lock().await = Some(prompt_phase_rx);
-                let (transport_started_tx, transport_started_rx) = oneshot::channel();
-                let backend = (*self).clone();
-                let prompt_result_tx = self.prompt_result_tx.clone();
-                let request_id_for_task = request_id.clone();
-                let prompt_meta_for_task = prompt_meta.clone();
-                let echo_id_for_task =
-                    nori_protocol::PromptEchoId::in_meta(prompt_meta.as_ref()).map(str::to_owned);
-                let original_content_for_task = original_content.clone();
-                let prompt_task = tokio::spawn(async move {
-                    let session_id = backend.session_id.read().await.clone();
-                    let mut prompt = prompt;
-                    if !matches!(
-                        prompt_kind,
-                        QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
-                    ) && let Some(context) = backend.take_goal_context_for_prompt().await
-                    {
-                        prompt.push(acp::ContentBlock::Text(acp::TextContent::new(context)));
+                    SessionRuntimeInput::PermissionRequest {
+                        pending_request,
+                        current_policy,
+                    } => {
+                        backend
+                            .handle_permission_request(pending_request, current_policy)
+                            .await;
                     }
-                    debug!(
-                        target: "acp_event_flow",
-                        request_id = %request_id_for_task,
-                        session_id = %session_id,
-                        ?prompt_kind,
-                        content_blocks = prompt.len(),
-                        "Sending ACP session/prompt request"
-                    );
-                    let (wire_request_id, result) = backend
-                        .connection
-                        .prompt_with_request_id(
-                            session_id,
-                            prompt,
-                            prompt_meta_for_task,
-                            Some(transport_started_tx),
-                        )
-                        .await;
-                    match result {
-                        Ok(stop_reason) => {
-                            debug!(
-                                target: "acp_event_flow",
-                                request_id = %wire_request_id,
-                                ?stop_reason,
-                                "Prompt task received ACP session/prompt response"
-                            );
-                            let _ = prompt_result_tx
-                                .send(InboundEvent::PromptResponse { stop_reason })
-                                .await;
-                        }
-                        Err(err) => {
-                            warn!(
-                                target: "acp_event_flow",
-                                request_id = %wire_request_id,
-                                error = %err,
-                                "Prompt task failed before reducer observed a prompt response"
-                            );
-                            if prompt_kind == QueuedPromptKind::User
-                                && nori_acp_host::is_subscription_exhausted(&err)
-                            {
-                                let (models, ranked) = backend.fallback_policy().await;
-                                let context = backend.recent_context().await;
-                                backend.wait_for_prompt_phase().await;
-                                let _ = backend
-                                    .backend_event_tx
-                                    .send(BackendEvent::Public(SessionEvent::Nori(
-                                        nori_protocol::NoriEvent::SubscriptionExhausted(
-                                            nori_protocol::SubscriptionExhausted {
-                                                request_id: wire_request_id.clone(),
-                                                echo_id: echo_id_for_task,
-                                                models,
-                                                ranked,
-                                                content: original_content_for_task,
-                                                context,
-                                                original_error: format!("{err:#}"),
-                                            },
-                                        ),
-                                    )))
-                                    .await;
-                            }
-                            let failure = backend
-                                .send_prompt_error(&wire_request_id, prompt_kind, &err)
-                                .await;
-                            let _ = prompt_result_tx
-                                .send(InboundEvent::PromptFailed {
-                                    failure: Some(failure),
-                                })
-                                .await;
-                        }
-                    }
-                });
-                *self.prompt_task_abort.lock().await = Some(prompt_task.abort_handle());
-
-                let transport_start_result =
-                    match transport_started_rx.await {
-                        Ok(Ok(wire_request_id)) => {
-                            let actions = self.session_driver.lock().await.apply(
-                                InboundEvent::PromptStarted {
-                                    request_id: wire_request_id.clone(),
-                                },
-                            );
-                            debug_assert!(actions.side_effects.is_empty());
-                            debug_assert!(actions.completed_turn.is_none());
-                            self.forward_client_events(&actions.events).await;
-                            self.forward_observer_turn_status("working").await;
-                            Ok(wire_request_id)
-                        }
-                        Ok(Err(error)) => Err(error),
-                        Err(_) => Err(anyhow::anyhow!(
-                            "ACP transport did not assign a prompt request ID"
-                        )),
-                    };
-
-                let handoff_retry = prompt_meta
-                    .as_ref()
-                    .and_then(|meta| meta.get(nori_protocol::HANDOFF_RETRY_META_KEY))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                if prompt_kind == QueuedPromptKind::User && !handoff_retry {
-                    if let Some(recorder) = self.transcript_recorder.read().await.clone()
-                        && let Some(display_text) = display_text.as_deref()
-                        && let Err(error) = recorder
-                            .record_user_message(&prompt_event_id, display_text, vec![])
-                            .await
-                    {
-                        warn!("Failed to record user message to transcript: {error}");
-                    }
-
-                    let session_id = self.session_id.read().await.clone();
-                    let message_id = acp::MessageId::new(prompt_event_id);
-                    let echo_meta = prompt_meta.as_ref().and_then(|meta| {
-                        meta.get(nori_protocol::PROMPT_ECHO_ID_META_KEY)
-                            .cloned()
-                            .map(|echo_id| {
-                                acp::Meta::from_iter([(
-                                    nori_protocol::PROMPT_ECHO_ID_META_KEY.to_string(),
-                                    echo_id,
-                                )])
+                    SessionRuntimeInput::Wake(wake) => {
+                        let live_requests = backend.live_request_ids().await;
+                        backend
+                            .apply_session_event(InboundEvent::Woke {
+                                wake,
+                                live_requests,
                             })
-                    });
-                    for content in original_content {
-                        let notification = acp::SessionNotification::new(
-                            session_id.clone(),
-                            acp::SessionUpdate::UserMessageChunk(
-                                acp::ContentChunk::new(content)
-                                    .message_id(message_id.clone())
-                                    .meta(echo_meta.clone()),
-                            ),
-                        );
-                        let _ = self
-                            .backend_event_tx
-                            .send(BackendEvent::Public(SessionEvent::Acp(
-                                nori_protocol::AcpEvent::Notification(
-                                    acp::AgentNotification::SessionNotification(notification),
-                                ),
-                            )))
                             .await;
                     }
                 }
-
-                if let Some(request_started) = client_request_started {
-                    let _ = request_started.send(transport_start_result);
-                }
-                let _ = prompt_phase_tx.send(true);
             }
-            SideEffect::SendCancel => {
-                let session_id = self.session_id.read().await.clone();
-                debug!(
-                    target: "acp_event_flow",
-                    session_id = %session_id,
-                    "Sending ACP session/cancel notification"
-                );
-                if let Err(err) = self.connection.cancel(&session_id).await {
-                    warn!("Failed to cancel ACP session: {err}");
-                }
-
-                let event_tx = self.backend_event_tx.clone();
-                let prompt_task_abort = Arc::clone(&self.prompt_task_abort);
-                let prompt_result_tx = self.prompt_result_tx.clone();
-                let watchdog = tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(CANCEL_WARNING_SECS)).await;
-                    warn!("Agent has not responded to cancel after {CANCEL_WARNING_SECS}s");
-                    let _ = event_tx
-                        .send(BackendEvent::Public(SessionEvent::Nori(
-                            nori_protocol::NoriEvent::Notice(nori_protocol::Notice {
-                                message: format!(
-                                    "Agent is slow to cancel. Will force-cancel in {}s…",
-                                    CANCEL_FORCE_SECS - CANCEL_WARNING_SECS
-                                ),
-                            }),
-                        )))
-                        .await;
-
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        CANCEL_FORCE_SECS - CANCEL_WARNING_SECS,
-                    ))
-                    .await;
-                    if let Some(abort) = prompt_task_abort.lock().await.take() {
-                        warn!("Force-cancelling prompt task after {CANCEL_FORCE_SECS}s timeout");
-                        abort.abort();
-                        let _ = prompt_result_tx
-                            .send(InboundEvent::PromptFailed { failure: None })
-                            .await;
-                    }
-                });
-                *self.cancel_timeout_abort.lock().await = Some(watchdog.abort_handle());
-            }
-            SideEffect::RejectPromptBusy { event_id } => {
-                if let Some(response_tx) = self
-                    .pending_prompt_submissions
-                    .lock()
-                    .await
-                    .remove(&event_id)
-                {
-                    let _ = response_tx.send(Err(super::PromptBusy.into()));
-                }
-            }
-            SideEffect::ResolvePermissionCancelled { request_id } => {
-                self.resolve_cancelled_permission(&request_id).await;
-            }
-        }
-    }
-
-    /// Publish a correlated prompt failure and return its disposition for the
-    /// reducer-owned completion.
-    async fn send_prompt_error(
-        &self,
-        request_id: &nori_protocol::acp::v1::RequestId,
-        prompt_kind: QueuedPromptKind,
-        err: &anyhow::Error,
-    ) -> crate::normalized::TurnFailure {
-        let (message, retryable) = match prompt_kind {
-            QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {
-                (format!("Compact failed: {err}"), false)
-            }
-            QueuedPromptKind::GoalContinuation => {
-                (format!("Goal continuation failed: {err}"), false)
-            }
-            QueuedPromptKind::TaskResults => (
-                format!("Delivering delegated task results failed: {err}"),
-                false,
-            ),
-            QueuedPromptKind::WorkflowHook => (format!("Workflow hook failed: {err}"), false),
-            QueuedPromptKind::User => {
-                let error_string = format!("{err:?}");
-                let AcpErrorDetails {
-                    category,
-                    message: agent_message,
-                    detail,
-                } = categorize_acp_error_chain(err);
-                // Prefer the concise structured ACP message. Falling back to
-                // top-level Display avoids dumping structured `data` as JSON.
-                // Preserve clean agent-supplied `data.detail` parenthetically,
-                // mirroring `enhance_agent_error`.
-                let display_error = agent_message.unwrap_or_else(|| format!("{err}"));
-                let retryable = category.is_retryable();
-                warn!(
-                    ?category,
-                    retryable, "ACP user prompt failed: {error_string}"
-                );
-                let message = match category {
-                    AcpErrorCategory::Authentication => {
-                        format!(
-                            "Authentication error: {display_error}. Please check your credentials or re-authenticate."
-                        )
-                    }
-                    AcpErrorCategory::QuotaExceeded => {
-                        format!("Rate limit or quota exceeded: {display_error}")
-                    }
-                    AcpErrorCategory::ExecutableNotFound => {
-                        format!("Agent executable not found: {display_error}")
-                    }
-                    AcpErrorCategory::Initialization => {
-                        format!("Agent initialization failed: {display_error}")
-                    }
-                    AcpErrorCategory::PromptTooLong => {
-                        "Prompt is too long. Try using /compact to reduce context size, or start a new session."
-                            .to_string()
-                    }
-                    AcpErrorCategory::ApiServerError => {
-                        "The API returned a server error. This is usually temporary — please try again."
-                            .to_string()
-                    }
-                    AcpErrorCategory::SessionNotFound => format!(
-                        "The session no longer exists on the agent — it may have expired or been closed elsewhere: {display_error}"
-                    ),
-                    AcpErrorCategory::SessionNotResumable => format!(
-                        "The session can't be reattached — start a new session instead: {display_error}"
-                    ),
-                    AcpErrorCategory::SessionAlreadyActive => format!(
-                        "A session is already active on the agent connection — close it before switching: {display_error}"
-                    ),
-                    AcpErrorCategory::NoActiveSession => format!(
-                        "No session is active on the agent connection — start a new chat with /new: {display_error}"
-                    ),
-                    AcpErrorCategory::AgentUnreachable => format!(
-                        "The agent's backing service is unreachable — check your network and try again: {display_error}"
-                    ),
-                    AcpErrorCategory::Unknown => format!("ACP prompt failed: {display_error}"),
-                };
-                // The agent-supplied `error.data.detail` is clean, user-facing
-                // context (e.g. "connection reset by broker") — keep it verbatim.
-                let message = match detail {
-                    Some(detail) => format!("{message} ({detail})"),
-                    None => message,
-                };
-                (message, retryable)
-            }
-        };
-
-        debug!("{message}");
-        let (request_failure_kind, turn_failure) = if retryable {
-            (
-                nori_protocol::RequestFailureKind::Retryable,
-                crate::normalized::TurnFailure::Retryable,
-            )
-        } else {
-            (
-                nori_protocol::RequestFailureKind::Fatal,
-                crate::normalized::TurnFailure::Fatal,
-            )
-        };
-        self.wait_for_prompt_phase().await;
-        let _ = self
-            .backend_event_tx
-            .send(BackendEvent::Public(SessionEvent::Nori(
-                nori_protocol::NoriEvent::RequestFailed(nori_protocol::RequestFailure {
-                    request_id: Some(request_id.clone()),
-                    message,
-                    kind: request_failure_kind,
-                }),
-            )))
-            .await;
-        turn_failure
-    }
-
-    async fn resolve_cancelled_permission(&self, request_id: &str) {
-        let mut pending = self.pending_approvals.lock().await;
-        if let Some(position) = pending.iter().position(|pending_request| {
-            pending_request.request.request_id.to_string() == request_id
-        }) {
-            let pending_request = pending.remove(position);
-            drop(pending_request);
-        }
-    }
-
-    async fn maybe_start_idle_timer(&self) {
-        let is_idle = {
-            let driver = self.session_driver.lock().await;
-            driver.active_request_id().is_none()
-        };
-        if !is_idle {
-            return;
-        }
-
-        let Some(duration) = self.notify_after_idle.as_duration() else {
-            return;
-        };
-
-        let idle_secs = duration.as_secs();
-        let user_notifier = Arc::clone(&self.user_notifier);
-        let session_id = self.session_id.read().await.to_string();
-        let idle_task = tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            user_notifier.notify(&crate::UserNotification::Idle {
-                session_id,
-                idle_duration_secs: idle_secs,
-            });
-        });
-        *self.idle_timer_abort.lock().await = Some(idle_task.abort_handle());
+        }))
+        .abort_handle()
     }
 }

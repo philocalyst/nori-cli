@@ -46,8 +46,11 @@ nori-forge = { workspace = true }
 nori-host-tools = { workspace = true }
 nori-workflow = { workspace = true }
 nori-pkl = { workspace = true }
+nori-conduit = { workspace = true }
+nori-bash = { workspace = true }
 notify-rust = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 shlex = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }

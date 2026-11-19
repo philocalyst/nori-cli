@@ -1073,6 +1073,20 @@ async fn active_prompt_broadcasts_original_content_once_before_agent_output() {
         "the complete user prompt must precede agent output"
     );
 
+    let recorder = session
+        .handle
+        .conversation_recorder()
+        .await
+        .unwrap()
+        .unwrap();
+    recorder.flush().await.unwrap();
+    let canonical_context = recorder.visible_context().await.unwrap();
+    assert!(canonical_context.contains("visible prompt"));
+    assert!(
+        !canonical_context.contains("Nori-only injected context"),
+        "assistant-only observations must not become user activity in the canonical journal"
+    );
+
     session.handle.shutdown().await.expect("shutdown session");
 }
 
@@ -1345,7 +1359,7 @@ async fn load_replay_user_message_notifications_remain_on_the_public_boundary() 
     clippy::expect_used,
     reason = "this helper turns missing ACP wire records into focused test failures"
 )]
-async fn record_cli_context_prompts(http_mcp: bool) -> Vec<String> {
+async fn record_cli_context_prompts(http_mcp: bool) -> Vec<serde_json::Value> {
     let _mcp_guard = http_mcp.then(|| {
         // SAFETY: callers are serialized with every other environment-mutating test.
         unsafe { std::env::set_var("MOCK_AGENT_MCP_HTTP", "1") };
@@ -1429,59 +1443,53 @@ async fn record_cli_context_prompts(http_mcp: bool) -> Vec<String> {
             record["direction"] == "client_to_agent"
                 && record["message"]["method"] == "session/prompt"
         })
-        .map(|record| {
-            record["message"]["params"]["prompt"]
-                .as_array()
-                .expect("prompt content blocks")
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect::<String>()
-        })
+        .map(|record| record["message"]["params"]["prompt"].clone())
         .collect()
 }
 
 #[tokio::test]
 #[serial]
 async fn http_mcp_agent_receives_goal_routing_context_once_without_fallback_guidance() {
+    let prompts = record_cli_context_prompts(true).await;
+    assert_eq!(prompts.len(), 2);
     assert_eq!(
-        record_cli_context_prompts(true).await,
-        vec![
-            [
-                "<context>",
-                "Source: this message is from Nori CLI.",
-                "",
-                "When <goal_context> is present, Nori CLI owns the goal. Nori delivers changed goal context automatically when supported; use `get_goal` only if you need to inspect the current state, and use `update_goal` to change its status.",
-                "</context>",
-                "",
-                "first prompt",
-            ]
-            .join("\n"),
-            "second prompt".to_string(),
-        ]
+        prompts[0][0]["annotations"]["audience"],
+        serde_json::json!(["assistant"])
     );
+    assert_eq!(
+        prompts[0][1],
+        serde_json::json!({"type": "text", "text": "first prompt"})
+    );
+    assert_eq!(
+        prompts[1],
+        serde_json::json!([{"type": "text", "text": "second prompt"}])
+    );
+    let context = prompts[0][0]["text"].as_str().unwrap();
+    let (routing_context, catalog) = context.split_once("<nori_agent_catalog>").unwrap();
+    assert_eq!(
+        routing_context.trim_end(),
+        include_str!("../../tui/session_context_http_mcp.md").trim_end()
+    );
+    let catalog = catalog
+        .lines()
+        .find_map(|line| line.strip_prefix("Cached configured delegation capabilities: "))
+        .unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    assert_eq!(catalog["can_delegate"], true);
+    assert!(catalog["agents"].is_array());
 }
 
 #[tokio::test]
 #[serial]
 async fn non_mcp_agent_receives_full_cli_fallback_context_once() {
-    assert_eq!(
-        record_cli_context_prompts(false).await,
-        vec![
-            [
-                "<context>",
-                "Source: this message is from Nori CLI.",
-                "",
-                "You are operating over ACP.",
-                "For Nori CLI implementation questions, use https://github.com/tilework-tech/nori-cli as the stable source reference.",
-                "MCP-backed Nori affordances, including /goal completion tools such as update_goal, are unavailable in this session.",
-                "</context>",
-                "",
-                "first prompt",
-            ]
-            .join("\n"),
-            "second prompt".to_string(),
-        ]
-    );
+    let prompts = record_cli_context_prompts(false).await;
+    assert_eq!(prompts, serde_json::json!([
+        [
+            {"type": "text", "text": include_str!("../../tui/session_context.md"), "annotations": {"audience": ["assistant"]}},
+            {"type": "text", "text": "first prompt"}
+        ],
+        [{"type": "text", "text": "second prompt"}]
+    ]).as_array().unwrap().clone());
 }
 
 #[tokio::test]

@@ -25,6 +25,9 @@ const DEFAULT_HOOK_TURNS: i64 = i64::MAX;
 pub(crate) struct WorkflowState {
     /// The workflow in force for this session.
     pub(super) active: Option<Workflow>,
+    /// How failed requests are retried and where the session falls back to. Children carry the
+    /// user's policy too, even though they run no workflow of their own.
+    pub(super) recovery: nori_workflow::RecoveryPolicy,
     /// The agent has been told the active workflow's rules.
     told: bool,
     /// Hook turns sent since the user's last turn.
@@ -39,8 +42,6 @@ pub(crate) struct WorkflowState {
     pub(super) pushed_before: Option<String>,
     /// The pushed commit whose checks are being watched, or were last reported.
     pub(super) ci_watching: Option<String>,
-    /// What CI said, waiting for the session to be idle.
-    pub(super) ci_owed: Option<super::ci_watch::CiReport>,
 }
 
 /// Always release prompt waiters, including if the background task is cancelled.
@@ -142,16 +143,20 @@ pub(super) async fn prepare_workflow(
     let (loaded, snapshot) = receiver
         .await
         .map_err(|error| anyhow::anyhow!("Workflow policy loader stopped: {error}"))?;
-    let active = match loaded {
-        Ok(policy) if child => policy.tools.map(|tools| Workflow {
-            tools: Some(tools),
-            ..Default::default()
-        }),
-        Ok(policy) => Some(policy),
+    let (active, recovery) = match loaded {
+        Ok(policy) if child => (
+            policy.tools.map(|tools| Workflow {
+                tools: Some(tools),
+                ..Default::default()
+            }),
+            policy.recovery,
+        ),
+        Ok(policy) => (Some(policy.clone()), policy.recovery),
         Err(error) => return Err(anyhow::anyhow!("Workflow policy failed to load: {error}")),
     };
     let workflow = Arc::new(Mutex::new(WorkflowState {
         active,
+        recovery,
         ..Default::default()
     }));
     let machine = Arc::new(OnceCell::new_with(Some(snapshot)));
@@ -218,6 +223,27 @@ impl WorkflowState {
 }
 
 impl AcpBackend {
+    /// The recovery policy programs run under, once the background policy load is done.
+    pub(crate) async fn program_recovery(&self) -> nori_workflow::RecoveryPolicy {
+        let mut ready = self.workflow_ready.subscribe();
+        while !*ready.borrow_and_update() {
+            if ready.changed().await.is_err() {
+                break;
+            }
+        }
+        self.workflow.lock().await.recovery.clone()
+    }
+
+    /// This session's Nori home, which a world's own home is seeded from.
+    pub(crate) fn program_nori_home(&self) -> &Path {
+        &self.nori_home
+    }
+
+    /// The session's working directory: where programs keep `.nori/runs/` and act.
+    pub(crate) fn program_cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     pub(crate) async fn program_machine_properties(
         &self,
     ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
@@ -228,23 +254,6 @@ impl AcpBackend {
         .await?;
         Ok(snapshot.properties())
     }
-    /// Resolve fallback policy even if the background workflow load has not finished yet.
-    pub(super) async fn fallback_policy(&self) -> (Vec<String>, bool) {
-        let mut ready = self.workflow_ready.subscribe();
-        while !*ready.borrow_and_update() {
-            if ready.changed().await.is_err() {
-                break;
-            }
-        }
-        self.workflow
-            .lock()
-            .await
-            .active
-            .as_ref()
-            .map(|workflow| (workflow.fallback_models.clone(), workflow.fallback_ranked))
-            .unwrap_or_default()
-    }
-
     /// Agents that cannot receive Nori tools may start while policy loads.
     pub(super) fn load_workflow_without_tools(&self) {
         let completion = PolicyLoadCompletion(self.workflow_ready.clone());
@@ -373,7 +382,9 @@ impl AcpBackend {
         let events: &[HookEvent] = match completed_turn.prompt.kind {
             // Hooks answer what the user's turn did; a hook turn's own commit may still be
             // followed up, but its edits never start another round.
-            QueuedPromptKind::User | QueuedPromptKind::TaskResults => &[
+            QueuedPromptKind::User
+            | QueuedPromptKind::TaskResults
+            | QueuedPromptKind::MonitorEvents => &[
                 HookEvent::AfterChange,
                 HookEvent::AfterCommit,
                 HookEvent::AfterTurn,
@@ -429,62 +440,62 @@ impl AcpBackend {
         if self.session_driver.lock().await.prompt_is_busy() {
             return;
         }
+        // The hook is spent only if the ledger let its turn start.
+        if self
+            .send_hook_turn(
+                generation,
+                format!("Workflow \"{}\" · {}", workflow.name, event.form()),
+                event,
+                prompt,
+            )
+            .await
         {
             let mut state = self.workflow.lock().await;
             state.hook_turns += 1;
             state.stop_hooked |= event == HookEvent::BeforeStop;
         }
-        self.send_hook_turn(
-            generation,
-            format!("Workflow \"{}\" · {}", workflow.name, event.form()),
-            event,
-            prompt,
-        )
-        .await;
     }
 
-    /// Send `body` as the hidden turn of the workflow hook `event`, announced by an info line.
+    /// Offer `body` to the ledger as the hidden turn of the workflow hook `event`, announced by
+    /// an info line once it has started. Returns whether the turn started.
     pub(super) async fn send_hook_turn(
         &self,
         generation: i64,
         label: String,
         event: HookEvent,
         body: String,
-    ) {
-        if generation != self.orchestrator.admission_generation() {
-            return;
-        }
-        // Routine, so an info line rather than a warning.
-        let _ = self
-            .backend_event_tx
-            .send(BackendEvent::Public(SessionEvent::Nori(
-                nori_protocol::NoriEvent::HookOutput(nori_protocol::HookOutput {
-                    message: label,
-                    level: nori_protocol::HookOutputLevel::Info,
-                }),
-            )))
-            .await;
+    ) -> bool {
         let text = format!(
             "<workflow_hook event=\"{}\">\n{body}\n</workflow_hook>",
             event.form()
         );
-        let _ = self
-            .session_event_tx
-            .send(
-                session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
-                    generation,
-                    event: session_reducer::InboundEvent::PromptSubmit(QueuedPrompt {
-                        event_id: format!("workflow-hook-{}", uuid::Uuid::new_v4()),
-                        kind: QueuedPromptKind::WorkflowHook,
-                        text: text.clone(),
-                        prompt_meta: None,
-                        original_content: Vec::new(),
-                        content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                        display_text: None,
-                    }),
+        let started = self
+            .offer_prompt(
+                Some(generation),
+                QueuedPrompt {
+                    event_id: format!("workflow-hook-{}", uuid::Uuid::new_v4()),
+                    kind: QueuedPromptKind::WorkflowHook,
+                    text: text.clone(),
+                    prompt_meta: None,
+                    original_content: Vec::new(),
+                    content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                    display_text: None,
                 },
             )
             .await;
+        if started {
+            // Routine, so an info line rather than a warning.
+            let _ = self
+                .backend_event_tx
+                .send(BackendEvent::Public(SessionEvent::Nori(
+                    nori_protocol::NoriEvent::HookOutput(nori_protocol::HookOutput {
+                        message: label,
+                        level: nori_protocol::HookOutputLevel::Info,
+                    }),
+                )))
+                .await;
+        }
+        started
     }
 }
 

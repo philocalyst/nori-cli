@@ -31,10 +31,18 @@ impl AcpBackend {
     ///
     /// On failure the goal-MCP connected flag is rolled back and the error is
     /// returned to the caller.
+    ///
+    /// Every swap, whatever its mode, runs with the turn ledger fenced (see
+    /// [`AcpBackend::while_fenced`]; a finished summary turn leaves the fence up for
+    /// compaction): no turn is open and no prompt can start while the session is replaced.
     pub(super) async fn swap_active_session(
         &self,
         mode: SessionSwapMode,
     ) -> Result<acp::SessionId> {
+        anyhow::ensure!(
+            self.session_driver.lock().await.is_fenced(),
+            "internal error: a session swap must hold the turn ledger's fence"
+        );
         let prior_model = if matches!(&mode, SessionSwapMode::Rewind { .. }) {
             self.connection
                 .config_options()
@@ -188,11 +196,13 @@ impl AcpBackend {
                 // `session_id` still names the old session) so the
                 // nori-client loop can take the local goal back over.
                 self.stop_stale_ext_goal().await;
-                {
+                let replaced = {
                     let mut active_session = self.session_id.write().await;
                     self.native_children.shutdown().await;
-                    *active_session = new_session_id.clone();
-                }
+                    std::mem::replace(&mut *active_session, new_session_id.clone())
+                };
+                // Nothing the replaced session sends reaches the new one's ledger.
+                self.retire_session(&replaced).await;
                 self.orchestrator.bind(orchestrator::Binding {
                     session_id: new_session_id.clone(),
                     approval_policy: self.approval_policy_tx.subscribe(),
@@ -227,6 +237,15 @@ impl AcpBackend {
                     ),
                 ))
                 .await;
+                // A new session of the conversation is the moment to go back to the route the
+                // user chose, when a fallback left it and the policy says `next_session`.
+                if matches!(
+                    mode,
+                    SessionSwapMode::NewAfterCompact | SessionSwapMode::Rewind { .. }
+                ) && let Some(request) = self.restore_primary(RestoreAt::SessionStart).await
+                {
+                    self.request_handoff(request);
+                }
                 Ok(new_session_id)
             }
             Err(err) => {
@@ -320,17 +339,12 @@ impl AcpBackend {
             anyhow::bail!("This agent does not support branching");
         }
 
-        let is_idle = matches!(
-            self.session_driver.lock().await.public_phase(),
-            nori_protocol::SessionPhase::Idle
-        );
-        if !is_idle {
-            anyhow::bail!("Cannot branch during an active turn");
-        }
-
         let from = self.session_id.read().await.clone();
-        self.swap_active_session(SessionSwapMode::ForkFromHead { from })
-            .await?;
+        self.while_fenced("branch", async {
+            self.swap_active_session(SessionSwapMode::ForkFromHead { from })
+                .await
+        })
+        .await?;
         Ok(())
     }
 }

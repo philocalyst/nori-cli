@@ -328,6 +328,7 @@ mod detect_shell_type_tests {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -338,7 +339,8 @@ mod tests {
 
         let shell_path = zsh_shell.shell_path;
 
-        assert_eq!(shell_path, PathBuf::from("/bin/zsh"));
+        assert!(shell_path.is_absolute());
+        assert_eq!(shell_path.file_name(), Some(std::ffi::OsStr::new("zsh")));
     }
 
     #[test]
@@ -348,7 +350,10 @@ mod tests {
 
         let shell_path = zsh_shell.shell_path;
 
-        assert_eq!(shell_path, PathBuf::from("/bin/zsh"));
+        assert_eq!(
+            shell_path,
+            get_shell(ShellType::Zsh, None).unwrap().shell_path
+        );
     }
 
     #[test]
@@ -370,10 +375,8 @@ mod tests {
     fn detects_sh() {
         let sh_shell = get_shell(ShellType::Sh, None).unwrap();
         let shell_path = sh_shell.shell_path;
-        assert!(
-            shell_path == *"/bin/sh" || shell_path == *"/usr/bin/sh",
-            "shell path: {shell_path:?}",
-        );
+        assert!(shell_path.is_absolute());
+        assert_eq!(shell_path.file_name(), Some(std::ffi::OsStr::new("sh")));
     }
 
     #[test]

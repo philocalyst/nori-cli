@@ -148,7 +148,7 @@ pub(crate) fn context_from_records(records: Vec<Record>) -> serde_json::Result<S
             .collect();
     let events: Vec<Value> = records
         .into_iter()
-        .filter(|record| !matches!(&record.event, Event::Command { name, .. } if name == "fork-context" || name == "fork-source" || name.starts_with("native-child-journal:") || name.starts_with("managed-child-journal:")))
+        .filter(|record| !matches!(&record.event, Event::Command { name, .. } if name == "fork-context" || name == "fork-source" || name.starts_with("native-child-journal:") || name.starts_with("managed-child-journal:") || name == "actor-delta" || name == "actor-snapshot"))
         .filter(|record| !matches!(&record.event, Event::Operation { name, args } if name == "transcript-entry" && serde_json::from_str::<TranscriptLine>(args).is_ok_and(|line| matches!(line.entry, TranscriptEntry::SessionEvent(entry) if matches!(entry.event, nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(_)))))))
         .map(|record| {
             let event = match record.event {

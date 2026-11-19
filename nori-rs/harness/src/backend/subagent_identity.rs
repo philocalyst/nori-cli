@@ -25,6 +25,7 @@ mod tests {
             parent_session_id: SessionId::new("parent"),
             session_id: SessionId::new("child"),
             agent: Patch::Keep,
+            model: Patch::Keep,
             title: Patch::Set("misleading title".to_owned()),
             description: Patch::Keep,
             state: Patch::Keep,

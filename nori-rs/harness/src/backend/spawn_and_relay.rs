@@ -260,7 +260,7 @@ impl AcpBackend {
         let connection = Arc::new(connection);
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
         let session_driver = Arc::new(Mutex::new(session_runtime_driver::SessionDriver::new()));
-        let (session_event_tx, mut session_event_rx) = mpsc::channel(128);
+        let (session_event_tx, session_event_rx) = mpsc::channel(128);
         let (prompt_result_tx, prompt_result_rx) = mpsc::channel(128);
         let use_native_notifications =
             config.os_notifications == crate::config::OsNotifications::Enabled;
@@ -285,12 +285,13 @@ impl AcpBackend {
             Some(Arc::clone(recorder))
         } else {
             Some(Arc::new(
-                TranscriptRecorder::new(
+                TranscriptRecorder::new_for(
                     &config.nori_home,
                     &cwd,
                     Some(config.agent.clone()),
                     &config.cli_version,
                     Some(session_id.to_string()),
+                    config.delegation.is_child(),
                 )
                 .await
                 .map_err(|error| {
@@ -326,7 +327,13 @@ impl AcpBackend {
         {
             warn!(%error, "Failed to record initial backend binding");
         }
-        let pending_hook_context = session_context_for_connection(config, &connection);
+        let pending_hook_context = orchestrator
+            .initial_catalog_context(
+                session_context_for_connection(config, &connection),
+                &workflow,
+                goal_mcp_http_server.lock().await.is_some(),
+            )
+            .await;
         let goal_ext_capability =
             goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta());
         let transcript_recorder_cell = Arc::new(RwLock::new(transcript_recorder));
@@ -408,50 +415,22 @@ impl AcpBackend {
             mcp_oauth_credentials_store_mode: config.mcp_oauth_credentials_store_mode,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             prompt_task_abort: Arc::new(Mutex::new(None)),
+            retired_sessions: Arc::default(),
+            recovery: super::route_moves::SessionRecovery::new(config.session_context.clone()),
             cancel_timeout_abort: Arc::new(Mutex::new(None)),
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
             native_children,
+            user_bash_session: Arc::new(Mutex::new(None)),
         };
 
         if !policy_before_session && !backend.orchestrator.is_child() {
             backend.load_workflow_without_tools();
         }
 
-        let runtime_backend = backend.clone();
-        let runtime_task = tokio::spawn(async move {
-            while let Some(input) = session_event_rx.recv().await {
-                match input {
-                    session_runtime_driver::SessionRuntimeInput::Reducer(event) => {
-                        runtime_backend.apply_session_event(event).await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
-                        generation,
-                        event,
-                    } => {
-                        runtime_backend
-                            .apply_guarded_continuation(generation, event)
-                            .await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::Barrier { response_tx } => {
-                        let _ = response_tx.send(());
-                    }
-                    session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event) => {
-                        runtime_backend.withdraw_cancelled_question(&event).await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::PermissionRequest {
-                        pending_request,
-                        current_policy,
-                    } => {
-                        runtime_backend
-                            .handle_permission_request(pending_request, current_policy)
-                            .await;
-                    }
-                }
-            }
-        });
-        *backend.runtime_task_abort.lock().await = Some(runtime_task.abort_handle());
+        *backend.runtime_task_abort.lock().await =
+            Some(backend.spawn_runtime_actor(session_event_rx));
         backend.orchestrator.bind(orchestrator::Binding {
             session_id: backend.session_id().await,
             approval_policy: backend.approval_policy_tx.subscribe(),
@@ -493,7 +472,15 @@ impl AcpBackend {
                     history_log_id: i64::try_from(history_log_id).unwrap_or(i64::MAX),
                     history_entry_count: i64::try_from(history_entry_count).unwrap_or(i64::MAX),
                     config_options: backend.config_options(),
+                    swap: None,
                 }),
+            )))
+            .await
+            .ok();
+
+        backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(
+                nori_protocol::NoriEvent::SessionReady(backend.session_id().await),
             )))
             .await
             .ok();
@@ -523,6 +510,16 @@ impl AcpBackend {
         let mut relay_seq = 0_i64;
         let mut suppress_next_session_update = false;
         let mut child_edits = super::child_edits::ChildEdits::default();
+        // usage: samples of what the agent reports about its own consumption.
+        let mut usage_tap = crate::usage::UsageTap::new(&backend.nori_home, backend.agent_name())
+            .for_actor(
+                backend
+                    .orchestrator
+                    .seed()
+                    .actor_view
+                    .as_ref()
+                    .map(ToString::to_string),
+            );
         loop {
             tokio::select! {
                 biased;
@@ -539,6 +536,8 @@ impl AcpBackend {
                             }
                             backend.wait_for_prompt_phase().await;
                             backend.observe_session_update_for_goal_ext(&update).await;
+                            // usage: the root session's usage and session-info updates.
+                            usage_tap.observe_root(&backend.session_id().await.to_string(), &update);
                             relay_seq += 1;
                             debug!(
                                 target: "acp_event_flow",
@@ -569,10 +568,18 @@ impl AcpBackend {
                                 let _ = backend.session_event_tx.send(session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event)).await;
                                 continue;
                             }
+                            // Traffic of a session a swap replaced never reaches the ledger, nor does
+                            // the reducer input that follows its notification.
+                            if backend.drops_retired(&event) {
+                                suppress_next_session_update = true;
+                                continue;
+                            }
                             backend.wait_for_prompt_phase().await;
                             if let nori_protocol::AcpEvent::ChildNotification(notification) = &*event {
                                 if !backend.native_children.observe_notification(notification).await { continue; }
                                 child_edits.observe(notification, &backend.edit_journal, &backend.cwd);
+                                // usage: a subagent's usage and session-info updates.
+                                usage_tap.observe_child(&notification.session_id.to_string(), &notification.update);
                             }
                             suppress_next_session_update = if let Some(chunk) =
                                 user_message_chunk(&event)
@@ -585,6 +592,17 @@ impl AcpBackend {
                             } else {
                                 false
                             };
+                            // A prompt's response ends its turn where it stands on the wire: what
+                            // the agent sends after it (a permission request, more work) is
+                            // after the turn, not in it. The task that awaited the response
+                            // reports the same outcome later; the ledger takes the first.
+                            let answered = match &*event {
+                                nori_protocol::AcpEvent::Response {
+                                    request_id,
+                                    response: Ok(nori_protocol::acp::v1::AgentResponse::PromptResponse(response)),
+                                } => Some((request_id.clone(), response.stop_reason)),
+                                _ => None,
+                            };
                             if !suppress_next_session_update {
                                 let _ = backend
                                     .backend_event_tx
@@ -593,9 +611,21 @@ impl AcpBackend {
                                     )))
                                     .await;
                             }
+                            if let Some((request_id, stop_reason)) = answered {
+                                let _ = backend
+                                    .session_event_tx
+                                    .send(session_runtime_driver::SessionRuntimeInput::Reducer(
+                                        session_reducer::InboundEvent::PromptResultFor {
+                                            request_id,
+                                            result: super::prompt_lifecycle::PromptResult::Response(stop_reason),
+                                        },
+                                    ))
+                                    .await;
+                            }
                         }
                         Some(crate::connection::ConnectionEvent::SessionClosed) => {
                             backend.withdraw_all_questions().await;
+                            backend.connection_lost().await;
                             let _ = backend
                                 .backend_event_tx
                                 .send(BackendEvent::Public(SessionEvent::Nori(
@@ -611,6 +641,9 @@ impl AcpBackend {
                         }
                         Some(crate::connection::ConnectionEvent::Barrier(reply)) => { let _ = reply.send(()); }
                         Some(crate::connection::ConnectionEvent::DelegatedRequest(request)) => {
+                            let Some(request) = backend.decline_retired_request(request).await else {
+                                continue;
+                            };
                             backend.wait_for_prompt_phase().await;
                             relay_seq += 1;
                             let current_policy = *approval_policy_rx.borrow();
@@ -669,6 +702,16 @@ impl AcpBackend {
                                         ),
                                     )))
                                     .await;
+                                // Fail any in-flight prompt loudly instead of
+                                // letting it wait on a dead transport forever.
+                                if let Some(task) = backend.prompt_task_abort.lock().await.take() {
+                                    task.abort();
+                                }
+                                // Whatever turn was open ends as failed and everything the agent
+                                // waited on is answered as cancelled.
+                                backend.connection_lost().await;
+                                // The session ends last: nothing after it reaches the client, so
+                                // the turn's closing (idle phase, closed tool calls) comes first.
                                 let _ = backend
                                     .backend_event_tx
                                     .send(BackendEvent::Public(SessionEvent::Nori(
@@ -680,19 +723,6 @@ impl AcpBackend {
                                         ),
                                     )))
                                     .await;
-                                // Fail any in-flight prompt loudly instead of
-                                // letting it wait on a dead transport forever.
-                                if let Some(abort) =
-                                    backend.prompt_task_abort.lock().await.take()
-                                {
-                                    abort.abort();
-                                    let _ = backend
-                                        .prompt_result_tx
-                                        .send(session_reducer::InboundEvent::PromptFailed {
-                                            failure: Some(crate::normalized::TurnFailure::Fatal),
-                                    })
-                                    .await;
-                                }
                             }
                             break;
                         }

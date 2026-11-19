@@ -69,6 +69,7 @@ fn replay_session_events(
         .clone()
         .unwrap_or_else(|| format!("transcript-{}", transcript.meta.session_id));
     let mut timing = super::replay_timing::TurnTiming::default();
+    let mut integrity = super::replay_integrity::ReplayIntegrity::new(session_id.clone());
     let mut replay = Vec::new();
     let mut response_end = None;
     let first_id = transcript.event_ids.first().copied();
@@ -80,36 +81,23 @@ fn replay_session_events(
                 entry.event,
                 nori_protocol::SessionEvent::Nori(
                     nori_protocol::NoriEvent::SubscriptionExhausted(_)
+                        | nori_protocol::NoriEvent::RetryScheduled(_)
                         | nori_protocol::NoriEvent::RequestFailed(_)
                 )
             ) {
                 continue;
             }
-            let assistant_chunk = matches!(&entry.event,
-                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification)
-                )) if matches!(notification.update, nori_protocol::acp::v1::SessionUpdate::AgentMessageChunk(_)));
-            let boundary = matches!(&entry.event,
-                nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                    nori_protocol::acp::v1::AgentNotification::SessionNotification(notification)
-                )) if matches!(notification.update,
-                    nori_protocol::acp::v1::SessionUpdate::AgentThoughtChunk(_)
-                    | nori_protocol::acp::v1::SessionUpdate::UserMessageChunk(_)
-                    | nori_protocol::acp::v1::SessionUpdate::ToolCall(_)))
-                || matches!(
-                    &entry.event,
-                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Request { .. })
-                        | nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
-                            response: Ok(nori_protocol::acp::v1::AgentResponse::PromptResponse(_)),
-                            ..
-                        })
-                        | nori_protocol::SessionEvent::Nori(
-                            nori_protocol::NoriEvent::ContextCompacted(_)
-                        )
-                        | nori_protocol::SessionEvent::Nori(
-                            nori_protocol::NoriEvent::SessionEnded(_)
-                        )
-                );
+            // One definition of where a message ends, shared with the live turn.
+            let flow = nori_protocol::message_flow(&entry.event);
+            let assistant_chunk =
+                flow == nori_protocol::MessageFlow::Chunk(nori_protocol::MessageStream::Answer);
+            let boundary = match flow {
+                nori_protocol::MessageFlow::Boundary => true,
+                nori_protocol::MessageFlow::Chunk(stream) => {
+                    stream != nori_protocol::MessageStream::Answer
+                }
+                nori_protocol::MessageFlow::Transparent => false,
+            };
             let boundary = boundary
                 || (preserve_child_responses
                     && matches!(
@@ -136,7 +124,53 @@ fn replay_session_events(
             if entry.historical_evidence {
                 continue;
             }
+            integrity.observe(&entry.event);
             match &entry.event {
+                // What the user saw and later events depend on: kept, as plain notices where
+                // replaying the live event would change the session's present state.
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::RequestDeclined(_)) => {
+                    replay.push(entry.event.clone());
+                    continue;
+                }
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::RouteChanged(
+                    changed,
+                )) => {
+                    replay.push(replayed_notice(format!(
+                        "Continued on {} instead of {}: {}.",
+                        changed.to,
+                        changed.from,
+                        changed.cause.label()
+                    )));
+                    continue;
+                }
+                // The failed attempt's output stays in the history; this marks it, as it did live.
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::AttemptSuperseded(
+                    superseded,
+                )) => {
+                    replay.push(replayed_notice(match superseded.by {
+                        nori_protocol::SupersededBy::Retry => {
+                            "Retried: the output above came from a failed attempt.".to_owned()
+                        }
+                        nori_protocol::SupersededBy::Route => {
+                            "Continued on another route: the output above came from a failed attempt."
+                                .to_owned()
+                        }
+                    }));
+                    continue;
+                }
+                // The session that continued the conversation on another agent says nothing the
+                // route change did not: the user saw one marker live and sees one here.
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionStarted(
+                    started,
+                )) if started.swap.is_some() => continue,
+                nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionEnded(
+                    ended,
+                )) if ended.reason == nori_protocol::SessionEndReason::ConnectionLost => {
+                    if let Some(message) = &ended.message {
+                        replay.push(replayed_notice(message.clone()));
+                    }
+                    continue;
+                }
                 nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response { .. })
                     if preserve_child_responses =>
                 {
@@ -178,6 +212,7 @@ fn replay_session_events(
 
         let updates: Vec<_> = match &line.entry {
             crate::transcript::TranscriptEntry::User(user) => {
+                replay.extend(integrity.user_prompt(&user.content));
                 timing.start_turn(&line.ts);
                 if canonical_user_message_ids.contains(&user.id) {
                     Vec::new()
@@ -238,7 +273,16 @@ fn replay_session_events(
             ),
         ));
     }
+    // A journal that stops mid-turn: what it left running is interrupted, and the prompt it
+    // never answered is offered back.
+    replay.extend(integrity.finish(!preserve_child_responses));
     replay
+}
+
+fn replayed_notice(message: String) -> nori_protocol::SessionEvent {
+    nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::Notice(nori_protocol::Notice {
+        message,
+    }))
 }
 
 /// Convert a loaded transcript into normalized replay events suitable for ACP
@@ -530,6 +574,7 @@ fn replay_entry_from_client_event(
         crate::normalized::ClientEvent::ApprovalRequest(_)
         | crate::normalized::ClientEvent::MessageDelta(_)
         | crate::normalized::ClientEvent::SessionPhaseChanged(_)
+        | crate::normalized::ClientEvent::ToolsInterrupted(_)
         | crate::normalized::ClientEvent::PromptCompleted(_)
         | crate::normalized::ClientEvent::LoadCompleted
         | crate::normalized::ClientEvent::QueueChanged(_)
@@ -583,6 +628,7 @@ mod tests {
             git: None,
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         };
 
         let mut lines = vec![TranscriptLine::new(TranscriptEntry::SessionMeta(

@@ -48,65 +48,70 @@ pub(crate) struct PromptBusy;
 // Error Categorization
 // =============================================================================
 
-pub use nori_acp_host::AcpErrorCategory;
-pub use nori_acp_host::AcpErrorDetails;
-pub use nori_acp_host::categorize_acp_error;
-pub use nori_acp_host::categorize_acp_error_chain;
+pub use nori_acp_host::FailureClass;
+pub use nori_acp_host::FailureDetails;
+pub use nori_acp_host::classify_failure;
+pub use nori_acp_host::classify_text;
 
 /// Generate an enhanced error message with actionable instructions.
 ///
 /// Based on the error category, this function produces a user-friendly message
 /// that explains the problem and provides steps to resolve it.
 pub fn enhanced_error_message(
-    category: AcpErrorCategory,
+    class: FailureClass,
     original_error: &str,
     provider_name: &str,
     auth_hint: &str,
     display_name: &str,
     install_hint: &str,
 ) -> String {
-    match category {
-        AcpErrorCategory::Authentication => {
+    match class {
+        FailureClass::Auth => {
             format!("Authentication required for {provider_name}. {auth_hint}")
         }
-        AcpErrorCategory::QuotaExceeded => {
-            format!("Rate limit or quota exceeded for {provider_name}: {original_error}")
+        FailureClass::RateLimited { .. }
+        | FailureClass::QuotaExhausted { .. }
+        | FailureClass::Capacity => {
+            format!("Rate limit, quota or capacity problem for {provider_name}: {original_error}")
         }
-        AcpErrorCategory::ExecutableNotFound => {
+        FailureClass::ModelUnavailable => {
+            format!("The model is not available on {provider_name}: {original_error}")
+        }
+        FailureClass::ExecutableNotFound => {
             format!("Could not find the {display_name} CLI. Please install it with: {install_hint}")
         }
-        AcpErrorCategory::Initialization => {
+        FailureClass::Initialization => {
             format!(
                 "Failed to initialize {provider_name}. The agent may be incompatible or experiencing issues. Original error: {original_error}"
             )
         }
-        AcpErrorCategory::PromptTooLong => {
+        FailureClass::PromptTooLong => {
             "Prompt is too long. Try using /compact to reduce context size, or start a new session."
                 .to_string()
         }
-        AcpErrorCategory::ApiServerError => {
+        FailureClass::ServerError => {
             "The API returned a server error. This is usually temporary — please try again."
                 .to_string()
         }
-        AcpErrorCategory::SessionNotFound => format!(
+        FailureClass::SessionNotFound => format!(
             "That session no longer exists on {provider_name} — it may have expired or been \
              closed elsewhere. Pick another session from /resume or start a new one."
         ),
-        AcpErrorCategory::SessionNotResumable => format!(
+        FailureClass::SessionNotResumable => format!(
             "That session can't be reattached on {provider_name}. Start a new session instead."
         ),
-        AcpErrorCategory::SessionAlreadyActive => format!(
+        FailureClass::SessionAlreadyActive => format!(
             "A session is already active on the {provider_name} connection. Close it with /close \
              before resuming or creating another."
         ),
-        AcpErrorCategory::NoActiveSession => format!(
+        FailureClass::NoActiveSession => format!(
             "No session is active on the {provider_name} connection. Start a new chat with /new."
         ),
-        AcpErrorCategory::AgentUnreachable => format!(
+        FailureClass::Network => format!(
             "Could not reach the {provider_name} backing service. Check your network and try \
              again. Original error: {original_error}"
         ),
-        AcpErrorCategory::Unknown => original_error.to_string(),
+        FailureClass::Unknown => original_error.to_string(),
     }
 }
 
@@ -117,12 +122,12 @@ pub fn enhance_agent_error(
     error: anyhow::Error,
     config: &crate::registry::AcpAgentConfig,
 ) -> anyhow::Error {
-    let details = categorize_acp_error_chain(&error);
+    let details = classify_failure(&error);
     // An agent-supplied `error.data.detail` (e.g. the exact login command for
     // this deployment) is more precise than the registry's static auth hint.
     let auth_hint = details.detail.as_deref().unwrap_or(&config.auth_hint);
     let mut message = enhanced_error_message(
-        details.category.clone(),
+        details.class.clone(),
         &format!("{error}"),
         &config.provider_info.name,
         auth_hint,
@@ -131,7 +136,7 @@ pub fn enhance_agent_error(
     );
     // For non-auth categories the detail is agent-supplied context (e.g.
     // "the session is no longer claimed") — keep it verbatim.
-    if details.category != AcpErrorCategory::Authentication
+    if details.class != FailureClass::Auth
         && let Some(detail) = details.detail
     {
         message = format!("{message} ({detail})");
@@ -356,10 +361,14 @@ pub struct AcpBackend {
     mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
     /// Set to true when Op::Shutdown is initiated, to avoid spurious disconnect errors
     is_shutting_down: Arc<AtomicBool>,
+    /// Sessions a swap replaced: nothing they send reaches the ledger.
+    retired_sessions: Arc<session_scope::RetiredSessions>,
     /// Abort handle for the in-flight prompt task (if any)
-    prompt_task_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    prompt_task_abort: Arc<Mutex<Option<prompt_lifecycle::PromptTask>>>,
+    /// Cancels a retry that is waiting out its backoff.
+    recovery: route_moves::SessionRecovery,
     /// Abort handle for the cancel timeout watchdog (if any)
-    cancel_timeout_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    cancel_timeout_abort: Arc<Mutex<Option<prompt_lifecycle::PromptTask>>>,
     /// Abort handle for the serialized reducer task.
     runtime_task_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// Abort handle for the connection event relay task.
@@ -367,6 +376,8 @@ pub struct AcpBackend {
     /// The tasks this session delegated to child sessions.
     orchestrator: orchestrator::Orchestrator,
     native_children: Arc<native_child_sessions::NativeChildren>,
+    /// Persistent in-process `brush` shell for user `!` commands.
+    user_bash_session: Arc<Mutex<Option<nori_bash::BashSession>>>,
 }
 
 impl AcpBackend {
@@ -414,6 +425,8 @@ mod forge_tools;
 mod git_tools;
 mod goal_ext;
 mod host_tools;
+mod monitor;
+mod native_child_archive;
 mod native_child_history;
 mod native_child_restore;
 mod native_child_sessions;
@@ -428,18 +441,29 @@ pub use orchestrator::CachedAgentModel;
 pub use orchestrator::cached_agent_models;
 pub use orchestrator::refresh_agent_catalog;
 pub use orchestrator::refresh_agent_catalog_except;
+mod pending_work;
 pub mod prepared;
+pub use pending_work::PendingWork;
+mod prompt_context;
+mod prompt_lifecycle;
+mod prompt_recovery;
+pub(crate) mod queue_journal;
+pub(crate) use route_moves::RestoreAt;
+mod replay_integrity;
 mod replay_timing;
 mod rewind;
+mod route_moves;
 mod session;
 mod session_defaults;
 pub(crate) mod session_reducer;
 mod session_runtime_driver;
+mod session_scope;
 mod session_swap;
 mod spawn_and_relay;
 mod submit_and_ops;
 mod thread_goal;
 mod transcript;
+mod turn;
 mod user_input;
 mod user_question;
 mod user_shell;

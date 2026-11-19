@@ -286,6 +286,7 @@ mod tests {
             git: None,
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         };
         let mut entries = vec![crate::transcript::TranscriptLine::new(
             crate::transcript::TranscriptEntry::SessionMeta(meta.clone()),

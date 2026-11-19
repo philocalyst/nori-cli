@@ -1,5 +1,3 @@
-#![expect(clippy::expect_used, reason = "focused integration fixture assertions")]
-
 use std::sync::Arc;
 use std::time::Duration;
 

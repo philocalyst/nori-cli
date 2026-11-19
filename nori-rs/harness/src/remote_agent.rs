@@ -360,7 +360,8 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
             }
             SessionEvent::Nori(NoriEvent::SessionPhaseChanged(phase)) => {
                 shared.current_turn = match phase {
-                    SessionPhase::Idle => None,
+                    // An agent-owned turn has no request a remote controller could own.
+                    SessionPhase::Idle | SessionPhase::Agent { .. } => None,
                     SessionPhase::Loading { request_id }
                     | SessionPhase::Prompting { request_id }
                     | SessionPhase::Cancelling { request_id } => Some(request_id),
@@ -436,9 +437,19 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
                 | NoriEvent::PromptSummaryUpdated(_)
                 | NoriEvent::Notice(_)
                 | NoriEvent::SubscriptionExhausted(_)
+                | NoriEvent::RouteChanged(_)
+                | NoriEvent::RetryScheduled(_)
+                | NoriEvent::AttemptSuperseded(_)
                 | NoriEvent::Subagent(_)
                 | NoriEvent::TaskResultsDelivered(_)
+                | NoriEvent::Monitor(_)
                 | NoriEvent::RequestWithdrawn(_)
+                | NoriEvent::AgentContinued(_)
+                | NoriEvent::RequestDeclined(_)
+                | NoriEvent::PromptUnanswered(_)
+                | NoriEvent::QueueRestored(_)
+                | NoriEvent::AgentSilent(_)
+                | NoriEvent::AgentHeard
             | NoriEvent::ConversationResponseBoundary(_),
             )
             // A remote controller sees the root session only.

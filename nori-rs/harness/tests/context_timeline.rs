@@ -874,6 +874,7 @@ fn session_identity(id: &str) -> SessionEvent {
         history_log_id: 0,
         history_entry_count: 0,
         config_options: Vec::new(),
+        swap: None,
     }))
 }
 

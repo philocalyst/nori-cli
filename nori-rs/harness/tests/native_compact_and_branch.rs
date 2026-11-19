@@ -394,8 +394,12 @@ async fn compact_without_native_support_swaps_and_injects_summary() {
     assert!(!follow_up.contains("You MUST summarize"), "{follow_up}");
     // The checkpoint is a block of its own ahead of the user's prompt.
     assert!(
-        follow_up.ends_with("</conversation-checkpoint>\n\n"),
+        follow_up.trim_end().ends_with("</conversation-checkpoint>"),
         "{follow_up}"
+    );
+    assert_eq!(
+        prompts[3]["prompt"][0]["annotations"]["audience"],
+        serde_json::json!(["assistant"])
     );
     assert_eq!(prompts[3]["prompt"][1]["text"].as_str(), Some("hi"));
 }

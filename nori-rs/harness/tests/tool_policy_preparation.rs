@@ -1,6 +1,7 @@
 //! Workflow loading must not block Cancel or Shutdown command handling.
 
 #![cfg(unix)]
+#![expect(clippy::expect_used, reason = "fixture failures should fail loudly")]
 
 use std::ffi::CString;
 use std::io::Write;

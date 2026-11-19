@@ -1,95 +1,77 @@
-//! Admit background continuations only to the conversation generation that created them.
+//! The one way a prompt nobody typed starts: it is offered to the turn ledger.
+//!
+//! Goal continuations, workflow hooks, delegated results, peer mail and CI verdicts are all
+//! decided on a stale view of the session by the time they reach it: the agent may have begun
+//! working, or the user may have rewound, since. The ledger is the only arbiter. An offer starts
+//! its prompt only if, at that instant, no turn of any owner is open, nothing is queued, no
+//! session swap is in flight, and (for background work) the conversation generation that
+//! created it is still current. Otherwise it is refused and the offerer keeps what it owed, to
+//! offer again at the next turn boundary. It is never queued behind another turn, where it could
+//! outlive the reason it was sent or be stranded by a cancelled stop reason.
 
 use super::AcpBackend;
-use super::orchestrator::Orchestrator;
 use super::session_reducer::InboundEvent;
-
-async fn run_current<F, Fut>(orchestrator: &Orchestrator, generation: i64, run: F)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let _admission = orchestrator.rewind_admission().await;
-    if generation == orchestrator.admission_generation() {
-        run().await;
-    }
-}
+use super::session_runtime_driver::SessionRuntimeInput;
+use crate::normalized::session_runtime::QueuedPrompt;
 
 impl AcpBackend {
-    pub(super) async fn apply_guarded_continuation(&self, generation: i64, event: InboundEvent) {
-        run_current(&self.orchestrator, generation, || {
-            self.apply_session_event(event)
-        })
-        .await;
+    /// Offer a prompt to the ledger. `generation` is the conversation generation a background
+    /// continuation belongs to; an offer from an older one is refused. Returns whether the
+    /// prompt started.
+    pub(super) async fn offer_prompt(&self, generation: Option<i64>, prompt: QueuedPrompt) -> bool {
+        // The runtime actor is the ledger's only writer and cannot wait on itself.
+        if super::session_runtime_driver::IN_RUNTIME_ACTOR
+            .try_with(|()| ())
+            .is_ok()
+        {
+            return self.admit_offer(generation, prompt).await;
+        }
+        let (admitted, reply) = tokio::sync::oneshot::channel();
+        let offer = SessionRuntimeInput::Offer {
+            generation,
+            prompt: Box::new(prompt),
+            admitted,
+        };
+        if self.session_event_tx.send(offer).await.is_err() {
+            return false;
+        }
+        reply.await.unwrap_or(false)
+    }
+
+    /// [`AcpBackend::apply_session_event`] behind a boxed boundary: applying an event can end a
+    /// turn, whose boundary can offer a prompt, which applies an event. The box is the one place
+    /// that cycle is allowed to close.
+    pub(super) fn apply_session_event_boxed(
+        &self,
+        event: InboundEvent,
+    ) -> futures::future::BoxFuture<'_, ()> {
+        Box::pin(self.apply_session_event(event))
+    }
+
+    /// Decide an offer. Only the runtime actor calls this, so nothing can change the ledger
+    /// between the check and the prompt starting. It takes no lock a caller might hold while it
+    /// waits for the answer: a rewind protects itself by fencing the ledger, which makes the
+    /// session busy, and by advancing the generation, which refuses what it outdated.
+    pub(super) async fn admit_offer(&self, generation: Option<i64>, prompt: QueuedPrompt) -> bool {
+        if generation
+            .is_some_and(|generation| generation != self.orchestrator.admission_generation())
+            || self.session_driver.lock().await.prompt_is_busy()
+        {
+            return false;
+        }
+        self.apply_session_event_boxed(InboundEvent::PromptSubmit(prompt))
+            .await;
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicI64;
-    use std::sync::atomic::Ordering;
-
-    #[tokio::test]
-    async fn old_goal_and_workflow_continuations_cannot_cross_rewind_admission() {
-        let (events, _) = tokio::sync::mpsc::channel(8);
-        let seed = super::super::orchestrator::Seed::root(
-            Arc::new(crate::config::NoriConfig::default()),
-            "test".to_owned(),
-        );
-        let (orchestrator, _) = Orchestrator::new(seed, events);
-        let generation = orchestrator.admission_generation();
-        let guard = orchestrator.rewind_admission().await;
-        let applied = Arc::new(AtomicI64::new(0));
-        let prompt = |kind| {
-            InboundEvent::PromptSubmit(crate::normalized::session_runtime::QueuedPrompt {
-                event_id: "stale".to_owned(),
-                kind,
-                text: "discarded turn".to_owned(),
-                prompt_meta: None,
-                original_content: Vec::new(),
-                content: Vec::new(),
-                display_text: None,
-            })
-        };
-        let goal_event =
-            prompt(crate::normalized::session_runtime::QueuedPromptKind::GoalContinuation);
-        let workflow_event =
-            prompt(crate::normalized::session_runtime::QueuedPromptKind::WorkflowHook);
-        let goal = run_current(&orchestrator, generation, || async {
-            assert!(matches!(goal_event, InboundEvent::PromptSubmit(_)));
-            applied.fetch_add(1, Ordering::SeqCst);
-        });
-        let workflow = run_current(&orchestrator, generation, || async {
-            assert!(matches!(workflow_event, InboundEvent::PromptSubmit(_)));
-            applied.fetch_add(10, Ordering::SeqCst);
-        });
-        tokio::pin!(goal);
-        tokio::pin!(workflow);
-        assert!(futures::poll!(&mut goal).is_pending());
-        assert!(futures::poll!(&mut workflow).is_pending());
-        orchestrator.advance_generation();
-        drop(guard);
-        goal.await;
-        workflow.await;
-        assert_eq!(applied.load(Ordering::SeqCst), 0);
-        run_current(
-            &orchestrator,
-            orchestrator.admission_generation(),
-            || async {
-                applied.fetch_add(1, Ordering::SeqCst);
-            },
-        )
-        .await;
-        assert_eq!(applied.load(Ordering::SeqCst), 1);
-    }
 
     #[tokio::test]
     async fn queued_old_continuations_never_reach_the_rewound_provider() {
-        use super::super::session_runtime_driver::SessionRuntimeInput;
-        use crate::normalized::session_runtime::QueuedPrompt;
         use crate::normalized::session_runtime::QueuedPromptKind;
         use nori_protocol::acp::v1 as acp;
 
@@ -130,47 +112,29 @@ mod tests {
             .rewind_and_rebind(recorder.session_id().to_owned(), None)
             .await
             .expect("rewind session");
-        let prompt = |kind, text: &str| {
-            InboundEvent::PromptSubmit(QueuedPrompt {
-                event_id: text.to_owned(),
-                kind,
-                text: text.to_owned(),
-                prompt_meta: None,
-                original_content: Vec::new(),
-                content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
-                display_text: None,
-            })
+        let prompt = |kind, text: &str| QueuedPrompt {
+            event_id: text.to_owned(),
+            kind,
+            text: text.to_owned(),
+            prompt_meta: None,
+            original_content: Vec::new(),
+            content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+            display_text: None,
         };
         for (kind, text) in [
             (QueuedPromptKind::GoalContinuation, "discarded goal"),
             (QueuedPromptKind::WorkflowHook, "discarded workflow"),
         ] {
-            backend
-                .session_event_tx
-                .send(SessionRuntimeInput::GuardedContinuation {
-                    generation: old,
-                    event: prompt(kind, text),
-                })
-                .await
-                .expect("queue old continuation");
+            assert!(!backend.offer_prompt(Some(old), prompt(kind, text)).await);
         }
-        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
-        backend
-            .session_event_tx
-            .send(SessionRuntimeInput::Barrier {
-                response_tx: barrier_tx,
-            })
-            .await
-            .expect("queue barrier");
-        barrier_rx.await.expect("old continuations drained");
-        backend
-            .session_event_tx
-            .send(SessionRuntimeInput::GuardedContinuation {
-                generation: backend.orchestrator.admission_generation(),
-                event: prompt(QueuedPromptKind::WorkflowHook, "current workflow"),
-            })
-            .await
-            .expect("queue current continuation");
+        assert!(
+            backend
+                .offer_prompt(
+                    Some(backend.orchestrator.admission_generation()),
+                    prompt(QueuedPromptKind::WorkflowHook, "current workflow"),
+                )
+                .await
+        );
         let wire_text = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let logs = std::fs::read_dir(&wire)

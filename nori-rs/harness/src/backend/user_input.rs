@@ -140,30 +140,7 @@ impl AcpBackend {
         // Save prompt text for post_user_prompt hooks (before it gets moved)
         let prompt_text_for_hooks = display_text;
 
-        // Prepend any accumulated hook context (from ::context:: lines)
-        // This must happen before the checkpoint so that the checkpoint always
-        // comes first.
-        let prompt_with_context = if let Some(ctx) = self.pending_hook_context.lock().await.take() {
-            format!("{ctx}\n{prompt_text}")
-        } else {
-            prompt_text.clone()
-        };
-        let prompt_with_goal_context = match workflow_rules {
-            Some(rules) => format!("{rules}\n\n{prompt_with_context}"),
-            None => prompt_with_context,
-        };
-
-        // A compaction, fork, or resume leaves a checkpoint for the first prompt to open with.
-        let mut pending_checkpoint = self.pending_compact_summary.lock().await.take();
-        let historical_content = pending_checkpoint
-            .as_mut()
-            .map(crate::transcript::fork_context::take_typed_history)
-            .unwrap_or_default();
-        let final_prompt_text = if let Some(checkpoint) = pending_checkpoint {
-            format!("{checkpoint}\n\n{prompt_with_goal_context}")
-        } else {
-            prompt_with_goal_context
-        };
+        let hook_context = self.pending_hook_context.lock().await.take();
 
         // Internal context is an additional leading block. The caller's ACP
         // content remains an ordered subsequence of the wire prompt.
@@ -178,19 +155,14 @@ impl AcpBackend {
             serde_json::Value::String(echo_id),
         );
         let original_content = content.clone();
-        let mut final_content = content;
-        final_content.splice(0..0, historical_content);
-        if final_prompt_text != prompt_text {
-            let injected_prefix = final_prompt_text
-                .strip_suffix(&prompt_text)
-                .unwrap_or(&final_prompt_text);
-            if !injected_prefix.is_empty() {
-                final_content.insert(
-                    0,
-                    acp::ContentBlock::Text(acp::TextContent::new(injected_prefix)),
-                );
-            }
-        }
+        // The checkpoint a compaction, fork, or resume leaves is not applied here: this prompt
+        // may wait in the queue past a session swap, and the first prompt to reach the new
+        // session must carry it whichever prompt that is. `send_prompt` applies it.
+        let final_content = super::prompt_context::with_context(
+            content,
+            Vec::new(),
+            [workflow_rules, hook_context].into_iter().flatten(),
+        );
 
         let (phase_before_submit, active_request_id_before_submit, queue_len_before_submit) = {
             let driver = self.session_driver.lock().await;
@@ -208,7 +180,7 @@ impl AcpBackend {
                 .as_deref()
                 .unwrap_or("<none>"),
             queue_len_before_submit,
-            prompt_text_len = final_prompt_text.len(),
+            prompt_text_len = prompt_text.len(),
             content_blocks = final_content.len(),
             "Accepted user prompt into ACP backend"
         );
@@ -216,7 +188,7 @@ impl AcpBackend {
         let prompt = crate::normalized::session_runtime::QueuedPrompt {
             event_id: id.to_string(),
             kind: crate::normalized::session_runtime::QueuedPromptKind::User,
-            text: final_prompt_text,
+            text: prompt_text,
             prompt_meta,
             original_content,
             content: final_content,

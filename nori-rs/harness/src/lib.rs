@@ -28,14 +28,17 @@ pub mod hooks;
 pub mod message_history;
 pub(crate) mod normalized;
 pub use nori_acp_host::registry;
+pub mod recovery;
 pub mod remote_agent;
 pub mod runtime;
 pub(crate) mod session_event_fanout;
+pub mod session_index;
 pub mod tracing_setup;
 pub mod transcript;
 pub mod transcript_discovery;
 pub mod undo;
 pub use undo::UndoSnapshot;
+pub mod usage;
 
 // Re-export message history types
 pub use message_history::ConversationId;

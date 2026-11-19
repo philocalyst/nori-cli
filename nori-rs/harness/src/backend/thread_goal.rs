@@ -154,6 +154,7 @@ impl ThreadGoalState {
                 | ClientEvent::MessageDelta(_)
                 | ClientEvent::PlanSnapshot(_)
                 | ClientEvent::SessionPhaseChanged(_)
+                | ClientEvent::ToolsInterrupted(_)
                 | ClientEvent::PromptCompleted(_)
                 | ClientEvent::LoadCompleted
                 | ClientEvent::QueueChanged(_)

@@ -1,6 +1,7 @@
 //! Workflow loading must not block Cancel or Shutdown command handling.
 
 #![cfg(unix)]
+#![expect(clippy::expect_used, reason = "fixture failures should fail loudly")]
 
 use std::ffi::CString;
 use std::io::Write;
@@ -33,8 +34,8 @@ struct FifoRelease {
 impl FifoRelease {
     async fn wait_until_policy_reads(&mut self) {
         let opened = self.opened.take().expect("one FIFO open notification");
-        // Real Pkl starts a JVM; under a full workspace build its startup can be slow.
-        // The cancellation and shutdown assertions below keep their two-second deadlines.
+        // Wait for the native evaluator's resource read, independently of admission.
+        // Cancellation and shutdown retain their two-second responsiveness deadlines.
         tokio::time::timeout(Duration::from_secs(120), opened)
             .await
             .expect("Pkl policy should start reading its FIFO")
@@ -223,10 +224,19 @@ async fn rewind_rejects_a_prompt_blocked_in_policy_admission() {
         .await
         .expect("recorder request")
         .expect("journal");
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
     let prompt_task = {
         let handle = session.handle.clone();
-        tokio::spawn(async move { handle.prompt(prompt("pending before rewind")).await })
+        tokio::spawn(async move {
+            let prompt = handle.prompt(prompt("pending before rewind"));
+            tokio::pin!(prompt);
+            let _ = futures::poll!(&mut prompt);
+            let _ = queued_tx.send(());
+            prompt.await
+        })
     };
+    queued_rx.await.expect("prompt command was queued");
+    let _ = session.handle.get_session_config().await;
     fifo.wait_until_policy_reads().await;
     let error = tokio::time::timeout(
         Duration::from_secs(2),

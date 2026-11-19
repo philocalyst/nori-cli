@@ -66,6 +66,8 @@ pub struct SessionMetadata {
     pub cwd: PathBuf,
     /// ACP agent used for the session (e.g., "claude-code", "codex", "gemini")
     pub agent: Option<String>,
+    /// A delegated child: not a conversation of its own (see `SessionMetaEntry::delegated`).
+    pub delegated: bool,
 }
 
 /// A loaded transcript with all entries.
@@ -139,6 +141,25 @@ impl Transcript {
                 })
                 .or_else(|| self.meta.acp_session_id.clone())
         })
+    }
+
+    /// The last usage the agent reported for this conversation: its context use and the cost
+    /// so far. A resumed session shows these at once instead of waiting for the next turn.
+    pub fn last_usage_update(&self) -> Option<nori_protocol::acp::v1::UsageUpdate> {
+        use nori_protocol::AcpEvent;
+        use nori_protocol::SessionEvent;
+        use nori_protocol::acp::v1 as acp;
+        let mut last = None;
+        for record in self.records() {
+            if let TranscriptRecord::SessionEvent(SessionEvent::Acp(AcpEvent::Notification(
+                acp::AgentNotification::SessionNotification(notification),
+            ))) = record
+                && let acp::SessionUpdate::UsageUpdate(usage) = &notification.update
+            {
+                last = Some(usage.clone());
+            }
+        }
+        last
     }
 
     /// Iterate over records without exposing the versioned storage schema.
@@ -668,13 +689,57 @@ async fn load_session_metadata(path: &Path, project_id: &str) -> io::Result<Sess
         started_at: meta.started_at,
         cwd: meta.cwd,
         agent: meta.agent,
+        delegated: meta.delegated,
     })
 }
 
 /// Load session metadata from the first line of a transcript file.
 async fn load_session_meta_from_path(path: &Path) -> io::Result<SessionMetaEntry> {
-    if path.with_extension("pkl").exists() {
-        return Ok(load_transcript_from_path(path).await?.meta);
+    let log_path = path.with_extension("pkl");
+    if log_path.exists() {
+        // The metadata as the full load derives it, read in one pass that decodes only the first
+        // metadata entry and the backend bindings: everything else is kept as an id, so a rewind
+        // can still hide a binding.
+        return tokio::task::spawn_blocking(move || {
+            let mut meta = None;
+            let mut last_rewind = None;
+            let mut visible: Vec<(i64, Option<serde_json::Value>)> = Vec::new();
+            nori_conversation::ConversationLog::scan(&log_path, |record| {
+                match &record.event {
+                    nori_conversation::Event::Rewind { head } => {
+                        last_rewind = Some(record.id);
+                        let keep = head.map_or(0, |head| {
+                            visible
+                                .iter()
+                                .position(|(id, _)| *id == head)
+                                .map_or(visible.len(), |index| index + 1)
+                        });
+                        visible.truncate(keep);
+                    }
+                    _ => {
+                        if meta.is_none()
+                            && let Some(Ok(line)) = transcript_entry(&record)
+                            && let TranscriptEntry::SessionMeta(found) = line.entry
+                        {
+                            meta = Some(found);
+                        }
+                        visible.push((record.id, backend_bound(&record).map(|(_, value)| value)));
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            })?;
+            let mut meta = meta.ok_or_else(|| {
+                io::Error::other("conversation log does not contain session metadata")
+            })?;
+            let binding = visible
+                .into_iter()
+                .rev()
+                .find_map(|(id, value)| value.map(|value| (id, value)));
+            bind_meta(&mut meta, last_rewind, binding);
+            Ok(meta)
+        })
+        .await
+        .map_err(io::Error::other)?;
     }
     let file = tokio::fs::File::open(path).await?;
     let reader = tokio::io::BufReader::new(file);
@@ -704,15 +769,24 @@ struct TranscriptLineKind {
 const FIRST_USER_PREVIEW_MAX_BYTES: usize = 1024 * 1024;
 
 async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<String>> {
-    if path.with_extension("pkl").exists() {
-        let transcript = load_transcript_from_path(path).await?;
-        return Ok(transcript
-            .entries
-            .iter()
-            .find_map(|line| match &line.entry {
-                TranscriptEntry::User(user) => Some(truncate_preview(&user.content)),
-                _ => None,
-            }));
+    let log_path = path.with_extension("pkl");
+    if log_path.exists() {
+        // Read up to the first user message only.
+        return tokio::task::spawn_blocking(move || {
+            let mut preview = None;
+            nori_conversation::ConversationLog::scan(&log_path, |record| {
+                if let Some(Ok(line)) = transcript_entry(&record)
+                    && let TranscriptEntry::User(user) = line.entry
+                {
+                    preview = Some(truncate_preview(&user.content));
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(())
+            })?;
+            Ok(preview)
+        })
+        .await
+        .map_err(io::Error::other)?;
     }
     let started = Instant::now();
     let file = tokio::fs::File::open(path).await?;
@@ -759,13 +833,38 @@ async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<Str
 }
 
 async fn count_user_turns_from_path(path: &Path) -> io::Result<usize> {
-    if path.with_extension("pkl").exists() {
-        let transcript = load_transcript_from_path(path).await?;
-        return Ok(transcript
-            .entries
-            .iter()
-            .filter(|line| matches!(line.entry, TranscriptEntry::User(_)))
-            .count());
+    let log_path = path.with_extension("pkl");
+    if log_path.exists() {
+        // Count what is visible: a rewind hides what came after its head. Only the ids and
+        // whether each is a user message are kept, never the conversation itself.
+        return tokio::task::spawn_blocking(move || {
+            let mut visible: Vec<(i64, bool)> = Vec::new();
+            nori_conversation::ConversationLog::scan(&log_path, |record| {
+                match &record.event {
+                    nori_conversation::Event::Rewind { head } => {
+                        let keep = head.map_or(0, |head| {
+                            visible
+                                .iter()
+                                .position(|(id, _)| *id == head)
+                                .map_or(visible.len(), |index| index + 1)
+                        });
+                        visible.truncate(keep);
+                    }
+                    nori_conversation::Event::Operation { name, args }
+                        if name == "transcript-entry" =>
+                    {
+                        let user = serde_json::from_str::<TranscriptLineKind>(args)
+                            .is_ok_and(|kind| kind.kind == "user");
+                        visible.push((record.id, user));
+                    }
+                    _ => visible.push((record.id, false)),
+                }
+                std::ops::ControlFlow::Continue(())
+            })?;
+            Ok(visible.iter().filter(|(_, user)| *user).count())
+        })
+        .await
+        .map_err(io::Error::other)?;
     }
     let started = Instant::now();
     let file = tokio::fs::File::open(path).await?;
@@ -802,6 +901,59 @@ async fn count_user_turns_from_path(path: &Path) -> io::Result<usize> {
     );
 
     Ok(count)
+}
+
+/// The agent and ACP session a `backend-bound` command record names.
+fn backend_bound(record: &nori_conversation::Record) -> Option<(i64, serde_json::Value)> {
+    match &record.event {
+        nori_conversation::Event::Command { name, payload } if name == "backend-bound" => {
+            serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .map(|value| (record.id, value))
+        }
+        _ => None,
+    }
+}
+
+/// Bring the first metadata of a conversation up to date with its last visible backend binding:
+/// a rewind after the binding means the next run needs a fresh one. Returns the bound ACP
+/// session and whether a fresh binding is required.
+fn bind_meta(
+    meta: &mut SessionMetaEntry,
+    last_rewind: Option<i64>,
+    visible_binding: Option<(i64, serde_json::Value)>,
+) -> (Option<String>, bool) {
+    let backend_binding = visible_binding
+        .as_ref()
+        .filter(|(id, _)| last_rewind.is_none_or(|rewind| *id > rewind))
+        .and_then(|(_, value)| value.get("acp_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let requires_fresh_binding = last_rewind.is_some() && backend_binding.is_none();
+    if requires_fresh_binding {
+        meta.acp_session_id = None;
+    }
+    if let Some(agent) = visible_binding
+        .as_ref()
+        .and_then(|(_, value)| value.get("agent"))
+        .and_then(serde_json::Value::as_str)
+    {
+        meta.agent = Some(agent.to_owned());
+    }
+    if let Some(session_id) = &backend_binding {
+        meta.acp_session_id = Some(session_id.clone());
+    }
+    (backend_binding, requires_fresh_binding)
+}
+
+/// The transcript line a conversation-log record carries, if it carries one.
+fn transcript_entry(record: &nori_conversation::Record) -> Option<io::Result<TranscriptLine>> {
+    match &record.event {
+        nori_conversation::Event::Operation { name, args } if name == "transcript-entry" => {
+            Some(serde_json::from_str(args).map_err(io::Error::other))
+        }
+        _ => None,
+    }
 }
 
 fn truncate_preview(content: &str) -> String {
@@ -857,41 +1009,14 @@ pub(super) async fn load_transcript_from_path(path: &Path) -> io::Result<Transcr
         let last_rewind = log.records().iter().rev().find_map(|record| {
             matches!(&record.event, nori_conversation::Event::Rewind { .. }).then_some(record.id)
         });
-        let visible_binding =
-            log.projection()
-                .visible()
-                .iter()
-                .rev()
-                .find_map(|record| match &record.event {
-                    nori_conversation::Event::Command { name, payload }
-                        if name == "backend-bound" =>
-                    {
-                        serde_json::from_str::<serde_json::Value>(payload)
-                            .ok()
-                            .map(|value| (record.id, value))
-                    }
-                    _ => None,
-                });
-        let backend_binding = visible_binding
-            .as_ref()
-            .filter(|(id, _)| last_rewind.is_none_or(|rewind| *id > rewind))
-            .and_then(|(_, value)| value.get("acp_session_id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let requires_fresh_binding = last_rewind.is_some() && backend_binding.is_none();
-        if requires_fresh_binding {
-            meta.acp_session_id = None;
-        }
-        if let Some(agent) = visible_binding
-            .as_ref()
-            .and_then(|(_, value)| value.get("agent"))
-            .and_then(serde_json::Value::as_str)
-        {
-            meta.agent = Some(agent.to_owned());
-        }
-        if let Some(session_id) = &backend_binding {
-            meta.acp_session_id = Some(session_id.clone());
-        }
+        let visible_binding = log
+            .projection()
+            .visible()
+            .iter()
+            .rev()
+            .find_map(backend_bound);
+        let (backend_binding, requires_fresh_binding) =
+            bind_meta(&mut meta, last_rewind, visible_binding);
         return Ok(Transcript {
             meta,
             entries,
@@ -991,6 +1116,7 @@ mod tests {
                     history_log_id: 0,
                     history_entry_count: 0,
                     config_options: Vec::new(),
+                    swap: None,
                 }),
             ))
         };

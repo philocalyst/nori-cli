@@ -100,6 +100,10 @@ pub struct SessionMetaEntry {
     /// forking the parent at its head (branch-at-head `/fork`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub forked_from: Option<String>,
+    /// The session is a delegated child (a subagent, a program actor): another session owns the
+    /// conversation, and this transcript is never resumed as a conversation of its own.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub delegated: bool,
 }
 
 /// Attachment type for user messages (images, files, etc.)
@@ -228,6 +232,7 @@ mod tests {
             git: None,
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -295,6 +300,7 @@ mod tests {
             git: None,
             acp_session_id: Some("acp-sess-abc123".to_string()),
             forked_from: None,
+            delegated: false,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -347,6 +353,7 @@ mod tests {
             git: None,
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

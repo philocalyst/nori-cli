@@ -15,13 +15,15 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Returns the default log level based on build configuration.
 ///
-/// - Debug builds: `debug` level (captures debug, info, warn, error)
+/// - Debug builds: `debug` for Nori, with third-party ACP wire/logging targets
+///   held at `warn` so JSON-RPC frames and launch arguments cannot enter the
+///   default daily log. `RUST_LOG` still overrides this policy explicitly.
 /// - Release builds: `warn,nori_tui=info,acp=info` (warn default, info for TUI/ACP)
 ///
 /// Note: This can be overridden by setting the RUST_LOG environment variable.
 fn default_log_level() -> &'static str {
     if cfg!(debug_assertions) {
-        "debug"
+        "debug,agent_client_protocol=warn,claude=warn,claude_acp=warn,rmcp=warn,rmcp_client=warn,codex_rmcp_client=warn"
     } else {
         "warn,nori_tui=info,acp=info"
     }
@@ -176,7 +178,8 @@ mod tests {
 
     /// Test that default_log_level returns the correct value based on build type.
     ///
-    /// - Debug builds: "debug" (all debug and above)
+    /// - Debug builds: "debug" for Nori, with third-party ACP wire/logging
+    ///   targets suppressed to warning level
     /// - Release builds: "warn,nori_tui=info,acp=info" (warn default, but info for TUI/ACP)
     #[test]
     fn test_default_log_level_returns_expected_value() {
@@ -185,8 +188,9 @@ mod tests {
         #[cfg(debug_assertions)]
         {
             assert_eq!(
-                level, "debug",
-                "Debug builds should default to 'debug' level"
+                level,
+                "debug,agent_client_protocol=warn,claude=warn,claude_acp=warn,rmcp=warn,rmcp_client=warn,codex_rmcp_client=warn",
+                "Debug builds should keep third-party ACP wire logging at warning level"
             );
         }
 

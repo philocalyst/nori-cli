@@ -20,10 +20,6 @@ use nori_protocol::SubagentWire;
 use nori_protocol::acp;
 use pretty_assertions::assert_eq;
 
-#[expect(
-    clippy::expect_used,
-    reason = "focused setup failure for this integration test"
-)]
 async fn launch(home: &Path) -> LaunchedSession {
     let config = NoriConfig {
         active_agent: "mock-model".to_owned(),

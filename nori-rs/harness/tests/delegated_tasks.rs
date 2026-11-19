@@ -301,6 +301,24 @@ async fn waits_follow_ups_and_models() {
         "{quiet:?}"
     );
 
+    let announced_models = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update))) => {
+                match &update.model {
+                    nori_protocol::Patch::Set(model) => Some(model.as_str()),
+                    nori_protocol::Patch::Keep | nori_protocol::Patch::Clear => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        announced_models.contains(&"Mock Fast Model"),
+        "{announced_models:?}"
+    );
+    assert!(announced_models.contains(&"gpt-9"), "{announced_models:?}");
+
     let results = tool_results(&events);
     assert!(
         results[0].contains("\"status\":\"completed\""),
@@ -490,7 +508,7 @@ async fn typed_child_follow_up_preserves_text_image_and_embedded_resource() {
                     "task": "initial child task",
                     "agent": "mock-model-alt",
                     "title": "Initial child task",
-                    "mode": "background"
+                    "mode": "wait"
                 }
             }])
             .to_string(),
@@ -501,6 +519,8 @@ async fn typed_child_follow_up_preserves_text_image_and_embedded_resource() {
         ),
         ("MOCK_AGENT_PROMPT_LOG", log.display().to_string()),
     ]);
+    // Finish the initial delegation inside its parent turn. A background
+    // result would legitimately wake the parent while this follow-up is tested.
     let mut session = launch(home.path());
     started(&mut session).await;
     prompt(&session, "DELEGATE a child task").await;
@@ -589,6 +609,13 @@ async fn typed_child_follow_up_preserves_text_image_and_embedded_resource() {
         )),
         "a child follow-up must not start another parent turn: {parent_events:#?}"
     );
+    assert_eq!(
+        prompts(&log)
+            .iter()
+            .filter(|prompt| prompt["agent"] == "mock-model")
+            .count(),
+        1
+    );
     session
         .handle
         .shutdown()
@@ -602,6 +629,7 @@ async fn typed_child_follow_up_preserves_text_image_and_embedded_resource() {
 async fn child_queue_promote_and_steer_preserve_order_and_images() {
     let home = tempfile::tempdir().unwrap_or_else(|error| panic!("home: {error}"));
     let log = home.path().join("prompts.jsonl");
+    let cancel_log = home.path().join("cancels.log");
     let _env = Env::set(&[
         ("MOCK_AGENT_MCP_HTTP", "1".to_owned()),
         ("MOCK_AGENT_MCP_CALLS_MOCK_MODEL", serde_json::json!([{
@@ -610,6 +638,7 @@ async fn child_queue_promote_and_steer_preserve_order_and_images() {
         }]).to_string()),
         ("MOCK_AGENT_STREAM_UNTIL_CANCEL_TEXT", "HOLD".to_owned()),
         ("MOCK_AGENT_PROMPT_LOG", log.display().to_string()),
+        ("MOCK_AGENT_CANCEL_LOG", cancel_log.display().to_string()),
     ]);
     let mut session = launch(home.path());
     started(&mut session).await;
@@ -626,8 +655,35 @@ async fn child_queue_promote_and_steer_preserve_order_and_images() {
             matches!(state, SubagentState::Running).then_some(acp::SessionId::new(id))
         })
         .expect("child announced");
+    let child_handle = session
+        .handle
+        .controlled_subagent_handle(child_id.clone())
+        .await
+        .unwrap_or_else(|error| panic!("child handle: {error:#}"))
+        .unwrap_or_else(|| panic!("controlled child handle missing"));
+    let mut child_events = child_handle
+        .subscribe_events()
+        .await
+        .unwrap_or_else(|error| panic!("child events: {error:#}"));
+    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let trace_sink = Arc::clone(&trace);
+    tokio::spawn(async move {
+        while let Some(event) = child_events.recv().await {
+            if matches!(
+                &event,
+                SessionEvent::Nori(_) | SessionEvent::Acp(AcpEvent::Response { .. })
+            ) {
+                trace_sink
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event);
+            }
+        }
+    });
     let wait_for = |count| {
         let log = &log;
+        let cancel_log = &cancel_log;
+        let trace = Arc::clone(&trace);
         async move {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -642,7 +698,7 @@ async fn child_queue_promote_and_steer_preserve_order_and_images() {
                 }
             })
             .await
-            .expect("child prompt arrived")
+            .unwrap_or_else(|error| panic!("waiting for child prompt {count}: {error}; observed prompts: {:#?}; observed cancels: {:?}; child lifecycle: {:#?}", prompts(log), std::fs::read_to_string(cancel_log), trace.lock().unwrap_or_else(std::sync::PoisonError::into_inner)))
         }
     };
     let first = wait_for(1).await;

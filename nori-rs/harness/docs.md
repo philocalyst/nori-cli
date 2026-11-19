@@ -587,9 +587,26 @@ record into the child and never corrupt the frozen parent.
 
 `/undo` restores from an `EditJournal` (`harness/src/undo.rs`) instead of git
 snapshots: per turn it records, for every file edit the agent reports as an
-ACP diff, what the file held before. Nothing runs on the submit path, and a
-missing original is read by a background task. Restoring unwinds newest
-first and skips a file that changed since. Edits the agent makes without
+ACP diff, what the file held before. That comes from the report alone and the
+disk is never read when it arrives, since the write may already have landed.
+A diff with `old_text` replaced that text. A diff without it means a new file
+(the ACP meaning), with two checks that can say otherwise: if the journal
+already knows the path from an earlier edit in the session, that earlier known
+content is what the edit replaced (a fragment diff leaves the whole content
+unknown, so the edit is reported as not reversible); and when the undo runs, if
+git's HEAD tracks the path (`git cat-file -e HEAD:./<file>`) the file was not
+new, and HEAD's text is restored if the file still holds what the agent wrote
+(uncommitted changes the file had before the agent's edit are not recoverable;
+a binary blob is reported as not reversible). Restoring unwinds newest first
+and skips a file that changed since; a deletion reported as an emptied file
+counts as unchanged when the file is gone.
+
+Undo never destroys data. Before it deletes or overwrites a file it copies the
+current content to `$NORI_HOME/undo-trash/<journal>/<turn>/files/<absolute path>`
+and appends an entry to that turn's `manifest.jsonl`; if the copy fails, the
+file is left alone and reported as skipped. The undo result lists every
+original path and where its content was kept. Journal directories not written
+for 14 days are pruned when an undo runs. Edits the agent makes without
 reporting a diff, such as through shell commands, cannot be undone, and the
 undo result says so when the turn ran commands.
 

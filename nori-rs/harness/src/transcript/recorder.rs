@@ -106,6 +106,30 @@ impl TranscriptRecorder {
         cli_version: &str,
         acp_session_id: Option<String>,
     ) -> io::Result<Self> {
+        Self::new_for(nori_home, cwd, agent, cli_version, acp_session_id, false).await
+    }
+
+    /// Like [`Self::new`] for a delegated child: its transcript says it belongs to another
+    /// session's conversation, so it is never offered or resumed as a conversation of its own.
+    pub async fn new_delegated(
+        nori_home: &Path,
+        cwd: &Path,
+        agent: Option<String>,
+        cli_version: &str,
+        acp_session_id: Option<String>,
+    ) -> io::Result<Self> {
+        Self::new_for(nori_home, cwd, agent, cli_version, acp_session_id, true).await
+    }
+
+    /// [`Self::new`] or [`Self::new_delegated`], by `delegated`.
+    pub(crate) async fn new_for(
+        nori_home: &Path,
+        cwd: &Path,
+        agent: Option<String>,
+        cli_version: &str,
+        acp_session_id: Option<String>,
+        delegated: bool,
+    ) -> io::Result<Self> {
         // Both only need the cwd, and each waits on git, so they run together.
         let (project_id_info, git_info) =
             tokio::join!(compute_project_id(cwd), collect_git_info(cwd));
@@ -157,6 +181,7 @@ impl TranscriptRecorder {
             git: git_info,
             acp_session_id,
             forked_from: None,
+            delegated,
         };
 
         let mut log = ConversationLog::open(transcript_path.with_extension("pkl"))?;
@@ -235,6 +260,7 @@ impl TranscriptRecorder {
             git: git_info,
             acp_session_id: Some(new_acp_session_id),
             forked_from: Some(forked_from.clone()),
+            delegated: false,
         };
 
         let mut log = ConversationLog::open(transcript_path.with_extension("pkl"))?;
@@ -461,6 +487,26 @@ impl TranscriptRecorder {
         }
     }
 
+    /// The payloads of every visible record of the command `name`, oldest first.
+    pub(crate) async fn journaled_commands(&self, name: &str) -> io::Result<Vec<String>> {
+        let Some(log) = &self.conversation else {
+            return Ok(Vec::new());
+        };
+        let log = log.lock().await;
+        Ok(log
+            .projection()
+            .visible()
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Command {
+                    name: recorded,
+                    payload,
+                } if recorded == name => Some(payload.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Most recent visible payload for a previously recorded command.
     pub(crate) async fn recorded_command_payload(&self, name: &str) -> Option<String> {
         let log = self.conversation.as_ref()?.lock().await;
@@ -487,15 +533,6 @@ impl TranscriptRecorder {
             Some(log) => log.lock().await.projection().head(),
             None => None,
         }
-    }
-
-    pub(crate) async fn conversation_next_id(&self) -> io::Result<i64> {
-        self.conversation
-            .as_ref()
-            .ok_or_else(|| io::Error::other("legacy session has no event log"))?
-            .lock()
-            .await
-            .next_id()
     }
 
     /// The ordered records in this journal's current visible projection.
@@ -569,6 +606,30 @@ impl TranscriptRecorder {
         Ok(())
     }
 
+    /// The typed-ahead prompts the journal says were queued when it ended, oldest first.
+    pub(crate) async fn journaled_queue(
+        &self,
+    ) -> io::Result<Vec<crate::normalized::session_runtime::QueuedPrompt>> {
+        let Some(log) = &self.conversation else {
+            return Ok(Vec::new());
+        };
+        let log = log.lock().await;
+        let records = log
+            .projection()
+            .visible()
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::Command { name, payload }
+                    if name == crate::backend::queue_journal::QUEUE_COMMAND =>
+                {
+                    serde_json::from_str::<crate::backend::queue_journal::QueueRecord>(payload).ok()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::backend::queue_journal::fold(records))
+    }
+
     /// Flush all pending writes.
     pub async fn flush(&self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -588,7 +649,10 @@ impl TranscriptRecorder {
             .await
             .map_err(|e| IoError::other(format!("failed to queue transcript shutdown: {e}")))?;
         rx.await
-            .map_err(|e| IoError::other(format!("failed waiting for transcript shutdown: {e}")))
+            .map_err(|e| IoError::other(format!("failed waiting for transcript shutdown: {e}")))?;
+        // The transcript is complete: bring its full-text index digest up to date.
+        crate::session_index::SessionIndex::sync_after_session(&self.transcript_path);
+        Ok(())
     }
 
     /// Get the path to this session's transcript file.

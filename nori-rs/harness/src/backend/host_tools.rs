@@ -134,7 +134,7 @@ impl HostTools for NoriHostTools {
     }
 
     fn instructions(&self) -> String {
-        super::nori_client_mcp::tool_instructions()
+        self.service.instructions()
     }
 
     fn specs(&self) -> Vec<HostToolSpec> {
@@ -168,10 +168,24 @@ impl HostTools for NoriHostTools {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let eligible = owner.as_deref() == Some(session_id) && self.service.has_tool(name);
         drop(owner);
-        let call = self.call(name, arguments);
         let service = self.service.clone();
+        let session_id = session_id.to_owned();
+        let name = name.to_owned();
         Box::pin(async move {
-            let mut output = call.await;
+            let service = match service.for_caller(Some(&session_id), &name).await {
+                Ok(service) => service,
+                Err(error) => return HostToolOutput::error(error.to_string()),
+            };
+            if !service.has_tool(&name) {
+                return HostToolOutput::error(format!("there is no Nori tool named {name}"));
+            }
+            let mut output = match dispatch(&service, &name, arguments).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => HostToolOutput::from_mcp_result(result),
+                    Err(error) => HostToolOutput::error(error.to_string()),
+                },
+                Err(error) => HostToolOutput::error(error),
+            };
             if eligible && let Some(context) = service.take_goal_context().await {
                 output.model_context = Some(context);
             }
@@ -210,7 +224,9 @@ async fn dispatch(
     arguments: Value,
 ) -> Result<CallToolResult, String> {
     let result = match name {
+        "bash" => service.bash(parameters(arguments)?).await,
         "conversation" => service.conversation(parameters(arguments)?).await,
+        "conversation_context" => service.conversation_context(parameters(arguments)?).await,
         "get_goal" => {
             no_arguments(name, &arguments)?;
             service.get_goal().await
@@ -226,6 +242,13 @@ async fn dispatch(
         "git_commit" => service.git_commit(parameters(arguments)?).await,
         "ci_status" => service.ci_status(parameters(arguments)?).await,
         "pull_request" => service.pull_request(parameters(arguments)?).await,
+        "monitor_start" => service.monitor_start(parameters(arguments)?).await,
+        "monitor_list" => {
+            no_arguments(name, &arguments)?;
+            service.monitor_list().await
+        }
+        "monitor_stop" => service.monitor_stop(parameters(arguments)?).await,
+        "monitor_rearm" => service.monitor_rearm(parameters(arguments)?).await,
         "agent_capabilities" => {
             no_arguments(name, &arguments)?;
             service.agent_capabilities().await
@@ -297,7 +320,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|text| text.contains("ship it"))
         );
-        assert_eq!(root.as_mcp_result(), child.as_mcp_result());
+        assert!(
+            child.is_error,
+            "an unobserved caller must not execute root tools"
+        );
+        assert!(!root.is_error);
         let unchanged = tools.call_scoped("task_list", json!({}), "root").await;
         assert_eq!(unchanged.model_context, None);
         tools
@@ -324,6 +351,10 @@ mod tests {
             ),
             events.clone(),
         );
+        orchestrator.bind(crate::backend::orchestrator::Binding {
+            session_id: "root".into(),
+            approval_policy: tokio::sync::watch::channel(nori_config::AskForApproval::Never).1,
+        });
         let shared = NoriClientShared::new(
             Arc::new(Mutex::new(ThreadGoalState::default())),
             events,
@@ -460,16 +491,16 @@ mod tests {
             names,
             vec![
                 "agent_capabilities",
-                "ci_status",
+                "bash",
                 "conversation",
+                "conversation_context",
                 "create_goal",
                 "delegate_task",
                 "get_goal",
-                "git_commit",
-                "git_diff",
-                "git_log",
-                "git_status",
-                "pull_request",
+                "monitor_list",
+                "monitor_rearm",
+                "monitor_start",
+                "monitor_stop",
                 "task_cancel",
                 "task_list",
                 "task_send",
@@ -544,10 +575,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_status_without_a_working_directory_is_an_error_not_a_panic() {
-        let output = tools(None).call("git_status", json!({})).await;
+    async fn git_status_is_excluded_by_default_and_callable_when_opted_in() {
+        let default_output = tools(None).call("git_status", json!({})).await;
+        assert!(default_output.is_error);
+        assert_eq!(
+            default_output.text,
+            "there is no Nori tool named git_status"
+        );
+
+        let selection = nori_host_tools::ToolSelection {
+            enabled: Some(["git_status".to_owned()].into_iter().collect()),
+            ..Default::default()
+        };
+        let opted_in = tools_with_selection(None, Some(selection));
+        let output = opted_in.call("git_status", json!({})).await;
         assert_eq!(output.text, "this session has no working directory");
         assert!(output.is_error);
         assert_eq!(output.as_mcp_result()["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn bash_host_tool_persists_state_across_calls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+
+        let tools = tools(Some(root));
+        let first = tools
+            .call(
+                "bash",
+                json!({"command": "export NORI_HOST_VAR=ok; hi() { echo $NORI_HOST_VAR; }; cd sub"}),
+            )
+            .await;
+        assert!(!first.is_error, "{}", first.text);
+
+        let second = tools.call("bash", json!({"command": "hi && pwd"})).await;
+        assert!(!second.is_error, "{}", second.text);
+        let parsed: Value = serde_json::from_str(&second.text).expect("json");
+        assert_eq!(parsed["exit_code"], 0);
+        assert_eq!(parsed["stdout"], format!("ok\n{}\n", sub.display()));
     }
 }

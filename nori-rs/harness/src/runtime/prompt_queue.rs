@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-struct PromptJob {
+pub(super) struct PromptJob {
     id: i64,
     content: Vec<acp::v1::ContentBlock>,
     meta: Option<acp::v1::Meta>,
@@ -33,7 +33,7 @@ pub(super) struct PromptQueue {
     tx: mpsc::UnboundedSender<PromptJob>,
     control: Arc<Mutex<PromptControl>>,
     shutdown_tx: watch::Sender<bool>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<mpsc::UnboundedReceiver<PromptJob>>>,
     next_id: i64,
 }
 
@@ -64,23 +64,36 @@ impl PromptQueue {
         admission: PromptAdmission,
         response_tx: oneshot::Sender<anyhow::Result<acp::v1::RequestId>>,
     ) {
-        self.next_id += 1;
-        let id = self.next_id;
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.control
-            .lock()
-            .await
-            .queued
-            .push_back((id, cancel_tx.clone()));
-        let job = PromptJob {
-            id,
+        self.push(PromptJob {
+            id: 0,
             content,
             meta,
             admission,
             response_tx,
             cancel_tx,
             cancel_rx,
-        };
+        })
+        .await;
+    }
+
+    /// Queue prompts taken from another queue behind what is queued here, in their order. Their
+    /// callers keep waiting on the same answers and can still cancel them.
+    pub(super) async fn adopt(&mut self, jobs: Vec<PromptJob>) {
+        for job in jobs {
+            self.push(job).await;
+        }
+    }
+
+    async fn push(&mut self, mut job: PromptJob) {
+        self.next_id += 1;
+        let id = self.next_id;
+        job.id = id;
+        self.control
+            .lock()
+            .await
+            .queued
+            .push_back((id, job.cancel_tx.clone()));
         if let Err(error) = self.tx.send(job) {
             let job = error.0;
             self.control
@@ -110,6 +123,29 @@ impl PromptQueue {
         control.active.is_some() || !control.queued.is_empty()
     }
 
+    /// Stop admitting prompts and hand back those that were queued and never admitted, for a
+    /// queue that replaces this one. The prompt being admitted, if any, finishes first.
+    pub(super) async fn take_pending(&mut self) -> Vec<PromptJob> {
+        self.shutdown_tx.send_replace(true);
+        let mut jobs = Vec::new();
+        if let Some(mut worker) = self.worker.take() {
+            // A worker waiting on a prompt that cannot start under a fence would never stop.
+            match tokio::time::timeout(std::time::Duration::from_secs(3), &mut worker).await {
+                Ok(Ok(mut rx)) => {
+                    while let Ok(job) = rx.try_recv() {
+                        jobs.push(job);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "prompt admission worker stopped unexpectedly");
+                }
+                Err(_) => worker.abort(),
+            }
+        }
+        self.control.lock().await.queued.clear();
+        jobs
+    }
+
     /// Stop prompt admission before the backend is shut down.
     pub(super) async fn shutdown(&mut self) {
         self.shutdown_tx.send_replace(true);
@@ -135,7 +171,7 @@ async fn run_prompt_worker(
     mut rx: mpsc::UnboundedReceiver<PromptJob>,
     control: Arc<Mutex<PromptControl>>,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> mpsc::UnboundedReceiver<PromptJob> {
     loop {
         let job = tokio::select! {
             biased;
@@ -172,6 +208,7 @@ async fn run_prompt_worker(
             break;
         }
     }
+    rx
 }
 
 async fn wait_until_true(receiver: &mut watch::Receiver<bool>) {

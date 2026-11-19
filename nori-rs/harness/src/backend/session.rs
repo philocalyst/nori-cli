@@ -233,6 +233,7 @@ impl AcpBackend {
             mut deferred_replay_batches,
             event_rx,
             session_driver_state,
+            held_requests,
         ) = if let Some(sid) = acp_session_id
             .filter(|_| supports_load_session && !(supports_session_resume && transcript.is_some()))
         {
@@ -247,13 +248,16 @@ impl AcpBackend {
                 let mut event_rx = event_rx;
                 let mut session_driver = session_runtime_driver::SessionDriver::new();
                 let mut buffered_session_events = Vec::new();
-                let load_request_id = load_started_rx.await.map_err(|_| {
+                // Requests the agent made during the load, held for the user until there is
+                // somewhere to ask: the replay turn owns them in the ledger meanwhile.
+                let mut held_requests = Vec::new();
+                let load_request_id: acp::RequestId = load_started_rx.await.map_err(|_| {
                     anyhow::anyhow!("session/load did not expose its wire request ID")
                 })?;
                 let mut buffered_events = client_events_to_replay_client_events(
                     session_driver
                         .apply(session_reducer::InboundEvent::LoadSubmit {
-                            request_id: load_request_id,
+                            request_id: load_request_id.clone(),
                         })
                         .events,
                 );
@@ -283,13 +287,7 @@ impl AcpBackend {
                                 Some(crate::connection::ConnectionEvent::SessionClosed) => break,
                                 Some(crate::connection::ConnectionEvent::Barrier(reply)) => { let _ = reply.send(()); }
                                 Some(crate::connection::ConnectionEvent::DelegatedRequest(request)) => {
-                                    let _ = request.response_tx.send(Ok(
-                                        acp::ClientResponse::RequestPermissionResponse(
-                                            acp::RequestPermissionResponse::new(
-                                                acp::RequestPermissionOutcome::Cancelled,
-                                            ),
-                                        ),
-                                    ));
+                                    hold_load_request(&mut session_driver, &mut held_requests, request);
                                 }
                                 Some(crate::connection::ConnectionEvent::ChildExited { status, stderr_tail }) => {
                                     warn!(?status, %stderr_tail, "ACP agent exited during session/load");
@@ -322,13 +320,7 @@ impl AcpBackend {
                                     crate::connection::ConnectionEvent::SessionClosed => {}
                                     crate::connection::ConnectionEvent::Barrier(reply) => { let _ = reply.send(()); }
                                     crate::connection::ConnectionEvent::DelegatedRequest(request) => {
-                                        let _ = request.response_tx.send(Ok(
-                                            acp::ClientResponse::RequestPermissionResponse(
-                                                acp::RequestPermissionResponse::new(
-                                                    acp::RequestPermissionOutcome::Cancelled,
-                                                ),
-                                            ),
-                                        ));
+                                        hold_load_request(&mut session_driver, &mut held_requests, request);
                                     }
                                     crate::connection::ConnectionEvent::ChildExited { status, stderr_tail } => {
                                         warn!(?status, %stderr_tail, "ACP agent exited during session/load drain");
@@ -337,7 +329,9 @@ impl AcpBackend {
                             }
                             buffered_events.extend(client_events_to_replay_client_events(
                                 session_driver
-                                    .apply(session_reducer::InboundEvent::LoadResponse)
+                                    .apply(session_reducer::InboundEvent::LoadResponse {
+                                        request_id: load_request_id,
+                                    })
                                     .events,
                             ));
                             break;
@@ -349,6 +343,7 @@ impl AcpBackend {
                     event_rx,
                     buffered_events,
                     buffered_session_events,
+                    held_requests,
                 ))
             });
 
@@ -376,6 +371,7 @@ impl AcpBackend {
                         recovered_rx,
                         buffered_client_events,
                         buffered_session_events,
+                        held_requests,
                     ) = collect_handle.await.map_err(|err| {
                         anyhow::anyhow!("load session collector task panicked: {err}")
                     })??;
@@ -434,15 +430,25 @@ impl AcpBackend {
                             .collect(),
                         recovered_rx,
                         session_driver,
+                        held_requests,
                     )
                 }
                 Err(e) => {
                     warn!("Server-side session/load failed: {e}");
                     let _ = load_done_tx.send(());
-                    let (_failed_driver, mut recovered_rx, _, buffered_session_events) =
-                        collect_handle.await.map_err(|err| {
-                            anyhow::anyhow!("load session collector task panicked: {err}")
-                        })??;
+                    let (
+                        _failed_driver,
+                        mut recovered_rx,
+                        _,
+                        buffered_session_events,
+                        abandoned_requests,
+                    ) = collect_handle.await.map_err(|err| {
+                        anyhow::anyhow!("load session collector task panicked: {err}")
+                    })??;
+                    // The session they were about no longer exists to continue.
+                    for request in abandoned_requests {
+                        decline_load_request(request);
+                    }
                     let load_request_id = response_request_id(&buffered_session_events)
                         .ok_or_else(|| {
                             anyhow::anyhow!("failed session/load produced no raw response")
@@ -550,6 +556,7 @@ impl AcpBackend {
                         replay_batches,
                         recovered_rx,
                         session_runtime_driver::SessionDriver::new(),
+                        Vec::new(),
                     )
                 }
             }
@@ -604,6 +611,7 @@ impl AcpBackend {
                 history,
                 event_rx,
                 session_runtime_driver::SessionDriver::new(),
+                Vec::new(),
             )
         } else {
             debug!(
@@ -665,6 +673,7 @@ impl AcpBackend {
                 .collect(),
                 event_rx,
                 session_runtime_driver::SessionDriver::new(),
+                Vec::new(),
             )
         };
 
@@ -776,7 +785,7 @@ impl AcpBackend {
         }
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
         let session_driver = Arc::new(Mutex::new(session_driver_state));
-        let (session_event_tx, mut session_event_rx) = mpsc::channel(128);
+        let (session_event_tx, session_event_rx) = mpsc::channel(128);
         let (prompt_result_tx, prompt_result_rx) = mpsc::channel(128);
         let use_native_notifications =
             config.os_notifications == crate::config::OsNotifications::Enabled;
@@ -795,6 +804,16 @@ impl AcpBackend {
         let agent_replays = deferred_replay_batches
             .iter()
             .any(|batch| batch.source == nori_protocol::ReplaySource::Agent);
+        if let Some(transcript) = transcript
+            && transcript.meta.delegated
+            && !config.delegation.is_child()
+        {
+            anyhow::bail!(
+                "transcript {} belongs to a delegated child session, not a conversation of its own; \
+                 resume the session that delegated it",
+                transcript.meta.session_id
+            );
+        }
         let recorded_transcript = transcript
             .filter(|_| !agent_replays)
             .map(|transcript| {
@@ -809,12 +828,13 @@ impl AcpBackend {
             let recorder = match recorded_transcript {
                 Some((path, meta)) => TranscriptRecorder::continue_session(path, meta).await,
                 None => {
-                    TranscriptRecorder::new(
+                    TranscriptRecorder::new_for(
                         &config.nori_home,
                         &cwd,
                         Some(config.agent.clone()),
                         &config.cli_version,
                         Some(session_id.to_string()),
+                        config.delegation.is_child(),
                     )
                     .await
                 }
@@ -861,7 +881,13 @@ impl AcpBackend {
         {
             warn!(%error, "Failed to record resumed backend binding");
         }
-        let pending_hook_context = session_context_for_connection(config, &connection);
+        let pending_hook_context = orchestrator
+            .initial_catalog_context(
+                session_context_for_connection(config, &connection),
+                &workflow,
+                goal_mcp_http_server.lock().await.is_some(),
+            )
+            .await;
         let goal_ext_capability =
             goal_ext::GoalExtCapability::from_initialize_meta(connection.initialize_meta());
         let transcript_recorder_cell = Arc::new(RwLock::new(transcript_recorder));
@@ -948,54 +974,28 @@ impl AcpBackend {
             mcp_oauth_credentials_store_mode: config.mcp_oauth_credentials_store_mode,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             prompt_task_abort: Arc::new(Mutex::new(None)),
+            retired_sessions: Arc::default(),
+            recovery: super::route_moves::SessionRecovery::new(config.session_context.clone()),
             cancel_timeout_abort: Arc::new(Mutex::new(None)),
             runtime_task_abort: Arc::new(Mutex::new(None)),
             relay_task_abort: Arc::new(Mutex::new(None)),
             orchestrator,
             native_children,
+            user_bash_session: Arc::new(Mutex::new(None)),
         };
 
         if !policy_before_session && !backend.orchestrator.is_child() {
             backend.load_workflow_without_tools();
         }
 
-        let runtime_backend = backend.clone();
-        let runtime_task = tokio::spawn(async move {
-            while let Some(input) = session_event_rx.recv().await {
-                match input {
-                    session_runtime_driver::SessionRuntimeInput::Reducer(event) => {
-                        runtime_backend.apply_session_event(event).await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::GuardedContinuation {
-                        generation,
-                        event,
-                    } => {
-                        runtime_backend
-                            .apply_guarded_continuation(generation, event)
-                            .await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::Barrier { response_tx } => {
-                        let _ = response_tx.send(());
-                    }
-                    session_runtime_driver::SessionRuntimeInput::QuestionCancelled(event) => {
-                        runtime_backend.withdraw_cancelled_question(&event).await;
-                    }
-                    session_runtime_driver::SessionRuntimeInput::PermissionRequest {
-                        pending_request,
-                        current_policy,
-                    } => {
-                        runtime_backend
-                            .handle_permission_request(pending_request, current_policy)
-                            .await;
-                    }
-                }
-            }
-        });
-        *backend.runtime_task_abort.lock().await = Some(runtime_task.abort_handle());
+        *backend.runtime_task_abort.lock().await =
+            Some(backend.spawn_runtime_actor(session_event_rx));
         backend.orchestrator.bind(orchestrator::Binding {
             session_id: backend.session_id().await,
             approval_policy: backend.approval_policy_tx.subscribe(),
         });
+        // Before the agent can be asked anything: what it armed is what `monitor_list` says.
+        backend.restore_monitors().await;
         backend.serve_orchestrator(orchestrator_signals);
         let previous_root =
             transcript.and_then(crate::transcript::Transcript::latest_acp_session_id);
@@ -1056,12 +1056,13 @@ impl AcpBackend {
                 parent_session_id: child.parent.clone(),
                 session_id: id.clone(),
                 agent: nori_protocol::Patch::Keep,
+                model: nori_protocol::Patch::Keep,
                 title: nori_protocol::Patch::Keep,
                 description: nori_protocol::Patch::Keep,
                 state: nori_protocol::Patch::Keep,
             });
             announcement.parent_session_id = child.parent;
-            announcement.state = nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle);
+            announcement.state = nori_protocol::Patch::Set(child.state);
             let announcement = SessionEvent::Nori(nori_protocol::NoriEvent::Subagent(
                 nori_protocol::SubagentWire::Update(announcement),
             ));
@@ -1116,6 +1117,7 @@ impl AcpBackend {
                     history_log_id: i64::try_from(history_log_id).unwrap_or(i64::MAX),
                     history_entry_count: i64::try_from(history_entry_count).unwrap_or(i64::MAX),
                     config_options: backend.config_options(),
+                    swap: None,
                 }),
             )))
             .await
@@ -1209,6 +1211,16 @@ impl AcpBackend {
                     )))
                     .await;
             }
+            // The requests the agent made during the load wait no longer: the ledger already
+            // holds them in the turn that continues the load, and the user is asked now.
+            for request in held_requests {
+                let policy = *approval_policy_rx.borrow();
+                relay_backend
+                    .handle_permission_request(Box::new(PendingApprovalRequest { request }), policy)
+                    .await;
+            }
+            // What the previous session had queued comes back held: the user sends or drops it.
+            relay_backend.restore_queued_prompts().await;
             Self::run_connection_event_relay(
                 relay_backend,
                 event_rx,
@@ -1240,4 +1252,51 @@ impl AcpBackend {
         self.teardown(false, None).await;
         Ok(())
     }
+}
+
+/// Hold a request the agent made during `session/load`. The ledger's replay turn owns it, and it
+/// waits for the backend's approval channel instead of being declined before anyone could be
+/// asked.
+fn hold_load_request(
+    driver: &mut session_runtime_driver::SessionDriver,
+    held: &mut Vec<crate::connection::DelegatedRequest>,
+    request: crate::connection::DelegatedRequest,
+) {
+    let (call_id, title) = match &request.request {
+        acp::AgentRequest::RequestPermissionRequest(permission) => (
+            Some(permission.tool_call.tool_call_id.to_string()),
+            permission
+                .tool_call
+                .fields
+                .title
+                .clone()
+                .unwrap_or_else(|| "tool request".to_string()),
+        ),
+        acp::AgentRequest::ExtMethodRequest(ext)
+            if ext.method.as_ref() == "_nori/request_user_input" =>
+        {
+            (None, "question".to_string())
+        }
+        _ => {
+            let _ = request
+                .response_tx
+                .send(Err(acp::Error::method_not_found()));
+            return;
+        }
+    };
+    driver.apply(session_reducer::InboundEvent::PermissionRequest {
+        request_id: request.request_id.to_string(),
+        call_id,
+        title,
+    });
+    held.push(request);
+}
+
+/// Answer a held load request as cancelled because the session it belonged to is gone.
+fn decline_load_request(request: crate::connection::DelegatedRequest) {
+    let _ = request
+        .response_tx
+        .send(Ok(acp::ClientResponse::RequestPermissionResponse(
+            acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Cancelled),
+        )));
 }

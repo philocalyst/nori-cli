@@ -304,6 +304,7 @@ mod types_tests {
             }),
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         });
 
         let line = TranscriptLine {
@@ -335,6 +336,7 @@ mod types_tests {
             git: None,
             acp_session_id: None,
             forked_from: None,
+            delegated: false,
         });
 
         let line = TranscriptLine {
