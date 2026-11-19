@@ -195,10 +195,6 @@ impl ChatWidget {
         self.push_notice(history_cell::NoticeKind::Error, message);
     }
 
-    pub(crate) fn add_warning_message(&mut self, message: String) {
-        self.push_notice(history_cell::NoticeKind::Warning, message);
-    }
-
     /// Queue a plain text message to be submitted as a user turn. If no task
     /// is currently running the message is submitted immediately; otherwise
     /// it is appended to the pending queue.
@@ -299,10 +295,6 @@ impl ChatWidget {
         (Some(text).filter(|text| !text.is_empty()), image_paths)
     }
 
-    pub(crate) fn has_initial_input(&self) -> bool {
-        self.initial_user_message.is_some()
-    }
-
     pub(crate) fn has_harness_session(&self) -> bool {
         self.harness_handle.is_some()
     }
@@ -346,10 +338,6 @@ impl ChatWidget {
 
     pub(crate) fn is_composer_in_vim_normal_mode(&self) -> bool {
         self.bottom_pane.is_composer_in_vim_normal_mode()
-    }
-
-    pub(crate) fn is_composer_popup_active(&self) -> bool {
-        self.bottom_pane.is_composer_popup_active()
     }
 
     pub(crate) fn submit_user_prompt_text(&mut self, text: String) {
@@ -607,10 +595,6 @@ impl ChatWidget {
 
     pub(crate) fn conversation_id(&self) -> Option<ConversationId> {
         self.conversation_id
-    }
-
-    pub(crate) fn rollout_path(&self) -> Option<PathBuf> {
-        self.current_rollout_path.clone()
     }
 
     /// Return a reference to the widget's current config (includes any

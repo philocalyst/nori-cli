@@ -5,7 +5,6 @@ use nori_tui_components::HelixConfig;
 use nori_tui_components::HelixEvent;
 use nori_tui_components::HelixItem;
 use nori_tui_components::HelixState;
-use nori_tui_components::KeyHint;
 use nori_tui_components::MenuDensity;
 use nori_tui_components::MenuItemTone;
 use nori_tui_components::MenuPlacement;
@@ -71,7 +70,6 @@ pub(crate) struct SelectionViewParams {
     pub subtitle: Option<String>,
     pub footer_hint: Option<Line<'static>>,
     pub footer_hint_right: Option<Line<'static>>,
-    pub picker_footer_hints: Option<Vec<KeyHint<'static>>>,
     pub items: Vec<SelectionItem>,
     pub is_searchable: bool,
     pub search_placeholder: Option<String>,
@@ -118,7 +116,6 @@ impl Default for SelectionViewParams {
             subtitle: None,
             footer_hint: None,
             footer_hint_right: None,
-            picker_footer_hints: None,
             items: Vec::new(),
             is_searchable: false,
             search_placeholder: None,
@@ -145,7 +142,7 @@ struct Row {
     selected_description: Option<String>,
     is_current: bool,
     display_shortcut: Option<KeyBinding>,
-    /// What a query is matched against, and the stable id of `update_item`.
+    /// What a query is matched against.
     search_value: Option<String>,
     section: Option<String>,
 }
@@ -280,47 +277,6 @@ impl ListSelectionView {
         view
     }
 
-    pub(crate) fn update_item(
-        &mut self,
-        stable_id: &str,
-        name: String,
-        description: Option<String>,
-        search_value: String,
-    ) -> bool {
-        let Some(index) = self.index_of(stable_id) else {
-            return false;
-        };
-        self.model.update(index, |row| {
-            row.name = name;
-            row.description = description;
-            row.search_value = Some(search_value);
-        });
-        self.sync_scroll();
-        true
-    }
-
-    pub(crate) fn remove_item(&mut self, stable_id: &str) -> bool {
-        let Some(index) = self.index_of(stable_id) else {
-            return false;
-        };
-        self.model.remove(index);
-        self.sync_scroll();
-        true
-    }
-
-    fn index_of(&self, stable_id: &str) -> Option<usize> {
-        self.model
-            .items()
-            .iter()
-            .find(|row| {
-                row.search_value
-                    .as_deref()
-                    .map(search_value_id)
-                    .is_some_and(|id| id == stable_id)
-            })
-            .map(|row| row.index)
-    }
-
     fn max_visible_rows(len: usize) -> usize {
         MAX_POPUP_ROWS.min(len.max(1))
     }
@@ -447,12 +403,6 @@ impl ListSelectionView {
     }
 }
 
-fn search_value_id(search_value: &str) -> &str {
-    search_value
-        .split_once(' ')
-        .map_or(search_value, |(id, _)| id)
-}
-
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match self.model.on_key(key_event) {
@@ -495,20 +445,6 @@ impl BottomPaneView for ListSelectionView {
             self.on_ctrl_c();
         }
         CancellationEvent::Handled
-    }
-
-    fn update_selection_item(
-        &mut self,
-        stable_id: &str,
-        name: String,
-        description: Option<String>,
-        search_value: String,
-    ) -> bool {
-        self.update_item(stable_id, name, description, search_value)
-    }
-
-    fn remove_selection_item(&mut self, stable_id: &str) -> bool {
-        self.remove_item(stable_id)
     }
 }
 

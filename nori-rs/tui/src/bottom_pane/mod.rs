@@ -18,7 +18,6 @@ use std::time::Duration;
 
 mod activity;
 mod approval_overlay;
-mod approval_tool_details;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
 mod bottom_pane_view;
@@ -26,7 +25,6 @@ mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
 mod component_overlay_menu_view;
-mod component_picker_view;
 mod file_search_popup;
 mod footer;
 mod history_search_popup;
@@ -34,7 +32,6 @@ mod list_selection_view;
 mod popup_layout;
 mod prompt_args;
 mod status_line;
-pub(crate) use component_picker_view::ComponentPickerParams;
 #[cfg(test)]
 pub(crate) use list_selection_view::ListSelectionView;
 pub(crate) use list_selection_view::SelectionViewParams;
@@ -560,10 +557,6 @@ impl BottomPane {
         self.composer.set_vim_mode(value);
     }
 
-    pub(crate) fn should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
-        self.composer.should_handle_vim_insert_escape(key_event)
-    }
-
     /// Set a footer segment's enabled state.
     pub(crate) fn set_footer_segment_enabled(
         &mut self,
@@ -598,14 +591,6 @@ impl BottomPane {
         }
     }
 
-    /// Show a domain-free picker from the shared component crate, adapting
-    /// typed outcomes into this application's event callbacks.
-    pub(crate) fn show_component_picker(&mut self, params: ComponentPickerParams) {
-        let view =
-            component_picker_view::ComponentPickerView::new(params, self.app_event_tx.clone());
-        self.push_view(Box::new(view));
-    }
-
     /// Replace the current top-of-stack selection view with a new one.
     ///
     /// This pops the existing view before pushing the replacement so the stack
@@ -623,28 +608,6 @@ impl BottomPane {
             self.view_stack.pop();
         }
         self.show_selection_view(params);
-    }
-
-    pub(crate) fn update_selection_item(
-        &mut self,
-        stable_id: &str,
-        name: String,
-        description: Option<String>,
-        search_value: String,
-    ) {
-        if let Some(view) = self.view_stack.last_mut()
-            && view.update_selection_item(stable_id, name, description, search_value)
-        {
-            self.request_redraw();
-        }
-    }
-
-    pub(crate) fn remove_selection_item(&mut self, stable_id: &str) {
-        if let Some(view) = self.view_stack.last_mut()
-            && view.remove_selection_item(stable_id)
-        {
-            self.request_redraw();
-        }
     }
 
     /// Update the queued messages preview shown above the composer.
@@ -785,10 +748,6 @@ impl BottomPane {
 
     pub(crate) fn is_composer_in_vim_normal_mode(&self) -> bool {
         self.composer.is_in_vim_normal_mode()
-    }
-
-    pub(crate) fn is_composer_popup_active(&self) -> bool {
-        self.composer.popup_active()
     }
 
     pub(crate) fn has_queued_user_messages(&self) -> bool {
@@ -1012,10 +971,6 @@ mod tests {
     use crate::app_event::AppEvent;
     use crossterm::event::KeyModifiers;
     use insta::assert_snapshot;
-    use nori_tui_components::PickerColumn;
-    use nori_tui_components::PickerDensity;
-    use nori_tui_components::PickerItem;
-    use nori_tui_components::PickerState;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -1306,52 +1261,6 @@ mod tests {
         assert!(
             pane.has_active_view(),
             "first Escape should leave the searchable selection view open"
-        );
-
-        pane.handle_key_event(KeyEvent::new(
-            KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert!(!pane.has_active_view());
-    }
-
-    #[test]
-    fn searchable_component_picker_consumes_escape_before_bottom_pane_dismissal() {
-        let mut pane = test_bottom_pane();
-        pane.show_component_picker(ComponentPickerParams {
-            state: PickerState::new(
-                "Sessions",
-                [PickerColumn::flexible("session", "Session")],
-                [PickerItem::new("alpha".to_string(), "session", "Alpha")],
-            ),
-            actions: std::collections::BTreeMap::new(),
-            on_dismiss: None,
-            on_shift_tab: None,
-            primary_column: "session".to_string(),
-            detail_column: None,
-            density: PickerDensity::Compact,
-            show_title: true,
-            show_details: true,
-            keep_open: std::collections::BTreeSet::new(),
-            footer_hints: None,
-        });
-
-        pane.handle_key_event(KeyEvent::new(
-            KeyCode::Char('f'),
-            crossterm::event::KeyModifiers::CONTROL,
-        ));
-        pane.handle_key_event(KeyEvent::new(
-            KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        pane.handle_key_event(KeyEvent::new(
-            KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-
-        assert!(
-            pane.has_active_view(),
-            "first Escape should leave the component picker open"
         );
 
         pane.handle_key_event(KeyEvent::new(

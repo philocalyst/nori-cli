@@ -619,14 +619,6 @@ impl ChatComposer {
             .insert(cmd, Line::from(desc));
     }
 
-    pub(crate) fn set_command_description_override_line(
-        &mut self,
-        cmd: SlashCommand,
-        desc: Line<'static>,
-    ) {
-        self.command_description_overrides.insert(cmd, desc);
-    }
-
     pub(crate) fn set_builtin_command_disabled(
         &mut self,
         cmd: SlashCommand,

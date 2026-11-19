@@ -111,16 +111,6 @@ impl AgentStatusOption {
         self.value.display()
     }
 
-    /// How the option reads on the single-line compact agent row. Boolean
-    /// toggles are presence-based there: the label appears when the toggle is
-    /// on and the option is dropped entirely when it is off.
-    pub(crate) fn compact_text(&self) -> Option<String> {
-        match &self.value {
-            AgentConfigValue::Select(value) => Some(value.clone()),
-            AgentConfigValue::Boolean(true) => Some(self.label.clone()),
-            AgentConfigValue::Boolean(false) => None,
-        }
-    }
 }
 
 /// The agent identity plus its advertised configuration, ordered for display.
@@ -375,18 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_text_drops_toggles_that_are_off() {
-        let on = AgentStatusOption {
-            label: "Fast mode".to_string(),
-            value: AgentConfigValue::Boolean(true),
-        };
+    fn disabled_toggle_displays_off() {
         let off = AgentStatusOption {
             label: "Fast mode".to_string(),
             value: AgentConfigValue::Boolean(false),
         };
 
-        assert_eq!(on.compact_text().as_deref(), Some("Fast mode"));
-        assert_eq!(off.compact_text(), None);
         assert_eq!(off.display_value(), "Off");
     }
 

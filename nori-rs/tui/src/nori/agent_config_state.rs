@@ -165,22 +165,6 @@ impl AgentConfigState {
         super::session_config_mode::acp_mode_config_from_options(&self.raw_options())
     }
 
-    /// Options whose resolved value differs from `previous`, in advertised
-    /// order. Options that appear for the first time are not reported as
-    /// changes; the initial announcement covers them.
-    pub(crate) fn changes_since(&self, previous: &Self) -> Vec<AgentConfigOption> {
-        self.options
-            .iter()
-            .filter(|option| {
-                previous
-                    .options
-                    .iter()
-                    .find(|prior| prior.id == option.id)
-                    .is_some_and(|prior| prior.value != option.value)
-            })
-            .cloned()
-            .collect()
-    }
 }
 
 /// Resolve a select option's current value to the label the agent advertises
@@ -274,30 +258,6 @@ mod tests {
             "boolean toggles stay booleans so views can render by presence"
         );
         assert_eq!(state.options()[0].display_value(), "On");
-    }
-
-    #[test]
-    fn changes_report_updated_values_but_not_new_options() {
-        let previous = AgentConfigState::from_options(&[select(
-            "model",
-            "Model",
-            "opus-5",
-            &[("opus-5", "Opus 5"), ("sonnet-5", "Sonnet 5")],
-        )]);
-        let next = AgentConfigState::from_options(&[
-            select(
-                "model",
-                "Model",
-                "sonnet-5",
-                &[("opus-5", "Opus 5"), ("sonnet-5", "Sonnet 5")],
-            ),
-            select("mode", "Mode", "plan", &[("plan", "Plan")]),
-        ]);
-
-        let changes = next.changes_since(&previous);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].name, "Model");
-        assert_eq!(changes[0].display_value(), "Sonnet 5");
     }
 
     #[test]

@@ -173,7 +173,6 @@ impl ChatWidget {
             acp_session_phase: None,
             plan_drawer_mode: PlanDrawerMode::Off,
             pinned_plan: None,
-            terminal_title_animation_origin: std::time::Instant::now(),
             last_terminal_title: None,
             user_shell_state: Default::default(),
         };
@@ -382,7 +381,6 @@ impl ChatWidget {
             acp_session_phase: None,
             plan_drawer_mode: PlanDrawerMode::Off,
             pinned_plan: None,
-            terminal_title_animation_origin: std::time::Instant::now(),
             last_terminal_title: None,
             user_shell_state: Default::default(),
         };

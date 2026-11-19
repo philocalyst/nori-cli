@@ -1,8 +1,0 @@
----
-source: tui/src/bottom_pane/approval_tool_details.rs
-assertion_line: 55
-expression: display
----
-▾ • Exploring
-  ◇ /etc/config.toml
-  42 lines read

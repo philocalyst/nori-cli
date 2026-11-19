@@ -47,29 +47,6 @@ impl PendingEchoes {
 }
 
 impl ChatWidget {
-    /// Retry a prompt already displayed in the conversation after a provider handoff.
-    pub(crate) fn retry_echoed_prompt(
-        &mut self,
-        content: Vec<acp::ContentBlock>,
-        echo_id: Option<String>,
-    ) {
-        let Some(handle) = self.harness_handle() else {
-            return;
-        };
-        let echo = echo_id
-            .map(PromptEchoId::new)
-            .unwrap_or_else(|| self.pending_echoes.issue());
-        self.pending_echoes.painted.insert(echo.clone());
-        let events = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle.prompt_handoff(content, &echo).await {
-                events.send(crate::app_event::AppEvent::PromptSubmitFailed(
-                    error.to_string(),
-                ));
-            }
-        });
-    }
-
     /// Whether a prompt submitted now starts a turn immediately, so painting it
     /// locally cannot get ahead of the queue.
     pub(super) fn can_echo_locally(&self) -> bool {

@@ -61,20 +61,4 @@ pub(crate) trait BottomPaneView: Renderable {
     fn withdraw_approval_request(&mut self, _request_id: &acp::RequestId) -> bool {
         false
     }
-
-    /// Update an item in a generic selection view by stable id.
-    fn update_selection_item(
-        &mut self,
-        _stable_id: &str,
-        _name: String,
-        _description: Option<String>,
-        _search_value: String,
-    ) -> bool {
-        false
-    }
-
-    /// Remove an item in a generic selection view by stable id.
-    fn remove_selection_item(&mut self, _stable_id: &str) -> bool {
-        false
-    }
 }

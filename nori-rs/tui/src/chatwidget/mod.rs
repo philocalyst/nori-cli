@@ -368,8 +368,6 @@ pub(crate) struct ChatWidget {
     /// the drawer on shows the most recent plan immediately.
     pinned_plan: Option<PlanUpdate>,
 
-    // Terminal title state: baseline instant for computing spinner frame index.
-    terminal_title_animation_origin: Instant,
     // Terminal title state: cache to avoid redundant OSC writes.
     last_terminal_title: Option<String>,
     user_shell_state: user_shell_cell::UserShellState,

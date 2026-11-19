@@ -13,16 +13,12 @@ use std::io;
 use std::io::IsTerminal;
 use std::io::stdout;
 use std::time::Duration;
-use std::time::Instant;
 
 use crossterm::Command;
 use crossterm::execute;
 
 /// Maximum number of characters allowed in the terminal title.
 const MAX_TERMINAL_TITLE_CHARS: usize = 240;
-
-/// Braille-pattern dot-spinner frames for the terminal title animation.
-pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Time between spinner frame advances in the terminal title.
 pub(crate) const SPINNER_INTERVAL: Duration = Duration::from_millis(100);
@@ -107,13 +103,6 @@ pub(crate) fn sanitize_terminal_title(input: &str) -> String {
     result
 }
 
-/// Returns the spinner frame for the given elapsed time since animation start.
-pub(crate) fn spinner_frame_at(animation_origin: Instant, now: Instant) -> &'static str {
-    let elapsed = now.saturating_duration_since(animation_origin);
-    let frame_index = (elapsed.as_millis() / SPINNER_INTERVAL.as_millis()) as usize;
-    SPINNER_FRAMES[frame_index % SPINNER_FRAMES.len()]
-}
-
 /// Compose the terminal title string.
 ///
 /// When `spinner_frame` is `Some`, the title is `"{spinner} {project}"`.
@@ -190,27 +179,6 @@ mod tests {
         let input = "Nori — 日本語プロジェクト";
         let result = sanitize_terminal_title(input);
         assert_eq!(result, "Nori — 日本語プロジェクト");
-    }
-
-    #[test]
-    fn spinner_frame_cycles_through_all_frames() {
-        let origin = Instant::now();
-        for (i, expected_frame) in SPINNER_FRAMES.iter().enumerate() {
-            let now = origin + SPINNER_INTERVAL * i as u32;
-            assert_eq!(
-                spinner_frame_at(origin, now),
-                *expected_frame,
-                "frame at index {i}"
-            );
-        }
-    }
-
-    #[test]
-    fn spinner_frame_wraps_around() {
-        let origin = Instant::now();
-        // After 10 frames (one full cycle), should be back to frame 0
-        let now = origin + SPINNER_INTERVAL * SPINNER_FRAMES.len() as u32;
-        assert_eq!(spinner_frame_at(origin, now), SPINNER_FRAMES[0]);
     }
 
     #[test]

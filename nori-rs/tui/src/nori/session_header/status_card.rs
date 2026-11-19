@@ -64,24 +64,6 @@ pub(super) fn agent_name_style(agent_kind: Option<AgentKindSimple>) -> Style {
     }
 }
 
-/// The compact agent row: the provider name, then each configured option's
-/// current value in display order. Boolean toggles read by presence, so a
-/// disabled toggle contributes nothing. Before the agent advertises any
-/// configuration this is the provider name alone.
-pub(super) fn agent_row_spans(agent: &AgentStatus) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        agent.provider.clone(),
-        agent_name_style(agent.kind),
-    )];
-    for option in &agent.options {
-        if let Some(text) = option.compact_text() {
-            spans.push(Span::from(" · ").dim());
-            spans.push(Span::from(text));
-        }
-    }
-    spans
-}
-
 /// The full-card agent block: one row per advertised option, in the agent's own
 /// aligned column, indented to the status value column.
 fn agent_detail_lines(agent: &AgentStatus) -> Vec<Line<'static>> {
