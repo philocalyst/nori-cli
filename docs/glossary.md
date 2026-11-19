@@ -6,10 +6,11 @@
 
 | Term         | Definition                                                                                     | Aliases to avoid          |
 | ------------ | ---------------------------------------------------------------------------------------------- | ------------------------- |
-| **User**     | The person whose intent and authorization a **client** mediates during agent work.             | Client, account, ACP peer |
+| **User**     | The person whose intent and authorization a **client** mediates during agent work.             | Client, ACP peer          |
 | **Client**   | An ACP client, such as Nori CLI or webchat, that mediates between a **user** and an **agent**. | Harness, peer, observer   |
 | **Agent**    | An ACP server that performs work and emits requests, responses, and session updates.           | Model, provider, backend  |
 | **Provider** | The external organization or service from which an **agent** obtains models or credentials.    | Agent, model, ACP server  |
+| **Account**  | One login of one **provider**: a home (the directory its credentials live in) and a name. Its identity is the agent's slug (`codex@work`); see [accounts.md](accounts.md). | User, profile, login |
 
 ### Nori runtime boundaries
 
@@ -61,9 +62,12 @@
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | **Prompt turn**          | The ACP v1 turn that begins with `session/prompt` and ends with its correlated response.                                         | Request, task, conversation                                |
 | **Client-owned turn**    | A **prompt turn** viewed from the **client connection** that sent its prompt request.                                            | Local turn, owned turn, normal turn                        |
-| **Agent-owned turn**     | A Nori extension turn established on a **client connection** by explicit agent-turn metadata rather than a local prompt request. | Proactive turn, observed turn, remote turn, agent-led turn |
+| **Agent-owned turn**     | A turn the session harness opens in its **turn ledger** when the agent works without a local request: declared by **agent-turn metadata** (observed), continuing a local request that ended (detached), or evidenced by activity alone (unprompted). | Proactive turn, remote turn, agent-led turn |
+| **Turn ledger**          | The session harness's single record of the one turn that currently owns the session and everything accounted to it. Replaces separate phase, active-request, and observer flags. | Phase, session state, active request |
+| **Detached turn**        | An **agent-owned turn** that continues a local request after its response, failure, or forced cancel, reported as running rather than warned about. | Orphan turn, leftover turn |
+| **Quiescence**           | The condition that ends an **agent-owned turn** without `idle` metadata: every tool call terminal, no unanswered agent request, and a quiet window with no activity. | Timeout, idle detection |
 | **Turn ownership**       | The connection-relative classification of a turn as client-owned or agent-owned.                                                 | Initiator, authority, control                              |
-| **Unowned update**       | A non-metadata **session update** received without an **active local request**.                                                  | Orphan update, stray update, agent-owned turn              |
+| **Unowned update**       | A non-metadata **session update** received while the **turn ledger** has no turn; it opens an **agent-owned turn**.              | Orphan update, stray update                                |
 | **Unowned presentation** | TUI-only grouping used to render **unowned updates** without asserting that an ACP turn exists.                                  | Proactive presentation, synthetic turn                     |
 
 ### Protocol
@@ -71,7 +75,7 @@
 | Term                     | Definition                                                                           | Aliases to avoid             |
 | ------------------------ | ------------------------------------------------------------------------------------ | ---------------------------- |
 | **Prompt request**       | The ACP `session/prompt` request that starts a **prompt turn**.                      | Prompt, user message         |
-| **Active local request** | A prompt or load request sent by this connection that has not received its response. | Active turn, working state   |
+| **Active local request** | A prompt or load request sent by this connection that has not received its response; it owns the **turn ledger**'s turn. | Active turn, working state   |
 | **Session update**       | An ACP `session/update` notification carrying agent output or session state.         | Turn, message, chunk         |
 | **Prompt response**      | The response to `session/prompt` that ends its **prompt turn** with a stop reason.   | Completion event, idle event |
 
@@ -91,7 +95,8 @@ ACP v1 defines prompt turns but no agent-initiated turn primitive.
 - A **prompt turn** is client-owned only on the connection that sent its **prompt request**.
 - With agent-turn metadata, the same work may be client-owned on one connection and agent-owned on another.
 - `working` establishes an **agent-owned turn**; `idle` ends it on that connection.
-- Without **agent-turn metadata**, **unowned updates** do not constitute a turn in ACP language.
+- Without **agent-turn metadata**, **unowned updates** do not constitute a turn in ACP language, but the **turn ledger** still opens an **agent-owned turn** so the work is accounted for, answerable, and cancellable.
+- **Permission requests** are valid in every turn; only a user cancellation of the owning turn or a lost connection answers one as cancelled.
 - **Unowned presentation** may render statusless updates without inventing a turn or request ID.
 - Ownership names provenance, not authority, controls, cancellation rights, or future protocol behavior.
 - Supporting a future ACP agent-initiated turn primitive will require an explicit terminology migration.
@@ -110,7 +115,7 @@ ACP v1 defines prompt turns but no agent-initiated turn primitive.
 
 - "Owned turn" omits both owner and connection; say **client-owned turn** or **agent-owned turn**.
 - **Agent-owned turn** is Nori extension language, not an ACP v1 protocol primitive.
-- **Unowned update** and **agent-owned turn** are not synonyms: metadata is required to establish the turn.
+- **Unowned update** and **agent-owned turn** are not synonyms: the update is the evidence, the turn is what the ledger opens for it.
 - "Ownership" must not imply authority, cancellation, permission, or queue semantics.
 - "Prompt" conflates text, a user-message update, and an ACP request; use **prompt request** for `session/prompt`.
 - "Completion" conflates a **prompt response** with `idle` agent-turn metadata; name the exact boundary.
@@ -233,3 +238,112 @@ ACP v1 defines prompt turns but no agent-initiated turn primitive.
 - ACP cancellation prose says clients should mark unfinished calls `cancelled`, but ACP's **tool call status** enumeration has no `cancelled` value; do not invent that wire status.
 - "Patch" and "diff" differ: a diff can report file effects without proving Nori applied a patch.
 - "Policy" alone is unusably broad; say **approval policy**, **sandbox policy**, or **execution policy**.
+
+## Delegation
+
+Agents Nori runs can hand work to each other in trees of any depth. This section names what is in that tree. It uses "actor" in a narrower sense than **Actors and Protocol Boundaries**: there it means a party to the ACP protocol, here an addressable agent session.
+
+### Delegation terms
+
+| Term                | Definition                                                                                                                                                         | Aliases to avoid                    |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------- |
+| **Delegation actor** | An addressable agent session in a delegation tree: the root session, a **managed child**, or a **provider child**. Usually called an actor in delegation contexts. | Subagent, worker, child (as a type) |
+| **Actor directory** | The one tree-wide registry of delegation actors: id, aliases, kind, parent, lifecycle, mailbox and task history. Every address resolves through it.                 | Mesh, task table, child registry    |
+| **Actor ID**        | The stable identity of a delegation actor; a managed child's is its session ID as the user's view shows it, the root keeps its first across `/compact`.            | Task ID, view ID                    |
+| **Alias**           | A one-word name for an actor, such as `reviewer`. One alias names one actor for the life of the tree.                                                              | Name, handle                        |
+| **Address**         | What names an actor or a task: `task-N`, an alias, `actor://alias`, `actor://<session-id>`, or a raw session ID. The resolver accepts all of them.                  | Target, recipient                   |
+| **Managed child**   | A full harness session Nori started for a delegation, a program or a fork, driven turn by turn.                                                                    | Subagent, delegated session         |
+| **Provider child**  | A child session the agent's own provider runs inside its session. Nori can queue work for it and read it, but does not own its turns.                              | Native subagent (when ambiguous)    |
+| **Task**            | One turn of work given to a delegation actor, identified `task-N`. It belongs to its actor and never creates one.                                                  | Child, subagent, job                |
+| **Message**         | What a task carries from its sender. It advances **queued**, **delivered**, **acknowledged**, and its sender can see which.                                         | Notification, ping                  |
+| **Mailbox**         | The messages queued for an actor that no turn of it has read yet.                                                                                                  | Inbox (except as a tool result key) |
+| **Revival**         | Sending a message to an actor whose session ended: the same actor, alias and identity restarts with its history restored from its journal. A **provider child** is revived as a **managed child** under the same session ID.                         | Respawn, restart as a new child     |
+| **Dormant actor**  | A delegation actor restored from the journal after a resume: ended, not running, revived with its history on the first message it receives.                  | Ghost, orphan                       |
+| **Monitor** | A background watcher an agent arms with `monitor_start` (a command, file, directory, peer actor, CI run or URL). Its events reach the agent as new messages; it survives the agent's turn and ends with its session, a timeout, `until`, a flood limit or `monitor_stop`. | Watcher, poller, background task |
+| **Monitor event** | One burst of matching lines from a **monitor**, or its end. A failure event is marked FAILED and always wakes an idle agent. | Notification, log line |
+| **Monitor wake** | The hidden turn that hands an agent the events of its monitors when it is idle, offered to the turn ledger like every other prompt nobody typed. | Callback, interrupt |
+| **Completion wake** | The hidden turn that hands an agent the results of tasks that finished while it was not waiting on them.                                                           | Callback, notification              |
+
+### Program terms
+
+| Term                | Definition                                                                                                                                                                         | Aliases to avoid                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| **Program**         | A Pkl module that amends `nori:Program`: actors, worlds, tools and typed steps. Evaluating it produces data; running it is a separate, journaled act.                              | Script, workflow (a workflow is policy), conversation program |
+| **Step**            | One typed element of a program (`Send`, `Par`, `Loop`, ...). It has a path, may bind its value, and may carry its own recovery.                                                    | Command, operation, op           |
+| **Op graph**        | The validated program compiled for execution. It travels in the `run.started` envelope.                                                                                            | Bytecode, AST                    |
+| **Binding**         | A name a step gives its value (`bind`), read by later `{{name}}` references and checks.                                                                                            | Variable, slot                   |
+| **World**           | An isolated scope a program, or part of one, runs in: its own worktree, a narrower sandbox and budget, optionally its own Nori home.                                               | Sandbox (that is one property of a world) |
+| **Run**             | One execution of a program, identified `run-...`, with a journal and a Pkl snapshot under `.nori/runs/<run-id>/`.                                                                  | Session, execution               |
+| **Envelope**        | One versioned message (`v`, `run`, `actor`, `turn`, `seq`, `op`, `payload`) recording a fact of a run; the unit of the journal and of every transport.                              | Event, record                    |
+| **Transport**       | A duplex of envelopes between a run and another world: file, in-process channel, or a daemon or BEAM node.                                                                          | Channel (as a type)              |
+| **Run handle**      | The live capability over a running program: subscribe to its envelopes, read its snapshot, signal, answer interrupts, cancel, wait.                                                    | Session, connection              |
+| **Host**            | The one trait through which a run acts on the world: start actors, deliver messages, call tools, apply session effects. The harness implements it.                                 | Backend, driver                  |
+
+### Delivery states
+
+| State            | Meaning                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| **Queued**       | Accepted into the actor's mailbox; no turn of the actor has read it. Not the same as received.       |
+| **Delivered**    | A turn of the actor started with the message in its input.                                           |
+| **Acknowledged** | That turn ended, or the actor replied to the sender.                                                 |
+
+### Relationships
+
+- A **task** belongs to exactly one **delegation actor**; an actor has many tasks over its life.
+- A message from the actor that delegated it is a **task** whose result returns to the sender; a message from anyone else is mail, answered by the recipient's own message.
+- An actor is **Starting**, **Idle**, **Working** or **Ended**; an ended actor is revived, not replaced.
+
+### Flagged ambiguities
+
+- "Child" and "subagent" name a role relative to a parent; say **managed child**, **provider child** or **delegation actor** for the kind.
+- "Task" is a turn, not a session: "restart the task" is **revive the actor**, "task failed" means one turn failed.
+- "Received" is only true of **delivered** or **acknowledged** messages; a **queued** message has not been read.
+
+## Recovery and Routes
+
+A **session** runs on a place; when that place fails, a declared policy decides what happens next. See [workflows.md](workflows.md#recovery).
+
+### Recovery terms
+
+| Term                | Definition                                                                                                                                                                  | Aliases to avoid                 |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| **Route**           | The place a session runs: an **agent** and, optionally, one of its models and settings. The status line shows the route actually running.                                    | Provider, backend, engine        |
+| **Gateway**         | An **agent** that reaches many **providers'** models behind one login, such as OpenCode. Native agents (`claude-code`, `codex`, `gemini`) rank before it for their own models. | Aggregator, proxy                |
+| **Failure kind**    | The classification of a failed request: `rate_limited`, `quota_exhausted`, `model_unavailable`, `capacity`, `server_error`, `network`, `auth`, `prompt_too_long`.            | Error type, error category       |
+| **Recovery policy** | The Pkl `recovery` block: **retry** and **fallback** rules per failure kind, with per-role and per-agent overrides. One harness engine executes it.                          | Fallback config, retry settings  |
+| **Retry**           | Sending the same request on the same **route** again after a visible, cancellable backoff.                                                                                  | Resend, re-prompt                |
+| **Fallback**        | Moving the session to the next **route** of the plan; it emits a route-changed event, so a session never silently runs on a different model than it shows.                  | Failover, switch                 |
+| **Chain**           | The explicit, ordered **routes** a policy names. A ranked plan continues after it.                                                                                         | Fallback list                    |
+| **Handoff**         | A **fallback** to another **agent**: the harness starts that agent with a checkpoint of the visible conversation, retires the old one and sends the failed prompt again. The conversation keeps its **Conversation ID**. |                                  |
+
+### Relationships
+
+- A **failure kind** selects **retry** first, then **fallback**, then a shown failure.
+- A **fallback** within one agent selects a model in the running **session**; a **handoff** replaces the **agent** and keeps the **conversation ID**. Both run inside the harness; the client only shows the route change.
+- Once a fallback has left the route the user chose (the **primary route**), the policy's `return_to_primary` says when the session goes back to it.
+- A **route** that failed in a conversation is not offered again in it.
+
+### Flagged ambiguities
+
+- "Provider" names the vendor behind an agent (**Provider**); a place a session can run is a **route**.
+- "Fallback" is only the move to another route; waiting and trying again is **retry**.
+
+## TUI Surface
+
+- **Stage**: the part of the TUI that owns what the primary screen shows of the conversation and what leaves it for the scrollback. See [tui-stage.md](tui-stage.md).
+- **Tail**: the cells of the conversation that are not in the terminal's scrollback yet; drawn, and redrawable, in the live region.
+- **Boundary**: the first row of the conversation that is not in the scrollback. Rows pass it exactly once.
+- **Focus**: the prompt a rewind is walking back to; one model for moving between prompts, editing in place, rewinding and forking.
+
+## Fake worlds
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **World** | A declarative Pkl or JSON script for one or more **fake agents**: their models and capabilities and, per agent, the **scenes** they play. | Fixture, mock, scenario |
+| **Fake agent** | An in-process **agent** built on `nori-acp-kit` that plays a **world's** scenes instead of calling a **provider**. | Mock agent, stub |
+| **Scene** | The steps a **fake agent** performs for the prompts it matches (by index, regular expression, or any). | Test case, script line |
+| **Fault** | A **step** (or scene policy) that makes a **fake agent** misbehave: a dropped, repeated or stale response, work after its turn ended, ignoring a cancel, a crash. | Error, failure |
+| **Wire tap** | The line-level interposer between the host's pipe and the kit that applies faults below the ACP library. | Proxy, middleware |
+| **Virtual clock** | A **world's** deterministic time, which jumps to the next deadline when every scripted task is asleep. | Fake timers, paused time |
+| **Flight recorder** | The ordered log of what the **fake agents** received and did, with the user's actions. | Event stream, transcript |
+| **World session** | The `nori-world` driver: the real **session harness** against a **world**, acting as the **user**. | Test harness |
