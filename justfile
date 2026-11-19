@@ -1,5 +1,13 @@
 set positional-arguments
 
+# Mitts does not yet resolve all of our renamed dependency aliases.
+cargo := `command -v cargo-stock || command -v cargo`
+
+# Keep local builds and tests on the same lightweight, incremental artifacts.
+# Explicit caller settings still win when debugging needs line tables.
+export CARGO_PROFILE_DEV_DEBUG := env_var_or_default("CARGO_PROFILE_DEV_DEBUG", "0")
+export CARGO_PROFILE_TEST_DEBUG := env_var_or_default("CARGO_PROFILE_TEST_DEBUG", "0")
+
 # Curated repo orientation
 help:
     #!/usr/bin/env bash
@@ -12,6 +20,8 @@ help:
 
     Standard targets:
       just dev [-- args]
+      just build [-- args]        Build nori incrementally for local iteration
+      just release [-- args]      Build the distribution nori binary
       just test [scope] [-- args]
       just doctor
 
@@ -19,7 +29,7 @@ help:
       just test                   Workspace tests (default)
       just test tui               TUI crate tests
       just test acp               ACP backend tests
-      just test core              Core library tests
+      just test core              Nori harness tests
       just test protocol          Protocol crate tests
       just test e2e               E2E tests (builds binary first)
       just test all               Full workspace with all features
@@ -34,7 +44,15 @@ help:
 
 # Run the nori binary (primary dev entrypoint)
 dev *args:
-    cd nori-rs && cargo run --bin nori -- "$@"
+    cd nori-rs && {{cargo}} run --bin nori -- "$@"
+
+# Build with Cargo's incremental dev profile; do not pay for release LTO locally.
+build *args:
+    cd nori-rs && {{cargo}} build --bin nori "$@"
+
+# Distribution build: fat LTO intentionally trades build time for binary size.
+release *args:
+    cd nori-rs && {{cargo}} build --release --bin nori "$@"
 
 # Run tests for a given scope (default: workspace)
 test *args:
@@ -44,25 +62,25 @@ test *args:
     shift 2>/dev/null || true
     case "$scope" in
       tui)
-        cd nori-rs && cargo test -p nori-tui "$@"
+        cd nori-rs && {{cargo}} test -p nori-tui "$@"
         ;;
       acp)
-        cd nori-rs && cargo test -p nori-acp "$@"
+        cd nori-rs && {{cargo}} test -p nori-acp-host -p nori-opencode-acp -p nori-codex-acp "$@"
         ;;
       core)
-        cd nori-rs && cargo test -p codex-core "$@"
+        cd nori-rs && {{cargo}} test -p nori-harness "$@"
         ;;
       protocol)
-        cd nori-rs && cargo test -p codex-protocol "$@"
+        cd nori-rs && {{cargo}} test -p nori-protocol "$@"
         ;;
       e2e)
-        cd nori-rs && cargo build --bin nori && cargo test -p tui-pty-e2e "$@"
+        cd nori-rs && {{cargo}} build --bin nori && {{cargo}} test -p tui-pty-e2e "$@"
         ;;
       all)
-        cd nori-rs && cargo test --all-features "$@"
+        cd nori-rs && {{cargo}} test --all-features "$@"
         ;;
       *)
-        cd nori-rs && cargo test ${scope:+"$scope"} "$@"
+        cd nori-rs && {{cargo}} test ${scope:+"$scope"} "$@"
         ;;
     esac
 
@@ -143,20 +161,20 @@ doctor:
 
 # Format code
 fmt:
-    cd nori-rs && cargo fmt -- --config imports_granularity=Item
+    cd nori-rs && {{cargo}} fmt -- --config imports_granularity=Item
 
 # Auto-fix clippy lints
 fix *args:
-    cd nori-rs && cargo clippy --fix --all-features --tests --allow-dirty "$@"
+    cd nori-rs && {{cargo}} clippy --fix --all-features --tests --allow-dirty "$@"
 
 # Run clippy
 clippy:
-    cd nori-rs && cargo clippy --all-features --tests
+    cd nori-rs && {{cargo}} clippy --all-features --tests
 
 # Fetch toolchain and dependencies
 install:
-    cd nori-rs && rustup show active-toolchain && cargo fetch
+    cd nori-rs && rustup show active-toolchain && {{cargo}} fetch
 
 # Run tests with cargo-nextest
 nextest:
-    cd nori-rs && cargo nextest run --no-fail-fast
+    cd nori-rs && {{cargo}} nextest run --no-fail-fast

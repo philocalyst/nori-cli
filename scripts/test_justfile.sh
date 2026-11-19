@@ -75,7 +75,7 @@ echo ""
 echo "[just test - target exists]"
 # Verify test target exists and supports subtargets by checking --show
 TEST_SHOW="$(cd "$REPO_ROOT" && just --show test 2>&1)" || true
-assert_contains "$TEST_SHOW" "cargo test" "test recipe delegates to cargo test"
+assert_contains "$TEST_SHOW" "{{ cargo }} test" "test recipe delegates to the selected Cargo"
 echo ""
 
 # ---- Forwarded targets ----
