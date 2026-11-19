@@ -4,6 +4,7 @@
 //! notifications that ACP does not define.
 
 mod message_flow;
+mod model_controls;
 mod monitor;
 mod route;
 mod session_event;
@@ -12,6 +13,7 @@ mod usage;
 
 pub use agent_client_protocol_schema as acp;
 pub use message_flow::*;
+pub use model_controls::*;
 pub use monitor::*;
 pub use route::*;
 pub use session_event::*;
