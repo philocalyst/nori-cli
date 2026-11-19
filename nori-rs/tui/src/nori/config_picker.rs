@@ -27,7 +27,6 @@ use crate::nori::skillset_picker;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsItem {
     PinnedPlanDrawer,
-    ResizeReflow,
     CustomWorkingMessages,
     VerticalFooter,
     TerminalNotifications,
@@ -59,7 +58,6 @@ pub fn config_picker_params(
         config.terminal_notifications == TerminalNotifications::Enabled;
     let os_notifications_enabled = config.os_notifications == OsNotifications::Enabled;
     let pinned_plan_drawer_enabled = config.pinned_plan_drawer;
-    let resize_reflow_enabled = config.resize_reflow;
     let custom_working_messages_enabled = config.custom_working_messages;
     let custom_working_messages_description = if config.custom_working_message_list.is_empty() {
         "Rotate playful status messages while the agent is working".to_string()
@@ -82,21 +80,6 @@ pub fn config_picker_params(
                     let new_value = !pinned_plan_drawer_enabled;
                     move || {
                         tx.send(AppEvent::SetConfigPinnedPlanDrawer(new_value));
-                    }
-                },
-            ),
-        ),
-        (
-            SettingsItem::ResizeReflow,
-            build_toggle_item(
-                "Resize Reflow",
-                "Reflow transcript history when the terminal width changes",
-                resize_reflow_enabled,
-                {
-                    let tx = app_event_tx.clone();
-                    let new_value = !resize_reflow_enabled;
-                    move || {
-                        tx.send(AppEvent::SetConfigResizeReflow(new_value));
                     }
                 },
             ),
@@ -873,49 +856,6 @@ mod tests {
             }
             _ => panic!("expected SetConfigCustomWorkingMessages event, got: {event:?}"),
         }
-    }
-
-    #[test]
-    fn config_picker_resize_reflow_action_sends_correct_event() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let config = make_test_config(false);
-
-        let params = config_picker_params(&config, tx.clone(), None);
-        let item = params
-            .items
-            .iter()
-            .find(|item| item.name.contains("Resize Reflow"))
-            .expect("config picker should include Resize Reflow");
-        assert!(item.name.contains("(on)"));
-        for action in &item.actions {
-            action(&tx);
-        }
-
-        match rx.try_recv().expect("should receive event") {
-            AppEvent::SetConfigResizeReflow(enabled) => assert!(!enabled),
-            event => panic!("expected SetConfigResizeReflow event, got: {event:?}"),
-        }
-    }
-
-    #[test]
-    fn config_picker_resize_reflow_snapshot() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let config = make_test_config(false);
-
-        let params = config_picker_params(&config, tx, None);
-        let item = params
-            .items
-            .iter()
-            .find(|item| item.name.contains("Resize Reflow"))
-            .expect("config picker should include Resize Reflow");
-
-        insta::assert_snapshot!(format!(
-            "{}\n{}",
-            item.name,
-            item.description.as_deref().unwrap_or_default()
-        ));
     }
 
     #[test]

@@ -243,9 +243,10 @@ pub(super) fn context_value(context: &ContextStatus) -> Option<String> {
     })
 }
 
-/// The compact welcome block: where the session runs, and which agent runs it.
-pub(super) fn compact_lines(model: &StatusViewModel, inner_width: usize) -> Vec<Line<'static>> {
-    let location = match &model.cloud_session {
+/// Where the session is, for the one-line welcome: the directory (home as `~`), or the cloud
+/// session.
+pub(super) fn compact_location(model: &StatusViewModel, inner_width: usize) -> String {
+    match &model.cloud_session {
         Some(cloud) => match &cloud.title {
             Some(title) => format!("{} ({title})", cloud.id),
             None => cloud.id.clone(),
@@ -254,25 +255,7 @@ pub(super) fn compact_lines(model: &StatusViewModel, inner_width: usize) -> Vec<
             &model.directory,
             Some(inner_width.saturating_sub(STATUS_VALUE_OFFSET)),
         ),
-    };
-
-    let mut system_parts = vec![location];
-    if let Some(approval_mode) = &model.approval_mode_label {
-        system_parts.push(format!("{approval_mode} approvals"));
     }
-
-    let mut system_spans = Vec::new();
-    for (index, part) in system_parts.into_iter().enumerate() {
-        if index > 0 {
-            system_spans.push(Span::from(" · ").dim());
-        }
-        system_spans.push(Span::from(part));
-    }
-
-    vec![
-        status_row("System", system_spans),
-        status_row("Agent", agent_row_spans(&model.agent_status())),
-    ]
 }
 
 /// The full `/status` card: session metadata, then the agent's configuration,

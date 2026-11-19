@@ -393,21 +393,28 @@ impl HistoryCell for NoriSessionHeaderCell {
 
         // The prompt marker is the sole Nori accent. The title and version use
         // ordinary text hierarchy and the block deliberately has no surface or border.
-        let mut lines: Vec<Line<'static>> = vec![
-            Line::from(vec![
-                Span::from("  › ").green(),
-                Span::from("Nori CLI").bold(),
-                Span::from(format!(" v{}", self.model.version)).dim(),
-            ]),
-            Line::from(""),
+        let title = vec![
+            Span::from("  › ").green(),
+            Span::from("Nori CLI").bold(),
+            Span::from(format!(" v{}", self.model.version)).dim(),
         ];
-
-        lines.extend(match self.display_mode {
-            DisplayMode::Compact => status_card::compact_lines(&self.model, inner_width),
-            DisplayMode::Full => status_card::full_lines(&self.model, inner_width),
-        });
-
-        lines
+        match self.display_mode {
+            // One quiet line: the status line under the composer already names the agent and
+            // model, so the welcome says only where this is.
+            DisplayMode::Compact => {
+                let mut line = title;
+                line.push(Span::from("  ·  ").dim());
+                line.push(
+                    Span::from(status_card::compact_location(&self.model, inner_width)).dim(),
+                );
+                vec![Line::from(line)]
+            }
+            DisplayMode::Full => {
+                let mut lines = vec![Line::from(title), Line::from("")];
+                lines.extend(status_card::full_lines(&self.model, inner_width));
+                lines
+            }
+        }
     }
 }
 

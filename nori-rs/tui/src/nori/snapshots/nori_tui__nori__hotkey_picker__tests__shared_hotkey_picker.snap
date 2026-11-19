@@ -23,7 +23,7 @@ expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
      Yank                            ctrl + y
      History Search                  ctrl + r
      Toggle Plan Drawer              ctrl + o
-     Clear Screen                    ctrl + shift + l
+     Clear Screen                    ctrl + l
      Next Model                      ctrl + n
      Previous Model                  ctrl + p
      Next Effort Level               ctrl + j

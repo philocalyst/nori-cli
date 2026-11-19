@@ -55,7 +55,15 @@ impl AgentConfigOption {
     fn from_acp(option: &acp::SessionConfigOption) -> Option<Self> {
         let value = match &option.kind {
             acp::SessionConfigKind::Select(select) => {
-                AgentConfigValue::Select(select_label(select))
+                let label = select_label(select);
+                // A model is written the one way everywhere (`GPT-6 Luna`, not the agent's `6 Luna`).
+                AgentConfigValue::Select(
+                    if option.category == Some(acp::SessionConfigOptionCategory::Model) {
+                        nori_harness::recovery::model_label(&select.current_value.0, &label, None)
+                    } else {
+                        label
+                    },
+                )
             }
             acp::SessionConfigKind::Boolean(boolean) => {
                 AgentConfigValue::Boolean(boolean.current_value)
@@ -83,38 +91,6 @@ impl AgentConfigOption {
     pub(crate) fn display_value(&self) -> String {
         self.value.display()
     }
-}
-
-/// Rank recognized models by their maximum Artificial Analysis Intelligence Index score.
-/// Unrecognized models follow in the order advertised by the agent. This only reorders
-/// advertised options; it does not add models to the agent's list.
-pub(crate) fn sort_models<T>(models: &mut [T], names: impl Fn(&T) -> (&str, &str)) {
-    models.sort_by_key(|model| {
-        let (value, name) = names(model);
-        let normalized = format!("{value} {name}")
-            .to_lowercase()
-            .replace(['-', '.', ' '], "");
-        // https://artificialanalysis.ai/leaderboards/models, Intelligence Index v5.
-        let score = [
-            ("fable52", 65),
-            ("gemini4carbon", 60),
-            ("opus55", 59),
-            ("gpt6astra", 57),
-            ("gpt61sol", 55),
-            ("sonnet55", 55),
-            ("gemini4hydrogen", 54),
-            ("gpt61terra", 51),
-            ("gemini4argon", 50),
-            ("fable51", 49),
-            ("gpt6sol", 44),
-            ("haiku55", 36),
-            ("gpt6luna", 28),
-        ]
-        .into_iter()
-        .find_map(|(model, score)| normalized.contains(model).then_some(score))
-        .unwrap_or(0);
-        std::cmp::Reverse(score)
-    });
 }
 
 /// Whether `option` is the agent's reasoning effort: the option it declares as its thought level,
@@ -230,34 +206,6 @@ fn select_label(select: &acp::SessionConfigSelect) -> String {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn models_are_sorted_by_known_scores_and_unknowns_remain_stable() {
-        let mut models = [
-            ("custom-a", "Custom A"),
-            ("gpt-6.1-terra", "GPT-6.1 Terra"),
-            ("gpt-6-astra", "GPT-6 Astra"),
-            ("claude-fable-5-2", "Fable 5.2"),
-            ("custom-b", "Custom B"),
-            ("gpt-6.1-sol", "GPT-6.1 Sol"),
-            ("gpt-6-sol", "GPT-6 Sol"),
-            ("gpt-6-luna", "GPT-6 Luna"),
-        ];
-        super::sort_models(&mut models, |model| (model.0, model.1));
-        assert_eq!(
-            models.map(|model| model.0),
-            [
-                "claude-fable-5-2",
-                "gpt-6-astra",
-                "gpt-6.1-sol",
-                "gpt-6.1-terra",
-                "gpt-6-sol",
-                "gpt-6-luna",
-                "custom-a",
-                "custom-b",
-            ]
-        );
-    }
 
     pub(crate) fn select(
         id: &str,

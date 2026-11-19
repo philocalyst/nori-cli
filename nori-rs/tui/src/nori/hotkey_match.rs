@@ -105,6 +105,16 @@ pub(crate) fn matches_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool
     same_key && modifiers_match(event, modifiers)
 }
 
+/// Check if a `KeyEvent` matches the Redraw binding, accepting `ctrl+shift+l` as a fallback
+/// when `Redraw` is at its default (`ctrl+l`) or unbound (`none`).
+pub(crate) fn matches_redraw_binding(binding: &HotkeyBinding, event: &KeyEvent) -> bool {
+    if matches_binding(binding, event) {
+        return true;
+    }
+    (binding.is_none() || binding.as_str() == "ctrl+l")
+        && matches_binding(&HotkeyBinding::from_str("ctrl+shift+l"), event)
+}
+
 /// Ctrl+Space is not a character a terminal can type: it sends NUL, which terminals and crossterm
 /// report as space with control, as a bare `Null`, or as `@` with control (NUL is `^@`).
 fn is_nul_for_ctrl_space(event: &KeyEvent) -> bool {

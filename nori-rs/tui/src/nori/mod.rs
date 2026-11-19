@@ -6,9 +6,11 @@
 pub(crate) mod agent_config_state;
 pub(crate) mod agent_picker;
 pub(crate) mod exit_message;
+pub(crate) mod fallbacks_panel;
 pub(crate) mod fork_picker;
 pub(crate) mod git_commit;
 pub(crate) mod onboarding;
+pub(crate) mod providers_panel;
 pub(crate) mod reference_session_picker;
 pub(crate) mod resume_session_picker;
 pub(crate) mod session_config_mode;
@@ -20,7 +22,6 @@ mod session_info_state;
 pub(crate) mod skillset_picker;
 pub(crate) mod token_count;
 pub(crate) mod unified_model_picker;
-pub(crate) mod viewonly_session_picker;
 
 pub(crate) mod config_picker;
 

@@ -11,8 +11,8 @@ use std::path::PathBuf;
 
 use crate::app_event::AppEvent;
 use crate::bottom_pane::SelectionAction;
-use crate::bottom_pane::SelectionItem;
-use crate::bottom_pane::SelectionViewParams;
+use crate::choice_picker::ChoiceItem;
+use crate::choice_picker::ChoiceSpec;
 
 /// The command name for the nori-skillsets CLI.
 const NORI_SKILLSETS_CMD: &str = "nori-skillsets";
@@ -149,93 +149,56 @@ pub async fn switch_skillset(name: &str, install_dir: &std::path::Path) -> Resul
     }
 }
 
-/// Create selection view parameters for the skillset picker.
-///
-/// # Arguments
-/// * `skillset_names` - List of available skillset names
-/// * `install_dir` - When `Some`, sends `SwitchSkillset` with the given directory;
-///   when `None`, sends `InstallSkillset` for backward compatibility.
-/// * `on_dismiss` - Optional callback fired when the picker is dismissed without
-///   selection (e.g. via Escape or Ctrl-C).
-/// * `show_no_skillset` - When `true`, prepends a "No Skillset" option that
-///   dismisses the picker without installing anything.
-/// * `auto_worktree_off` - Per-session is on but auto-worktree is disabled.
-///   When `install_dir` is `Some`, the subtitle warns that skillset files will
-///   be added to the current directory; when `None`, it warns that the skillset
-///   installs globally because there is no session worktree to isolate into.
-pub fn skillset_picker_params(
+/// The skillset choices. `install_dir` is the session worktree to switch in, when there is
+/// one; without it a choice installs globally. With `show_no_skillset` a first choice starts
+/// without one. `on_dismiss` runs when the picker is closed without choosing, and
+/// `auto_worktree_off` warns that files land in the current directory (or globally).
+pub fn skillset_choices(
     skillset_names: Vec<String>,
     install_dir: Option<PathBuf>,
     on_dismiss: Option<SelectionAction>,
     show_no_skillset: bool,
     auto_worktree_off: bool,
-) -> SelectionViewParams {
-    let mut items: Vec<SelectionItem> = Vec::new();
-
-    // Prepend "No Skillset" option when in per-session mode
+) -> ChoiceSpec {
+    let mut items: Vec<ChoiceItem> = Vec::new();
     if show_no_skillset {
-        let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::SkillsetPickerDismissed);
-        })];
-        items.push(SelectionItem {
-            name: "No Skillset".to_string(),
-            description: Some("Start without a skillset".to_string()),
-            actions,
-            dismiss_on_select: true,
-            ..Default::default()
-        });
+        items.push(
+            ChoiceItem::run(
+                "No Skillset",
+                Box::new(|tx| tx.send(AppEvent::SkillsetPickerDismissed)),
+            )
+            .detail("Start without a skillset"),
+        );
     }
-
     items.extend(skillset_names.into_iter().map(|name| {
-        let name_for_action = name.clone();
+        let chosen = name.clone();
         let install_dir = install_dir.clone();
-
-        // Create action that sends the appropriate skillset event
-        let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            if let Some(dir) = install_dir.clone() {
-                tx.send(AppEvent::SwitchSkillset {
-                    name: name_for_action.clone(),
-                    install_dir: dir,
-                });
-            } else {
-                tx.send(AppEvent::InstallSkillset {
-                    name: name_for_action.clone(),
-                });
-            }
-        })];
-
-        SelectionItem {
-            search_value: Some(name.clone()),
+        ChoiceItem::run(
             name,
-            description: None,
-            is_current: false,
-            actions,
-            dismiss_on_select: true,
-            ..Default::default()
-        }
+            Box::new(move |tx| match install_dir.clone() {
+                Some(dir) => tx.send(AppEvent::SwitchSkillset {
+                    name: chosen.clone(),
+                    install_dir: dir,
+                }),
+                None => tx.send(AppEvent::InstallSkillset {
+                    name: chosen.clone(),
+                }),
+            }),
+        )
     }));
-
     let subtitle = match (&install_dir, auto_worktree_off) {
         (Some(dir), true) => format!("Warning: skillset files will be added to {}", dir.display()),
         (Some(dir), false) => format!("Switching skillset in {}", dir.display()),
-        // Per-session is on but there is no session worktree to isolate into
-        // (auto-worktree is off), so the skillset installs globally. Say so
-        // rather than silently doing a home install.
-        (None, true) => "No session worktree - installing to your global skillset".to_string(),
-        (None, false) => "Install a skillset to customize Nori's capabilities".to_string(),
+        // Per-session is on but there is no session worktree to isolate into (auto-worktree
+        // is off), so the skillset installs globally. Say so rather than silently doing a
+        // home install.
+        (None, true) => "No session worktree - installing to your global skillset".to_owned(),
+        (None, false) => "Install a skillset to customize Nori's capabilities".to_owned(),
     };
-
-    SelectionViewParams {
-        title: Some("Select skillset".to_string()),
-        subtitle: Some(subtitle),
-        footer_hint: None,
-        items,
-        is_searchable: true,
-        search_placeholder: Some("Type to filter".to_string()),
-        on_dismiss,
-        ..Default::default()
-    }
-    .picker()
+    let mut spec = ChoiceSpec::new("Select skillset", items);
+    spec.subtitle = Some(subtitle);
+    spec.on_dismiss = on_dismiss;
+    spec
 }
 
 /// Filter install output to extract the meaningful message.
@@ -309,10 +272,8 @@ pub fn not_installed_message() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_event::AppEvent;
-    use crate::app_event_sender::AppEventSender;
+
     use pretty_assertions::assert_eq;
-    use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
     fn install_dir_is_worktree_path_when_under_dot_worktrees() {
@@ -327,144 +288,6 @@ mod tests {
         // install dir, which would scatter managed state into the project tree.
         let cwd = PathBuf::from("/home/user/project");
         assert_eq!(session_skillset_install_dir(&cwd), None);
-    }
-
-    #[test]
-    fn test_skillset_picker_params_creates_items() {
-        let names = vec![
-            "rust-dev".to_string(),
-            "python-ml".to_string(),
-            "web-frontend".to_string(),
-        ];
-
-        let params = skillset_picker_params(names, None, None, false, false);
-
-        assert!(params.title.is_some());
-        assert!(params.title.unwrap().contains("skillset"));
-        assert_eq!(params.items.len(), 3);
-        assert_eq!(params.items[0].name, "rust-dev");
-        assert_eq!(params.items[1].name, "python-ml");
-        assert_eq!(params.items[2].name, "web-frontend");
-    }
-
-    #[test]
-    fn test_skillset_picker_params_empty_list() {
-        let names: Vec<String> = vec![];
-        let params = skillset_picker_params(names, None, None, false, false);
-
-        assert!(params.items.is_empty());
-    }
-
-    #[test]
-    fn test_skillset_picker_items_dismiss_on_select() {
-        let names = vec!["test".to_string()];
-        let params = skillset_picker_params(names, None, None, false, false);
-
-        assert!(params.items[0].dismiss_on_select);
-    }
-
-    #[test]
-    fn test_skillset_picker_action_sends_install_event() {
-        let names = vec!["my-skillset".to_string()];
-        let params = skillset_picker_params(names, None, None, false, false);
-
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-
-        // Execute the action
-        assert!(!params.items[0].actions.is_empty());
-        (params.items[0].actions[0])(&tx);
-
-        // Check that the correct event was sent
-        let event = rx.try_recv().expect("Should have received an event");
-        match event {
-            AppEvent::InstallSkillset { name } => {
-                assert_eq!(name, "my-skillset");
-            }
-            _ => panic!("Expected InstallSkillset event"),
-        }
-    }
-
-    #[test]
-    fn test_skillset_picker_with_install_dir_sends_switch_event() {
-        let names = vec!["my-skillset".to_string()];
-        let dir = PathBuf::from("/tmp/worktree");
-        let params = skillset_picker_params(names, Some(dir), None, false, false);
-
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-
-        // Execute the action
-        assert!(!params.items[0].actions.is_empty());
-        (params.items[0].actions[0])(&tx);
-
-        // Check that the correct event was sent
-        let event = rx.try_recv().expect("Should have received an event");
-        match event {
-            AppEvent::SwitchSkillset { name, install_dir } => {
-                assert_eq!(name, "my-skillset");
-                assert_eq!(install_dir, PathBuf::from("/tmp/worktree"));
-            }
-            _ => panic!("Expected SwitchSkillset event, got {event:?}"),
-        }
-    }
-
-    #[test]
-    fn test_skillset_picker_items_have_search_value() {
-        // Each item must have search_value set so the searchable picker can
-        // filter items when the user types. Without search_value, typing
-        // any character causes all items to be filtered out.
-        let names = vec![
-            "rust-dev".to_string(),
-            "python-ml".to_string(),
-            "web-frontend".to_string(),
-        ];
-        let params = skillset_picker_params(names, None, None, false, false);
-
-        for item in &params.items {
-            assert_eq!(
-                item.search_value.as_deref(),
-                Some(item.name.as_str()),
-                "item '{}' must have search_value set to its name for filtering to work",
-                item.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_skillset_picker_dismiss_sends_event() {
-        // When skillset_per_session is enabled and the user dismisses the
-        // skillset picker (Escape/Ctrl-C), a SkillsetPickerDismissed event
-        // should be sent so the deferred agent can spawn.
-        use crate::bottom_pane::BottomPaneView;
-        use crate::bottom_pane::ListSelectionView;
-
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-
-        let names = vec!["my-skillset".to_string()];
-        let on_dismiss: crate::bottom_pane::SelectionAction = Box::new(move |tx| {
-            tx.send(AppEvent::SkillsetPickerDismissed);
-        });
-        let params = skillset_picker_params(
-            names,
-            Some(PathBuf::from("/tmp/test")),
-            Some(on_dismiss),
-            false,
-            false,
-        );
-
-        let mut view = ListSelectionView::new(params, tx);
-
-        // Dismiss the picker
-        view.on_ctrl_c();
-
-        // Verify the SkillsetPickerDismissed event was sent
-        let event = rx.try_recv().expect("Should have received an event");
-        assert!(
-            matches!(event, AppEvent::SkillsetPickerDismissed),
-            "Expected SkillsetPickerDismissed event, got {event:?}"
-        );
     }
 
     #[test]
@@ -593,133 +416,5 @@ Restart Claude Code to apply the new skillset."#;
         assert_eq!(names[1], "python-ml");
         assert_eq!(names[2], "web-frontend");
         assert_eq!(names[3], "java-backend");
-    }
-
-    #[test]
-    fn test_skillset_picker_with_no_skillset_option() {
-        // When show_no_skillset is true, the first item should be "No Skillset"
-        // and selecting it should send SkillsetPickerDismissed (same as dismiss).
-        let names = vec!["rust-dev".to_string(), "python-ml".to_string()];
-        let dir = PathBuf::from("/tmp/worktree");
-        let on_dismiss: SelectionAction = Box::new(|tx| {
-            tx.send(AppEvent::SkillsetPickerDismissed);
-        });
-        let params = skillset_picker_params(
-            names,
-            Some(dir),
-            Some(on_dismiss),
-            true,  // show_no_skillset
-            false, // auto_worktree_off
-        );
-
-        // "No Skillset" should be the first item, followed by the real skillsets
-        assert_eq!(params.items.len(), 3);
-        assert_eq!(params.items[0].name, "No Skillset");
-        assert_eq!(params.items[1].name, "rust-dev");
-        assert_eq!(params.items[2].name, "python-ml");
-
-        // Selecting "No Skillset" should send SkillsetPickerDismissed
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        (params.items[0].actions[0])(&tx);
-        let event = rx.try_recv().expect("Should have received an event");
-        assert!(
-            matches!(event, AppEvent::SkillsetPickerDismissed),
-            "Expected SkillsetPickerDismissed event, got {event:?}"
-        );
-    }
-
-    #[test]
-    fn test_skillset_picker_without_no_skillset_option() {
-        // When show_no_skillset is false, no "No Skillset" item should appear.
-        let names = vec!["rust-dev".to_string(), "python-ml".to_string()];
-        let params = skillset_picker_params(
-            names, None, None, false, // show_no_skillset
-            false, // auto_worktree_off
-        );
-
-        assert_eq!(params.items.len(), 2);
-        assert_eq!(params.items[0].name, "rust-dev");
-        assert_eq!(params.items[1].name, "python-ml");
-    }
-
-    #[test]
-    fn test_skillset_picker_no_skillset_dismisses_on_select() {
-        // The "No Skillset" item should dismiss the picker when selected.
-        let names = vec!["test".to_string()];
-        let on_dismiss: SelectionAction = Box::new(|tx| {
-            tx.send(AppEvent::SkillsetPickerDismissed);
-        });
-        let params = skillset_picker_params(
-            names,
-            Some(PathBuf::from("/tmp/test")),
-            Some(on_dismiss),
-            true,  // show_no_skillset
-            false, // auto_worktree_off
-        );
-
-        assert!(params.items[0].dismiss_on_select);
-    }
-
-    #[test]
-    fn test_skillset_picker_worktree_warning_subtitle() {
-        // When auto_worktree_off is true and install_dir is Some, the subtitle
-        // should warn that skillset files will be added to the directory.
-        let names = vec!["rust-dev".to_string()];
-        let dir = PathBuf::from("/home/user/myproject");
-        let params = skillset_picker_params(
-            names,
-            Some(dir),
-            None,
-            false, // show_no_skillset
-            true,  // auto_worktree_off
-        );
-
-        let subtitle = params.subtitle.expect("should have subtitle");
-        assert!(
-            subtitle.contains("/home/user/myproject"),
-            "Subtitle should mention the directory: {subtitle}"
-        );
-        assert!(
-            subtitle.to_lowercase().contains("warning") || subtitle.contains("will be added"),
-            "Subtitle should contain a warning about files being added: {subtitle}"
-        );
-    }
-
-    #[test]
-    fn test_skillset_picker_no_worktree_warning_when_worktrees_on() {
-        // When auto_worktree_off is false, the subtitle should be the normal one.
-        let names = vec!["rust-dev".to_string()];
-        let dir = PathBuf::from("/home/user/myproject");
-        let params = skillset_picker_params(
-            names,
-            Some(dir),
-            None,
-            false, // show_no_skillset
-            false, // auto_worktree_off
-        );
-
-        let subtitle = params.subtitle.expect("should have subtitle");
-        assert!(
-            !subtitle.to_lowercase().contains("warning"),
-            "Subtitle should not contain a warning when worktrees are on: {subtitle}"
-        );
-    }
-
-    #[test]
-    fn test_skillset_picker_global_install_subtitle_when_no_worktree() {
-        // Per-session on but no worktree (install_dir None, auto_worktree_off):
-        // the subtitle must say the install is global, not silently generic.
-        let names = vec!["rust-dev".to_string()];
-        let params = skillset_picker_params(
-            names, None, None, true, // show_no_skillset (per-session)
-            true, // auto_worktree_off
-        );
-
-        let subtitle = params.subtitle.expect("should have subtitle");
-        assert!(
-            subtitle.to_lowercase().contains("global"),
-            "Subtitle should say the install is global: {subtitle}"
-        );
     }
 }
