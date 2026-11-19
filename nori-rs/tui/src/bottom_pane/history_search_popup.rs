@@ -208,23 +208,26 @@ impl WidgetRef for HistorySearchPopup {
             }
         }
 
-        // Last row: status line
+        // Last row: concise match count (no shortcut spam)
         let status_y = area.y + area.height - 1;
         if status_y > area.y {
-            let hint = if self.search_active {
-                "esc stop search  enter select  up/down move  type to filter"
+            let total = self.all_entries.len();
+            let count = if total > 0 {
+                format!("{filtered_len}/{total}")
             } else {
-                "esc close  enter select  j/k move  / search"
+                String::new()
             };
-            Line::from(hint.dim()).render(
-                Rect {
-                    x: area.x + 2,
-                    y: status_y,
-                    width: area.width.saturating_sub(2),
-                    height: 1,
-                },
-                buf,
-            );
+            if !count.is_empty() {
+                Line::from(count.dim()).render(
+                    Rect {
+                        x: area.x + 2,
+                        y: status_y,
+                        width: area.width.saturating_sub(2),
+                        height: 1,
+                    },
+                    buf,
+                );
+            }
         }
     }
 }

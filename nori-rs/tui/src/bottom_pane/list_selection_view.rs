@@ -1,12 +1,16 @@
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
-use crossterm::event::KeyModifiers;
-use itertools::Itertools as _;
+use nori_tui_components::Field;
+use nori_tui_components::HelixConfig;
+use nori_tui_components::HelixEvent;
+use nori_tui_components::HelixItem;
+use nori_tui_components::HelixState;
 use nori_tui_components::KeyHint;
 use nori_tui_components::MenuDensity;
 use nori_tui_components::MenuItemTone;
 use nori_tui_components::MenuPlacement;
 use nori_tui_components::MenuRowPattern;
+use nori_tui_components::RowContext;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
@@ -54,8 +58,6 @@ pub(crate) struct SelectionItem {
     pub selected_description: Option<String>,
     pub is_current: bool,
     pub actions: Vec<SelectionAction>,
-    /// Fired when the cursor lands on this row, before anything is chosen (pickers only).
-    pub on_highlight: Option<SelectionAction>,
     pub dismiss_on_select: bool,
     pub search_value: Option<String>,
     /// When true, this row is a non-selectable section header: navigation skips
@@ -133,23 +135,65 @@ impl Default for SelectionViewParams {
     }
 }
 
+/// A selection row for the engine: what it filters on, and what the painter needs.
+struct Row {
+    /// Position in the items the view was built from; the engine's identity for the row, and
+    /// what [`ListSelectionView::take_last_selected_index`] reports.
+    index: usize,
+    name: String,
+    description: Option<String>,
+    selected_description: Option<String>,
+    is_current: bool,
+    display_shortcut: Option<KeyBinding>,
+    /// What a query is matched against, and the stable id of `update_item`.
+    search_value: Option<String>,
+    section: Option<String>,
+}
+
+impl HelixItem for Row {
+    type Id = usize;
+
+    fn id(&self) -> usize {
+        self.index
+    }
+
+    fn fields<'a>(&'a self, out: &mut Vec<Field<'a>>) {
+        // A row with no search value cannot be found by a query.
+        if let Some(value) = &self.search_value {
+            out.push(Field::new("title", value, 0));
+        }
+    }
+
+    fn section(&self) -> Option<&str> {
+        self.section.as_deref()
+    }
+
+    fn rows(&self, _cx: &RowContext<'_>) -> Vec<Line<'static>> {
+        // Painted by `render_rows`, not by the engine.
+        Vec::new()
+    }
+}
+
+/// The selection list shown in the bottom pane. The engine ([`HelixState`]) is its model:
+/// filtering, selection, sections, digit and `/` modes. This type paints the rows the way every
+/// bottom-pane popup does (`render_rows`) and carries what a bottom-pane view carries: header,
+/// footer hints, dismiss and Shift-Tab actions.
 pub(crate) struct ListSelectionView {
     footer_hint: Option<Line<'static>>,
     footer_hint_right: Option<Line<'static>>,
-    items: Vec<SelectionItem>,
-    state: ScrollState,
+    model: HelixState<Row>,
+    /// What each row does when chosen, by `Row::index`; header slots hold `None`.
+    actions: Vec<Option<(Vec<SelectionAction>, bool)>>,
+    /// Scroll window of the painted rows (section headings count as rows).
+    scroll: ScrollState,
     complete: bool,
     app_event_tx: AppEventSender,
     is_searchable: bool,
-    search_query: String,
     search_placeholder: Option<String>,
-    filtered_indices: Vec<usize>,
     last_selected_actual_idx: Option<usize>,
     header: Box<dyn Renderable>,
-    initial_selected_idx: Option<usize>,
     on_dismiss: Option<SelectionAction>,
     on_shift_tab: Option<SelectionAction>,
-    search_active: bool,
 }
 
 impl ListSelectionView {
@@ -164,34 +208,76 @@ impl ListSelectionView {
                 Box::new(subtitle),
             ]));
         }
-        let mut s = Self {
+        let mut model = HelixState::new(HelixConfig {
+            title: String::new(),
+            placeholder: String::new(),
+            empty_text: "no matches".to_owned(),
+            no_match_text: "no matches".to_owned(),
+            filter_keys: &[],
+            preview: false,
+            multi: false,
+            searchable: params.is_searchable,
+            on_demand: true,
+            numbered: true,
+            subtitle: None,
+        });
+        let mut rows = Vec::with_capacity(params.items.len());
+        let mut actions = Vec::with_capacity(params.items.len());
+        let mut section: Option<String> = None;
+        let mut current = None;
+        for (index, item) in params.items.into_iter().enumerate() {
+            if item.is_header {
+                // A header names the section of the rows after it; it is not a row.
+                section = Some(item.name);
+                actions.push(None);
+                continue;
+            }
+            if item.is_current && current.is_none() {
+                current = Some(index);
+            }
+            actions.push(Some((item.actions, item.dismiss_on_select)));
+            rows.push(Row {
+                index,
+                name: item.name,
+                description: item.description,
+                selected_description: item.selected_description,
+                is_current: item.is_current,
+                display_shortcut: item.display_shortcut,
+                search_value: item.search_value,
+                section: section.clone(),
+            });
+        }
+        model.set_items(rows);
+        model.refresh();
+        // The row that starts selected: the one asked for, else (in a list with no search) the
+        // current one, else the first.
+        let start = params
+            .initial_selected_idx
+            .or_else(|| (!params.is_searchable).then_some(current).flatten());
+        if let Some(index) = start {
+            model.select(index);
+        }
+        let mut view = Self {
             footer_hint: params.footer_hint,
             footer_hint_right: params.footer_hint_right,
-            items: params.items,
-            state: ScrollState::new(),
+            model,
+            actions,
+            scroll: ScrollState::new(),
             complete: false,
             app_event_tx,
             is_searchable: params.is_searchable,
-            search_query: String::new(),
-            search_placeholder: if params.is_searchable {
-                Some(
-                    params
-                        .search_placeholder
-                        .unwrap_or_else(|| "Type to filter".to_string()),
-                )
-            } else {
-                None
-            },
-            filtered_indices: Vec::new(),
+            search_placeholder: params.is_searchable.then(|| {
+                params
+                    .search_placeholder
+                    .unwrap_or_else(|| "Type to filter".to_string())
+            }),
             last_selected_actual_idx: None,
             header,
-            initial_selected_idx: params.initial_selected_idx,
             on_dismiss: params.on_dismiss,
             on_shift_tab: params.on_shift_tab,
-            search_active: false,
         };
-        s.apply_filter();
-        s
+        view.sync_scroll();
+        view
     }
 
     pub(crate) fn update_item(
@@ -201,116 +287,53 @@ impl ListSelectionView {
         description: Option<String>,
         search_value: String,
     ) -> bool {
-        let Some(item) = self.items.iter_mut().find(|item| {
-            item.search_value
-                .as_deref()
-                .map(search_value_id)
-                .is_some_and(|id| id == stable_id)
-        }) else {
+        let Some(index) = self.index_of(stable_id) else {
             return false;
         };
-
-        item.name = name;
-        item.description = description;
-        item.search_value = Some(search_value);
-        self.apply_filter();
+        self.model.update(index, |row| {
+            row.name = name;
+            row.description = description;
+            row.search_value = Some(search_value);
+        });
+        self.sync_scroll();
         true
     }
 
     pub(crate) fn remove_item(&mut self, stable_id: &str) -> bool {
-        let Some(index) = self.items.iter().position(|item| {
-            item.search_value
-                .as_deref()
-                .map(search_value_id)
-                .is_some_and(|id| id == stable_id)
-        }) else {
+        let Some(index) = self.index_of(stable_id) else {
             return false;
         };
-
-        self.items.remove(index);
-        self.apply_filter();
+        self.model.remove(index);
+        self.sync_scroll();
         true
     }
 
-    fn visible_len(&self) -> usize {
-        self.filtered_indices.len()
+    fn index_of(&self, stable_id: &str) -> Option<usize> {
+        self.model
+            .items()
+            .iter()
+            .find(|row| {
+                row.search_value
+                    .as_deref()
+                    .map(search_value_id)
+                    .is_some_and(|id| id == stable_id)
+            })
+            .map(|row| row.index)
     }
 
     fn max_visible_rows(len: usize) -> usize {
         MAX_POPUP_ROWS.min(len.max(1))
     }
 
-    fn apply_filter(&mut self) {
-        let previously_selected = self
-            .state
-            .selected_idx
-            .and_then(|visible_idx| self.filtered_indices.get(visible_idx).copied())
-            .or_else(|| self.initial_selected_idx.take())
-            .or_else(|| {
-                (!self.is_searchable)
-                    .then(|| self.items.iter().position(|item| item.is_current))
-                    .flatten()
-            });
-
-        if self.is_searchable && !self.search_query.is_empty() {
-            let query_lower = self.search_query.to_lowercase();
-            self.filtered_indices = self
-                .items
-                .iter()
-                .positions(|item| {
-                    item.search_value
-                        .as_ref()
-                        .is_some_and(|v| v.to_lowercase().contains(&query_lower))
-                })
-                .collect();
-        } else {
-            self.filtered_indices = (0..self.items.len()).collect();
-        }
-
-        let len = self.filtered_indices.len();
-        let first_selectable = self.first_selectable_visible_idx();
-        self.state.selected_idx = self
-            .state
-            .selected_idx
-            .and_then(|visible_idx| {
-                self.filtered_indices
-                    .get(visible_idx)
-                    .and_then(|idx| self.filtered_indices.iter().position(|cur| cur == idx))
-            })
-            .or_else(|| {
-                previously_selected.and_then(|actual_idx| {
-                    self.filtered_indices
-                        .iter()
-                        .position(|idx| *idx == actual_idx)
-                })
-            })
-            .or(first_selectable);
-
-        // Never rest the cursor on a non-selectable section header.
-        if let Some(sel) = self.state.selected_idx
-            && self.is_header_visible(sel)
-        {
-            self.state.selected_idx = first_selectable;
-        }
-
-        let visible = Self::max_visible_rows(len);
-        self.state.clamp_selection(len);
-        self.state.ensure_visible(len, visible);
-    }
-
-    fn build_rows(&self) -> Vec<GenericDisplayRow> {
-        let show_numbers = !self.is_searchable || !self.search_active;
-        let mut rows = Vec::with_capacity(self.filtered_indices.len());
-        // Numbers count only selectable rows so section headers do not consume
-        // a position in the 1..N sequence.
-        let mut number = 0usize;
-        for (visible_idx, actual_idx) in self.filtered_indices.iter().enumerate() {
-            let Some(item) = self.items.get(*actual_idx) else {
-                continue;
-            };
-            if item.is_header {
+    /// The rows as painted, and the position of the selected one among them.
+    fn build_rows(&self) -> (Vec<GenericDisplayRow>, Option<usize>) {
+        let show_numbers = !self.is_searchable || !self.model.searching();
+        let mut rows = Vec::new();
+        let mut selected = None;
+        for visible in self.model.visible() {
+            if let Some(section) = visible.opens_section {
                 rows.push(GenericDisplayRow {
-                    name: item.name.clone(),
+                    name: section.to_owned(),
                     display_shortcut: None,
                     match_indices: None,
                     description: None,
@@ -319,23 +342,23 @@ impl ListSelectionView {
                     is_header: true,
                     two_line: false,
                 });
-                continue;
             }
-            number += 1;
-            let is_selected = self.state.selected_idx == Some(visible_idx);
-            let prefix = if is_selected { '›' } else { ' ' };
-            let name = item.name.as_str();
-            let name_with_marker = if item.is_current {
-                format!("{name} (current)")
+            let item = visible.item;
+            if visible.selected {
+                selected = Some(rows.len());
+            }
+            let prefix = if visible.selected { '›' } else { ' ' };
+            let name = if item.is_current {
+                format!("{} (current)", item.name)
             } else {
                 item.name.clone()
             };
-            let display_name = if show_numbers {
-                format!("{prefix} {number}. {name_with_marker}")
-            } else {
-                format!("{prefix} {name_with_marker}")
+            let display_name = match visible.number {
+                Some(number) if show_numbers => format!("{prefix} {number}. {name}"),
+                _ => format!("{prefix} {name}"),
             };
-            let description = is_selected
+            let description = visible
+                .selected
                 .then(|| item.selected_description.clone())
                 .flatten()
                 .or_else(|| item.description.clone());
@@ -350,85 +373,39 @@ impl ListSelectionView {
                 two_line: false,
             });
         }
-        rows
+        (rows, selected)
     }
 
-    /// Whether the visible row at `visible_idx` is a non-selectable header.
-    fn is_header_visible(&self, visible_idx: usize) -> bool {
-        self.filtered_indices
-            .get(visible_idx)
-            .and_then(|actual| self.items.get(*actual))
-            .is_some_and(|item| item.is_header)
-    }
-
-    /// The first visible row that is not a header, if any.
-    fn first_selectable_visible_idx(&self) -> Option<usize> {
-        (0..self.filtered_indices.len()).find(|&idx| !self.is_header_visible(idx))
-    }
-
-    /// Visible index of the `n`-th (1-based) selectable row, matching the numbers
-    /// shown in the list. Headers are unnumbered, so digit selection must count
-    /// only selectable rows.
-    fn nth_selectable_visible_idx(&self, n: usize) -> Option<usize> {
-        n.checked_sub(1).and_then(|skip| {
-            (0..self.filtered_indices.len())
-                .filter(|&idx| !self.is_header_visible(idx))
-                .nth(skip)
-        })
-    }
-
-    fn move_up(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            return;
-        }
-        for _ in 0..len {
-            self.state.move_up_wrap(len);
-            if !self.is_header_visible(self.state.selected_idx.unwrap_or(0)) {
-                break;
-            }
-        }
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
-    }
-
-    fn move_down(&mut self) {
-        let len = self.visible_len();
-        if len == 0 {
-            return;
-        }
-        for _ in 0..len {
-            self.state.move_down_wrap(len);
-            if !self.is_header_visible(self.state.selected_idx.unwrap_or(0)) {
-                break;
-            }
-        }
-        let visible = Self::max_visible_rows(len);
-        self.state.ensure_visible(len, visible);
+    /// Keep the scroll window on the selected row after anything changed.
+    fn sync_scroll(&mut self) {
+        self.model.refresh();
+        let (rows, selected) = self.build_rows();
+        self.scroll.selected_idx = selected;
+        self.scroll.clamp_selection(rows.len());
+        self.scroll
+            .ensure_visible(rows.len(), Self::max_visible_rows(rows.len()));
     }
 
     fn accept(&mut self) {
-        if let Some(idx) = self.state.selected_idx
-            && let Some(actual_idx) = self.filtered_indices.get(idx)
-            && let Some(item) = self.items.get(*actual_idx)
-        {
-            self.last_selected_actual_idx = Some(*actual_idx);
-            for act in &item.actions {
-                act(&self.app_event_tx);
+        let Some(index) = self.model.selected().map(HelixItem::id) else {
+            self.complete = true;
+            return;
+        };
+        self.last_selected_actual_idx = Some(index);
+        if let Some(Some((actions, dismiss_on_select))) = self.actions.get(index) {
+            for action in actions {
+                action(&self.app_event_tx);
             }
-            if item.dismiss_on_select {
+            if *dismiss_on_select {
                 self.complete = true;
             }
-        } else {
-            self.complete = true;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn set_search_query(&mut self, query: String) {
-        self.search_active = true;
-        self.search_query = query;
-        self.apply_filter();
+        self.model.set_query(query);
+        self.sync_scroll();
     }
 
     pub(crate) fn take_last_selected_index(&mut self) -> Option<usize> {
@@ -437,7 +414,7 @@ impl ListSelectionView {
 
     /// Whether the search input row should be shown.
     fn show_search_row(&self) -> bool {
-        self.is_searchable && self.search_active
+        self.is_searchable && self.model.searching()
     }
 
     /// Compute the effective footer hint based on current state.
@@ -445,7 +422,7 @@ impl ListSelectionView {
         if !self.is_searchable {
             return self.footer_hint.clone();
         }
-        if self.search_active {
+        if self.model.searching() {
             Some(Line::from(vec![
                 "type to filter, ↑/↓ navigate, ".into(),
                 key_hint::plain(KeyCode::Enter).into(),
@@ -478,124 +455,23 @@ fn search_value_id(search_value: &str) -> &str {
 
 impl BottomPaneView for ListSelectionView {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
-        match key_event {
-            KeyEvent {
-                code: KeyCode::Up, ..
-            } => self.move_up(),
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            } => self.move_down(),
-            KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            } if self.is_searchable && self.search_active => {
-                self.search_query.pop();
-                self.apply_filter();
-            }
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } if self.search_active => {
-                self.search_active = false;
-                self.search_query.clear();
-                self.apply_filter();
-            }
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
+        match self.model.on_key(key_event) {
+            HelixEvent::Submit(_) => self.accept(),
+            HelixEvent::Cancel | HelixEvent::Interrupt => {
                 self.on_ctrl_c();
             }
-            KeyEvent {
-                code: KeyCode::BackTab,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::SHIFT,
-                ..
-            } => {
+            HelixEvent::Secondary => {
                 if let Some(action) = &self.on_shift_tab {
                     action(&self.app_event_tx);
                 }
             }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if self.is_searchable
-                && self.search_active
-                && !modifiers.contains(KeyModifiers::CONTROL)
-                && !modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.search_query.push(c);
-                self.apply_filter();
-            }
-            KeyEvent {
-                code: KeyCode::Char('f'),
-                modifiers,
-                ..
-            } if self.is_searchable
-                && !self.search_active
-                && modifiers == KeyModifiers::CONTROL =>
-            {
-                self.search_active = true;
-            }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if self.is_searchable
-                && !self.search_active
-                && !modifiers.contains(KeyModifiers::CONTROL)
-                && !modifiers.contains(KeyModifiers::ALT) =>
-            {
-                match c {
-                    'f' | '/' => self.search_active = true,
-                    'k' => self.move_up(),
-                    'j' => self.move_down(),
-                    _ => {
-                        if let Some(idx) = c
-                            .to_digit(10)
-                            .map(|d| d as usize)
-                            .and_then(|n| self.nth_selectable_visible_idx(n))
-                        {
-                            self.state.selected_idx = Some(idx);
-                            self.accept();
-                        }
-                    }
-                }
-            }
-            // Non-searchable lists keep their direct navigation and selection shortcuts.
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                ..
-            } if !self.is_searchable
-                && !modifiers.contains(KeyModifiers::CONTROL)
-                && !modifiers.contains(KeyModifiers::ALT) =>
-            {
-                match c {
-                    'k' => self.move_up(),
-                    'j' => self.move_down(),
-                    _ => {
-                        if let Some(idx) = c
-                            .to_digit(10)
-                            .map(|d| d as usize)
-                            .and_then(|n| self.nth_selectable_visible_idx(n))
-                        {
-                            self.state.selected_idx = Some(idx);
-                            self.accept();
-                        }
-                    }
-                }
-            }
-            KeyEvent {
-                code: KeyCode::Enter,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } => self.accept(),
-            _ => {}
+            HelixEvent::Idle
+            | HelixEvent::Redraw
+            | HelixEvent::Action(..)
+            | HelixEvent::SubmitMany(_)
+            | HelixEvent::Composed(..) => {}
         }
+        self.sync_scroll();
     }
 
     fn is_complete(&self) -> bool {
@@ -611,10 +487,10 @@ impl BottomPaneView for ListSelectionView {
     }
 
     fn on_escape(&mut self) -> CancellationEvent {
-        if self.search_active {
-            self.search_active = false;
-            self.search_query.clear();
-            self.apply_filter();
+        if self.model.searching() {
+            self.model.set_query(String::new());
+            self.model.stop_searching();
+            self.sync_scroll();
         } else {
             self.on_ctrl_c();
         }
@@ -640,9 +516,9 @@ impl Renderable for ListSelectionView {
     fn desired_height(&self, width: u16) -> u16 {
         // Measure wrapped height for up to MAX_POPUP_ROWS items at the given width.
         // Build the same display rows used by the renderer so wrapping math matches.
-        let rows = self.build_rows();
+        let (rows, _) = self.build_rows();
         let rows_width = Self::rows_width(width);
-        let rows_height = measure_rows_height(&rows, &self.state, MAX_POPUP_ROWS, rows_width);
+        let rows_height = measure_rows_height(&rows, &self.scroll, MAX_POPUP_ROWS, rows_width);
 
         // Subtract 4 for the padding on the left and right of the header.
         let mut height = self.header.desired_height(width.saturating_sub(4));
@@ -676,9 +552,9 @@ impl Renderable for ListSelectionView {
             .header
             // Subtract 4 for the padding on the left and right of the header.
             .desired_height(content_area.width.saturating_sub(4));
-        let rows = self.build_rows();
+        let (rows, _) = self.build_rows();
         let rows_width = Self::rows_width(content_area.width);
-        let rows_height = measure_rows_height(&rows, &self.state, MAX_POPUP_ROWS, rows_width);
+        let rows_height = measure_rows_height(&rows, &self.scroll, MAX_POPUP_ROWS, rows_width);
         let [header_area, _, search_area, list_area] = Layout::vertical([
             Constraint::Max(header_height),
             Constraint::Max(1),
@@ -700,14 +576,15 @@ impl Renderable for ListSelectionView {
         }
 
         if self.show_search_row() {
-            Line::from(self.search_query.clone()).render(search_area, buf);
-            let query_span: Span<'static> = if self.search_query.is_empty() {
+            let query = self.model.query().to_owned();
+            Line::from(query.clone()).render(search_area, buf);
+            let query_span: Span<'static> = if query.is_empty() {
                 self.search_placeholder
                     .as_ref()
                     .map(|placeholder| placeholder.clone().dim())
                     .unwrap_or_else(|| "".into())
             } else {
-                self.search_query.clone().into()
+                query.into()
             };
             Line::from(query_span).render(search_area, buf);
         }
@@ -723,7 +600,7 @@ impl Renderable for ListSelectionView {
                 render_area,
                 buf,
                 &rows,
-                &self.state,
+                &self.scroll,
                 render_area.height as usize,
                 "no matches",
             );
@@ -764,1029 +641,132 @@ impl Renderable for ListSelectionView {
 mod tests {
     use super::*;
     use crate::app_event::AppEvent;
-    use crate::bottom_pane::popup_consts::standard_popup_hint_line;
-    use insta::assert_snapshot;
-    use ratatui::layout::Rect;
+    use crossterm::event::KeyModifiers;
     use tokio::sync::mpsc::unbounded_channel;
 
-    fn make_selection_view(subtitle: Option<&str>) -> ListSelectionView {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "Read Only".to_string(),
-                description: Some("Nori can read files".to_string()),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Full Access".to_string(),
-                description: Some("Nori can edit files".to_string()),
-                is_current: false,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Select approval mode".to_string()),
-                subtitle: subtitle.map(str::to_string),
-                footer_hint: Some(standard_popup_hint_line()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        )
-    }
-
-    fn render_lines(view: &ListSelectionView) -> String {
-        render_lines_with_width(view, 48)
-    }
-
-    fn render_lines_with_width(view: &ListSelectionView, width: u16) -> String {
-        let height = view.desired_height(width);
-        let area = Rect::new(0, 0, width, height);
-        let mut buf = Buffer::empty(area);
-        view.render(area, &mut buf);
-
-        let lines: Vec<String> = (0..area.height)
-            .map(|row| {
-                let mut line = String::new();
-                for col in 0..area.width {
-                    let symbol = buf[(area.x + col, area.y + row)].symbol();
-                    if symbol.is_empty() {
-                        line.push(' ');
-                    } else {
-                        line.push_str(symbol);
-                    }
-                }
-                line
-            })
-            .collect();
-        lines.join("\n")
-    }
-
-    #[test]
-    fn renders_blank_line_between_title_and_items_without_subtitle() {
-        let view = make_selection_view(None);
-        assert_snapshot!(
-            "list_selection_spacing_without_subtitle",
-            render_lines(&view)
-        );
-    }
-
-    #[test]
-    fn renders_blank_line_between_subtitle_and_items() {
-        let view = make_selection_view(Some("Switch between Nori approval presets"));
-        assert_snapshot!("list_selection_spacing_with_subtitle", render_lines(&view));
-    }
-
-    #[test]
-    fn snapshot_vim_mode_enter_behavior_picker() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let params = crate::nori::config_picker::vim_mode_picker_params(
-            nori_config::VimEnterBehavior::AlwaysSubmit,
-            tx.clone(),
-            false,
-        );
-        let view = ListSelectionView::new(params, tx);
-
-        assert_snapshot!(
-            "vim_mode_enter_behavior_picker",
-            render_lines_with_width(&view, 80)
-        );
-    }
-
-    #[test]
-    fn renders_right_aligned_footer_hint_without_extra_height() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
+    fn view(
+        items: Vec<SelectionItem>,
+        searchable: bool,
+    ) -> (
+        ListSelectionView,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let (tx_raw, rx) = unbounded_channel::<AppEvent>();
         let view = ListSelectionView::new(
             SelectionViewParams {
-                title: Some("Select agent".to_string()),
-                footer_hint: Some(Line::from("Press esc to dismiss.")),
-                footer_hint_right: Some(Line::from("Recording: ○ off  Shift-Tab to enable")),
-                items: vec![SelectionItem {
-                    name: "ElizACP".to_string(),
-                    description: Some("Local test ACP agent".to_string()),
-                    is_current: true,
-                    dismiss_on_select: true,
-                    ..Default::default()
-                }],
+                items,
+                is_searchable: searchable,
                 ..Default::default()
             },
-            tx,
+            AppEventSender::new(tx_raw),
         );
+        (view, rx)
+    }
 
-        assert_snapshot!(
-            "list_selection_right_aligned_footer_hint",
-            render_lines_with_width(&view, 80)
-        );
+    fn item(name: &str, dismiss: bool) -> SelectionItem {
+        SelectionItem {
+            name: name.to_owned(),
+            dismiss_on_select: dismiss,
+            search_value: Some(name.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn header(name: &str) -> SelectionItem {
+        SelectionItem {
+            name: name.to_owned(),
+            is_header: true,
+            ..Default::default()
+        }
+    }
+
+    fn press(view: &mut ListSelectionView, code: KeyCode) {
+        view.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     #[test]
-    fn shift_tab_runs_action_without_dismissing_selection_view() {
+    fn shift_tab_runs_action_without_dismissing() {
         let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
         let mut view = ListSelectionView::new(
             SelectionViewParams {
-                items: vec![SelectionItem {
-                    name: "ElizACP".to_string(),
-                    dismiss_on_select: true,
-                    ..Default::default()
-                }],
+                items: vec![item("ElizACP", true)],
                 on_shift_tab: Some(Box::new(|tx| {
                     tx.send(AppEvent::SetConfigAcpWireRecording(true));
                 })),
                 ..Default::default()
             },
-            tx,
+            AppEventSender::new(tx_raw),
         );
-
         view.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-
-        let event = rx.try_recv().expect("shift-tab event");
-        assert!(
-            matches!(event, AppEvent::SetConfigAcpWireRecording(true)),
-            "expected SetConfigAcpWireRecording(true), got: {event:?}"
-        );
-        assert!(!view.is_complete(), "shift-tab should keep picker open");
-    }
-
-    #[test]
-    fn renders_search_query_line_when_enabled() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![SelectionItem {
-            name: "Read Only".to_string(),
-            description: Some("Nori can read files".to_string()),
-            is_current: false,
-            dismiss_on_select: true,
-            ..Default::default()
-        }];
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Select approval mode".to_string()),
-                footer_hint: Some(standard_popup_hint_line()),
-                items,
-                is_searchable: true,
-                search_placeholder: Some("Type to search branches".to_string()),
-                ..Default::default()
-            },
-            tx,
-        );
-        view.set_search_query("filters".to_string());
-
-        let lines = render_lines(&view);
-        assert!(
-            lines.contains("filters"),
-            "expected search query line to include rendered query, got {lines:?}"
-        );
-    }
-
-    #[test]
-    fn update_item_refreshes_row_and_search_index() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                items: vec![SelectionItem {
-                    name: "Apr 27, 2026 15:44".to_string(),
-                    search_value: Some("session-1".to_string()),
-                    ..Default::default()
-                }],
-                is_searchable: true,
-                ..Default::default()
-            },
-            tx,
-        );
-
-        let updated = view.update_item(
-            "session-1",
-            "Apr 27, 2026 15:44 · 2 turns".to_string(),
-            Some("\"first prompt\"".to_string()),
-            "session-1 first prompt".to_string(),
-        );
-
-        assert!(updated);
-        assert_eq!(view.items[0].name, "Apr 27, 2026 15:44 · 2 turns");
-        assert_eq!(
-            view.items[0].description.as_deref(),
-            Some("\"first prompt\"")
-        );
-
-        view.set_search_query("first prompt".to_string());
-        assert_eq!(view.filtered_indices, vec![0]);
-    }
-
-    #[test]
-    fn width_changes_do_not_hide_rows() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "gpt-5.1-codex".to_string(),
-                description: Some(
-                    "Optimized for Nori. Balance of reasoning quality and coding ability."
-                        .to_string(),
-                ),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "gpt-5.1-codex-mini".to_string(),
-                description: Some(
-                    "Optimized for Nori. Cheaper, faster, but less capable.".to_string(),
-                ),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "gpt-4.1-codex".to_string(),
-                description: Some(
-                    "Legacy model. Use when you need compatibility with older automations."
-                        .to_string(),
-                ),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Select model and effort".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        let mut missing: Vec<u16> = Vec::new();
-        for width in 60..=90 {
-            let rendered = render_lines_with_width(&view, width);
-            if !rendered.contains("3.") {
-                missing.push(width);
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "third option missing at widths {missing:?}"
-        );
-    }
-
-    #[test]
-    fn on_dismiss_callback_fires_on_ctrl_c() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let dismissed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dismissed_clone = dismissed.clone();
-        let items = vec![SelectionItem {
-            name: "Option A".to_string(),
-            dismiss_on_select: true,
-            ..Default::default()
-        }];
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items,
-                on_dismiss: Some(Box::new(move |_tx| {
-                    dismissed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                })),
-                ..Default::default()
-            },
-            tx,
-        );
-
-        // Dismiss via Ctrl-C
-        view.on_ctrl_c();
-
-        assert!(
-            dismissed.load(std::sync::atomic::Ordering::SeqCst),
-            "on_dismiss callback should fire when picker is dismissed via Ctrl-C"
-        );
-        assert!(view.is_complete(), "view should be complete after dismiss");
-    }
-
-    #[test]
-    fn on_dismiss_callback_not_fired_on_accept() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let dismissed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let dismissed_clone = dismissed.clone();
-        let items = vec![SelectionItem {
-            name: "Option A".to_string(),
-            dismiss_on_select: true,
-            ..Default::default()
-        }];
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items,
-                on_dismiss: Some(Box::new(move |_tx| {
-                    dismissed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-                })),
-                ..Default::default()
-            },
-            tx,
-        );
-
-        // Accept via Enter (should NOT fire on_dismiss)
-        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(
-            !dismissed.load(std::sync::atomic::Ordering::SeqCst),
-            "on_dismiss callback should NOT fire when an item is selected"
-        );
-    }
-
-    #[test]
-    fn narrow_width_keeps_all_rows_visible() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let desc = "x".repeat(10);
-        let items: Vec<SelectionItem> = (1..=3)
-            .map(|idx| SelectionItem {
-                name: format!("Item {idx}"),
-                description: Some(desc.clone()),
-                dismiss_on_select: true,
-                ..Default::default()
-            })
-            .collect();
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Debug".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        let rendered = render_lines_with_width(&view, 24);
-        assert!(
-            rendered.contains("3."),
-            "third option missing for width 24:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn snapshot_model_picker_width_80() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "gpt-5.1-codex".to_string(),
-                description: Some(
-                    "Optimized for Nori. Balance of reasoning quality and coding ability."
-                        .to_string(),
-                ),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "gpt-5.1-codex-mini".to_string(),
-                description: Some(
-                    "Optimized for Nori. Cheaper, faster, but less capable.".to_string(),
-                ),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "gpt-4.1-codex".to_string(),
-                description: Some(
-                    "Legacy model. Use when you need compatibility with older automations."
-                        .to_string(),
-                ),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Select model and effort".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        assert_snapshot!(
-            "list_selection_model_picker_width_80",
-            render_lines_with_width(&view, 80)
-        );
-    }
-
-    fn sectioned_items() -> Vec<SelectionItem> {
-        vec![
-            SelectionItem {
-                name: "Recommended".to_string(),
-                is_header: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Alpha".to_string(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Other".to_string(),
-                is_header: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Beta".to_string(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ]
-    }
-
-    #[test]
-    fn digit_keys_select_numbered_selectable_row_skipping_headers() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        // sectioned_items renders as: Recommended (header), 1. Alpha,
-        // Other (header), 2. Beta. Headers are unnumbered.
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items: sectioned_items(),
-                is_searchable: false,
-                ..Default::default()
-            },
-            tx,
-        );
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-
-        assert_eq!(
-            view.take_last_selected_index(),
-            Some(3),
-            "pressing '2' should accept the row shown as 2 (Beta), not a header or Alpha"
-        );
-    }
-
-    #[test]
-    fn navigation_skips_header_rows() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items: sectioned_items(),
-                is_searchable: false,
-                ..Default::default()
-            },
-            tx,
-        );
-
-        assert_eq!(
-            view.state.selected_idx,
-            Some(1),
-            "initial selection skips the leading header and lands on the first selectable"
-        );
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(3),
-            "down should skip the 'Other' header and land on Beta"
-        );
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(1),
-            "down from the last selectable should wrap to the first selectable"
-        );
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(3),
-            "up from the first selectable should wrap to the last, skipping both headers"
-        );
-    }
-
-    #[test]
-    fn snapshot_model_picker_sections_width_80() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "Recommended".to_string(),
-                is_header: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Opus 5".to_string(),
-                description: Some("Most capable".to_string()),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Sonnet 5".to_string(),
-                description: Some("Fast and capable".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Other".to_string(),
-                is_header: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Opus 4.6".to_string(),
-                description: Some("claude-opus-4-6".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Sonnet 4.6".to_string(),
-                description: Some("claude-sonnet-4-6".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Use custom model...".to_string(),
-                description: Some("Enter any model ID".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Model".to_string()),
-                subtitle: Some("Select a value for this ACP session setting".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-
-        assert_snapshot!(
-            "list_selection_model_picker_sections_width_80",
-            render_lines_with_width(&view, 80)
-        );
-    }
-
-    #[test]
-    fn snapshot_narrow_width_preserves_third_option() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let desc = "x".repeat(10);
-        let items: Vec<SelectionItem> = (1..=3)
-            .map(|idx| SelectionItem {
-                name: format!("Item {idx}"),
-                description: Some(desc.clone()),
-                dismiss_on_select: true,
-                ..Default::default()
-            })
-            .collect();
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Debug".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        assert_snapshot!(
-            "list_selection_narrow_width_preserves_rows",
-            render_lines_with_width(&view, 24)
-        );
-    }
-
-    #[test]
-    fn test_jk_navigation_when_not_searchable() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "Item 1".to_string(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Item 2".to_string(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Item 3".to_string(),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let mut view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items,
-                is_searchable: false, // explicitly false
-                ..Default::default()
-            },
-            tx,
-        );
-
-        // Initial selection should be at index 0
-        assert_eq!(view.state.selected_idx, Some(0));
-
-        // Press 'j' to move down
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(1),
-            "j should move selection down"
-        );
-
-        // Press 'j' again to move to index 2
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(2),
-            "j should move selection down again"
-        );
-
-        // Press 'k' to move up
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(1),
-            "k should move selection up"
-        );
-
-        // Press 'k' again to go back to index 0
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(0),
-            "k should move selection up again"
-        );
-
-        // Press 'k' at index 0 should wrap to last item
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(2),
-            "k at first item should wrap to last"
-        );
-    }
-
-    fn make_searchable_view() -> ListSelectionView {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "alpha".to_string(),
-                search_value: Some("alpha".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "beta".to_string(),
-                search_value: Some("beta".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "gamma".to_string(),
-                search_value: Some("gamma".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Test".to_string()),
-                items,
-                is_searchable: true,
-                ..Default::default()
-            },
-            tx,
-        )
-    }
-
-    #[test]
-    fn searchable_list_uses_jk_for_navigation_until_search_is_active() {
-        let mut view = make_searchable_view();
-        assert_eq!(view.state.selected_idx, Some(0));
-
-        // 'j' should move down, NOT add 'j' to search query
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(1),
-            "j should move selection down"
-        );
-        assert!(
-            view.search_query.is_empty(),
-            "j should not go to search query"
-        );
-
-        // 'k' should move up, NOT add 'k' to search query
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-        assert_eq!(
-            view.state.selected_idx,
-            Some(0),
-            "k should move selection up"
-        );
-        assert!(
-            view.search_query.is_empty(),
-            "k should not go to search query"
-        );
-    }
-
-    #[test]
-    fn searchable_slash_activates_search_then_chars_filter() {
-        let mut view = make_searchable_view();
-
-        // Press '/' to activate search
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        assert!(view.search_active, "/ should activate search mode");
-
-        // Now typing 'a' should filter
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(
-            view.search_query, "a",
-            "char should append to search query in search mode"
-        );
-        // 'a' matches 'alpha', 'beta', 'gamma' — all contain 'a'
-        assert_eq!(view.filtered_indices.len(), 3);
-
-        // Type 'l' to narrow further — 'al' matches 'alpha' only
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
-        assert_eq!(view.search_query, "al");
-        assert_eq!(view.filtered_indices.len(), 1);
-    }
-
-    #[test]
-    fn searchable_esc_in_search_exits_search_not_dismiss() {
-        let mut view = make_searchable_view();
-
-        // Activate search and type something
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(view.search_query, "b");
-        assert!(view.search_active);
-
-        // Esc should exit search mode but NOT dismiss the popup
-        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!view.search_active, "Esc should deactivate search mode");
-        assert!(
-            view.search_query.is_empty(),
-            "Esc should clear search query"
-        );
-        assert!(
-            !view.is_complete(),
-            "Esc in search mode should NOT dismiss the popup"
-        );
-        // All items should be visible again
-        assert_eq!(view.filtered_indices.len(), 3);
-    }
-
-    #[test]
-    fn searchable_esc_outside_search_dismisses() {
-        let mut view = make_searchable_view();
-
-        // Esc when NOT in search mode should dismiss
-        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(
-            view.is_complete(),
-            "Esc outside search mode should dismiss the popup"
-        );
-    }
-
-    #[test]
-    fn searchable_digits_direct_select_when_not_searching() {
-        let mut view = make_searchable_view();
-
-        // Press '2' — should select item at index 1 and accept
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert!(view.is_complete(), "digit should accept selection");
-        assert_eq!(view.last_selected_actual_idx, Some(1));
-    }
-
-    #[test]
-    fn searchable_backspace_in_search_pops_char() {
-        let mut view = make_searchable_view();
-
-        // Activate search and type
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        assert_eq!(view.search_query, "be");
-
-        // Backspace should remove last char
-        view.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(view.search_query, "b");
-    }
-
-    #[test]
-    fn searchable_list_ignores_unbound_printable_keys_while_inactive() {
-        let mut view = make_searchable_view();
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-
-        assert_eq!(view.state.selected_idx, Some(0));
-        assert_eq!(view.search_query, "");
-    }
-
-    #[test]
-    fn searchable_esc_dismisses_when_search_is_inactive() {
-        let mut view = make_searchable_view();
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(view.is_complete());
-    }
-
-    #[test]
-    fn searchable_list_supports_all_search_activation_keys() {
-        let activation_keys = [
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-        ];
-
-        for activation_key in activation_keys {
-            let mut view = make_searchable_view();
-
-            view.handle_key_event(activation_key);
-            view.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-            assert_eq!(view.search_query, "a", "activation key: {activation_key:?}");
-
-            view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            assert_eq!(view.search_query, "", "activation key: {activation_key:?}");
-            assert!(!view.is_complete(), "activation key: {activation_key:?}");
-
-            view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            assert!(view.is_complete(), "activation key: {activation_key:?}");
-        }
-    }
-
-    #[test]
-    fn empty_active_search_exits_before_the_picker_dismisses() {
-        let mut view = make_searchable_view();
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!view.is_complete());
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(view.is_complete());
-    }
-
-    #[test]
-    fn active_list_search_receives_reserved_and_general_printable_characters() {
-        let mut view = make_searchable_view();
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for (character, modifiers) in [
-            ('j', KeyModifiers::NONE),
-            ('k', KeyModifiers::NONE),
-            ('f', KeyModifiers::NONE),
-            ('/', KeyModifiers::NONE),
-            ('A', KeyModifiers::SHIFT),
-            ('7', KeyModifiers::NONE),
-            (' ', KeyModifiers::NONE),
-            ('?', KeyModifiers::NONE),
-            ('λ', KeyModifiers::NONE),
-        ] {
-            view.handle_key_event(KeyEvent::new(KeyCode::Char(character), modifiers));
-        }
-
-        assert_eq!(view.search_query, "jkf/A7 ?λ");
-    }
-
-    #[test]
-    fn settings_picker_filters_by_description_and_runs_the_selected_action() {
-        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let params = crate::nori::config_picker::config_picker_params(
-            &nori_config::NoriConfig::default(),
-            tx.clone(),
-            None,
-        );
-        let mut view = ListSelectionView::new(params, tx);
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        for character in "native desktop".chars() {
-            view.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
-        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
         assert!(matches!(
             rx.try_recv(),
-            Ok(AppEvent::SetConfigOsNotifications(_))
+            Ok(AppEvent::SetConfigAcpWireRecording(true))
         ));
+        assert!(!view.is_complete());
     }
 
     #[test]
-    fn settings_picker_navigation_and_search_modes_snapshot() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let params = crate::nori::config_picker::config_picker_params(
-            &nori_config::NoriConfig::default(),
-            tx.clone(),
-            None,
+    fn digits_choose_numbered_rows_skipping_headers() {
+        let (mut view, _rx) = view(
+            vec![
+                header("A"),
+                item("one", true),
+                header("B"),
+                item("two", true),
+            ],
+            false,
         );
-        let mut view = ListSelectionView::new(params, tx);
-
-        assert_snapshot!(
-            "settings_picker_navigation_mode",
-            render_lines_with_width(&view, 90)
-        );
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for character in "native desktop".chars() {
-            view.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
-        assert_snapshot!(
-            "settings_picker_search_mode",
-            render_lines_with_width(&view, 90)
-        );
+        press(&mut view, KeyCode::Char('2'));
+        assert_eq!(view.take_last_selected_index(), Some(3));
+        assert!(view.is_complete());
     }
 
     #[test]
-    fn narrow_terminal_no_single_char_description_lines() {
-        // Reproduce the bug: on a narrow terminal, descriptions that are pushed
-        // to a high desc_col wrap with huge indent, producing one-char-per-line.
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "Vertical Footer (on)".to_string(),
-                description: Some(
-                    "Stack footer segments vertically instead of horizontally".to_string(),
-                ),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "Terminal Notifications (on)".to_string(),
-                description: Some("Send OSC 9 escape sequences to notify the terminal".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let view = ListSelectionView::new(
+    fn navigation_skips_headers_and_wraps() {
+        let (mut view, _rx) = view(
+            vec![
+                header("A"),
+                item("one", true),
+                header("B"),
+                item("two", true),
+            ],
+            false,
+        );
+        press(&mut view, KeyCode::Down);
+        press(&mut view, KeyCode::Enter);
+        assert_eq!(view.take_last_selected_index(), Some(3));
+    }
+
+    #[test]
+    fn slash_opens_search_and_esc_closes_it_before_dismissing() {
+        let (mut view, _rx) = view(vec![item("alpha", true), item("beta", true)], true);
+        press(&mut view, KeyCode::Char('/'));
+        press(&mut view, KeyCode::Char('b'));
+        assert!(view.model.searching());
+        assert_eq!(view.model.match_count(), 1);
+        press(&mut view, KeyCode::Esc);
+        assert!(!view.model.searching() && !view.is_complete());
+        press(&mut view, KeyCode::Esc);
+        assert!(view.is_complete());
+    }
+
+    #[test]
+    fn on_dismiss_fires_on_ctrl_c_not_on_accept() {
+        let (tx_raw, mut rx) = unbounded_channel::<AppEvent>();
+        let mut view = ListSelectionView::new(
             SelectionViewParams {
-                title: Some("Configuration".to_string()),
-                items,
+                items: vec![item("a", true)],
+                on_dismiss: Some(Box::new(|tx| {
+                    tx.send(AppEvent::SetConfigAcpWireRecording(false));
+                })),
                 ..Default::default()
             },
-            tx,
+            AppEventSender::new(tx_raw),
         );
-        let rendered = render_lines_with_width(&view, 30);
-
-        // The rendered output should NOT have lines that are just whitespace + a
-        // single visible character. That pattern is the telltale sign of the
-        // one-char-per-line wrapping bug.
-        for (line_num, line) in rendered.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.len() == 1 && trimmed != "›" {
-                panic!(
-                    "line {} has single-char content '{trimmed}', \
-                     indicating broken description wrapping:\n{rendered}",
-                    line_num + 1
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn snapshot_very_narrow_config_popup() {
-        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx_raw);
-        let items = vec![
-            SelectionItem {
-                name: "Vertical Footer (on)".to_string(),
-                description: Some(
-                    "Stack footer segments vertically instead of horizontally".to_string(),
-                ),
-                is_current: true,
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            SelectionItem {
-                name: "OS Notifications (off)".to_string(),
-                description: Some("Send native desktop notifications on events".to_string()),
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-        ];
-        let view = ListSelectionView::new(
-            SelectionViewParams {
-                title: Some("Configuration".to_string()),
-                items,
-                ..Default::default()
-            },
-            tx,
-        );
-        assert_snapshot!(
-            "list_selection_very_narrow_config",
-            render_lines_with_width(&view, 30)
-        );
+        view.on_ctrl_c();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::SetConfigAcpWireRecording(false))
+        ));
     }
 }

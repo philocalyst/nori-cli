@@ -219,6 +219,14 @@ fn render_composer_rows(width: u16, height: u16, acp_mode_label: &str) -> Vec<St
         "Ask Nori to do anything".to_string(),
         false,
     );
+    let layout_toml: nori_config::NoriConfigToml = toml::from_str(
+        r#"[tui.footer_layout]
+textarea_top_right = ["mode_indicator"]"#,
+    )
+    .unwrap();
+    composer.set_footer_layout_config(nori_config::FooterLayoutConfig::from_toml(
+        &layout_toml.tui.footer_layout,
+    ));
     composer.set_acp_mode_label(Some(acp_mode_label.to_string()));
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

@@ -82,9 +82,6 @@ impl ComponentPickerView {
                             });
                             if let Some(index) = selected {
                                 self.state.selected_index = Some(index);
-                                if let Some(highlight) = self.highlights.get(&key) {
-                                    highlight(&self.app_event_tx);
-                                }
                                 self.handle_action(PickerAction::Submit);
                             }
                         }

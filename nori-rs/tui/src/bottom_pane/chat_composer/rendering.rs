@@ -5,6 +5,37 @@ use crate::nori::session_header::GitStatus;
 use crate::nori::session_header::StatusFooterValues;
 
 impl ChatComposer {
+    /// Where the agent's activity may show in the prompt bar drawn in `area`: the prompt row
+    /// (with how much of it the user's text takes) and the blank row along its top edge.
+    pub(crate) fn activity_slots(
+        &self,
+        area: Rect,
+    ) -> Option<crate::bottom_pane::activity::ActivitySlots> {
+        if !self.input_enabled {
+            return None;
+        }
+        let [composer_rect, textarea_rect, _] = self.layout_areas(area);
+        if textarea_rect.is_empty() {
+            return None;
+        }
+        let typed = self
+            .textarea
+            .text()
+            .lines()
+            .next()
+            .map_or(0, |line| {
+                u16::try_from(unicode_width::UnicodeWidthStr::width(line)).unwrap_or(u16::MAX)
+            })
+            .saturating_add(LIVE_PREFIX_COLS);
+        let prompt_row = Rect::new(composer_rect.x, textarea_rect.y, composer_rect.width, 1);
+        let rail = (textarea_rect.y > composer_rect.y)
+            .then(|| Rect::new(composer_rect.x, composer_rect.y, composer_rect.width, 1));
+        Some(crate::bottom_pane::activity::ActivitySlots {
+            prompt_row: Some((prompt_row, typed)),
+            rail,
+        })
+    }
+
     pub(super) fn layout_areas(&self, area: Rect) -> [Rect; 3] {
         let footer_props = self.footer_props();
         let footer_hint_height = self
@@ -113,10 +144,7 @@ impl ChatComposer {
 
         FooterProps {
             mode: FooterMode::ContextOnly,
-            esc_backtrack_hint: self.esc_backtrack_hint,
-            use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
-            vertical_footer: self.vertical_footer,
             context_window_percent,
             context_tokens,
             context_window_tokens,
@@ -148,6 +176,21 @@ impl ChatComposer {
             acp_mode_label: self.acp_mode_label.clone(),
             model_label: self.model_label.clone(),
             cloud_session: self.cloud_session.clone(),
+            active_subagent_count: self.active_subagent_count,
+            monitor_count: self.monitor_count,
+            rewind_badge: self.rewind_badge,
+            bash_mode: self.is_shell_mode,
+            status_note: self.status_note.clone(),
+            key_help: if matches!(self.footer_mode(), FooterMode::ShortcutOverlay) {
+                self.keymap
+                    .help(self.textarea.hotkey_config(), self.use_shift_enter_hint)
+            } else {
+                Vec::new()
+            },
+            agent_cost: self
+                .session_usage
+                .as_ref()
+                .and_then(|usage| usage.cost_display.clone()),
         }
     }
 
@@ -215,7 +258,6 @@ impl ChatComposer {
 
     pub(super) fn footer_mode(&self) -> FooterMode {
         match self.footer_mode {
-            FooterMode::EscHint => FooterMode::EscHint,
             FooterMode::ShortcutOverlay => FooterMode::ShortcutOverlay,
             FooterMode::CtrlCReminder => FooterMode::CtrlCReminder,
             FooterMode::ShortcutSummary if self.ctrl_c_quit_hint => FooterMode::CtrlCReminder,

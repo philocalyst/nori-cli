@@ -8,11 +8,9 @@ use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::list_selection_view::ListSelectionView;
 use crate::bottom_pane::list_selection_view::SelectionItem;
 use crate::bottom_pane::list_selection_view::SelectionViewParams;
-use crate::diff_render::DiffSummary;
 use crate::history_cell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
-use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -33,6 +31,8 @@ pub(crate) struct ApprovalRequest {
     pub(crate) cwd: PathBuf,
     pub(crate) snapshot: Box<crate::presentation::ToolSnapshot>,
     pub(crate) options: Vec<acp::PermissionOption>,
+    /// The agent ignored a cancel: besides allowing or denying, the user may stop the agent.
+    pub(crate) offer_stop: bool,
 }
 
 pub(crate) struct ApprovalOverlay {
@@ -69,14 +69,13 @@ impl ApprovalOverlay {
     }
 
     fn set_current(&mut self, request: ApprovalRequest) {
-        let header = approval_header(&request);
         self.options = request
             .options
             .iter()
             .cloned()
             .map(ApprovalOption::from)
             .collect();
-        let items = self
+        let mut items: Vec<SelectionItem> = self
             .options
             .iter()
             .map(|option| SelectionItem {
@@ -88,8 +87,18 @@ impl ApprovalOverlay {
                 ..Default::default()
             })
             .collect();
-        let kind = crate::client_event_format::format_tool_kind(&request.kind);
-        let title = format!("Would you like to allow {kind}: {}?", request.title);
+        if request.offer_stop {
+            // The last row: the agent ignored a cancel, and the user may end its connection.
+            items.push(SelectionItem {
+                name: "Stop the agent".to_owned(),
+                display_shortcut: Some(key_hint::plain(KeyCode::Char('x'))),
+                dismiss_on_select: false,
+                ..Default::default()
+            });
+        }
+        // One line: the tool and its target, which the transcript's own card shows in full above
+        // (`Ctrl+A` opens the whole request).
+        let title = format!("Allow {}?", lowercase_first(&request.title));
         self.list = ListSelectionView::new(
             SelectionViewParams {
                 footer_hint: Some(Line::from(vec![
@@ -100,11 +109,7 @@ impl ApprovalOverlay {
                     " to cancel".into(),
                 ])),
                 items,
-                header: Box::new(ColumnRenderable::with([
-                    Line::from(title.bold()).into(),
-                    Line::from("").into(),
-                    header,
-                ])),
+                header: Box::new(Line::from(title.bold())),
                 ..Default::default()
             },
             self.app_event_tx.clone(),
@@ -115,6 +120,15 @@ impl ApprovalOverlay {
 
     fn apply_selection(&mut self, index: usize) {
         if self.current_complete {
+            return;
+        }
+        if index == self.options.len()
+            && self
+                .current_request
+                .as_ref()
+                .is_some_and(|request| request.offer_stop)
+        {
+            self.stop_agent();
             return;
         }
         let (Some(request), Some(option)) =
@@ -140,6 +154,16 @@ impl ApprovalOverlay {
             }));
         self.current_complete = true;
         self.advance_queue();
+    }
+
+    /// Decline the pending request and tear the agent's connection down.
+    fn stop_agent(&mut self) {
+        self.cancel_current();
+        self.app_event_tx
+            .send(AppEvent::HarnessAction(HarnessAction::StopAgent));
+        self.queue.clear();
+        self.current_complete = true;
+        self.done = true;
     }
 
     fn cancel_current(&self) {
@@ -178,6 +202,19 @@ impl ApprovalOverlay {
                 } else {
                     false
                 }
+            }
+            KeyEvent {
+                kind: KeyEventKind::Press,
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self
+                .current_request
+                .as_ref()
+                .is_some_and(|request| request.offer_stop) =>
+            {
+                self.stop_agent();
+                true
             }
             event => {
                 let selected = self.options.iter().position(|option| {
@@ -257,37 +294,13 @@ impl Renderable for ApprovalOverlay {
     }
 }
 
-fn approval_header(request: &ApprovalRequest) -> Box<dyn Renderable> {
-    let edit_like = matches!(
-        request.kind,
-        crate::presentation::ToolKind::Create
-            | crate::presentation::ToolKind::Edit
-            | crate::presentation::ToolKind::Delete
-            | crate::presentation::ToolKind::Move
-    );
-    if edit_like {
-        let mut changes = crate::client_tool_cell::diff_changes_from_artifacts(
-            &request.snapshot.artifacts,
-            &request.cwd,
-        );
-        if changes.is_empty() {
-            changes = crate::client_tool_cell::changes_from_invocation(
-                &request.snapshot.invocation,
-                &request.cwd,
-            );
-        }
-        if !changes.is_empty() {
-            return DiffSummary::new(changes, request.cwd.clone()).into();
-        }
+/// `Edit src/a.rs` as `edit src/a.rs`, so "Allow" reads as a sentence.
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
     }
-
-    Box::new(super::approval_tool_details::ToolDetails(
-        crate::client_tool_cell::ClientToolCell::new(
-            (*request.snapshot).clone(),
-            request.cwd.clone(),
-            false,
-        ),
-    ))
 }
 
 #[derive(Clone)]

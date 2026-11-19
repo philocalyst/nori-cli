@@ -25,7 +25,6 @@ use super::command_popup::CommandPopup;
 use super::file_search_popup::FileSearchPopup;
 use super::footer::FooterMode;
 use super::footer::FooterProps;
-use super::footer::esc_hint_mode;
 use super::footer::footer_height;
 use super::footer::render_footer;
 use super::footer::reset_mode_after_activity;
@@ -125,7 +124,6 @@ pub(crate) struct ChatComposer {
     app_event_tx: AppEventSender,
     history: ChatComposerHistory,
     ctrl_c_quit_hint: bool,
-    esc_backtrack_hint: bool,
     use_shift_enter_hint: bool,
     dismissed_file_popup_token: Option<String>,
     dismissed_skill_popup_token: Option<String>,
@@ -133,6 +131,9 @@ pub(crate) struct ChatComposer {
     current_file_query: Option<String>,
     pending_pastes: Vec<(String, String)>,
     is_shell_mode: bool,
+    status_note: Option<crate::bottom_pane::status_line::StatusNote>,
+    /// Every key the TUI answers, for the `?` list.
+    keymap: nori_config::Keymap,
     has_focus: bool,
     attached_images: Vec<AttachedImage>,
     placeholder_text: String,
@@ -165,6 +166,9 @@ pub(crate) struct ChatComposer {
     session_title: Option<String>,
     footer_segment_config: nori_config::FooterSegmentConfig,
     footer_layout_config: nori_config::FooterLayoutConfig,
+    active_subagent_count: i64,
+    monitor_count: i64,
+    rewind_badge: Option<(i64, i64)>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -207,7 +211,6 @@ impl ChatComposer {
             app_event_tx,
             history: ChatComposerHistory::new(),
             ctrl_c_quit_hint: false,
-            esc_backtrack_hint: false,
             use_shift_enter_hint,
             dismissed_file_popup_token: None,
             dismissed_skill_popup_token: None,
@@ -215,6 +218,8 @@ impl ChatComposer {
             current_file_query: None,
             pending_pastes: Vec::new(),
             is_shell_mode: false,
+            status_note: None,
+            keymap: nori_config::Keymap::default(),
             has_focus: has_input_focus,
             attached_images: Vec::new(),
             placeholder_text,
@@ -242,6 +247,9 @@ impl ChatComposer {
             session_title: None,
             footer_segment_config: nori_config::FooterSegmentConfig::default(),
             footer_layout_config: nori_config::FooterLayoutConfig::default(),
+            active_subagent_count: 0,
+            monitor_count: 0,
+            rewind_badge: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -275,9 +283,25 @@ impl ChatComposer {
         self.footer_layout_config = config;
     }
 
+    pub(crate) fn set_active_subagent_count(&mut self, count: i64) {
+        self.active_subagent_count = count;
+    }
+
+    pub(crate) fn set_monitor_count(&mut self, count: i64) {
+        self.monitor_count = count;
+    }
+
+    pub(crate) fn set_rewind_badge(&mut self, badge: Option<(i64, i64)>) {
+        self.rewind_badge = badge;
+    }
+
     #[cfg(test)]
     pub(super) fn set_placeholder_for_test(&mut self, placeholder: &str) {
         self.placeholder_text = placeholder.to_owned();
+    }
+
+    pub(crate) fn set_keymap(&mut self, keymap: nori_config::Keymap) {
+        self.keymap = keymap;
     }
 
     pub(crate) fn set_hotkey_config(&mut self, config: nori_config::HotkeyConfig) {
@@ -335,6 +359,10 @@ impl ChatComposer {
 
     pub(crate) fn is_vim_operator_pending(&self) -> bool {
         self.textarea.is_in_vim_normal_mode() && self.textarea.is_vim_operator_pending()
+    }
+
+    pub(crate) fn is_in_vim_normal_mode(&self) -> bool {
+        self.textarea.is_in_vim_normal_mode()
     }
 
     /// Set a footer segment's enabled state.
@@ -436,6 +464,30 @@ impl ChatComposer {
         Some(previous)
     }
 
+    pub(crate) fn set_status_note(
+        &mut self,
+        note: Option<crate::bottom_pane::status_line::StatusNote>,
+    ) {
+        self.status_note = note;
+    }
+
+    pub(crate) fn status_note(&self) -> Option<&crate::bottom_pane::status_line::StatusNote> {
+        self.status_note.as_ref()
+    }
+
+    pub(crate) fn shell_text_is(&self, text: &str) -> bool {
+        self.is_shell_mode && self.textarea.text() == text
+    }
+
+    pub(crate) fn replace_shell_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        if !self.is_shell_mode || range.end > self.textarea.text().len() {
+            return;
+        }
+        let cursor = range.start + text.len();
+        self.textarea.replace_range(range, text);
+        self.textarea.set_cursor(cursor);
+    }
+
     /// Get the current composer text.
     pub(crate) fn current_text(&self) -> String {
         if self.is_shell_mode {
@@ -507,7 +559,6 @@ impl ChatComposer {
         self.active_popup = ActivePopup::None;
         self.footer_hint_override = Some(Vec::new());
         self.ctrl_c_quit_hint = false;
-        self.esc_backtrack_hint = false;
         self.paste_burst.clear_after_explicit_paste();
     }
 
@@ -588,15 +639,6 @@ impl ChatComposer {
         }
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_disabled_builtins(self.disabled_builtin_commands.clone());
-        }
-    }
-
-    pub(crate) fn set_esc_backtrack_hint(&mut self, show: bool) {
-        self.esc_backtrack_hint = show;
-        if show {
-            self.footer_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-        } else {
-            self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
     }
 
@@ -769,6 +811,7 @@ impl Renderable for ChatComposer {
         let body_rect = Self::textarea_body_rect(textarea_rect, prompt_indicator);
         self.rendered_body_area.set(Some(body_rect));
         let mut state = self.textarea_state.borrow_mut();
+        self.textarea.set_shell_highlight(self.is_shell_mode);
         StatefulWidgetRef::render_ref(&(&self.textarea), body_rect, buf, &mut state);
         if prompt_indicator.hides_textarea_prefix() && !textarea_rect.is_empty() {
             buf.set_string(

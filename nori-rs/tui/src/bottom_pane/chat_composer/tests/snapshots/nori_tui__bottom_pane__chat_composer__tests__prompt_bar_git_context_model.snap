@@ -2,7 +2,7 @@
 source: tui/src/bottom_pane/chat_composer/tests/mod.rs
 expression: terminal.backend()
 ---
-" ⎇ main · 44%                                                                 GPT-6 Astra · [ Plan ]"
+" ⎇ main · 44%                                                                                       "
 "› Ask Nori to do anything                                                                           "
 "                                                                                                    "
 "                                                                                                    "
@@ -10,3 +10,4 @@ expression: terminal.backend()
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
+"                                                                        GPT-6 Astra · [ Plan ] · 44%"

@@ -215,4 +215,50 @@ mod tests {
         editor.set_text("first\n\n");
         assert_eq!(editor.text(), "first\n\n");
     }
+
+    #[test]
+    fn exact_width_draft_stays_visible_when_shrunk_and_expanded() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut editor = KakouneEditor::new();
+        let draft = "draft survives child switch";
+        for ch in draft.chars() {
+            editor.input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        editor.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let wide_h = editor.desired_height(119);
+        let mut wide_buf = Buffer::empty(Rect::new(0, 0, 119, wide_h));
+        editor.render(Rect::new(0, 0, 119, wide_h), &mut wide_buf);
+
+        for narrow_w in [27_u16, 28, 26] {
+            let narrow_h = editor.desired_height(narrow_w);
+            let mut narrow_buf = Buffer::empty(Rect::new(0, 0, narrow_w, narrow_h));
+            editor.render(Rect::new(0, 0, narrow_w, narrow_h), &mut narrow_buf);
+            let text: String = (0..narrow_h)
+                .map(|y| {
+                    (0..narrow_w)
+                        .map(|x| narrow_buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                text.contains("draft survives") && text.contains("child switch"),
+                "width={narrow_w} height={narrow_h} rendered={text:?}"
+            );
+        }
+
+        let rewide_h = editor.desired_height(119);
+        assert_eq!(rewide_h, 1);
+        let mut rewide_buf = Buffer::empty(Rect::new(0, 0, 119, rewide_h));
+        editor.render(Rect::new(0, 0, 119, rewide_h), &mut rewide_buf);
+        let draft_w = u16::try_from(draft.len()).expect("width");
+        let rewide_row0: String = (0..draft_w).map(|x| rewide_buf[(x, 0)].symbol()).collect();
+        assert_eq!(rewide_row0, draft);
+    }
 }

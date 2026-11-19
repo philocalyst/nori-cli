@@ -31,7 +31,6 @@ use super::SelectionViewParams;
 pub(crate) struct ComponentPickerParams {
     pub state: PickerState<String>,
     pub actions: BTreeMap<String, SelectionAction>,
-    pub highlights: BTreeMap<String, SelectionAction>,
     pub on_dismiss: Option<SelectionAction>,
     pub on_shift_tab: Option<SelectionAction>,
     pub primary_column: String,
@@ -48,7 +47,6 @@ impl ComponentPickerParams {
         let searchable = params.is_searchable;
         let initial_selected_idx = params.initial_selected_idx;
         let mut actions = BTreeMap::new();
-        let mut highlights = BTreeMap::new();
         let mut keep_open = BTreeSet::new();
         let mut has_descriptions = false;
         let items = params
@@ -73,9 +71,6 @@ impl ComponentPickerParams {
                     .section_heading(item.is_header);
                 if let Some(description) = description {
                     picker_item = picker_item.description(description);
-                }
-                if let Some(on_highlight) = item.on_highlight {
-                    highlights.insert(key.clone(), on_highlight);
                 }
                 if !item.actions.is_empty() {
                     let callbacks = item.actions;
@@ -134,7 +129,6 @@ impl ComponentPickerParams {
         Self {
             state,
             actions,
-            highlights,
             on_dismiss: params.on_dismiss,
             on_shift_tab: params.on_shift_tab,
             primary_column: "name".to_string(),
@@ -155,7 +149,6 @@ impl ComponentPickerParams {
 pub(crate) struct ComponentPickerView {
     state: PickerState<String>,
     actions: BTreeMap<String, SelectionAction>,
-    highlights: BTreeMap<String, SelectionAction>,
     on_dismiss: Option<SelectionAction>,
     on_shift_tab: Option<SelectionAction>,
     app_event_tx: AppEventSender,
@@ -174,7 +167,6 @@ impl ComponentPickerView {
         Self {
             state: params.state,
             actions: params.actions,
-            highlights: params.highlights,
             on_dismiss: params.on_dismiss,
             on_shift_tab: params.on_shift_tab,
             app_event_tx,
@@ -203,12 +195,9 @@ impl ComponentPickerView {
                 }
                 self.complete = true;
             }
-            PickerOutcome::SelectionChanged(key) => {
-                if let Some(on_highlight) = key.and_then(|key| self.highlights.get(&key)) {
-                    on_highlight(&self.app_event_tx);
-                }
-            }
-            PickerOutcome::Unchanged
+            // Moving the cursor is local: nothing is applied until a row is chosen.
+            PickerOutcome::SelectionChanged(_)
+            | PickerOutcome::Unchanged
             | PickerOutcome::Toggled { .. }
             | PickerOutcome::Submitted(_)
             | PickerOutcome::SearchModeChanged(_)
@@ -519,7 +508,6 @@ mod tests {
                 ],
             ),
             actions: BTreeMap::new(),
-            highlights: Default::default(),
             on_dismiss: None,
             on_shift_tab: None,
             primary_column: "session".to_string(),
@@ -551,38 +539,6 @@ mod tests {
             view.state.selected_item().map(|item| item.key.as_str()),
             Some("two")
         );
-    }
-
-    #[test]
-    fn moving_the_cursor_fires_the_highlight_of_the_row_it_lands_on() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let tx = AppEventSender::new(tx);
-        let mut params = params();
-        let highlighted = |name: &'static str| -> SelectionAction {
-            Box::new(move |tx| {
-                tx.send(crate::app_event::AppEvent::WarmAgentCandidate {
-                    agent_name: name.to_string(),
-                    display_name: name.to_string(),
-                });
-            })
-        };
-        params
-            .highlights
-            .insert("two".to_string(), highlighted("two"));
-        let mut view = ComponentPickerView::new(params, tx);
-
-        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        view.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-
-        // Down onto "two", down onto "three" (no highlight), up onto "two" again.
-        let mut warmed = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let crate::app_event::AppEvent::WarmAgentCandidate { agent_name, .. } = event {
-                warmed.push(agent_name);
-            }
-        }
-        assert_eq!(warmed, vec!["two".to_string(), "two".to_string()]);
     }
 
     #[test]

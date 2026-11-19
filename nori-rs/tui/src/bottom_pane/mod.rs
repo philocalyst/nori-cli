@@ -16,6 +16,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use std::time::Duration;
 
+mod activity;
 mod approval_overlay;
 mod approval_tool_details;
 pub(crate) use approval_overlay::ApprovalOverlay;
@@ -32,6 +33,7 @@ mod history_search_popup;
 mod list_selection_view;
 mod popup_layout;
 mod prompt_args;
+mod status_line;
 pub(crate) use component_picker_view::ComponentPickerParams;
 #[cfg(test)]
 pub(crate) use list_selection_view::ListSelectionView;
@@ -45,6 +47,9 @@ mod skill_popup;
 mod user_question;
 pub(crate) use user_question::UserQuestionRequest;
 pub(crate) mod textarea;
+pub(crate) use status_line::Mode as StatusMode;
+pub(crate) use status_line::StatusNote;
+pub(crate) use status_line::render_mode_row;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -76,7 +81,6 @@ pub(crate) struct BottomPane {
     has_input_focus: bool,
     is_task_running: bool,
     ctrl_c_quit_hint: bool,
-    esc_backtrack_hint: bool,
     animations_enabled: bool,
     custom_working_messages: bool,
     custom_working_message_list: Vec<String>,
@@ -150,7 +154,6 @@ impl BottomPane {
             ctrl_c_quit_hint: false,
             status: None,
             queued_user_messages: QueuedUserMessages::new(),
-            esc_backtrack_hint: false,
             animations_enabled,
             custom_working_messages,
             custom_working_message_list,
@@ -402,22 +405,6 @@ impl BottomPane {
         self.status.is_some()
     }
 
-    pub(crate) fn show_esc_backtrack_hint(&mut self) {
-        self.esc_backtrack_hint = true;
-        self.composer.set_esc_backtrack_hint(true);
-        self.request_redraw();
-    }
-
-    pub(crate) fn clear_esc_backtrack_hint(&mut self) {
-        if self.esc_backtrack_hint {
-            self.esc_backtrack_hint = false;
-            self.composer.set_esc_backtrack_hint(false);
-            self.request_redraw();
-        }
-    }
-
-    // esc_backtrack_hint_visible removed; hints are controlled internally.
-
     pub fn set_task_running(&mut self, running: bool) {
         let was_running = self.is_task_running;
         self.is_task_running = running;
@@ -513,6 +500,19 @@ impl BottomPane {
         self.composer.set_vertical_footer(vertical_footer);
     }
 
+    pub(crate) fn set_active_subagent_count(&mut self, count: i64) {
+        self.composer.set_active_subagent_count(count);
+    }
+
+    /// How many monitors the agent has armed and running.
+    pub(crate) fn set_monitor_count(&mut self, count: i64) {
+        self.composer.set_monitor_count(count);
+    }
+
+    pub(crate) fn set_rewind_badge(&mut self, badge: Option<(i64, i64)>) {
+        self.composer.set_rewind_badge(badge);
+    }
+
     pub(crate) fn set_custom_working_messages(&mut self, enabled: bool) {
         self.custom_working_messages = enabled;
         if let Some(status) = self.status.as_mut() {
@@ -525,6 +525,10 @@ impl BottomPane {
     }
 
     /// Update the hotkey configuration used by the textarea for editing bindings.
+    pub(crate) fn set_keymap(&mut self, keymap: nori_config::Keymap) {
+        self.composer.set_keymap(keymap);
+    }
+
     pub(crate) fn set_hotkey_config(&mut self, config: nori_config::HotkeyConfig) {
         self.composer.set_hotkey_config(config);
     }
@@ -578,7 +582,11 @@ impl BottomPane {
                 self.push_view(Box::new(view));
             }
             list_selection_view::SelectionPresentation::Picker => {
-                self.show_component_picker(ComponentPickerParams::from_selection(params));
+                // Lists are the Helix engine's: shown by the app as an overlay.
+                self.app_event_tx
+                    .send(crate::app_event::AppEvent::ShowChoicePicker(Box::new(
+                        crate::choice_picker::ChoiceSpec::from(params),
+                    )));
             }
             list_selection_view::SelectionPresentation::Menu => {
                 let view = component_overlay_menu_view::ComponentOverlayMenuView::new(
@@ -606,11 +614,14 @@ impl BottomPane {
         &mut self,
         params: list_selection_view::SelectionViewParams,
     ) {
-        debug_assert!(
-            !self.view_stack.is_empty(),
-            "replace_selection_view called with empty view stack"
-        );
-        self.view_stack.pop();
+        // A picker is an overlay that the new one replaces; other views are popped first.
+        if params.presentation != list_selection_view::SelectionPresentation::Picker {
+            debug_assert!(
+                !self.view_stack.is_empty(),
+                "replace_selection_view called with empty view stack"
+            );
+            self.view_stack.pop();
+        }
         self.show_selection_view(params);
     }
 
@@ -748,8 +759,36 @@ impl BottomPane {
         self.composer.context_usage_snapshot()
     }
 
+    pub(crate) fn set_status_note(&mut self, note: Option<StatusNote>) {
+        self.composer.set_status_note(note);
+        self.request_redraw();
+    }
+
+    pub(crate) fn status_note(&self) -> Option<&StatusNote> {
+        self.composer.status_note()
+    }
+
+    /// Whether the composer holds the shell command `text` (without its `!`).
+    pub(crate) fn shell_text_is(&self, text: &str) -> bool {
+        self.composer.shell_text_is(text)
+    }
+
+    /// Replace `range` of the shell command in the composer with `text`.
+    pub(crate) fn replace_shell_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        self.composer.replace_shell_range(range, text);
+        self.request_redraw();
+    }
+
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.composer.is_empty()
+    }
+
+    pub(crate) fn is_composer_in_vim_normal_mode(&self) -> bool {
+        self.composer.is_in_vim_normal_mode()
+    }
+
+    pub(crate) fn is_composer_popup_active(&self) -> bool {
+        self.composer.popup_active()
     }
 
     pub(crate) fn has_queued_user_messages(&self) -> bool {
@@ -773,25 +812,6 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
-    }
-
-    /// Forward MCP auth statuses to the active view (if any).
-    pub(crate) fn update_mcp_auth_statuses(
-        &mut self,
-        statuses: &std::collections::HashMap<String, codex_rmcp_client::McpAuthStatus>,
-    ) {
-        if let Some(view) = self.view_stack.last_mut() {
-            view.update_mcp_auth_statuses(statuses);
-            self.request_redraw();
-        }
-    }
-
-    /// Forward MCP OAuth completion to the active view (if any).
-    pub(crate) fn handle_mcp_oauth_complete(&mut self, server_name: &str, success: bool) {
-        if let Some(view) = self.view_stack.last_mut() {
-            view.handle_mcp_oauth_complete(server_name, success);
-            self.request_redraw();
-        }
     }
 
     /// A request the agent asked about no longer needs an answer: stop asking it.
@@ -944,33 +964,33 @@ impl BottomPane {
                 RenderableItem::Borrowed(view)
             }
         } else {
+            // The working indicator is drawn into the prompt bar itself, not as a row above it.
             let mut flex = FlexRenderable::new();
-            if let Some(status) = &self.status {
-                flex.push(0, RenderableItem::Borrowed(status));
-            }
             flex.push(1, RenderableItem::Borrowed(&self.queued_user_messages));
-            if self.status.is_some() || !self.queued_user_messages.messages.is_empty() {
+            if !self.queued_user_messages.messages.is_empty() {
                 flex.push(0, RenderableItem::Owned("".into()));
             }
             let mut flex2 = FlexRenderable::new();
             flex2.push(1, RenderableItem::Owned(flex.into()));
-            flex2.push(0, RenderableItem::Borrowed(&self.composer));
+            flex2.push(
+                0,
+                RenderableItem::Owned(Box::new(activity::ComposerWithActivity {
+                    composer: &self.composer,
+                    activity: self.status.as_ref(),
+                })),
+            );
             RenderableItem::Owned(Box::new(flex2))
         }
     }
 }
 
 impl BottomPane {
-    /// Rows of a popup or view that is open, beyond the prompt's own height, which the screen
-    /// shows it over instead of pushing the history away.
-    pub(crate) fn popup_rows(&self, width: u16) -> u16 {
-        match self.active_view() {
-            Some(view) if view.keeps_composer_visible() => view.desired_height(width),
-            Some(view) => view
-                .desired_height(width)
-                .saturating_sub(self.composer.desired_height(width)),
-            None => self.composer.popup_rows(width),
-        }
+    /// The rows the composer keeps at rest: the prompt and its status line, without a popup, an
+    /// open view, the working indicator or queued messages above it.
+    pub(crate) fn resting_height(&self, width: u16) -> u16 {
+        self.composer
+            .desired_height(width)
+            .saturating_sub(self.composer.popup_rows(width))
     }
 }
 
@@ -1044,6 +1064,7 @@ mod tests {
                 "Allow",
                 nori_protocol::acp::v1::PermissionOptionKind::AllowOnce,
             )],
+            offer_stop: false,
         }
     }
 
@@ -1304,7 +1325,6 @@ mod tests {
                 [PickerItem::new("alpha".to_string(), "session", "Alpha")],
             ),
             actions: std::collections::BTreeMap::new(),
-            highlights: Default::default(),
             on_dismiss: None,
             on_shift_tab: None,
             primary_column: "session".to_string(),

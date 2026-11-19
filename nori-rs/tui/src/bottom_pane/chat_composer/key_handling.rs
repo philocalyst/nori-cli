@@ -113,13 +113,7 @@ impl ChatComposer {
             self.active_popup = ActivePopup::None;
             return (InputResult::None, true);
         }
-        if key_event.code == KeyCode::Esc {
-            let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-            if next_mode != self.footer_mode {
-                self.footer_mode = next_mode;
-                return (InputResult::None, true);
-            }
-        } else {
+        if key_event.code != KeyCode::Esc {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
         let ActivePopup::Command(popup) = &mut self.active_popup else {
@@ -335,13 +329,7 @@ impl ChatComposer {
             self.active_popup = ActivePopup::None;
             return self.handle_input_basic(key_event);
         }
-        if key_event.code == KeyCode::Esc {
-            let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-            if next_mode != self.footer_mode {
-                self.footer_mode = next_mode;
-                return (InputResult::None, true);
-            }
-        } else {
+        if key_event.code != KeyCode::Esc {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
 
@@ -457,13 +445,7 @@ impl ChatComposer {
             self.active_popup = ActivePopup::None;
             return self.handle_input_basic(key_event);
         }
-        if key_event.code == KeyCode::Esc {
-            let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-            if next_mode != self.footer_mode {
-                self.footer_mode = next_mode;
-                return (InputResult::None, true);
-            }
-        } else {
+        if key_event.code != KeyCode::Esc {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
         let ActivePopup::File(popup) = &mut self.active_popup else {
@@ -704,6 +686,33 @@ impl ChatComposer {
             self.is_shell_mode = false;
             return (InputResult::None, true);
         }
+        // `?` on an empty composer lists the keys; `?` or Esc closes the list.
+        if key_event.kind == KeyEventKind::Press
+            && !self.is_shell_mode
+            && (matches!(self.footer_mode, FooterMode::ShortcutOverlay)
+                && matches!(key_event.code, KeyCode::Esc | KeyCode::Char('?'))
+                || self.is_empty()
+                    && key_event.code == KeyCode::Char('?')
+                    && !key_event.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.footer_mode = if matches!(self.footer_mode, FooterMode::ShortcutOverlay) {
+                FooterMode::ShortcutSummary
+            } else {
+                FooterMode::ShortcutOverlay
+            };
+            return (InputResult::None, true);
+        }
+        if self.is_shell_mode
+            && key_event.code == KeyCode::Tab
+            && key_event.modifiers == KeyModifiers::NONE
+            && key_event.kind == KeyEventKind::Press
+        {
+            self.app_event_tx.send(AppEvent::ShellComplete {
+                text: self.textarea.text().to_owned(),
+                cursor: self.textarea.cursor(),
+            });
+            return (InputResult::None, true);
+        }
         if self.is_vim_operator_pending() {
             return self.handle_input_basic(key_event);
         }
@@ -727,15 +736,7 @@ impl ChatComposer {
                 _ => {}
             }
         }
-        if key_event.code == KeyCode::Esc {
-            if self.is_empty() && !self.textarea.kakoune_mode_enabled() {
-                let next_mode = esc_hint_mode(self.footer_mode, self.is_task_running);
-                if next_mode != self.footer_mode {
-                    self.footer_mode = next_mode;
-                    return (InputResult::None, true);
-                }
-            }
-        } else {
+        if key_event.code != KeyCode::Esc {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
         match key_event {

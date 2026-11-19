@@ -113,6 +113,9 @@ pub(crate) struct TextArea {
     /// Whether we are inside a vim insert-session undo group.
     /// While true, mutations do not push individual undo snapshots.
     in_undo_group: bool,
+    /// The text is a shell command: draw it highlighted. Set by the composer as it draws, so
+    /// it is a cell.
+    shell_highlight: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +151,13 @@ impl TextArea {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             in_undo_group: false,
+            shell_highlight: std::cell::Cell::new(false),
         }
+    }
+
+    /// Draw the text as a shell command from now on, or as plain text.
+    pub(crate) fn set_shell_highlight(&self, on: bool) {
+        self.shell_highlight.set(on);
     }
 
     pub fn set_hotkey_config(&mut self, config: HotkeyConfig) {
@@ -1840,12 +1849,17 @@ impl TextArea {
         lines: &[Range<usize>],
         range: std::ops::Range<usize>,
     ) {
+        let highlighted = self.shell_highlight.get().then(|| shell_styles(&self.text));
         for (row, idx) in range.enumerate() {
             let r = &lines[idx];
             let y = area.y + row as u16;
             let line_range = r.start..r.end - 1;
-            // Draw base line with default style.
-            buf.set_string(area.x, y, &self.text[line_range.clone()], Style::default());
+            if let Some(styles) = &highlighted {
+                draw_styled_line(buf, area.x, y, &self.text, line_range.clone(), styles);
+            } else {
+                // Draw base line with default style.
+                buf.set_string(area.x, y, &self.text[line_range.clone()], Style::default());
+            }
 
             // Overlay styled segments for elements that intersect this line.
             for elem in &self.elements {
@@ -1861,6 +1875,58 @@ impl TextArea {
                 buf.set_string(area.x + x_off, y, styled, style);
             }
         }
+    }
+}
+
+/// The style of every byte of `text` read as a shell script: what the highlighter says each
+/// token is.
+fn shell_styles(text: &str) -> Vec<Style> {
+    let mut styles = vec![Style::default(); text.len()];
+    let mut offset = 0;
+    for (line, spans) in text
+        .split('\n')
+        .zip(crate::render::bash_highlight::highlight_shell_lines(
+            text,
+            &crate::render::bash_highlight::ShellStyles::live(),
+        ))
+    {
+        let mut at = offset;
+        for span in spans {
+            let end = (at + span.content.len()).min(offset + line.len());
+            for style in &mut styles[at.min(end)..end] {
+                *style = span.style;
+            }
+            at = end;
+        }
+        offset += line.len() + 1;
+    }
+    styles
+}
+
+/// Draw `text[range]` at (`x`, `y`), each run of bytes in its own style from `styles`.
+fn draw_styled_line(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    text: &str,
+    range: Range<usize>,
+    styles: &[Style],
+) {
+    let mut column = x;
+    let mut start = range.start;
+    while start < range.end {
+        let style = styles.get(start).copied().unwrap_or_default();
+        let mut end = start;
+        while end < range.end && styles.get(end).copied().unwrap_or_default() == style {
+            end += 1;
+            while end < range.end && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        let run = &text[start..end];
+        buf.set_string(column, y, run, style);
+        column += u16::try_from(run.width()).unwrap_or(0);
+        start = end;
     }
 }
 

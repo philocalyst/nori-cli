@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-
 use crate::bottom_pane::ApprovalRequest;
 use crate::render::renderable::Renderable;
-use codex_rmcp_client::McpAuthStatus;
 use crossterm::event::KeyEvent;
 use nori_protocol::acp::v1 as acp;
 
@@ -64,14 +61,6 @@ pub(crate) trait BottomPaneView: Renderable {
     fn withdraw_approval_request(&mut self, _request_id: &acp::RequestId) -> bool {
         false
     }
-
-    /// Update MCP server auth statuses. Only meaningful for the MCP server
-    /// picker; other views ignore this.
-    fn update_mcp_auth_statuses(&mut self, _statuses: &HashMap<String, McpAuthStatus>) {}
-
-    /// Handle MCP OAuth login completion. Only meaningful for the MCP server
-    /// picker; other views ignore this.
-    fn handle_mcp_oauth_complete(&mut self, _server_name: &str, _success: bool) {}
 
     /// Update an item in a generic selection view by stable id.
     fn update_selection_item(
