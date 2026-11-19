@@ -54,6 +54,7 @@ pub fn registration() -> Registration {
         "opencode",
         |spec| async move { OpenCodeAgent::from_spec(spec) },
     )
+    .with_availability(crate::server::known_unavailable)
 }
 
 pub(crate) struct OpenCodeAgent {

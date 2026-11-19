@@ -284,15 +284,19 @@ pub struct AcpAgentInfo {
     pub is_installed: bool,
     /// Package manager used to manage this agent (if installed)
     pub managed_by: Option<PackageManager>,
+    /// Why a built-in agent that runs inside Nori cannot be used right now, such as its server
+    /// not running. Such an agent is not `is_installed`, but it is not missing either.
+    pub unavailable: Option<String>,
 }
 
 impl AcpAgentInfo {
     /// Create agent info from an AgentKind enum
     pub fn from_agent(agent: AgentKind) -> Self {
         // A built-in agent that runs inside Nori has no CLI to find, so it counts as installed.
-        let in_process = native_name(agent).is_some_and(crate::in_process::in_process_available);
-        let (is_installed, managed_by) = if in_process {
-            (true, None)
+        let native = native_name(agent).filter(|name| crate::in_process::in_process_available(name));
+        let unavailable = native.and_then(crate::in_process::in_process_unavailable);
+        let (is_installed, managed_by) = if native.is_some() {
+            (unavailable.is_none(), None)
         } else {
             detect_agent_installation(agent)
         };
@@ -305,6 +309,7 @@ impl AcpAgentInfo {
             provider_slug: agent.slug().to_string(),
             is_installed,
             managed_by,
+            unavailable,
         }
     }
 }
@@ -551,6 +556,7 @@ fn list_available_agents_with_mock_binary(
             provider_slug: "mock-acp".to_string(),
             is_installed: true,
             managed_by: None,
+            unavailable: None,
         });
         agents.push(AcpAgentInfo {
             agent: AgentKind::ClaudeCode, // Dummy, not really used
@@ -560,6 +566,7 @@ fn list_available_agents_with_mock_binary(
             provider_slug: "mock-acp-alt".to_string(),
             is_installed: true,
             managed_by: None,
+            unavailable: None,
         });
     }
     #[cfg(not(debug_assertions))]
@@ -580,6 +587,7 @@ fn list_available_agents_with_mock_binary(
                 provider_slug: registered.slug,
                 is_installed: true,
                 managed_by: None,
+                unavailable: None,
             });
         }
     }

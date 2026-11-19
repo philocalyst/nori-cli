@@ -3,7 +3,8 @@
 //! The host classifies a failure from the structured error first and from prose only when nothing
 //! structured identifies it (`nori-acp-host`'s `classify_failure`): the JSON-RPC `code`
 //! (`-32000` authentication, `-32002` an unknown session, `-32010` an unreachable backing service,
-//! `-32012` a session that cannot be reattached) and then identifiers in `data`: `code`,
+//! `-32012` a session that cannot be reattached, `-32016` a backing service that is not running)
+//! and then identifiers in `data`: `code`,
 //! `status`, `retry_after`, `resetsAt`. `data.detail` is the reason a person reads. This module
 //! writes exactly those fields, so the host's retry and fallback policy never parses prose an
 //! agent wrote.
@@ -16,6 +17,9 @@ use serde_json::json;
 const UNREACHABLE_CODE: i32 = -32010;
 /// `-32012`: the session exists but cannot be reattached.
 const NOT_RESUMABLE_CODE: i32 = -32012;
+/// `-32016`: the service behind the agent is not running, so there is nothing to reach. The host
+/// classifies it like a missing executable: the agent is not available, and waiting does not help.
+const NOT_RUNNING_CODE: i32 = -32016;
 
 /// Why a provider call failed, as far as the retry and fallback policy cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +121,10 @@ pub enum AgentError {
     /// The service behind the agent is not reachable.
     #[error("agent backend unreachable: {0}")]
     Unreachable(String),
+    /// The service behind the agent is not running at all (nothing listens where it should), so
+    /// the person has to start it. Not a network problem.
+    #[error("agent backend not running: {0}")]
+    NotRunning(String),
     /// The request cannot be served in the state the agent is in, such as a second prompt on a
     /// session that is still running one.
     #[error("{0}")]
@@ -194,6 +202,13 @@ impl From<AgentError> for acp::Error {
             AgentError::Unreachable(detail) => {
                 acp::Error::new(UNREACHABLE_CODE, "Agent backend unreachable")
                     .data(detail_data(&detail))
+            }
+            AgentError::NotRunning(detail) => {
+                let mut data = detail_data(&detail);
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("code".to_owned(), json!("agent_not_running"));
+                }
+                acp::Error::new(NOT_RUNNING_CODE, "Agent backend not running").data(data)
             }
             AgentError::Busy(detail) | AgentError::InvalidParams(detail) => {
                 acp::Error::invalid_params().data(detail_data(&detail))

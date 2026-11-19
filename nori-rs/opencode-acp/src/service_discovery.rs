@@ -14,6 +14,28 @@ pub(crate) struct Registration {
     pub version: Option<String>,
 }
 
+impl Registration {
+    /// Whether the process that wrote the registration still exists. A registration outlives a
+    /// server that was killed, so a dead process means the URL is stale. Answers `true` when it
+    /// cannot tell (another user's process, or a platform without a cheap check).
+    pub(crate) fn process_is_running(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(pid) = i32::try_from(self.pid) else {
+                return true;
+            };
+            // Signal 0 only checks that the process can be signalled.
+            let gone = unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            !gone
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+}
+
 pub(crate) fn read(environment: &HashMap<OsString, OsString>) -> Option<Registration> {
     let variable = |name: &str| {
         environment

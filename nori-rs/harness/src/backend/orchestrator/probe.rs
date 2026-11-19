@@ -4,6 +4,9 @@
 //! A probe is a bare session: no hooks, no MCP servers, no transcript. Each agent has at most
 //! one probe at a time, and an agent whose entry is fresh enough is left alone, so asking often
 //! costs nothing. Asking while a probe runs waits for that probe instead of starting another.
+//! An agent whose probe failed is left alone too, for longer after each failure in a row, so an
+//! agent that cannot start (OpenCode with no server running) costs one attempt per backoff period
+//! however often the catalog is asked about.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,6 +15,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
+use std::time::Instant;
 
 use nori_protocol::NoriEvent;
 use nori_protocol::SessionEvent;
@@ -25,6 +29,16 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const REPROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Agents probed at once.
 const PARALLEL_PROBES: usize = 3;
+
+/// How long an agent is left alone after its first failed probe; each failure in a row doubles it.
+const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest an agent is left alone after failing.
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
+
+/// Agents whose last probes failed: when to try again, and how many failed in a row. Cleared by
+/// the first probe that succeeds.
+static FAILED: LazyLock<Mutex<HashMap<ProbeKey, (Instant, i32)>>> =
+    LazyLock::new(Default::default);
 
 /// Agents with a probe running, each with what turns true when it ends.
 type ProbeKey = (PathBuf, String);
@@ -64,6 +78,12 @@ pub(crate) async fn refresh_excluding(
             let refreshed_at = super::catalog::remembered(&config.nori_home, agent).refreshed_at;
             now - refreshed_at >= fresh_for.as_secs() as i64
         })
+        .filter(|agent| {
+            let failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+            failed
+                .get(&(home.clone(), agent.clone()))
+                .is_none_or(|(retry_at, _)| Instant::now() >= *retry_at)
+        })
         .map(|agent| {
             let key = (home.clone(), agent.clone());
             let mut probing = PROBING.lock().unwrap_or_else(PoisonError::into_inner);
@@ -77,13 +97,12 @@ pub(crate) async fn refresh_excluding(
             let cli_version = cli_version.clone();
             let permits = Arc::clone(&permits);
             tokio::spawn(async move {
-                if let Ok(_permit) = permits.acquire().await
-                    && let Err(error) =
+                if let Ok(_permit) = permits.acquire().await {
+                    let outcome =
                         tokio::time::timeout(PROBE_TIMEOUT, probe(&config, cli_version, &agent))
                             .await
-                            .unwrap_or_else(|_| Err("timed out".to_owned()))
-                {
-                    tracing::debug!(%agent, %error, "could not read what the agent offers");
+                            .unwrap_or_else(|_| Err("timed out".to_owned()));
+                    note_outcome(&key, &outcome);
                 }
                 PROBING
                     .lock()
@@ -107,9 +126,39 @@ pub(crate) async fn reprobe(
     cli_version: String,
     agent: &str,
 ) -> Result<(), String> {
-    tokio::time::timeout(REPROBE_TIMEOUT, probe(&config, cli_version, agent))
+    let key = (
+        config
+            .nori_home
+            .canonicalize()
+            .unwrap_or_else(|_| config.nori_home.clone()),
+        agent.to_owned(),
+    );
+    let outcome = tokio::time::timeout(REPROBE_TIMEOUT, probe(&config, cli_version, agent))
         .await
-        .unwrap_or_else(|_| Err("timed out".to_owned()))
+        .unwrap_or_else(|_| Err("timed out".to_owned()));
+    note_outcome(&key, &outcome);
+    outcome
+}
+
+/// Remember how a probe ended: a failure postpones the next background probe of that agent, a
+/// success forgets earlier failures.
+fn note_outcome(key: &ProbeKey, outcome: &Result<(), String>) {
+    let mut failed = FAILED.lock().unwrap_or_else(PoisonError::into_inner);
+    let Err(error) = outcome else {
+        failed.remove(key);
+        return;
+    };
+    let streak = failed.get(key).map_or(1, |(_, streak)| streak + 1);
+    let backoff = FIRST_BACKOFF
+        .saturating_mul(1 << (streak - 1).min(10))
+        .min(MAX_BACKOFF);
+    failed.insert(key.clone(), (Instant::now() + backoff, streak));
+    tracing::debug!(
+        agent = %key.1,
+        %error,
+        retry_in_secs = backoff.as_secs(),
+        "could not read what the agent offers"
+    );
 }
 
 /// Start `agent` in a bare session, remember what it advertises, and stop it.

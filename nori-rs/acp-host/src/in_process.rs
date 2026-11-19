@@ -49,6 +49,15 @@ pub fn in_process_available(name: &str) -> bool {
     registration(name).is_some()
 }
 
+/// Why the built-in agent `name` cannot be used right now, if it knows without being started: for
+/// OpenCode, that the server its registration names has exited. Local state only, so it is safe to
+/// ask whenever agents are listed.
+pub fn in_process_unavailable(name: &str) -> Option<String> {
+    registration(name)
+        .and_then(|registration| registration.availability)
+        .and_then(|check| check())
+}
+
 /// Have the built-in agent `config` runs start a session for `cwd` ahead of time, so switching to
 /// it later is instant. Does nothing for an agent that is not built in or cannot prewarm.
 pub fn prewarm(

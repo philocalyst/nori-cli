@@ -8,6 +8,7 @@ license.workspace = true
 base64 = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 nori-acp-kit = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 serde_json = { workspace = true }

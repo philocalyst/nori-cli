@@ -350,7 +350,8 @@ async fn establish_connection(
                             Routed::Held => return Ok(()),
                         };
                         let session_id = notification.session_id.to_string();
-                        debug!(
+                        // One per streamed chunk: trace, so a long reply is not a long log.
+                        tracing::trace!(
                             target: "acp_event_flow",
                             session_id,
                             update_kind = super::session_update_kind(&notification.update),

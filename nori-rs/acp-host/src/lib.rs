@@ -15,6 +15,7 @@ pub mod sign_in;
 
 pub use error_category::FailureClass;
 pub use error_category::FailureDetails;
+pub use error_category::agent_not_running;
 pub use error_category::classify_failure;
 pub use error_category::classify_text;
 pub use error_category::is_subscription_exhausted;

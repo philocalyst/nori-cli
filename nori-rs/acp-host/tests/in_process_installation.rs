@@ -25,6 +25,7 @@ fn built_in_agents_are_installed_without_their_cli_on_path() {
             launch: Arc::new(|_, _, _| Box::pin(async { Ok(()) })),
             prewarm: None,
             resolve: None,
+            availability: None,
         });
 
         let info = AcpAgentInfo::from_agent(agent);

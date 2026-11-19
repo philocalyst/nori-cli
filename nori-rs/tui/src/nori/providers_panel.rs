@@ -174,7 +174,10 @@ fn summary(row: &Row) -> String {
             .reduce(|line, part| format!("{line} · {part}"))
             .unwrap_or_else(|| "signed in".to_owned()),
         Standing::SignIn => "not signed in".to_owned(),
-        Standing::NotInstalled => format!("not installed · {}", row.agent.description),
+        Standing::NotInstalled => match &row.agent.unavailable {
+            Some(reason) => reason.clone(),
+            None => format!("not installed · {}", row.agent.description),
+        },
     }
 }
 

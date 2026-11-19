@@ -10447,6 +10447,7 @@ dependencies = [
  "base64 0.22.1",
  "eventsource-stream",
  "futures",
+ "libc",
  "nori-acp-kit",
  "pretty_assertions",
  "reqwest 0.12.28",

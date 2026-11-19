@@ -147,6 +147,11 @@ pub type Prewarmer = Arc<dyn Fn(InProcessSpec, PathBuf, serde_json::Value) + Sen
 /// per-agent environment.
 pub type Resolver = fn(InProcessSpec, &HashMap<String, String>) -> InProcessSpec;
 
+/// Says why the agent cannot be used right now, when that is known without starting it. The host
+/// asks on the user's thread whenever it lists agents, so an answer must come from local state
+/// (a file, a process id), never from the network.
+pub type AvailabilityCheck = fn() -> Option<String>;
+
 /// One built-in agent, ready for the host.
 #[derive(Clone)]
 pub struct Registration {
@@ -155,6 +160,7 @@ pub struct Registration {
     pub launch: Launcher,
     pub prewarm: Option<Prewarmer>,
     pub resolve: Option<Resolver>,
+    pub availability: Option<AvailabilityCheck>,
 }
 
 impl std::fmt::Debug for Registration {
@@ -164,6 +170,7 @@ impl std::fmt::Debug for Registration {
             .field("name", &self.name)
             .field("prewarm", &self.prewarm.is_some())
             .field("resolve", &self.resolve.is_some())
+            .field("availability", &self.availability.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -189,6 +196,7 @@ impl Registration {
             }),
             prewarm: None,
             resolve: None,
+            availability: None,
         }
     }
 
@@ -198,6 +206,12 @@ impl Registration {
         prewarm: impl Fn(InProcessSpec, PathBuf, serde_json::Value) + Send + Sync + 'static,
     ) -> Self {
         self.prewarm = Some(Arc::new(prewarm));
+        self
+    }
+
+    /// Let the agent say, from local state, that it cannot be used right now.
+    pub fn with_availability(mut self, availability: AvailabilityCheck) -> Self {
+        self.availability = Some(availability);
         self
     }
 

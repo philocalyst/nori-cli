@@ -34,6 +34,7 @@ pub fn registration() -> Registration {
         launch: Arc::new(|spec, pipe, host| Box::pin(serve_spec(spec, pipe, host))),
         prewarm: None,
         resolve: None,
+        availability: None,
     }
 }
 

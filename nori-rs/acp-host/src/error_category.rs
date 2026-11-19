@@ -30,7 +30,8 @@ pub enum FailureClass {
     Auth,
     /// The prompt exceeds the model's context window.
     PromptTooLong,
-    /// The agent executable could not be found.
+    /// The agent, or the service it needs, is not there to run: its executable is missing, or its
+    /// server is not running (ACP `-32016`). Nothing here is a network problem.
     ExecutableNotFound,
     /// The agent failed to initialise or speak ACP.
     Initialization,
@@ -113,6 +114,26 @@ impl FailureClass {
     }
 }
 
+/// ACP `-32016`: the service behind the agent is not running.
+const NOT_RUNNING_CODE: i32 = -32016;
+
+/// What the agent says when its server is not running (ACP `-32016`): a complete sentence that
+/// says what is true and what to do, to show as it is instead of a generic "not installed" hint.
+pub fn agent_not_running(error: &anyhow::Error) -> Option<String> {
+    error.chain().find_map(|cause| {
+        let acp_error = cause.downcast_ref::<acp::Error>()?;
+        if i32::from(acp_error.code) != NOT_RUNNING_CODE {
+            return None;
+        }
+        acp_error
+            .data
+            .as_ref()?
+            .get("detail")?
+            .as_str()
+            .map(str::to_owned)
+    })
+}
+
 /// A classified failure, carrying the agent-supplied message and `error.data.detail` (for
 /// example a login hint) when the chain includes a structured ACP error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +161,8 @@ pub fn is_subscription_exhausted(error: &anyhow::Error) -> bool {
 ///
 /// The code table mirrors the agent side (`nori-handroll acp`): `-32000` auth_required,
 /// `-32002` resource/session not found, `-32010` backing service unreachable, `-32012`
-/// session not resumable, `-32014` no active session, `-32015` a session is already active.
+/// session not resumable, `-32014` no active session, `-32015` a session is already active,
+/// `-32016` the agent's server is not running.
 pub fn classify_failure(error: &anyhow::Error) -> FailureDetails {
     for cause in error.chain() {
         let Some(acp_error) = cause.downcast_ref::<acp::Error>() else {
@@ -182,6 +204,7 @@ fn classify_structured(error: &acp::Error) -> Option<FailureClass> {
         -32012 => return Some(FailureClass::SessionNotResumable),
         -32014 => return Some(FailureClass::NoActiveSession),
         -32015 => return Some(FailureClass::SessionAlreadyActive),
+        NOT_RUNNING_CODE => return Some(FailureClass::ExecutableNotFound),
         _ => {}
     }
     let data = error.data.as_ref();
@@ -250,6 +273,7 @@ fn classify_identifier(identifier: &str, data: Option<&serde_json::Value>) -> Op
         | "connection_error"
         | "timeout_error"
         | "request_timeout" => FailureClass::Network,
+        "agent_not_running" => FailureClass::ExecutableNotFound,
         "authentication_error" | "unauthorized" | "invalid_api_key" => FailureClass::Auth,
         "not_found_error" | "model_not_found" | "model_not_available" | "unsupported_model" => {
             FailureClass::ModelUnavailable

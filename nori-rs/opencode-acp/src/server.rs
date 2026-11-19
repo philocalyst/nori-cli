@@ -10,15 +10,58 @@ use reqwest::Method;
 use serde_json::Value;
 use tokio::process::Child;
 
-/// A failed call to the OpenCode server as the error the host sees: an unreachable server is
-/// said to be unreachable, anything else keeps its message.
+/// What a person is told when no OpenCode server answers. It says what is true (nothing is
+/// running) and what to do, and it is not a network problem: the server is local.
+const NOT_RUNNING: &str = "OpenCode isn't running: start it (`opencode serve`, or open the OpenCode app) and Nori will use it.";
+
+/// No OpenCode server is running to talk to, known without a request: its registration names a
+/// process that has exited.
+#[derive(Debug)]
+pub(crate) struct ServerNotRunning;
+
+impl std::fmt::Display for ServerNotRunning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(NOT_RUNNING)
+    }
+}
+
+impl std::error::Error for ServerNotRunning {}
+
+/// A failed call to the OpenCode server as the error the host sees. A server that refuses the
+/// connection, or whose registration names a process that is gone, is not running; one that does
+/// not answer in time is unreachable; anything else keeps its message.
 pub(crate) fn failure(error: Box<dyn std::error::Error + Send + Sync>) -> nori_acp_kit::AgentError {
+    if error.is::<ServerNotRunning>() {
+        return nori_acp_kit::AgentError::NotRunning(NOT_RUNNING.to_owned());
+    }
     match error.downcast_ref::<reqwest::Error>() {
-        Some(source) if source.is_connect() || source.is_timeout() => {
+        Some(source) if source.is_connect() => {
+            nori_acp_kit::AgentError::NotRunning(NOT_RUNNING.to_owned())
+        }
+        Some(source) if source.is_timeout() => {
             nori_acp_kit::AgentError::Unreachable(error.to_string())
         }
-        Some(_) | None => nori_acp_kit::AgentError::internal(error),
+        Some(_) => nori_acp_kit::AgentError::internal(error),
+        None if error.is::<tokio::time::error::Elapsed>() => {
+            nori_acp_kit::AgentError::Unreachable(error.to_string())
+        }
+        None => nori_acp_kit::AgentError::internal(error),
     }
+}
+
+/// Why OpenCode cannot be used, when local state alone says so: a registration whose process has
+/// exited, with nothing configured to point elsewhere. `None` means unknown or running; a server
+/// that is merely not registered is found out when a session is opened, not here.
+pub(crate) fn known_unavailable() -> Option<String> {
+    let configured = ["NORI_OPENCODE_URL", "OPENCODE_SERVER_URL"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    if configured {
+        return None;
+    }
+    crate::service_discovery::read(&HashMap::new())
+        .filter(|registration| !registration.process_is_running())
+        .map(|_| NOT_RUNNING.to_owned())
 }
 
 /// An isolated OpenCode v2 server and its authenticated API client.
@@ -59,6 +102,9 @@ impl OpenCodeServer {
             .await;
         }
         if let Some(registration) = crate::service_discovery::read(environment) {
+            if !registration.process_is_running() {
+                return Err(ServerNotRunning.into());
+            }
             let password = password.map_or(registration.password, |value| {
                 value.to_string_lossy().into_owned()
             });

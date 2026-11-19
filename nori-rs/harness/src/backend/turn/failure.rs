@@ -42,6 +42,7 @@ impl AcpBackend {
                 // mirroring `enhance_agent_error`.
                 let display_error = agent_message.unwrap_or_else(|| format!("{err}"));
                 let retryable = class.is_transient();
+                let not_running = nori_acp_host::agent_not_running(err);
                 warn!(?class, retryable, "ACP user prompt failed: {error_string}");
                 let message = match class {
                     FailureClass::Auth => {
@@ -64,9 +65,10 @@ impl AcpBackend {
                     FailureClass::Capacity => format!(
                         "The provider has no capacity for this model right now: {display_error}"
                     ),
-                    FailureClass::ExecutableNotFound => {
-                        format!("Agent executable not found: {display_error}")
-                    }
+                    FailureClass::ExecutableNotFound => match &not_running {
+                        Some(reason) => reason.clone(),
+                        None => format!("Agent executable not found: {display_error}"),
+                    },
                     FailureClass::Initialization => {
                         format!("Agent initialization failed: {display_error}")
                     }
@@ -98,8 +100,8 @@ impl AcpBackend {
                 // The agent-supplied `error.data.detail` is clean, user-facing
                 // context (e.g. "connection reset by broker") — keep it verbatim.
                 let message = match detail {
-                    Some(detail) => format!("{message} ({detail})"),
-                    None => message,
+                    Some(detail) if not_running.is_none() => format!("{message} ({detail})"),
+                    Some(_) | None => message,
                 };
                 (message, retryable)
             }
