@@ -46,6 +46,9 @@ $NORI_HOME/transcripts/by-project/{project-id}/
   transcript when it cannot continue the local one, because the agent's history
   may be newer than the local copy.
 
+The full-text index of these transcripts is derived data under
+`$NORI_HOME/index/v1/`; see [pickers.md](pickers.md#the-full-text-index).
+
 ## Canonical Pkl event journal
 
 Each `.pkl` file is an append-only sequence of Pkl properties named
@@ -62,11 +65,31 @@ selected history slice remains addressable after later rewinds. A forked
 transcript has its own session ID and records the parent lineage and source
 range.
 
+Journal records are parsed by the native Rust Pkl parser. Replay inspects literal
+event fields without evaluating expressions or resolving imports. Property
+spacing, comments and field order do not affect decoding. Computed payloads for
+known events are rejected; future event kinds retain their original source.
+
+Streamed events append incrementally: the current reducer validates the change
+before writing and applies it after the durable append succeeds. Ordinary
+appends do not reload the journal or copy the existing transcript. File writers
+compare the byte version under an OS lock; a competing writer triggers a reload
+and revalidation of the expected head and stable command ID.
+
 Rewind binds a fresh ACP session to the selected visible history. It rejects
 pending prompt admission, active delegated work, and concurrent program effects.
 If recording the rewind succeeds but its new backend binding is interrupted,
 resume creates a fresh ACP session instead of reusing an older provider session.
 The archived records remain available throughout this recovery.
+
+A native child interrupted before its provider configuration was recorded keeps
+its independent journal as an archived, unavailable child. Resuming its parent
+preserves that history and hierarchy; sending work, cancelling or configuring
+that child reports why it is unavailable. Nori does not invent a model or resume
+the retired provider session. If the exact configuration reached the child journal
+before shutdown interrupted the parent binding update, Nori recovers that
+recorded snapshot and restores the child's independent control plane. Complete
+or malformed provider bindings still undergo the normal strict validation.
 
 The harness appends a command before attempting its effect. Conversation
 programs also record their source and each typed operation before dispatch, then

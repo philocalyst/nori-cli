@@ -47,7 +47,7 @@ When a root session of any agent is created, the harness
 (`backend::prewarm`) asks every other installed built-in agent to prewarm for
 the same working directory and MCP servers, through
 `nori_acp_host::in_process::prewarm`. Only agents that register a prewarmer do
-anything; today that is Claude (`cli/src/native_agents.rs`). Delegated child
+anything; today that is Claude (its `Registration` in `nori-claude-acp`). Delegated child
 sessions do not prime others. The result: switching from Codex to Claude, a
 `/new` on Claude, and a task delegated to Claude all find a running CLI.
 
