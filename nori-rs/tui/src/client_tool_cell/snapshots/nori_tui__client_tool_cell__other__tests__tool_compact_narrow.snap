@@ -1,7 +1,0 @@
----
-source: tui/src/client_tool_cell/other.rs
-assertion_line: 263
-expression: "project(&cell, 30, false)"
----
-▸ ● execute
-  └ No active goal

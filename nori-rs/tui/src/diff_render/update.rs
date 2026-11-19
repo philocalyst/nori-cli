@@ -31,7 +31,6 @@ use disparate::pair::THRESHOLD;
 use disparate::pair::Term;
 use disparate::syntax::Language;
 use disparate::syntax::Structural;
-use ratatui::style::Stylize;
 use ratatui::text::Line as RtLine;
 use ratatui::text::Span as RtSpan;
 
@@ -59,12 +58,14 @@ pub(super) struct EditDiff<'a> {
 }
 
 /// A line of an edit as it is shown.
-struct Shown {
-    kind: DiffLineType,
+pub(super) struct Shown {
+    pub(super) kind: DiffLineType,
     /// Its index in its own side's text: the old text for a removed line, else the new.
-    line: usize,
+    pub(super) line: usize,
+    /// The before-side line index (meaningful for `Context` lines in split diff).
+    pub(super) before_line: usize,
     /// The byte ranges of the line, from its start, to emphasise.
-    emphasis: Vec<Range<usize>>,
+    pub(super) emphasis: Vec<Range<usize>>,
 }
 
 impl<'a> EditDiff<'a> {
@@ -107,17 +108,30 @@ impl<'a> EditDiff<'a> {
         self.lines.changed()
     }
 
+    pub(super) fn sources(&self) -> Both<&'a str> {
+        self.sources
+    }
+
+    pub(super) fn texts(&self) -> &Both<Text<&'a [u8]>> {
+        &self.texts
+    }
+
     /// Draws the hunks into `out` within `width`, numbered from `first_line` and highlighted
-    /// as `path`'s language.
+    /// as `path`'s language. Uses side-by-side split view when `split` is true.
     pub(super) fn render(
         &self,
         first_line: usize,
         path: &Path,
         width: usize,
+        split: bool,
         ctx: &DiffRenderStyleContext,
         out: &mut Vec<RtLine<'static>>,
     ) {
         let groups = self.shown();
+        if split {
+            super::split::render_split(self, &groups, first_line, path, width, ctx, out);
+            return;
+        }
         let side_of = |kind: DiffLineType| match kind {
             DiffLineType::Delete => Side::Before,
             DiffLineType::Insert | DiffLineType::Context => Side::After,
@@ -136,8 +150,8 @@ impl<'a> EditDiff<'a> {
             if index > 0 {
                 let spacer = format!("{:width$} ", "", width = layout.line_number_width.max(1));
                 out.push(RtLine::from(vec![
-                    RtSpan::styled(spacer, style_gutter()),
-                    "⋮".dim(),
+                    RtSpan::styled(spacer, style_gutter(ctx)),
+                    RtSpan::styled("⋮", style_gutter(ctx)),
                 ]));
             }
             // Each side's lines in the window are highlighted together, in their own text,
@@ -196,6 +210,7 @@ impl<'a> EditDiff<'a> {
                         shown.push(Shown {
                             kind: DiffLineType::Context,
                             line: lines.after.start,
+                            before_line: lines.before.start,
                             emphasis: Vec::new(),
                         });
                         continue;
@@ -204,6 +219,7 @@ impl<'a> EditDiff<'a> {
                         shown.push(Shown {
                             kind: DiffLineType::Delete,
                             line: lines.before.start,
+                            before_line: lines.before.start,
                             emphasis: std::mem::take(&mut emphasis.before),
                         });
                     }
@@ -211,6 +227,7 @@ impl<'a> EditDiff<'a> {
                         added.push(Shown {
                             kind: DiffLineType::Insert,
                             line: lines.after.start,
+                            before_line: lines.before.start,
                             emphasis: emphasis.after,
                         });
                     }

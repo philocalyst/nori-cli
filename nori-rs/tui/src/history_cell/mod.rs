@@ -1,26 +1,61 @@
-use crate::markdown::append_markdown;
-use crate::render::line_utils::prefix_lines;
-use crate::render::line_utils::push_owned_lines;
+//! Everything the transcript is made of.
+//!
+//! A [`HistoryCell`] is one block of the conversation: it turns itself into rows for a width.
+//! The cells are drawn from one design system ([`chrome`]) and live in modules by what they say:
+//!
+//! * [`prose`]: the user's prompt, reasoning, the model's answer;
+//! * [`notice`]: what Nori says (information, warnings, errors), merged when adjacent;
+//! * [`peer`]: peer messages, route changes and agent-owned turns;
+//! * [`plan`]: the agent's plan;
+//! * [`bento`] and [`shell_block`]: the grid and the command block that tool cells are built
+//!   from.
+//!
+//! Tool calls are in `client_tool_cell`, subagents in `chatwidget::subagents`.
+
+pub(crate) mod bento;
+pub(crate) mod chrome;
+mod monitor;
+mod notice;
+mod peer;
+mod plan;
+mod prose;
+pub(crate) mod shell_block;
+
+pub(crate) use monitor::MonitorEventsCell;
+pub use notice::FinalMessageSeparator;
+pub(crate) use notice::Notice;
+pub(crate) use notice::NoticeCell;
+pub(crate) use notice::NoticeKind;
+pub(crate) use notice::PlainHistoryCell;
+pub(crate) use notice::new_error_event;
+pub(crate) use notice::new_info_event;
+pub(crate) use notice::new_remote_control_event;
+pub(crate) use notice::new_skillset_switched_event;
+pub(crate) use peer::AgentTurnCell;
+pub(crate) use peer::AgentTurnKind;
+pub(crate) use peer::PeerDelivery;
+pub(crate) use peer::PeerHandle;
+pub(crate) use peer::PeerMessageCell;
+pub(crate) use peer::PeerParty;
+pub(crate) use peer::RouteEnd;
+pub(crate) use peer::RouteNotice;
+pub(crate) use peer::RouteNoticeCell;
+pub(crate) use plan::new_plan_update;
+pub(crate) use plan::render_plan_lines;
+pub(crate) use prose::AgentMarkdownCell;
+pub(crate) use prose::AgentMessageCell;
+pub(crate) use prose::UserHistoryCell;
+
 use crate::render::renderable::Renderable;
-use crate::style::user_message_style;
-use crate::ui_consts::LIVE_PREFIX_COLS;
-use crate::ui_types::PlanItem;
-use crate::ui_types::PlanUpdate;
-use crate::ui_types::StepStatus;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
-use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_lines;
-use crate::wrapping::word_wrap_lines;
 use nori_config::NoriConfig as Config;
+use prose::ReasoningSummaryCell;
 use ratatui::prelude::*;
-use ratatui::style::Styled;
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::any::Any;
-use std::path::Path;
-use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 
 /// Represents an event to display in the conversation history. Returns its
@@ -56,6 +91,23 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn full_transcript(&self) -> bool {
         false
     }
+
+    /// Whether the cell's rows change with time alone (a spinner, a running clock). A layout
+    /// cached for such a cell goes stale between updates, so it is laid out again each frame.
+    fn animated(&self) -> bool {
+        false
+    }
+
+    /// `Some(expanded)` when the cell can show more than its collapsed form (a diff beyond its
+    /// first hunk rows, a command's whole output, a peer message's whole body); `None` when what
+    /// it draws is all there is. Whoever routes the keys flips it with [`Self::set_expanded`].
+    fn expansion(&self) -> Option<bool> {
+        None
+    }
+
+    /// Expand or collapse the cell. Takes `&self`: cells in the transcript are shared, and the
+    /// state is a flag the next draw reads.
+    fn set_expanded(&self, _expanded: bool) {}
 }
 
 impl Renderable for Box<dyn HistoryCell> {
@@ -87,245 +139,6 @@ impl dyn HistoryCell {
 
     pub(crate) fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct UserHistoryCell {
-    pub message: String,
-}
-
-impl HistoryCell for UserHistoryCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let style = user_message_style();
-        let message = self
-            .message
-            .lines()
-            .map(|line| Line::from(line.to_owned()).style(style))
-            .collect();
-        let mut lines = vec![Line::from("").style(style)];
-        lines.extend(prefix_lines(message, "› ".bold().dim(), "  ".into()));
-        lines.push(Line::from("").style(style));
-        lines
-    }
-
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-
-        let wrap_width = width
-            .saturating_sub(
-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
-            )
-            .max(1);
-
-        let style = user_message_style();
-
-        let wrapped = word_wrap_lines(
-            self.message.lines().map(|l| Line::from(l).style(style)),
-            // Wrap algorithm matches textarea.rs.
-            RtOptions::new(usize::from(wrap_width))
-                .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-        );
-
-        lines.push(Line::from("").style(style));
-        lines.extend(prefix_lines(wrapped, "› ".bold().dim(), "  ".into()));
-        lines.push(Line::from("").style(style));
-        lines
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ReasoningSummaryCell {
-    content: String,
-    transcript_only: bool,
-}
-
-impl ReasoningSummaryCell {
-    pub(crate) fn new(content: String, transcript_only: bool) -> Self {
-        Self {
-            content,
-            transcript_only,
-        }
-    }
-
-    fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        append_markdown(
-            &self.content,
-            Some((width as usize).saturating_sub(2)),
-            &mut lines,
-        );
-        let summary_style = Style::default().dim().italic();
-        let summary_lines = lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans = line
-                    .spans
-                    .into_iter()
-                    .map(|span| span.patch_style(summary_style))
-                    .collect();
-                line
-            })
-            .collect::<Vec<_>>();
-
-        word_wrap_lines(
-            &summary_lines,
-            RtOptions::new(width as usize)
-                .initial_indent("• ".dim().into())
-                .subsequent_indent("  ".into()),
-        )
-    }
-}
-
-impl HistoryCell for ReasoningSummaryCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        if self.transcript_only {
-            return Vec::new();
-        }
-        let mut lines = Vec::new();
-        append_markdown(&self.content, None, &mut lines);
-        let style = Style::default().dim().italic();
-        for line in &mut lines {
-            for span in &mut line.spans {
-                *span = span.clone().patch_style(style);
-            }
-        }
-        prefix_lines(lines, "• ".dim(), "  ".into())
-    }
-
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if self.transcript_only {
-            Vec::new()
-        } else {
-            self.lines(width)
-        }
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        if self.transcript_only {
-            0
-        } else {
-            self.lines(width).len() as u16
-        }
-    }
-
-    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.lines(width)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct AgentMessageCell {
-    lines: Vec<Line<'static>>,
-    is_first_line: bool,
-}
-
-impl AgentMessageCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
-        Self {
-            lines,
-            is_first_line,
-        }
-    }
-}
-
-impl HistoryCell for AgentMessageCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let first = if self.is_first_line {
-            "• ".dim()
-        } else {
-            "  ".into()
-        };
-        prefix_lines(self.lines.clone(), first, "  ".into())
-    }
-
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        adaptive_wrap_lines(
-            &self.lines,
-            RtOptions::new(width as usize)
-                .initial_indent(if self.is_first_line {
-                    "• ".dim().into()
-                } else {
-                    "  ".into()
-                })
-                .subsequent_indent("  ".into()),
-        )
-    }
-
-    fn is_stream_continuation(&self) -> bool {
-        !self.is_first_line
-    }
-}
-
-/// A completed assistant message that keeps raw Markdown for width-aware replay.
-#[derive(Debug)]
-pub(crate) struct AgentMarkdownCell {
-    markdown_source: String,
-    cwd: PathBuf,
-    /// The layout at the width it was last asked for. A cell is laid out again only when the
-    /// width changes, so replaying a transcript at an unchanged width costs a copy of the rows.
-    layout: std::sync::Mutex<Option<(u16, Vec<Line<'static>>)>>,
-}
-
-impl AgentMarkdownCell {
-    pub(crate) fn new(markdown_source: String, cwd: &Path) -> Self {
-        Self {
-            markdown_source,
-            cwd: cwd.to_path_buf(),
-            layout: std::sync::Mutex::new(None),
-        }
-    }
-}
-
-impl HistoryCell for AgentMarkdownCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        crate::markdown::append_markdown_with_cwd(
-            &self.markdown_source,
-            None,
-            Some(&self.cwd),
-            &mut lines,
-        );
-        prefix_lines(lines, "• ".dim(), "  ".into())
-    }
-
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut layout = self
-            .layout
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((laid_out_width, lines)) = layout.as_ref()
-            && *laid_out_width == width
-        {
-            return lines.clone();
-        }
-        let mut lines = Vec::new();
-        crate::markdown::append_markdown_with_cwd(
-            &self.markdown_source,
-            Some(usize::from(width.saturating_sub(2).max(1))),
-            Some(&self.cwd),
-            &mut lines,
-        );
-        let lines = prefix_lines(lines, "• ".dim(), "  ".into());
-        *layout = Some((width, lines.clone()));
-        lines
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct PlainHistoryCell {
-    lines: Vec<Line<'static>>,
-}
-
-impl PlainHistoryCell {
-    pub(crate) fn new(lines: Vec<Line<'static>>) -> Self {
-        Self { lines }
-    }
-}
-
-impl HistoryCell for PlainHistoryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.lines.clone()
     }
 }
 
@@ -382,46 +195,6 @@ impl HistoryCell for UpdateAvailableHistoryCell {
             .min(usize::from(width.saturating_sub(4)))
             .max(1);
         with_border_with_inner_width(content.lines, inner_width)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct PrefixedWrappedHistoryCell {
-    text: Text<'static>,
-    initial_prefix: Line<'static>,
-    subsequent_prefix: Line<'static>,
-}
-
-impl PrefixedWrappedHistoryCell {
-    pub(crate) fn new(
-        text: impl Into<Text<'static>>,
-        initial_prefix: impl Into<Line<'static>>,
-        subsequent_prefix: impl Into<Line<'static>>,
-    ) -> Self {
-        Self {
-            text: text.into(),
-            initial_prefix: initial_prefix.into(),
-            subsequent_prefix: subsequent_prefix.into(),
-        }
-    }
-}
-
-impl HistoryCell for PrefixedWrappedHistoryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if width == 0 {
-            return Vec::new();
-        }
-        let opts = RtOptions::new(width.max(1) as usize)
-            .initial_indent(self.initial_prefix.clone())
-            .subsequent_indent(self.subsequent_prefix.clone());
-        let wrapped = word_wrap_lines(&self.text, opts);
-        let mut out = Vec::new();
-        push_owned_lines(&wrapped, &mut out);
-        out
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.display_lines(width).len() as u16
     }
 }
 
@@ -569,129 +342,6 @@ impl HistoryCell for CompositeHistoryCell {
     }
 }
 
-pub(crate) fn new_skillset_switched_event(name: &str) -> PlainHistoryCell {
-    let lines: Vec<Line<'static>> = vec![
-        vec![
-            "✔ ".green(),
-            "Switched to skillset ".green(),
-            format!("\"{name}\"").green().bold(),
-        ]
-        .into(),
-    ];
-    PlainHistoryCell { lines }
-}
-
-#[allow(clippy::disallowed_methods)]
-pub(crate) fn new_warning_event(message: String) -> PrefixedWrappedHistoryCell {
-    PrefixedWrappedHistoryCell::new(message.yellow(), "⚠ ".yellow(), "  ")
-}
-
-pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHistoryCell {
-    let mut line = vec!["• ".dim(), message.into()];
-    if let Some(hint) = hint {
-        line.push(" ".into());
-        line.push(hint.dark_gray());
-    }
-    let lines: Vec<Line<'static>> = vec![line.into()];
-    PlainHistoryCell { lines }
-}
-
-pub(crate) fn new_remote_control_event(lines: &[String]) -> PlainHistoryCell {
-    let lines = lines
-        .iter()
-        .enumerate()
-        .map(|(index, text)| {
-            let prefix = if index == 0 {
-                "• ".dim()
-            } else {
-                "  ".into()
-            };
-            Line::from(vec![prefix, text.clone().into()])
-        })
-        .collect();
-    PlainHistoryCell::new(lines)
-}
-
-pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
-    // Use a hair space (U+200A) to create a subtle, near-invisible separation
-    // before the text. VS16 is intentionally omitted to keep spacing tighter
-    // in terminals like Ghostty.
-    let lines: Vec<Line<'static>> = vec![vec![format!("■ {message}").red()].into()];
-    PlainHistoryCell { lines }
-}
-
-/// Render plan steps as styled ratatui lines with checkbox formatting.
-/// Shared by both `PlanUpdateCell` (history) and `PinnedPlanDrawer` (viewport).
-pub(crate) fn render_plan_lines(
-    explanation: Option<&str>,
-    plan: &[PlanItem],
-    width: u16,
-) -> Vec<Line<'static>> {
-    let render_note = |text: &str| -> Vec<Line<'static>> {
-        let wrap_width = width.saturating_sub(4).max(1) as usize;
-        textwrap::wrap(text, wrap_width)
-            .into_iter()
-            .map(|s| s.to_string().dim().italic().into())
-            .collect()
-    };
-
-    let render_step = |status: &StepStatus, text: &str| -> Vec<Line<'static>> {
-        let (box_str, step_style) = match status {
-            StepStatus::Completed => ("✔ ", Style::default().crossed_out().dim()),
-            StepStatus::InProgress => ("□ ", Style::default().cyan().bold()),
-            StepStatus::Pending => ("□ ", Style::default().dim()),
-        };
-        let wrap_width = (width as usize)
-            .saturating_sub(4)
-            .saturating_sub(box_str.width())
-            .max(1);
-        let parts = textwrap::wrap(text, wrap_width);
-        let step_text = parts
-            .into_iter()
-            .map(|s| s.to_string().set_style(step_style).into())
-            .collect();
-        prefix_lines(step_text, box_str.into(), "  ".into())
-    };
-
-    let mut lines: Vec<Line<'static>> = vec![];
-    lines.push(vec!["• ".dim(), "Updated Plan".bold()].into());
-
-    let mut indented_lines = vec![];
-    let note = explanation.map(str::trim).filter(|t| !t.is_empty());
-    if let Some(expl) = note {
-        indented_lines.extend(render_note(expl));
-    };
-
-    if plan.is_empty() {
-        indented_lines.push(Line::from("(no steps provided)".dim().italic()));
-    } else {
-        for PlanItem { step, status } in plan.iter() {
-            indented_lines.extend(render_step(status, step));
-        }
-    }
-    lines.extend(prefix_lines(indented_lines, "  └ ".dim(), "    ".into()));
-
-    lines
-}
-
-/// Render a user‑friendly plan update styled like a checkbox todo list.
-pub(crate) fn new_plan_update(update: PlanUpdate) -> PlanUpdateCell {
-    let PlanUpdate { explanation, plan } = update;
-    PlanUpdateCell { explanation, plan }
-}
-
-#[derive(Debug)]
-pub(crate) struct PlanUpdateCell {
-    explanation: Option<String>,
-    plan: Vec<PlanItem>,
-}
-
-impl HistoryCell for PlanUpdateCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        render_plan_lines(self.explanation.as_deref(), &self.plan, width)
-    }
-}
-
 pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
     let trimmed = full_reasoning_buffer.trim();
     if let Some(after_open) = trimmed.strip_prefix("**")
@@ -704,80 +354,4 @@ pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<
     }
 
     Box::new(ReasoningSummaryCell::new(full_reasoning_buffer, true))
-}
-
-#[derive(Debug)]
-pub struct FinalMessageSeparator {
-    elapsed_seconds: Option<u64>,
-}
-impl FinalMessageSeparator {
-    pub(crate) fn new(elapsed_seconds: Option<u64>) -> Self {
-        Self { elapsed_seconds }
-    }
-}
-impl HistoryCell for FinalMessageSeparator {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let elapsed_seconds = self
-            .elapsed_seconds
-            .map(super::status_indicator_widget::fmt_elapsed_compact);
-        if let Some(elapsed_seconds) = elapsed_seconds {
-            let worked_for = format!("─ Worked for {elapsed_seconds} ─");
-            let worked_for_width = worked_for.width();
-            vec![
-                Line::from_iter([
-                    worked_for,
-                    "─".repeat((width as usize).saturating_sub(worked_for_width)),
-                ])
-                .dim(),
-            ]
-        } else {
-            vec![Line::from_iter(["─".repeat(width as usize).dim()])]
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use insta::assert_snapshot;
-    use pretty_assertions::assert_eq;
-    use pretty_assertions::assert_ne;
-
-    use super::*;
-
-    #[test]
-    fn native_message_keeps_a_logical_line_longer_than_u16_width() {
-        let source = "a".repeat(70_000);
-        let cell = AgentMessageCell::new(vec![Line::from(source.clone())], true);
-        let lines = cell.native_lines(80);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), format!("• {source}"));
-    }
-
-    #[test]
-    fn finalized_agent_markdown_reparses_at_each_width() {
-        let cell = AgentMarkdownCell::new(
-            "A deliberately long paragraph with [a long clickable link](https://example.com/a/very/long/path) before a table.\n\n| Name | Description |\n| --- | --- |\n| resize | a deliberately long explanation |".to_string(),
-            Path::new("/tmp"),
-        );
-
-        let wide = cell.display_lines(80);
-        let narrow = cell.display_lines(36);
-
-        assert_ne!(wide, narrow);
-        assert_snapshot!(
-            wide.iter()
-                .map(Line::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        assert_snapshot!(
-            narrow
-                .iter()
-                .map(Line::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
 }

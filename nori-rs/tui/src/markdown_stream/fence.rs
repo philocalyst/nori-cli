@@ -91,6 +91,8 @@ enum Lines {
     Plain,
     /// A known language: highlighted lines, trailing blank lines dropped.
     Highlighted(Box<LineHighlighter>),
+    /// Shell: lines painted by the shell highlighter every command in the transcript uses.
+    Shell,
 }
 
 /// A fenced code block that is the open block of a streaming message.
@@ -127,6 +129,7 @@ impl OpenFence {
     pub(super) fn new(opener: FenceOpener, body_start: usize) -> Self {
         let lines = match &opener.lang {
             None => Lines::Bare,
+            Some(lang) if crate::render::highlight::is_shell_language(lang) => Lines::Shell,
             Some(lang) => LineHighlighter::for_lang(lang).map_or(Lines::Plain, |highlighter| {
                 Lines::Highlighted(Box::new(highlighter))
             }),
@@ -182,6 +185,14 @@ impl OpenFence {
                 }
                 vec![Span::raw(body.to_owned())]
             }
+            Lines::Shell => {
+                if body.is_empty() {
+                    self.held_blank += 1;
+                    return;
+                }
+                self.highlighted_bytes += body.len() + 1;
+                crate::render::bash_highlight::highlight_bash_spans(body)
+            }
             Lines::Highlighted(highlighter) => {
                 if body.is_empty() {
                     self.held_blank += 1;
@@ -202,7 +213,7 @@ impl OpenFence {
         };
         for _ in 0..std::mem::take(&mut self.held_blank) {
             out.push(code_line(match self.lines {
-                Lines::Highlighted(_) => Vec::new(),
+                Lines::Highlighted(_) | Lines::Shell => Vec::new(),
                 Lines::Bare | Lines::Plain => vec![Span::raw("")],
             }));
         }
@@ -220,6 +231,7 @@ impl OpenFence {
             Lines::Highlighted(highlighter) => highlighter
                 .preview(partial)
                 .unwrap_or_else(|| vec![Span::raw(partial.to_owned())]),
+            Lines::Shell => crate::render::bash_highlight::highlight_bash_spans(partial),
             Lines::Bare | Lines::Plain => vec![Span::raw(partial.to_owned())],
         };
         let mut lines = Vec::with_capacity(self.held_blank + 1);

@@ -165,7 +165,8 @@ pub(crate) struct NativeView {
 }
 
 impl NativeView {
-    /// The header as plain text, for transcripts and tests.
+    /// The header as plain text, for tests.
+    #[cfg(test)]
     pub(crate) fn header_text(&self) -> String {
         self.header.iter().map(|part| part.text.as_str()).collect()
     }

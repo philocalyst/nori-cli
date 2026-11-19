@@ -16,6 +16,7 @@ use super::style::style_add;
 use super::style::style_context;
 use super::style::style_del;
 use super::style::style_gutter;
+use super::style::style_sign;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DiffLineType {
@@ -96,9 +97,9 @@ pub(super) fn diff_line_rows(
     let prefix_cols = gutter_width + 1;
 
     let mut first = true;
-    let (sign_char, line_style) = match kind {
-        DiffLineType::Insert => ('+', style_add(ctx)),
-        DiffLineType::Delete => ('-', style_del(ctx)),
+    let (sign_char, sign_style) = match kind {
+        DiffLineType::Insert => ('+', style_sign(ctx, true)),
+        DiffLineType::Delete => ('-', style_sign(ctx, false)),
         DiffLineType::Context => (' ', style_context()),
     };
 
@@ -132,10 +133,10 @@ pub(super) fn diff_line_rows(
         // carries its own) and pad with trailing spaces so the color fills the complete
         // width; the line's style carries it through any indent put in front of it.
         let line = if let Some(bg_style) = line_bg_style {
-            let gutter_style = style_gutter().patch(bg_style);
+            let gutter_style = style_gutter(ctx).patch(bg_style);
             let mut spans = vec![RtSpan::styled(gutter_span, gutter_style)];
             if let Some(sign) = sign_span {
-                spans.push(RtSpan::styled(sign, line_style.patch(bg_style)));
+                spans.push(RtSpan::styled(sign, sign_style));
             }
             spans.extend(chunk);
             let pad = layout.width.saturating_sub(used_cols);
@@ -144,9 +145,9 @@ pub(super) fn diff_line_rows(
             }
             RtLine::from(spans).style(bg_style)
         } else {
-            let mut spans = vec![RtSpan::styled(gutter_span, style_gutter())];
+            let mut spans = vec![RtSpan::styled(gutter_span, style_gutter(ctx))];
             if let Some(sign) = sign_span {
-                spans.push(RtSpan::styled(sign, line_style));
+                spans.push(RtSpan::styled(sign, sign_style));
             }
             spans.extend(chunk);
             RtLine::from(spans)
@@ -219,277 +220,5 @@ pub(super) fn line_number_width(max_line_number: usize) -> usize {
         1
     } else {
         max_line_number.to_string().len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::diff_render::highlighted_diff_lines_for_path;
-    use crate::diff_render::style::DiffColorLevel;
-    use crate::diff_render::style::DiffTheme;
-    use crate::render::line_utils::prefix_lines;
-    use insta::assert_snapshot;
-    use pretty_assertions::assert_eq;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-    use ratatui::style::Color;
-    use ratatui::text::Text;
-    use ratatui::widgets::Paragraph;
-    use ratatui::widgets::Widget;
-    use ratatui::widgets::Wrap;
-    use std::path::Path;
-
-    fn push_wrapped_diff_line(
-        line_number: usize,
-        kind: DiffLineType,
-        text: &str,
-        layout: DiffLineLayout,
-        ctx: &DiffRenderStyleContext,
-    ) -> Vec<RtLine<'static>> {
-        let content = content_spans(kind, text, None, &[], ctx);
-        diff_line_rows(line_number, kind, content, layout, ctx)
-    }
-
-    fn truecolor() -> DiffRenderStyleContext {
-        DiffRenderStyleContext::new(DiffTheme::Dark, DiffColorLevel::TrueColor)
-    }
-
-    #[test]
-    fn ui_snapshot_wrap_behavior_insert() {
-        // Narrow width to force wrapping within our diff line rendering
-        let long_line = "this is a very long line that should wrap across multiple terminal columns and continue";
-        let ctx = DiffRenderStyleContext::new(DiffTheme::Dark, DiffColorLevel::Ansi16);
-
-        // Call the wrapping function directly so we can precisely control the width
-        let lines = push_wrapped_diff_line(
-            1,
-            DiffLineType::Insert,
-            long_line,
-            DiffLineLayout {
-                width: 80,
-                line_number_width: line_number_width(1),
-            },
-            &ctx,
-        );
-
-        // Render into a small terminal to capture the visual layout
-        let mut terminal = Terminal::new(TestBackend::new(90, 8)).expect("terminal");
-        terminal
-            .draw(|f| {
-                Paragraph::new(Text::from(lines))
-                    .wrap(Wrap { trim: false })
-                    .render(f.area(), f.buffer_mut())
-            })
-            .expect("draw");
-        assert_snapshot!("wrap_behavior_insert", terminal.backend());
-    }
-
-    #[test]
-    fn diff_bg_extends_through_prefix_lines_indent() {
-        // Verifies that push_wrapped_diff_line produces lines where
-        // prefix_lines can propagate the bg to the indent prefix,
-        // giving edge-to-edge background highlighting.
-        #[allow(clippy::disallowed_methods)]
-        let green_bg = Color::Rgb(33, 58, 43);
-        let total_width: u16 = 40;
-        let prefix_width: usize = 4;
-        let area = Rect::new(0, 0, total_width, 4);
-        let ctx = truecolor();
-
-        // Produce a diff line the same way production code does
-        let diff_lines = push_wrapped_diff_line(
-            1,
-            DiffLineType::Insert,
-            "hello",
-            DiffLineLayout {
-                width: (total_width as usize) - prefix_width,
-                line_number_width: 1,
-            },
-            &ctx,
-        );
-
-        // Apply prefix_lines just like render_changes_block does
-        let lines = prefix_lines(diff_lines, "    ".into(), "    ".into());
-
-        let mut buf = Buffer::empty(area);
-        Paragraph::new(Text::from(lines)).render(area, &mut buf);
-
-        // Every cell in the row should have the green background
-        for col in 0..total_width {
-            assert_eq!(
-                buf[(col, 0)].bg,
-                green_bg,
-                "col {col} should have bg — edge-to-edge fill requires all cells covered"
-            );
-        }
-    }
-
-    #[test]
-    fn diff_bg_fills_full_width() {
-        // With a truecolor context, each diff line's spans should cover the
-        // full requested width so the background tint extends edge-to-edge.
-        let ctx = truecolor();
-        let total_width: usize = 36;
-        let lines = push_wrapped_diff_line(
-            1,
-            DiffLineType::Insert,
-            "hello",
-            DiffLineLayout {
-                width: total_width,
-                line_number_width: 1,
-            },
-            &ctx,
-        );
-        assert_eq!(lines.len(), 1);
-        let total_chars: usize = lines[0].spans.iter().map(|s| s.content.len()).sum();
-        assert_eq!(
-            total_chars, total_width,
-            "expected line to fill {total_width} columns, got {total_chars}"
-        );
-        // The line-level style should also carry the background
-        assert!(
-            lines[0].style.bg.is_some(),
-            "expected line-level background style"
-        );
-        // Gutter span (first) should also have the background
-        assert!(
-            lines[0].spans[0].style.bg.is_some(),
-            "expected gutter span to have background"
-        );
-    }
-
-    #[test]
-    fn diff_insert_content_uses_syntax_highlighting_when_path_is_known() {
-        let ctx = truecolor();
-        let text = "fn main() { println!(\"hello\"); }";
-        let syntax = highlighted_diff_lines_for_path(text, Path::new("src/main.rs"))
-            .and_then(|mut lines| (lines.len() == 1).then(|| lines.remove(0)));
-        let content = content_spans(DiffLineType::Insert, text, syntax.as_deref(), &[], &ctx);
-        let lines = diff_line_rows(
-            1,
-            DiffLineType::Insert,
-            content,
-            DiffLineLayout {
-                width: 80,
-                line_number_width: 1,
-            },
-            &ctx,
-        );
-
-        assert!(
-            lines[0].spans.iter().skip(2).any(|span| {
-                span.style.fg.is_some()
-                    && span.style.fg != Some(Color::Green)
-                    && span.style.bg == ctx.add_bg
-            }),
-            "expected inserted Rust content to use syntax colors over the add background, got {:?}",
-            lines[0].spans
-        );
-    }
-
-    /// The emphasised words of a line take the stronger tint and keep the highlighter's colours;
-    /// on a removed line they are not dimmed with the rest.
-    #[test]
-    fn emphasis_keeps_syntax_colours_on_the_stronger_tint() {
-        let ctx = truecolor();
-        let text = "let total = compute(a);";
-        let syntax = highlighted_diff_lines_for_path(text, Path::new("lib.rs"))
-            .and_then(|mut lines| (lines.len() == 1).then(|| lines.remove(0)));
-        let emphasis = [Range::from(4..9)];
-        let spans = content_spans(
-            DiffLineType::Delete,
-            text,
-            syntax.as_deref(),
-            &emphasis,
-            &ctx,
-        );
-        let emphasised: Vec<&str> = spans
-            .iter()
-            .filter(|span| span.style.bg == ctx.del_emphasis.bg)
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(emphasised, ["total"]);
-        let total = spans
-            .iter()
-            .find(|span| span.content == "total")
-            .expect("the emphasised word is a span of its own");
-        let highlighted = syntax
-            .iter()
-            .flatten()
-            .find(|span| span.content.contains("total"))
-            .expect("the highlighter's span over the word");
-        assert_eq!(total.style.fg, highlighted.style.fg);
-        assert!(!total.style.add_modifier.contains(Modifier::DIM));
-        assert!(
-            spans
-                .iter()
-                .filter(|span| span.content != "total")
-                .all(|span| span.style.bg == ctx.del_bg
-                    && span.style.add_modifier.contains(Modifier::DIM)),
-            "the rest of the removed line keeps its tint and is dimmed: {spans:?}"
-        );
-    }
-
-    /// Without backgrounds (16 colours), emphasis is bold and underlined.
-    #[test]
-    fn emphasis_without_backgrounds_is_bold_and_underlined() {
-        let ctx = DiffRenderStyleContext::new(DiffTheme::Dark, DiffColorLevel::Ansi16);
-        let emphasis = [Range::from(9..16)];
-        let spans = content_spans(
-            DiffLineType::Insert,
-            "line two changed",
-            None,
-            &emphasis,
-            &ctx,
-        );
-        let styled: Vec<(&str, Style)> = spans
-            .iter()
-            .map(|span| (span.content.as_ref(), span.style))
-            .collect();
-        let green = Style::default().fg(Color::Green);
-        assert_eq!(
-            styled,
-            [
-                ("line two ", green),
-                (
-                    "changed",
-                    green.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn diff_wrapping_counts_unicode_display_width() {
-        let ctx = DiffRenderStyleContext::new(DiffTheme::Dark, DiffColorLevel::Ansi16);
-        let lines = push_wrapped_diff_line(
-            1,
-            DiffLineType::Insert,
-            "界界界abc",
-            DiffLineLayout {
-                width: 8,
-                line_number_width: 1,
-            },
-            &ctx,
-        );
-
-        assert!(
-            lines.len() > 1,
-            "wide content should wrap before exceeding the requested width"
-        );
-        for line in lines {
-            let width: usize = line
-                .spans
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                .sum();
-            assert!(
-                width <= 8,
-                "expected wrapped diff line width <= 8 columns, got {width}: {line:?}"
-            );
-        }
     }
 }

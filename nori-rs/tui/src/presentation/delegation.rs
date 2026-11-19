@@ -57,6 +57,12 @@ impl DelegationCall {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         };
+        // The canonical argument is `target`; the others are accepted as synonyms.
+        let target = || {
+            ["target", "to", "actor", "recipient", "task_id", "id"]
+                .iter()
+                .find_map(|key| text(key))
+        };
         Some(match tool {
             "delegate_task" => Self::Delegate {
                 agent: text("agent"),
@@ -74,11 +80,11 @@ impl DelegationCall {
                     .unwrap_or_default(),
             },
             "task_send" => Self::FollowUp {
-                task_id: text("task_id").unwrap_or_default(),
+                task_id: target().unwrap_or_default(),
             },
             "task_wait" => Self::Wait {
                 task_ids: input
-                    .and_then(|input| input.get("task_ids"))
+                    .and_then(|input| input.get("targets").or_else(|| input.get("task_ids")))
                     .and_then(serde_json::Value::as_array)
                     .map(|ids| {
                         ids.iter()
@@ -89,10 +95,10 @@ impl DelegationCall {
                     .unwrap_or_default(),
             },
             "task_status" => Self::Read {
-                task_id: text("task_id").unwrap_or_default(),
+                task_id: target().unwrap_or_default(),
             },
             "task_cancel" => Self::Cancel {
-                task_id: text("task_id").unwrap_or_default(),
+                task_id: target().unwrap_or_default(),
             },
             "task_list" => Self::List,
             "agent_capabilities" => Self::Capabilities,
@@ -173,20 +179,34 @@ pub(crate) fn outcome(result: &str) -> Option<String> {
             return Some(line.to_owned());
         }
     };
+    // What happened, not the tool's internal task ids: those mean nothing to the reader.
     let describe = |task: &serde_json::Value| {
-        let id = task.get("task_id")?.as_str()?;
         let status = task.get("status")?.as_str()?;
-        Some(match status {
-            "starting" | "running" => format!("{id} {status} in the background"),
-            _ => format!("{id} {status}"),
-        })
+        Some(
+            match status {
+                "starting" | "queued" | "pending" => "starting",
+                "running" => "running",
+                other => other,
+            }
+            .to_owned(),
+        )
     };
     if let Some(tasks) = value.get("tasks").and_then(serde_json::Value::as_array) {
-        let described: Vec<String> = tasks.iter().filter_map(describe).collect();
-        return Some(if described.is_empty() {
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for status in tasks.iter().filter_map(describe) {
+            match counts.iter_mut().find(|(seen, _)| *seen == status) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((status, 1)),
+            }
+        }
+        return Some(if counts.is_empty() {
             "no tasks".to_owned()
         } else {
-            described.join(" · ")
+            counts
+                .into_iter()
+                .map(|(status, count)| format!("{count} {status}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
         });
     }
     if let Some(agents) = value.get("agents").and_then(serde_json::Value::as_array) {
@@ -246,12 +266,12 @@ mod tests {
         );
         assert_eq!(
             outcome(r#"{"task_id":"task-1","status":"running","agent":"codex"}"#).as_deref(),
-            Some("task-1 running in the background")
+            Some("running")
         );
         assert_eq!(
             outcome(r#"{"tasks":[{"task_id":"task-1","status":"completed"},{"task_id":"task-2","status":"failed"}]}"#)
                 .as_deref(),
-            Some("task-1 completed · task-2 failed")
+            Some("1 completed · 1 failed")
         );
         assert_eq!(
             outcome("this agent has no model `x`\nmore").as_deref(),

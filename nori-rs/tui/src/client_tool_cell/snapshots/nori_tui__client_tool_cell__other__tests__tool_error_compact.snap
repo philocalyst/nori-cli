@@ -1,7 +1,0 @@
----
-source: tui/src/client_tool_cell/other.rs
-assertion_line: 180
-expression: "project(&failure_cell, 30, false)"
----
-▸ ● execute
-  └ permission denied
