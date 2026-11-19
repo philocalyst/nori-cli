@@ -15,7 +15,10 @@ against the same state the TUI uses.
 Agents that advertise Nori host-tool support get these tools directly instead
 of through the server; see [host-tools.md](host-tools.md). The in-process
 OpenCode adapter uses the `nori-client` MCP server because OpenCode's engine
-runs as a separate local process.
+runs as a separate local process. On its shared service, each session registers
+its own namespaced MCP servers with session permissions that exclude other
+sessions' registrations. The adapter refreshes these connections before a turn
+and removes its registrations when the session closes.
 Everything below about goals, capabilities and the connected gate applies to
 them too, with "initialized `nori-client`" read as "has the session".
 
@@ -28,11 +31,112 @@ The server is intentionally general-purpose: goal tools are the first tenant,
 not the whole API. It should remain the narrow harness-side channel for
 capabilities that ACP does not yet provide directly.
 
-The `conversation` tool accepts a Pkl program and applies ordered conversation
-commands through the same runtime as `HarnessHandle`. Programs, operation
-intents, actor bindings, and results are journaled. See
-[conversation-programs.md](conversation-programs.md) for the command schema and
-replay guarantees.
+The `conversation` tool runs a Pkl program (a module that amends `nori:Program`)
+through the same runtime as `HarnessHandle`. The program's source and outcome are
+journaled in the conversation, and each run keeps its own journal and snapshot
+under `.nori/runs/`. See [programs.md](programs.md) for the schema, recovery and
+replay guarantees. The read-only `conversation_context` tool returns bounded pages
+of canonical context with event IDs, visible bounds and the current head so an
+agent can select history for Pkl context, forks and rewinds.
+
+OpenCode calls carry the invoking provider session in transport metadata
+`_meta["ai.opencode/sessionID"]`. Nori validates it against this backend's root
+binding and observed native child ancestry; unknown or foreign IDs fail rather
+than inheriting root authority. It briefly waits for a racing child announcement.
+Native callers share the root's user control plane, but keep their own task
+ownership, delegation depth, idempotency keys, journal and completion destination.
+A native child's background result queues a prompt to that child even while the
+root is busy. Direct host calls carrying a session ID use the same validation.
+Native child `conversation_context` reads that child's journal. Root goal tools
+and mutating Pkl `conversation` programs currently return an explicit unsupported
+caller-scope error for native children; they never operate on the root implicitly.
+
+## Delegation Tools: Actors, Tasks and Messages
+
+The task tools (`agent_capabilities`, `delegate_task`, `task_send`, `task_status`,
+`task_wait`, `task_cancel`, `task_list`) operate on the tree-wide **actor directory**
+(see the Delegation section of [glossary.md](glossary.md)); their agent-facing text is
+`nori_host_tools::DELEGATION_INSTRUCTIONS` and the tool descriptions in
+`harness/src/backend/orchestrator/tools.rs`.
+
+- One resolver accepts `task-N` (a task the caller started), an alias, `actor://alias`,
+  `actor://<session-id>` and a raw session ID, for every tool, for conversation-program `send`,
+  and for the TUI's subagent controls. An address that names nothing returns an error listing the
+  addressable actors (alias, agent, state), the caller's tasks and the accepted forms. Task IDs
+  are private to the actor that started them; a provider-owned caller (an OpenCode child) sees
+  only its own tasks but can message any actor.
+- `task_send` queues a message for an actor and returns the same actor and task, never a new
+  child. Mail queued for the root session is delivered in a hidden turn only when no turn of any
+  owner is open, and a rewind waits until it is delivered. An idle actor takes it now, a working one at its next turn boundary, `steer: true`
+  interrupts the current turn first, and an ended actor is revived with its history (`outcome:
+  "revived"`). A provider's own child that ended is revived as a managed actor on the same
+  agent with the same session ID, seeded with its recorded history; when that history or its
+  configuration was never recorded, the error says so. Of several senders that find an ended
+  actor at once, exactly one restarts it. A message to the actor's parent-delegated child is a task whose answer returns to
+  the sender; a message to any other actor is mail that the recipient answers with its own
+  `task_send`.
+- `delegate_task` with an `alias` that already names an actor sends it the task (`outcome:
+  "reused"`) instead of starting a duplicate. It reports success only once the child's session
+  is open; a child that cannot start is an error with the cause. A turn that ends with no text and
+  no tool calls fails with an explanation instead of reporting success.
+- The addressed actor is always `target` (`task_send`, `task_status`, `task_cancel`, and
+  `targets` for `task_wait`); `to`, `actor`, `recipient`, `task_id` and `id` are accepted
+  silently and never shown in the schema.
+- A parent can read the mail between its descendants without being woken: `task_list` shows
+  `mail` (the recent messages with delivery states) and `mail_open` (how many are not
+  acknowledged yet; zero means the exchanges are over), and `task_status` on an actor shows the
+  mail involving it. `task_send` with `cc_parent: true` also tells the sender's parent, by one
+  mail from the actor whose turn ended last, when the exchange between the two settles (no mail
+  waiting, neither has a turn open); replies in the exchange keep the setting.
+- Every message has a delivery state (`queued`, `delivered`, `acknowledged`) shown in
+  `task_status`, `task_list` and in the UI's peer-message cards; `queued` is never described as
+  received.
+- Results and replies arrive as new turns. `task_wait` returns at once for a task that nothing
+  returns from (a peer message) or when a message for the caller is waiting, and messages queued
+  for the caller are delivered inline in any task tool result (`inbox`) so a reply never sits
+  behind a blocking call. Repeated unchanged `task_status`/`task_wait` answers tell the caller to
+  stop polling and end its turn.
+- Interrupting the root's turn never stops its children: tasks run on and deliver at the next
+  boundary. They stop on `task_cancel`, an explicit stop, session end, or a discarding rewind.
+- `bash` reports a non-zero exit code as a tool error (`isError`), with the full output in the
+  result.
+
+### Compaction and resume
+
+The directory is tree-wide and outlives any one session. When the root is compacted or replaced
+it is the same root actor under a new session ID, and the checkpoint handed to the new session
+carries a roster in `<subagent-continuity>`: each actor's address, session, agent and model,
+state (with the failure cause when it failed), the headline of its last result, its outstanding
+tasks and pinned facts, plus every message still waiting in a mailbox. A child compacting
+changes what the child remembers, never its identity, alias or state as its parent sees them.
+
+The directory is journaled event-sourced in the root conversation's journal: each change (an
+actor registered, its session started or ended, one task enqueued or changed, a digest pinned)
+is one small `actor-delta` command, and every 200 deltas, at root compaction and at session end
+the whole tree is written as one `actor-snapshot`. A restore folds the latest snapshot and the
+deltas after it, in journal order; rewound records are ignored. A delta is the size of one task,
+so the journal grows linearly with activity. Only the stored text of a result is capped (64 KiB);
+the full text stays in the actor's own journal, which its record names.
+
+On resume the actors come back **ended and dormant**: nothing is spawned, none shows as running,
+and a turn that was in flight when the old run ended is reported as failed with that cause. The
+first message to an actor revives it with its history, after delivering the mail still queued for
+it in order; messages already delivered, and results already read, are never delivered again, and
+mail queued for the root session is delivered once it is idle. Restored grandchildren are owned
+by the root's orchestrator until their parent is revived; the parent's new orchestrator then
+takes over its dormant children. Transcripts without these records load as before.
+
+The root session's own presence in `task_list` follows its turn ledger: working while any turn
+is open, whoever owns it. A child's request that was declined after a cancel, or a child that
+kept working after one, is announced to the user under that child's alias and agent.
+
+## Monitor Tools
+
+`monitor_start`, `monitor_list`, `monitor_stop` and `monitor_rearm` arm and manage background
+watchers whose events wake the agent instead of being polled for. They are served like every other
+`nori-client` tool, with the same sandbox and tool selection, and their guidance
+(`MONITOR_INSTRUCTIONS`) travels with the delegation instructions. A provider's own child session may
+not call them. See [monitors.md](monitors.md).
 
 ## Target Shape
 
