@@ -129,6 +129,19 @@ impl LoginHandler {
                             args: vec!["auth".to_string(), "login".to_string()],
                         },
                     },
+                    AgentKind::Antigravity => AgentLoginSupport::Supported {
+                        agent: AgentKind::Antigravity,
+                        is_installed: info.is_installed,
+                        // The official CLI signs in through its ACP entry point; it may live
+                        // only in Nori's side-by-side install directory, not on PATH.
+                        login_method: LoginMethod::ExternalCli {
+                            command: nori_acp_host::antigravity_cli::discover().map_or_else(
+                                |_| "agy".to_string(),
+                                |install| install.path.to_string_lossy().into_owned(),
+                            ),
+                            args: vec!["acp".to_string(), "--login".to_string()],
+                        },
+                    },
                 }
             }
             None => AgentLoginSupport::Unknown {

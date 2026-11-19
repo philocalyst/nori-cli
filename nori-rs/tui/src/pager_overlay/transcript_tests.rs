@@ -110,17 +110,17 @@ fn a_click_selects_the_message_under_it_on_any_of_its_rows() {
     // The second row of a wrapped, two-line answer belongs to that answer.
     let second_row = row_of(&mut overlay, "Here is why.");
     click(&mut overlay, second_row, now);
-    assert_eq!(overlay.selected_cell(), Some(1));
+    assert_eq!(overlay.highlight_cell, Some(1));
     let prompt = row_of(&mut overlay, "Fix it");
     click(&mut overlay, prompt, now + Duration::from_secs(1));
-    assert_eq!(overlay.selected_cell(), Some(3));
-    assert!(!overlay.has_menu());
+    assert_eq!(overlay.highlight_cell, Some(3));
+    assert!(overlay.menu_cell().is_none());
 
     // Scrolled, the same row shows another message, and the click follows it.
     overlay.view.scroll_offset = 2;
     let row = row_of(&mut overlay, "Fixed.");
     click(&mut overlay, row, now + Duration::from_secs(2));
-    assert_eq!(overlay.selected_cell(), Some(4));
+    assert_eq!(overlay.highlight_cell, Some(4));
 }
 
 #[test]
@@ -133,10 +133,10 @@ fn a_double_click_opens_the_actions_of_one_message() {
     // Two clicks on different messages are two selections.
     click(&mut overlay, prompt, now);
     click(&mut overlay, answer, now + Duration::from_millis(100));
-    assert!(!overlay.has_menu());
+    assert!(overlay.menu_cell().is_none());
     // Two clicks on one message too far apart are too.
     click(&mut overlay, answer, now + Duration::from_millis(900));
-    assert!(!overlay.has_menu());
+    assert!(overlay.menu_cell().is_none());
 
     click(&mut overlay, answer, now + Duration::from_millis(1_100));
     assert_eq!(overlay.menu_cell(), Some(1));
@@ -148,7 +148,7 @@ fn a_double_click_opens_the_actions_of_one_message() {
             choice: MessageChoice::ForkThrough
         })
     );
-    assert!(!overlay.has_menu());
+    assert!(overlay.menu_cell().is_none());
 }
 
 #[test]
@@ -156,17 +156,17 @@ fn brackets_step_between_messages_and_enter_opens_the_actions() {
     let mut overlay = conversation();
     // With nothing selected, `[` picks the newest message.
     key(&mut overlay, KeyCode::Char('['));
-    assert_eq!(overlay.selected_cell(), Some(4));
+    assert_eq!(overlay.highlight_cell, Some(4));
     key(&mut overlay, KeyCode::Char('['));
-    assert_eq!(overlay.selected_cell(), Some(3));
+    assert_eq!(overlay.highlight_cell, Some(3));
     // The continuation of an answer is not a message of its own.
     key(&mut overlay, KeyCode::Char('['));
-    assert_eq!(overlay.selected_cell(), Some(1));
+    assert_eq!(overlay.highlight_cell, Some(1));
     key(&mut overlay, KeyCode::Char('['));
     key(&mut overlay, KeyCode::Char('['));
-    assert_eq!(overlay.selected_cell(), Some(0));
+    assert_eq!(overlay.highlight_cell, Some(0));
     key(&mut overlay, KeyCode::Char(']'));
-    assert_eq!(overlay.selected_cell(), Some(1));
+    assert_eq!(overlay.highlight_cell, Some(1));
     key(&mut overlay, KeyCode::Char('['));
 
     key(&mut overlay, KeyCode::Enter);
@@ -182,7 +182,7 @@ fn brackets_step_between_messages_and_enter_opens_the_actions() {
     // Esc closes the actions without choosing.
     key(&mut overlay, KeyCode::Enter);
     key(&mut overlay, KeyCode::Esc);
-    assert!(!overlay.has_menu());
+    assert!(overlay.menu_cell().is_none());
     assert_eq!(overlay.take_chosen(), None);
 }
 
@@ -200,14 +200,13 @@ fn the_selected_prompt_and_its_actions() {
 fn response_focus_navigates_answers_and_dispatches_actions() {
     let mut overlay = conversation();
     overlay.focus_responses();
-    assert_eq!(overlay.selected_cell(), Some(4));
-    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-    overlay.on_key(ctrl('h'));
-    assert_eq!(overlay.selected_cell(), Some(1));
-    overlay.on_key(ctrl('h'));
-    assert_eq!(overlay.selected_cell(), Some(1));
-    overlay.on_key(ctrl('l'));
-    assert_eq!(overlay.selected_cell(), Some(4));
+    assert_eq!(overlay.highlight_cell, Some(4));
+    key(&mut overlay, KeyCode::Char('['));
+    assert_eq!(overlay.highlight_cell, Some(1));
+    key(&mut overlay, KeyCode::Char('['));
+    assert_eq!(overlay.highlight_cell, Some(1));
+    key(&mut overlay, KeyCode::Char(']'));
+    assert_eq!(overlay.highlight_cell, Some(4));
     key(&mut overlay, KeyCode::Char(' '));
     assert_eq!(
         overlay.take_chosen(),
@@ -216,7 +215,7 @@ fn response_focus_navigates_answers_and_dispatches_actions() {
             choice: MessageChoice::ForkSubagent
         })
     );
-    overlay.on_key(ctrl('h'));
+    key(&mut overlay, KeyCode::Char('['));
     key(&mut overlay, KeyCode::Enter);
     assert_eq!(
         overlay.take_chosen(),
@@ -288,7 +287,7 @@ fn response_navigation_includes_consolidated_markdown() {
     ];
     let mut overlay = TranscriptOverlay::new(cells);
     overlay.focus_responses();
-    assert_eq!(overlay.selected_cell(), Some(1));
-    overlay.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
-    assert_eq!(overlay.selected_cell(), Some(0));
+    assert_eq!(overlay.highlight_cell, Some(1));
+    key(&mut overlay, KeyCode::Char('['));
+    assert_eq!(overlay.highlight_cell, Some(0));
 }

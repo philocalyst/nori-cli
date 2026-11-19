@@ -2,5 +2,3 @@
 #[path = "../src/test_backend.rs"]
 #[allow(dead_code)]
 mod inner;
-
-pub use inner::VT100Backend;

@@ -19,5 +19,5 @@ expression: text(&render(&mut overlay))
 ~
 ~
 ───────────────────────────────────────────────────── 100% ─
- ctrl + h/ctrl + l responses   esc cancel
+ [/] responses   esc cancel
  enter roll back   space fork subagent

@@ -8,7 +8,11 @@ use app::App;
 pub use app::AppExitInfo;
 pub use app::RESUME_HINT_LEAD;
 pub use app::resume_command_for_conversation;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::OutboundProxyPolicy;
+use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
+use codex_login::AuthRouteConfig;
 #[cfg(target_os = "windows")]
 use codex_sandbox::get_platform_sandbox;
 use nori_config::AskForApproval;
@@ -29,11 +33,11 @@ pub use ui_types::TokenUsage;
 
 mod additional_dirs;
 mod app;
-mod app_backtrack;
 mod app_event;
 mod app_event_sender;
 mod bottom_pane;
 mod chatwidget;
+mod choice_picker;
 mod cli;
 mod client_event_format;
 mod client_tool_cell;
@@ -44,22 +48,22 @@ pub mod custom_terminal;
 mod diff_render;
 mod editor;
 mod effective_cwd_tracker;
-mod exec_cell;
 mod exec_command;
 mod file_search;
 pub mod frame_writer;
 mod frames;
 mod get_git_diff;
 mod git_marker;
+mod helix_picker;
 mod history_cell;
-pub mod insert_history;
+mod hyperlink;
 mod key_hint;
 pub mod live_wrap;
 mod login_handler;
+mod login_terminal;
 mod markdown;
 mod markdown_render;
 mod markdown_stream;
-mod native_history;
 mod nori;
 mod overlay_menu;
 mod pager_overlay;
@@ -73,6 +77,7 @@ mod session_log;
 pub mod session_stats;
 mod shimmer;
 mod slash_command;
+mod stage;
 pub mod startup_trace;
 mod status;
 mod status_indicator_widget;
@@ -85,10 +90,11 @@ mod system_info;
 mod terminal_palette;
 mod terminal_title;
 mod text_formatting;
-mod transcript_reflow;
+mod transcript_cells;
 mod tui;
 mod ui_consts;
 mod ui_types;
+mod usage;
 mod viewonly_transcript;
 
 // Nori-specific update modules
@@ -111,7 +117,6 @@ pub(crate) use nori::update_prompt::run_update_prompt_if_needed;
 mod version;
 
 mod wrapping;
-mod written_history;
 
 #[cfg(test)]
 pub mod test_backend;
@@ -387,7 +392,14 @@ async fn run_ratatui_app(
         initial_config.nori_home.clone(),
         false,
         codex_login::AuthCredentialsStoreMode::File,
-    );
+        None,
+        None,
+        AuthKeyringBackendKind::default(),
+        AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+            OutboundProxyPolicy::ReqwestDefault,
+        )),
+    )
+    .await;
     startup_trace::mark("auth_manager");
     let should_show_trust_screen = should_show_trust_screen(&initial_config);
     let should_show_onboarding = !cli.cloud_mode && should_show_trust_screen;
@@ -467,16 +479,26 @@ async fn run_ratatui_app(
             .find_session_metadata_by_id(id_str)
             .await?
         {
-            Some(metadata) => match resume_target_from_metadata(
-                config.nori_home.clone(),
-                metadata,
-                resume_agent_filter,
-            ) {
-                Ok(target) => resume_picker::ResumeSelection::Resume(target),
-                Err(message) => {
-                    return resume_startup_error(&mut tui, message);
+            Some(metadata) => {
+                // A delegated child is never a conversation of its own.
+                if let Err(reason) =
+                    nori_harness::session_index::SessionIndex::open(&config.nori_home)
+                        .refuse_child(&metadata.project_id, &metadata.session_id)
+                        .await
+                {
+                    return resume_startup_error(&mut tui, reason);
                 }
-            },
+                match resume_target_from_metadata(
+                    config.nori_home.clone(),
+                    metadata,
+                    resume_agent_filter,
+                ) {
+                    Ok(target) => resume_picker::ResumeSelection::Resume(target),
+                    Err(message) => {
+                        return resume_startup_error(&mut tui, message);
+                    }
+                }
+            }
             None => {
                 return resume_startup_error(
                     &mut tui,
@@ -496,19 +518,28 @@ async fn run_ratatui_app(
             .list_resumable_session_metadata(filter_cwd, resume_agent_filter)
             .await
         {
-            Ok(sessions) => match sessions.into_iter().next() {
-                Some(metadata) => match resume_target_from_metadata(
-                    config.nori_home.clone(),
-                    metadata,
-                    resume_agent_filter,
-                ) {
-                    Ok(target) => resume_picker::ResumeSelection::Resume(target),
-                    Err(message) => {
-                        return resume_startup_error(&mut tui, message);
-                    }
-                },
-                None => resume_picker::ResumeSelection::StartFresh,
-            },
+            // The most recently active conversation: delegated children are not candidates.
+            Ok(sessions) => {
+                match nori_harness::session_index::SessionIndex::open(&config.nori_home)
+                    .roots(sessions)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                {
+                    Some(metadata) => match resume_target_from_metadata(
+                        config.nori_home.clone(),
+                        metadata,
+                        resume_agent_filter,
+                    ) {
+                        Ok(target) => resume_picker::ResumeSelection::Resume(target),
+                        Err(message) => {
+                            return resume_startup_error(&mut tui, message);
+                        }
+                    },
+                    None => resume_picker::ResumeSelection::StartFresh,
+                }
+            }
             Err(_) => resume_picker::ResumeSelection::StartFresh,
         }
     } else if cli.resume_picker {
@@ -684,6 +715,7 @@ mod tests {
             started_at: "2025-01-01T00:00:00Z".to_string(),
             cwd: PathBuf::from("/tmp/project"),
             agent: agent.map(str::to_string),
+            delegated: false,
         }
     }
 

@@ -4,19 +4,17 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Widget;
 
 use rand::Rng;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
-use crate::exec_cell::spinner;
-use crate::key_hint;
 use crate::render::renderable::Renderable;
 use crate::shimmer::shimmer_spans;
 use crate::tui::FrameRequester;
@@ -56,6 +54,25 @@ pub(crate) const WHIMSICAL_STATUS_MESSAGES: &[&str] = &[
     "Awaiting further instructions from the void",
 ];
 
+/// The dot in front of the status line: it shimmers while the agent works and, on a terminal
+/// without true colour, blinks.
+fn spinner(start_time: Option<Instant>, animations_enabled: bool) -> Span<'static> {
+    if !animations_enabled {
+        return "•".dim();
+    }
+    let elapsed = start_time
+        .map(|started| started.elapsed())
+        .unwrap_or_default();
+    if supports_color::on_cached(supports_color::Stream::Stdout).is_some_and(|level| level.has_16m)
+    {
+        shimmer_spans("•")[0].clone()
+    } else if (elapsed.as_millis() / 600).is_multiple_of(2) {
+        "•".into()
+    } else {
+        "◦".dim()
+    }
+}
+
 pub(crate) const DEFAULT_STATUS_MESSAGE: &str = "Working";
 
 pub(crate) fn random_status_message() -> String {
@@ -82,10 +99,11 @@ pub(crate) fn pick_status_message(custom_working_messages: bool, user_list: &[St
 pub(crate) struct StatusIndicatorWidget {
     /// Animated header text (randomly selected whimsical message by default).
     header: String,
-    show_interrupt_hint: bool,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
+    /// When the work this indicator shows began, for its animation's phase.
+    animation_origin: Instant,
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
@@ -119,9 +137,9 @@ impl StatusIndicatorWidget {
     ) -> Self {
         Self {
             header: pick_status_message(custom_working_messages, &custom_working_message_list),
-            show_interrupt_hint: true,
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
+            animation_origin: Instant::now(),
             is_paused: false,
 
             app_event_tx,
@@ -146,9 +164,9 @@ impl StatusIndicatorWidget {
         &self.header
     }
 
-    pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
-        self.show_interrupt_hint = visible;
-    }
+    /// Kept for callers that still say whether Esc interrupts: the line no longer spells it
+    /// out, so there is nothing to show or hide.
+    pub(crate) fn set_interrupt_hint_visible(&mut self, _visible: bool) {}
 
     pub(crate) fn pause_timer(&mut self) {
         self.pause_timer_at(Instant::now());
@@ -190,6 +208,20 @@ impl StatusIndicatorWidget {
     pub fn elapsed_seconds(&self) -> u64 {
         self.elapsed_seconds_at(Instant::now())
     }
+
+    pub(crate) fn animations_enabled(&self) -> bool {
+        self.animations_enabled
+    }
+
+    /// When the animation started, so its frames are steady across draws.
+    pub(crate) fn started_at(&self) -> Instant {
+        self.animation_origin
+    }
+
+    /// Ask for the next animation frame.
+    pub(crate) fn request_frame_in(&self, delay: Duration) {
+        self.frame_requester.schedule_frame_in(delay);
+    }
 }
 
 impl Renderable for StatusIndicatorWidget {
@@ -218,15 +250,9 @@ impl Renderable for StatusIndicatorWidget {
             spans.push(self.header.clone().into());
         }
         spans.push(" ".into());
-        if self.show_interrupt_hint {
-            spans.extend(vec![
-                format!("({pretty_elapsed} • ").dim(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to interrupt)".dim(),
-            ]);
-        } else {
-            spans.push(format!("({pretty_elapsed})").dim());
-        }
+        // The elapsed time is the only thing worth a second look; what interrupts a turn is
+        // not repeated on every line.
+        spans.push(format!("({pretty_elapsed})").dim());
 
         Line::from(spans).render(area, buf);
     }

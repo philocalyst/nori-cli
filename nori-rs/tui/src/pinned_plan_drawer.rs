@@ -10,14 +10,15 @@ use crate::ui_types::PlanUpdate;
 use crate::ui_types::StepStatus;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Widget;
-use unicode_width::UnicodeWidthStr;
 
+use crate::history_cell::chrome::Chrome;
+use crate::history_cell::chrome::Header;
+use crate::history_cell::chrome::Target;
 use crate::history_cell::render_plan_lines;
 use crate::render::renderable::Renderable;
 
@@ -70,83 +71,39 @@ impl Renderable for PinnedPlanDrawerCollapsed<'_> {
     }
 }
 
-/// Build the collapsed summary line for the plan.
-///
-/// Format: `Plan: X/Y completed  *  > Current: step_name`
+/// The collapsed summary: `◈ Plan  ▸ the step in progress · 2/5`. With nothing in progress the
+/// next pending step is shown, and a finished plan says so.
 fn build_collapsed_line(plan: &[PlanItem], width: usize) -> Line<'static> {
-    let total = plan.len();
-    let completed = plan
+    let chrome = Chrome::live();
+    let done = plan
         .iter()
-        .filter(|s| matches!(s.status, StepStatus::Completed))
+        .filter(|item| matches!(item.status, StepStatus::Completed))
         .count();
-
-    let progress = format!("{completed}/{total} completed");
-    let progress_width = progress.width();
-    let mut spans: Vec<Span<'static>> = vec!["Plan: ".bold(), progress.dim()];
-
-    // Find the current (in-progress) step, or fall back to next pending, or "All done".
-    let current_step = plan
+    let current = plan
         .iter()
-        .find(|s| matches!(s.status, StepStatus::InProgress));
-    let next_pending = plan
+        .find(|item| matches!(item.status, StepStatus::InProgress));
+    let next = plan
         .iter()
-        .find(|s| matches!(s.status, StepStatus::Pending));
-
-    let (label, step_name, use_cyan) = if let Some(step) = current_step {
-        ("Current: ", step.step.clone(), true)
-    } else if let Some(step) = next_pending {
-        ("Next: ", step.step.clone(), false)
-    } else {
-        ("", "All done".to_string(), false)
+        .find(|item| matches!(item.status, StepStatus::Pending));
+    let step = match (current, next) {
+        (Some(item), _) => vec![
+            Span::styled("▸ ", chrome.cyan()),
+            Span::styled(item.step.clone(), chrome.strong()),
+        ],
+        (None, Some(item)) => vec![
+            Span::styled("○ ", chrome.faint()),
+            Span::styled(item.step.clone(), chrome.muted()),
+        ],
+        (None, None) => vec![Span::styled("all done", chrome.mint())],
     };
-
-    // Separator + step info
-    let sep = "  \u{2022}  ";
-    let prefix_marker = "\u{25b8} ";
-
-    // Calculate how much width remains for the step name.
-    let fixed_prefix_width =
-        "Plan: ".width() + progress_width + sep.width() + prefix_marker.width() + label.width();
-
-    if width > fixed_prefix_width + 3 {
-        spans.push(sep.dim());
-        spans.push(prefix_marker.into());
-        if !label.is_empty() {
-            spans.push(label.into());
-        }
-
-        let budget = width.saturating_sub(fixed_prefix_width);
-        let truncated = truncate_to_width(&step_name, budget);
-
-        if use_cyan {
-            spans.push(truncated.cyan().bold());
-        } else if completed == total && total > 0 {
-            spans.push(truncated.green());
-        } else {
-            spans.push(truncated.dim());
-        }
-    }
-
-    Line::from(spans)
-}
-
-/// Truncate a string to fit within `max_width` display columns, appending "..."
-/// if truncation is needed.
-fn truncate_to_width(s: &str, max_width: usize) -> Span<'static> {
-    if s.width() <= max_width {
-        return Span::from(s.to_string());
-    }
-    let ellipsis = "...";
-    let target = max_width.saturating_sub(ellipsis.width());
-    let mut end = 0;
-    let mut w = 0;
-    for ch in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w + cw > target {
-            break;
-        }
-        w += cw;
-        end += ch.len_utf8();
-    }
-    Span::from(format!("{}{ellipsis}", &s[..end]))
+    chrome.header(
+        Header {
+            glyph: Span::styled("◈", chrome.violet()),
+            verb: "Plan".to_owned(),
+            target: Target::Spans(step),
+            chip: Vec::new(),
+            meta: vec![chrome.fact(format!("{done}/{}", plan.len()))],
+        },
+        width,
+    )
 }

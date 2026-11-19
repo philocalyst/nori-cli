@@ -37,6 +37,12 @@ pub(crate) enum Overlay {
     Static(StaticOverlay),
     /// The subagent switcher.
     Subagents(Box<crate::subagent_switcher::SubagentOverlay>),
+    /// Helix-inspired two-pane `/resume` session picker.
+    Resume(Box<crate::resume_picker::helix_overlay::ResumeOverlay>),
+    /// The `/usage` view.
+    Usage(Box<crate::usage::UsageOverlay>),
+    /// A list of choices, as data: see [`crate::choice_picker`].
+    Choice(Box<crate::choice_picker::ChoiceOverlay>),
 }
 
 impl Overlay {
@@ -60,6 +66,9 @@ impl Overlay {
             Overlay::Transcript(o) => o.handle_event(tui, event),
             Overlay::Static(o) => o.handle_event(tui, event),
             Overlay::Subagents(o) => o.handle_event(tui, event),
+            Overlay::Resume(o) => o.handle_event(tui, event),
+            Overlay::Usage(o) => o.handle_event(tui, event),
+            Overlay::Choice(o) => o.handle_event(tui, event),
         }
     }
 
@@ -68,6 +77,9 @@ impl Overlay {
             Overlay::Transcript(o) => o.is_done(),
             Overlay::Static(o) => o.is_done(),
             Overlay::Subagents(o) => o.is_done(),
+            Overlay::Resume(o) => o.is_done(),
+            Overlay::Usage(o) => o.is_done(),
+            Overlay::Choice(o) => o.is_done(),
         }
     }
 }
@@ -85,34 +97,6 @@ const KEY_ENTER: KeyBinding = key_hint::plain(KeyCode::Enter);
 const KEY_CTRL_T: KeyBinding = key_hint::ctrl(KeyCode::Char('t'));
 const KEY_CTRL_C: KeyBinding = key_hint::ctrl(KeyCode::Char('c'));
 const TRANSCRIPT_HISTORY_MAX_LINES: usize = 20;
-
-// Common pager navigation hints rendered on the first line
-const PAGER_KEY_HINTS: &[(&[KeyBinding], &str)] = &[
-    (&[KEY_UP, KEY_DOWN], "to scroll"),
-    (&[KEY_PAGE_UP, KEY_PAGE_DOWN], "to page"),
-    (&[KEY_HOME, KEY_END], "to jump"),
-];
-
-// Render a single line of key hints from (key(s), description) pairs.
-fn render_key_hints(area: Rect, buf: &mut Buffer, pairs: &[(&[KeyBinding], &str)]) {
-    let mut spans: Vec<Span<'static>> = vec![" ".into()];
-    let mut first = true;
-    for (keys, desc) in pairs {
-        if !first {
-            spans.push("   ".into());
-        }
-        for (i, key) in keys.iter().enumerate() {
-            if i > 0 {
-                spans.push("/".into());
-            }
-            spans.push(Span::from(key));
-        }
-        spans.push(" ".into());
-        spans.push(Span::from(desc.to_string()));
-        first = false;
-    }
-    Paragraph::new(vec![Line::from(spans).dim()]).render(area, buf);
-}
 
 /// Where each item of a pager starts, in rows, at one width.
 ///
@@ -540,20 +524,12 @@ impl StaticOverlay {
         }
     }
 
-    fn render_hints(&self, area: Rect, buf: &mut Buffer) {
-        let line1 = Rect::new(area.x, area.y, area.width, 1);
-        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-        render_key_hints(line1, buf, PAGER_KEY_HINTS);
-        let pairs: Vec<(&[KeyBinding], &str)> = vec![(&[KEY_Q], "to quit")];
-        render_key_hints(line2, buf, &pairs);
-    }
-
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let top_h = area.height.saturating_sub(3);
+        let top_h = area.height.saturating_sub(1);
         let top = Rect::new(area.x, area.y, area.width, top_h);
-        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, 1);
         self.view.render(top, buf);
-        self.render_hints(bottom, buf);
+        crate::bottom_pane::render_mode_row(bottom, buf, crate::bottom_pane::StatusMode::View);
     }
 }
 

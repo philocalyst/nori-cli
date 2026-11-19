@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use nori_protocol::acp::v1 as acp;
 use ratatui::text::Line;
 
+pub use crate::choice_picker::choice_specimen;
 use crate::history_cell::HistoryCell;
 use crate::nori::agent_config_state::AgentConfigState;
 use crate::nori::session_header::AgentStatus;
@@ -21,6 +22,11 @@ use crate::nori::session_header::NoriSessionHeaderCell;
 use crate::nori::session_header::SkillsetStatus;
 use crate::nori::session_header::StatusViewModel;
 use crate::nori::token_count::TokenCount;
+pub use crate::resume_picker::specimen::resume_specimen;
+pub use crate::subagent_switcher::specimen::actors_specimen;
+pub use crate::usage::Metric as UsageMetric;
+pub use crate::usage::fixtures::Specimen as UsageSpecimen;
+pub use crate::usage::fixtures::usage_specimen;
 
 /// Render fixture context data using the same history cell as `/context`.
 pub fn context_specimen_lines(used: Option<i64>, width: u16) -> Vec<Line<'static>> {

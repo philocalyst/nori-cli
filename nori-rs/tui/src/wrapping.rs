@@ -390,48 +390,6 @@ pub(crate) fn line_contains_url_like(line: &Line<'_>) -> bool {
     })
 }
 
-pub(crate) fn line_has_mixed_url_and_non_url_tokens(line: &Line<'_>) -> bool {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let mut saw_url = false;
-    let mut saw_non_url = false;
-
-    for raw_token in text.split_ascii_whitespace() {
-        let token = raw_token.trim_matches(|character: char| {
-            matches!(
-                character,
-                '(' | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '<'
-                    | '>'
-                    | ','
-                    | '.'
-                    | ';'
-                    | ':'
-                    | '!'
-                    | '\''
-                    | '"'
-            )
-        });
-        if token.contains("://") || token.starts_with("www.") {
-            saw_url = true;
-        } else if token.chars().any(char::is_alphanumeric)
-            && !(token.chars().all(|character| character.is_ascii_digit())
-                && (raw_token.ends_with('.') || raw_token.ends_with(')')))
-        {
-            saw_non_url = true;
-        }
-    }
-
-    saw_url && saw_non_url
-}
-
 #[allow(private_bounds)]
 pub(crate) fn adaptive_wrap_lines<'a, I, L>(lines: I, options: RtOptions<'a>) -> Vec<Line<'static>>
 where

@@ -21,13 +21,11 @@ use super::KEY_CTRL_T;
 use super::KEY_ENTER;
 use super::KEY_ESC;
 use super::KEY_Q;
-use super::PAGER_KEY_HINTS;
 use super::PagerView;
 use super::message_menu::MenuOutcome;
 use super::message_menu::MessageAction;
 use super::message_menu::MessageChoice;
 use super::message_menu::MessageMenu;
-use super::render_key_hints;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
@@ -47,13 +45,13 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const WHEEL_ROWS: usize = 3;
 const KEY_PREVIOUS_MESSAGE: KeyBinding = key_hint::plain(KeyCode::Char('['));
 const KEY_NEXT_MESSAGE: KeyBinding = key_hint::plain(KeyCode::Char(']'));
-const KEY_PREVIOUS_RESPONSE: KeyBinding = key_hint::ctrl(KeyCode::Char('h'));
-const KEY_NEXT_RESPONSE: KeyBinding = key_hint::ctrl(KeyCode::Char('l'));
+const KEY_PREVIOUS_RESPONSE: KeyBinding = key_hint::plain(KeyCode::Char('['));
+const KEY_NEXT_RESPONSE: KeyBinding = key_hint::plain(KeyCode::Char(']'));
 
 pub(crate) struct TranscriptOverlay {
     pub(super) view: PagerView,
     pub(super) cells: Vec<Arc<dyn HistoryCell>>,
-    highlight_cell: Option<usize>,
+    pub(super) highlight_cell: Option<usize>,
     response_focus: bool,
     /// The last press of the left button, and the cell it was on, to tell a double click.
     last_click: Option<(Instant, usize)>,
@@ -86,10 +84,6 @@ impl TranscriptOverlay {
     pub(crate) fn focus_responses(&mut self) {
         self.response_focus = true;
         self.step_response(true);
-    }
-
-    pub(crate) fn is_response_focus(&self) -> bool {
-        self.response_focus
     }
 
     fn step_response(&mut self, older: bool) {
@@ -195,16 +189,6 @@ impl TranscriptOverlay {
         if let Some(idx) = self.highlight_cell {
             self.view.scroll_chunk_into_view(idx);
         }
-    }
-
-    /// The selected cell, if a message is selected.
-    pub(crate) fn selected_cell(&self) -> Option<usize> {
-        self.highlight_cell
-    }
-
-    /// Whether a message's actions are open; they take every key until closed.
-    pub(crate) fn has_menu(&self) -> bool {
-        self.menu.is_some()
     }
 
     /// The action the user chose for a message, once.
@@ -332,46 +316,16 @@ impl TranscriptOverlay {
         }
     }
 
-    fn render_hints(&self, area: Rect, buf: &mut Buffer) {
-        let line1 = Rect::new(area.x, area.y, area.width, 1);
-        let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
-        if self.response_focus {
-            render_key_hints(
-                line1,
-                buf,
-                &[
-                    (&[KEY_PREVIOUS_RESPONSE, KEY_NEXT_RESPONSE], "responses"),
-                    (&[KEY_ESC], "cancel"),
-                ],
-            );
-            render_key_hints(
-                line2,
-                buf,
-                &[
-                    (&[KEY_ENTER], "roll back"),
-                    (&[super::KEY_SPACE], "fork subagent"),
-                ],
-            );
-            return;
-        }
-        render_key_hints(line1, buf, PAGER_KEY_HINTS);
-        let mut pairs: Vec<(&[KeyBinding], &str)> = vec![
-            (&[KEY_Q], "to quit"),
-            (&[KEY_ESC], "to edit prev"),
-            (&[KEY_PREVIOUS_MESSAGE, KEY_NEXT_MESSAGE], "to select"),
-        ];
-        if self.highlight_cell.is_some() {
-            pairs.push((&[KEY_ENTER], "for actions"));
-        }
-        render_key_hints(line2, buf, &pairs);
-    }
-
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let top_h = area.height.saturating_sub(3);
+        let top_h = area.height.saturating_sub(1);
         let top = Rect::new(area.x, area.y, area.width, top_h);
-        let bottom = Rect::new(area.x, area.y + top_h, area.width, 3);
+        let bottom = Rect::new(area.x, area.y + top_h, area.width, 1);
         self.view.render(top, buf);
-        self.render_hints(bottom, buf);
+        crate::bottom_pane::render_mode_row(
+            bottom,
+            buf,
+            crate::bottom_pane::StatusMode::Transcript,
+        );
         if let Some(menu) = &self.menu {
             let message = self.view.item_rows(menu.cell());
             menu.render(self.view.content_area(top), message, buf);

@@ -364,16 +364,17 @@ the active session. The remaining picker entries are the earlier user messages
 and drive the unchanged rewind-to-message local fork path; agents without fork
 support see only those.
 
-Ctrl+H or Ctrl+L focuses the latest response in the
-shared chat view. The selected response is highlighted in the scrollable
-conversation; Ctrl+H/L move through responses
-and then to the latest sent prompt. The draft remains in the composer. On a
-response, Enter rolls back through it and Space forks a subagent from it; Esc
-cancels. The sent prompt is read-only in this navigation. Nori captures mouse
-input in the chat; desktop terminal text selection generally uses Shift-drag.
-The same controls apply to a focused child with a conversation journal. A child
-without one shows a notice in its chat. Rollback requires the recorded response
-boundary and does not silently substitute a different action when it is absent.
+`Esc` on an empty composer while idle (or `[` in normal mode) focuses the last
+sent prompt in place: it becomes an amber card, everything after it is dimmed,
+`[`/`]` move between prompts, `Enter` edits the prompt where it is, `r` rewinds
+to it (restoring files), `R` rewinds keeping files, `f` forks a subagent from its
+response and `Esc` leaves. A running turn is interrupted by `Esc` instead. The
+whole model lives in `app/focus.rs` and is drawn by `stage/focus.rs`; see
+`docs/tui-stage.md`. The same model walks the prompts of a focused child with a
+conversation journal, where the actions are the journal's rollback and fork; a
+child without one shows a notice in its chat. Rollback requires the recorded
+response boundary and does not silently substitute a different action when it is
+absent. Every rewind ends in `App::fork_conversation_at`.
 
 The transcript overlay (Ctrl+T) captures the mouse while it is open
 (`Tui::set_mouse_capture`, released when it closes and by `tui::restore`), so
@@ -565,27 +566,30 @@ otherwise be handed an EOF'd pipe and exit immediately.
 
 Nori stays on the terminal's primary screen throughout startup, conversation
 navigation, search, response focus, suspend/resume, and shutdown. It never
-enters the alternate screen. Completed main-conversation output is written
-once into native terminal scrollback; resizing does not clear or replay that
-history. The terminal owns scrolling and reflow of the rows already written.
+enters the alternate screen. The **stage** (`stage/`) owns every row from where
+the program started to the bottom of the terminal: the tail of the conversation
+(cells not yet in the scrollback, drawn into the frame and so redrawable) and the
+bottom block (live tail, composer, status line). Rows leave the tail from the top
+only when the region is full: the screen scrolls, the rows that pass the top edge
+are in the scrollback exactly once, and the boundary moves past them. While a
+prompt is focused or a tool card expanded the tail is clipped instead of
+scrolling. Full-screen views (pickers, child conversations, the pager) draw over
+the region without scrolling or committing anything; the next ordinary frame
+draws the tail again. See `docs/tui-stage.md`.
 
-The composer and single-row child strip remain in a bounded live viewport.
-Child conversations and temporary search or response views reuse that primary
-screen viewport. Closing them restores the main composer without copying
-child history into the main conversation's scrollback. Per-cell layout caches
-and a cumulative row index bound the work needed for visible history; a cold
-deep jump or a very large single cell can still require extra layout work.
+Resize events are coalesced into the next draw. The event stream asks the terminal where the
+cursor is after a resize; the difference from where the last frame parked it says how many rows
+the terminal pushed into the scrollback or pulled back. Pushed rows of the tail are marked
+committed, the region is erased row by row and the rest of the tail is drawn again at the new
+width, so the conversation stays visible and no row is drawn twice. Without an answer the context
+is kept and a row may repeat. Composer drafts, cursor positions, selections, and queued messages remain scoped to their
+conversations. See `docs/tui-stage.md`.
 
-Resize events are coalesced into the next draw, including a burst that returns
-to the original dimensions. Live text is laid out at the current width;
-composer drafts, cursor positions, selections, and queued messages remain
-scoped to their conversations.
-
-Native wheel scrolling takes priority on the main conversation. Terminal mouse
-reporting consumes wheel events as well as clicks, so it is enabled only for
-focused child and overlay views. Use conversation search or Ctrl+Tab to enter
-a child, and Tab to return to its parent. Main-screen child cards remain
-visible while the terminal handles scrolling.
+Native wheel scrolling takes priority on the main conversation. The root chat
+leaves mouse reporting off so the terminal owns wheel scrolling and native
+selection. The picker and a focused child temporarily enable application mouse
+capture for their own wheel and click gestures; closing either view restores the
+primary terminal immediately.
 
 #### Startup
 
@@ -622,21 +626,14 @@ thousands is on screen from its first frame. A turn that ends with such a burst
 still unrendered leaves the rest to the frames that follow (`stream_ending`)
 rather than rendering it in one stall; anything shown after it waits for it.
 The width-aware live renderer keeps only the newest rows of a very long
-unfinished paragraph active. A separate unwrapped collector writes completed
-logical lines into native scrollback without inserting hard line breaks, so the
-terminal can reflow them after a resize. For an unusually long unfinished
-paragraph, earlier rows enter scrollback when the paragraph completes; the
-bounded live tail remains visible as it streams. Structured cells retain their
+unfinished paragraph active. Completed cells are handed to the stage, which wraps them to the screen. Structured cells retain their
 own width-aware layouts. On exit, an exceptionally large unfinished line is
 abbreviated in terminal output to keep shutdown responsive; its recorded source
 remains in the conversation journal.
 
-History reaches the terminal through `tui/history_queue.rs`, which writes at
-most 2,000 lines or about 256 KB a frame and asks for the next frame at once
-when more is queued: a burst, a reflow, or a resumed history goes out in
-bounded synchronized updates, its first rows promptly, and no terminal with a
-short timeout for a synchronized update draws one half done. Nothing queued is
-ever dropped.
+Cells reach the screen through the stage (`stage/mod.rs`): a long history, such as a
+resumed session, is typed from the top of the region in one frame and scrolls into the
+scrollback as it goes, each row once and in order.
 
 A prompt submitted while the session is idle is painted at once. Its
 `PromptEchoId` travels in `_meta` on the `session/prompt` request and on every
@@ -644,24 +641,11 @@ A prompt submitted while the session is idle is painted at once. Its
 the chunks whose id it painted: a hash lookup, never a text comparison.
 
 Each frame is written with one `write` through `FrameWriter`, inside one
-synchronized update. The prompt sits at the bottom of the screen: the first frame
-moves what is on screen down with it (blank rows fall in at the top, and only
-blank rows below the viewport fall off), and nothing moves the screen down
-again, because doing so each time the prompt shrinks would put blank rows into
-the middle of the scrollback. The Redraw hotkey (default `ctrl+shift+l`) hides
-everything above the prompt: the next frame scrolls the rows above the viewport
-up into the scrollback, which stays whole (`ESC[2J` and `ESC[3J` are never
-sent), leaves the screen above the prompt empty, and places the prompt at the
-bottom again. History written afterwards fills in above the prompt as usual.
-
-The terminal keeps a record of the history rows it wrote directly above the
-viewport, a screenful at most (`written_history.rs`), so that a repaint can
-write exactly those rows again where they are (`insert_history::repaint_owned_history`,
-requested with `HistoryQueue::request_repaint`; the clear forgets the record,
-since the rows are gone from the screen). The repaint never reads or replaces the
-history queue (`tui/history_queue.rs`), so a line committed in the same frame is
-written exactly once. Rows written at another width, or above a viewport the
-shell moved (after `^Z`), are not Nori's to rewrite and are left as they are.
+synchronized update. The content flows from where the program started and the
+bottom block follows it until the region is full; the Redraw hotkey (default
+`ctrl+l`) pushes everything on screen into the scrollback, which stays whole
+(`ESC[2J` and `ESC[3J` are never sent), and starts a clean region with the composer
+at the top.
 
 The terminal's colors are not asked for before the first frame: a new terminal tab
 can take seconds to answer, and the question held the first paint back for its
@@ -691,11 +675,18 @@ The harness routes child-scoped ACP updates separately from parent output and
 preserves immediate parent IDs for nested children. Nori task tools and native
 provider children share this presentation.
 
-The child strip beneath the composer occupies one row. Bordered icon pills
-stay horizontal at every width; horizontal scrolling and chevrons reveal more
-cards. Actual work orders cards by recency. Idle and completed children remain
-reachable without extra status text or elapsed-time rows. Tapping a card opens
-its conversation; a swipe scrolls without selecting it.
+Running subagents are drawn in the chat as lanes of one tree under `◈ main`
+(`chatwidget/subagents/lanes.rs`), never below the composer and never as a
+separate view. Each child is one row: `● name  agent/model · 12s · latest
+activity`, the state word shown only when it is not `running`. A subtree that
+is not focused is one row (`⋮ 4 nested · ●2 ✓1 ✗1 · what is happening in it`),
+however deep it goes; focusing a child opens the path to it, one row per child,
+each child's own subtree compressed again. With several children running in
+parallel at 100 columns or more the lanes sit side by side as cards of three
+rows (who, what it is doing, what is under it). Idle and finished children
+leave the lanes; a finished child becomes one transcript cell (`✓ name
+agent/model · 1 tool · 34s`, the start of its conclusion, and one row counting
+what finished under it). Tapping a lane opens its conversation.
 
 Ctrl+Tab cycles recently visited conversations. Tab moves to the focused
 conversation's parent. Escape stops work in the focused conversation. Each
@@ -710,13 +701,71 @@ the selected conversation in the shared canvas. `/reference` searches locally
 recorded conversations for the current project; selecting one inserts a bounded
 excerpt and its identifiers into the draft.
 
-Completed tool calls fold into compact summaries. Expanding a read shows its
-file path, line count, and readable content; execution shows the command or
-source, and edits show colored diffs. Unknown structured results use labeled
-fields and lists rather than serialized JSON. Ctrl+E toggles tool details. Expansion is
-scoped to the conversation, and pointer release must match the original target
-so scrolling does not accidentally toggle a tool. The presentation does not
-replace the canonical rich tool result passed through the harness.
+#### Transcript cells
+
+Every cell is drawn from one design system (`history_cell/chrome.rs`) and takes
+its colours from the live theme's tokens, never from names: a status glyph in
+column 0 (`●` done, a spinner while it runs, `●` coral when it failed), text from
+column 2, a one-line header `● Verb target · meta` that is truncated, not
+wrapped, and a body that is collapsed until the cell is expanded. A cell exposes
+`expansion()` / `set_expanded()`; the transcript view's own toggle works on call
+ids and uses the same collapsed and expanded renderers.
+
+- **Reads, searches, listings** (`client_tool_cell/explore.rs`): one call is a
+  line (`● Read src/app.rs:120–180`); several in a row are one card, a header
+  counting them (`● Explored · 5 files · 2 searches`) over a grid of two to
+  four equal tiles by width (`history_cell/bento.rs`), each `◈ dir/file.rs:10–40`;
+  expanded, each tile grows into a few rows of what it returned (a read's first
+  lines numbered and coloured, a search's matching lines with the hit marked). One
+  search is `⌕ “query” in src · 12 matches`. Paths inside the working directory
+  are always relative.
+- **Edits** (`client_tool_cell/edit.rs`): `● Edited path  +14 −4` over the diff,
+  two panes of one width and a single faint divider from 120 columns and unified
+  below, line numbers faint, the changed words on a stronger tint, at most 14 rows collapsed and `⋯ +N more lines`.
+- **Shell** (`history_cell/shell_block.rs`, shared with `!` commands): `$ command`
+  highlighted by brush-parser (`render/bash_highlight.rs`, the only shell
+  highlighter: exec cells, `!` cells, lane activity, picker previews and fenced
+  `bash` blocks all use it), the duration only when it took a second, a non-zero
+  exit as a coral chip, and the tail of the output: the last two rows, six when it
+  failed, `⋮ N earlier lines` above.
+- **Peer messages** (`history_cell/peer.rs`): `✉ reviewer → main · queued`
+  (`delivered`, `acked`, read from `SubagentMessage.delivery`) and the first
+  rows of the body, each name in the style of its provider. The harness
+  re-announces a message as its delivery advances; the card is drawn once.
+- **Who runs it** (`Chrome::identity`): a model is shown by its short name in
+  the theme's `provider_*` style, and the agent only when the model does not
+  say where it ran (`deepseek/v4 via opencode`). Lanes, finished subagents,
+  peer cards and route changes all use it.
+- **Route changes and retries, agent-owned turns**: `⇄ from → to · reason`,
+  `↻ Retrying in 4s · 2/4 · overloaded`, `◈ The agent is working · unprompted`,
+  each one row.
+- **Nori's own words** (`history_cell/notice.rs`): `◇` information, `▲` warning,
+  `✗` error, quiet text. Notices that arrive while a turn runs are one cell, and
+  a notice never lands inside the model's text: the answer being streamed is
+  finished first. An adapter's warning carried in the text stream
+  (`nori_protocol::AGENT_WARNING_PREFIX`) is never conflated with the text around
+  it and is split out wherever it appears in a chunk.
+- **Nothing lands inside a message.** A finished subagent, a peer card, a notice or
+  a route change that arrives while an answer streams waits for the message to be
+  whole and is committed after it (`ChatWidget::add_side_cell`); the harness's
+  message flow does not end a message for subagent or task-result events. A
+  child's `✗` card is live: if the child runs again (its fallback route took over) the card
+  on screen flips to `↻ … continued on another route` in place; a peer card reads its delivery state (shared with the
+  harness's announcements) each frame it is on screen, so it moves from `queued` to
+  `acked` or `failed · reason` in place (`HistoryCell::animated`). A tool call closed after
+  its turn's response updates its cell instead of making a second.
+- **Proposals wait.** A call that asks permission shows `Edit src/x.rs · awaiting
+  approval` with a still glyph, not a spinner and not the past tense.
+- A plan update that only moved steps along draws the new count and the steps that
+  moved, not the whole plan again.
+- A turn that took under ten seconds has no "worked for" rule; longer ones get
+  one faint row with the duration.
+
+Unknown structured results use labeled fields and lists rather than serialized
+JSON. Expansion is scoped to the conversation, and pointer release must match
+the original target so scrolling does not accidentally toggle a tool. The
+presentation does not replace the canonical rich tool result passed through the
+harness.
 
 #### File-change diffs
 
@@ -736,8 +785,10 @@ counterpart. Either way, three unchanged lines are shown around each hunk and
 `⋮` stands for the rest; a hunk's removed lines come before its added ones;
 the header counts are the diff's lines removed and added.
 
-Each line keeps the look Codex uses (right-aligned line numbers, `+`/`-`,
-syntect colours, a tint by theme and colour depth). A changed line that is an
+Each line has right-aligned faint line numbers, `+`/`-` in the accent colours,
+syntax colours from the theme's tokens (`render/syntax_theme.rs` builds the
+syntect theme from them), and the theme's diff tints (`diff_add`, `diff_del`);
+256-colour terminals tint from the xterm palette. A changed line that is an
 edit of another also shows what changed in it, on a stronger tint over the same
 syntax colours (`disparate::layout::segments` cuts the line where colours and
 changes begin and end): in a structural diff, the novel tokens on it (a line
@@ -750,7 +801,7 @@ half. A paired line that was also rewrapped (split, or joined with its
 neighbour) is compared with all the lines it became, and when those have
 nothing new in them the words that only moved are not emphasised. A line new
 throughout is only tinted, as added and removed lines are. On 16-colour terminals, which have no
-tints, the changed words are bold and underlined instead. A diff costs what
+tints, the changed words are bold instead. A diff costs what
 changed, not the file: equal lines are compared as bytes, only the top-level
 items around changes are parsed, and only the lines shown are highlighted.
 Diffs are drawn on the UI thread and cached per width with the cell.
@@ -1082,6 +1133,36 @@ observe the same request on its own stream. The transport retains one remote
 controller, while the fan-out can feed future bounded observers. Policy for
 simultaneous local and remote input is deliberately deferred by the spec.
 
+#### Subagent navigation
+
+The in-chat lanes show running actors only. Once the last actor becomes idle or
+finishes, the lanes and their hit regions disappear. Completed actors remain in
+the transcript and conversation picker.
+
+Ctrl+Space opens the conversation picker. Plain text filters the roster using
+Helix's `nucleo` fuzzy matcher; `%agent`, `%model`, `%status`, `%parent`, and
+`%detail` restrict terms to those fields. For example, `%model deepseek` finds
+children with a reported DeepSeek model, and `%status completed` matches the
+visible `done` status. An unknown model stays unknown rather than inheriting
+the parent's model. Metadata arriving after completion can still update the
+retained entry without making the actor run again.
+
+Press `/` to edit a search, then Enter to keep its matches and use `n`/`N` to
+iterate. Ctrl+N/P and arrow keys move through matches; Ctrl+U clears the query.
+Enter on a selected result focuses its conversation, and Ctrl+Space reopens the
+picker with its search and selection retained. Wide panes show a transcript
+preview beside the list; narrow panes keep the list usable without the preview.
+
+Nested actors are represented as a compact tree. A grandchild is attached to
+its immediate parent and is counted in the one row under that parent;
+grandchild prose is available by opening the child conversation or its preview,
+not by expanding the lanes into a second transcript. Parent completion is
+deferred until known descendants have reported their terminal state, so the
+root row is emitted once with stable sibling ordering. A completed conversation
+can be reactivated only when it reports `running`; late chunks or metadata do
+not resurrect a terminal entry. Reactivation keeps the old archived detail and
+appends the new live detail under the same conversation identity.
+
 #### Footer configuration
 
 The shipped default is a quiet shell. An idle local session shows the agent
@@ -1265,18 +1346,18 @@ configuration; `/status` takes a detached snapshot so printed output does not
 change afterwards. After a
 branch-at-head fork the block also shows a `Forked from` row (the parent
 conversation id): the harness emits `NoriEvent::SessionForked` when it forks the
-transcript, and `on_session_forked` (`@/nori-rs/tui/src/chatwidget/event_handlers.rs`)
-updates `conversation_id`, records `forked_from`, and drops a copy-pasteable
-`nori resume <previous>` hint cell so the previous (now frozen) conversation
-stays resumable.
+transcript, and `on_session_forked` (`@/nori-rs/tui/src/chatwidget/event_handlers/nori.rs`)
+updates `conversation_id`, records `forked_from`, and says so in a notice that
+carries the copy-pasteable `nori resume <previous>` hint, so the previous (now
+frozen) conversation stays resumable.
 
 #### Transcripts and view-only mode
 
 Between `ReplayStarted` and `ReplayFinished`, replayed updates go through the
 same handlers as live ones (`chatwidget/replay.rs`), so a resumed session
 renders as it did live: text that continues across a tool call stays one
-message, and a "Worked for" separator shows the duration its turn ran, which
-the replayed chunk carries (`nori_protocol::turn_elapsed_in_meta`). A replay
+message, and a duration rule shows how long its turn ran when that was ten
+seconds or more, which the replayed chunk carries (`nori_protocol::turn_elapsed_in_meta`). A replay
 has no turn lifecycle; a user message starts a turn and ends the one before,
 doing to the history what the end of a live turn does, and the end of the
 replay ends the last. The cells of a replay go into the transcript only, and
@@ -1314,17 +1395,34 @@ part of the public harness protocol.
 Created and maintained by Nori.
 
 
-Ctrl+H opens response navigation at the latest answer while preserving the
-composer draft. Ctrl+H and Ctrl+L move between answers; moving forward past
-the latest answer focuses the latest sent prompt. Enter rewinds the visible conversation
-through the selected answer and starts a fresh agent session from that history.
-Space starts a background subagent from the selected history while the main
-session remains active. For responses with canonical event boundaries, the log
-retains the original events and records the rewind or fork by those boundaries.
-A response without a usable recorded boundary reports that limitation instead
-of silently substituting a different action. The agent receives reconstructed
-history rather than its former hidden state. Esc
-cancels the selection.
+### Primary-screen rendering, `Ctrl+L` scrollback push, in-place rewind, and Helix pickers
+
+- **Zero alternate screen**: Nori never enters the terminal alternate screen
+  (`EnterAlternateScreen`). All overlays, pickers, subagent previews, and
+  transcript views project inline on the primary screen so native terminal
+  selection and scrollback remain intact at all times.
+- **`Ctrl+L` redraw & scrollback push**: `HotkeyAction::Redraw` (`ctrl+l`) pushes
+  everything on screen cleanly into native terminal scrollback (the stage
+  scrolls it off, see `docs/tui-stage.md`) and starts a clean region with the
+  composer at the top.
+- **Direct in-place focus-backwards rewind & edit**: `Esc` on an empty composer
+  while idle, or `[` in normal mode, focuses the last sent prompt in place inside
+  the chat stream (amber `▌` rail, `↶ Turn K of N` header, `⇣ rolls back below on
+  submit` divider, everything after it dimmed) without touching the composer
+  draft. `[`/`]` or the arrows move between prompts; `Enter` or `e` edits the
+  focused prompt inline and a second `Enter` restores the recorded files, forks
+  before it and sends the edit; `r` rewinds to it (composer prefilled), `R` keeps
+  the files, `f` forks a background subagent from its response; `Esc` leaves.
+- **In-chat subagents & Helix two-pane pickers**: Live and completed subagents
+  render directly inside the chat stream (`InChatSubagents`, clickable via
+  primary-screen SGR mouse) rather than in a strip below the composer. `Ctrl+Space`
+  opens the two-pane Helix subagent search + streaming preview overlay, and
+  `/resume` opens the two-pane Helix full-text transcript search + match-highlighted
+  conversation preview overlay.
+- **In-process `!` `brush` shell**: Prefixing input with `!` executes the command
+  in a persistent in-process `nori-bash` (`brush`) shell (`cd`, `export`,
+  functions, and aliases persist across `!` calls) and renders an AST-highlighted
+  `UserShellCell` directly in chat without claiming an ACP session.
 
 ### Selection-first prompt editing
 

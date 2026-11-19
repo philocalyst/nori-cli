@@ -31,6 +31,8 @@ storybook = []
 workspace = true
 
 [dependencies]
+vt100 = { workspace = true }
+webbrowser = { workspace = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }
@@ -39,6 +41,8 @@ clap = { workspace = true, features = ["derive"] }
 nori-harness = { workspace = true }
 nori-acp-host = { workspace = true }
 nori-config = { workspace = true }
+nori-pkl = { workspace = true }
+nori-bash = { workspace = true }
 nori-host-tools = { workspace = true }
 codex-ansi-escape = { workspace = true }
 codex-arg0 = { workspace = true }
@@ -54,7 +58,11 @@ nori-installed = { workspace = true }
 nori-protocol = { workspace = true }
 codex-file-search = { workspace = true }
 nori-tui-components = { workspace = true }
-codex-login = { workspace = true }
+nucleo-matcher = { workspace = true }
+# Use the vendored SDK's standalone auth crate. Keeping auth out of the legacy
+# nori-rs/core package avoids compiling the old Codex backend for the Nori bin.
+codex-login = { path = "../../vendor/codex/login" }
+codex-http-client = { path = "../../vendor/codex/http-client" }
 codex-utils-pty = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
@@ -128,6 +136,16 @@ required-features = ["storybook"]
 [[example]]
 name = "status_card_storybook"
 path = "examples/status_card_storybook.rs"
+required-features = ["storybook"]
+
+[[example]]
+name = "usage_storybook"
+path = "examples/usage_storybook.rs"
+required-features = ["storybook"]
+
+[[example]]
+name = "lens_storybook"
+path = "examples/lens_storybook.rs"
 required-features = ["storybook"]
 
 [[test]]
