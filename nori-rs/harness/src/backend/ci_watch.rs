@@ -1,45 +1,24 @@
-//! The workflow's CI hooks. After a turn in which the agent pushed its branch, Nori watches the
-//! checks on the pushed commit. Once they decide, it sends the workflow's `on-ci-fail` prompt
-//! with what failed and the end of each failed job's log, or its `on-ci-pass` prompt, as a hidden
-//! turn when the session is idle and the turn budget allows.
+//! The workflow's CI hooks. After a turn in which the agent pushed its branch, Nori arms a `ci`
+//! monitor on the pushed commit (see [`super::monitor`]): the same watcher an agent can arm
+//! itself. The workflow adds its `on-ci-fail` or `on-ci-pass` prompt, which the monitor appends to
+//! the verdict, so the agent is told what CI said and what to do about it, in a turn of its own
+//! when the session is idle and the turn budget allows.
 
-use std::time::Duration;
-use std::time::Instant;
-
-use nori_forge::CheckState;
-use nori_forge::Checks;
-use nori_forge::RunState;
 use nori_workflow::HookEvent;
 use nori_workflow::Workflow;
 
 use super::*;
+use monitor::source::SourceEnv;
+use monitor::spec::CiFollowUp;
+use monitor::spec::Limits;
+use monitor::spec::Rules;
+use monitor::spec::Source;
+use monitor::spec::Spec;
+use monitor::spec::WakeMode;
 use workflow::notice;
 
-/// The waits between reads of a commit's checks; the last repeats.
-const POLLS: [Duration; 4] = [
-    Duration::from_secs(10),
-    Duration::from_secs(15),
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-];
-/// Checks still undecided this long after the push are left alone.
-const GIVE_UP: Duration = Duration::from_secs(45 * 60);
-/// A commit with no checks this long after its push has no CI.
-const NO_CI: Duration = Duration::from_secs(3 * 60);
-/// Reads in a row that may fail before the watch stops.
-const MAX_ERRORS: i64 = 5;
-const LOG_LINES: i64 = 30;
-const LOGS_READ: usize = 3;
-
-/// What CI decided about a pushed commit, ready to go to the agent.
-pub(crate) struct CiReport {
-    generation: i64,
-    event: HookEvent,
-    /// One line for the user.
-    summary: String,
-    /// The detail for the agent.
-    text: String,
-}
+/// The label of the monitor the workflow arms; a newer push replaces it.
+const LABEL: &str = "ci";
 
 /// Whether `workflow` has a prompt for CI's verdict, so pushes are worth watching.
 pub(super) fn hooks_ci(workflow: &Workflow) -> bool {
@@ -83,163 +62,67 @@ impl AcpBackend {
         if generation != self.orchestrator.admission_generation() {
             return;
         }
-        {
+        let follow_up = {
             let mut state = self.workflow.lock().await;
             if pushed == before || state.ci_watching.as_ref() == Some(&pushed) {
                 return;
             }
             state.ci_watching = Some(pushed.clone());
-        }
-        let backend = self.clone();
-        tokio::spawn(async move { backend.watch_ci(pushed, generation).await });
-    }
-
-    async fn watch_ci(&self, sha: String, generation: i64) {
-        let place = match forge_tools::place(self.cwd.clone(), None).await {
-            Ok(place) => place,
-            Err(error) => {
-                notice(&self.backend_event_tx, format!("CI watch: {error}")).await;
-                return;
-            }
-        };
-        let started = Instant::now();
-        let mut waits = POLLS.into_iter().chain(std::iter::repeat(POLLS[3]));
-        let mut errors = 0;
-        loop {
-            tokio::time::sleep(waits.next().unwrap_or(POLLS[3])).await;
-            let superseded = self.workflow.lock().await.ci_watching.as_ref() != Some(&sha);
-            if superseded || self.is_shutting_down.load(Ordering::Relaxed) {
-                return;
-            }
-            let checks = match place.forge.checks(&sha).await {
-                Ok(checks) => checks,
-                Err(error) => {
-                    errors += 1;
-                    if errors >= MAX_ERRORS {
-                        notice(&self.backend_event_tx, format!("CI watch stopped: {error}")).await;
-                        return;
-                    }
-                    continue;
-                }
-            };
-            errors = 0;
-            let event = match checks.state() {
-                // A failure decides, even while other checks run.
-                CheckState::Failing => HookEvent::CiFailed,
-                CheckState::Passing => HookEvent::CiPassed,
-                CheckState::Cancelled => return,
-                CheckState::None if started.elapsed() > NO_CI => return,
-                CheckState::None | CheckState::Pending if started.elapsed() > GIVE_UP => return,
-                CheckState::None | CheckState::Pending => continue,
-            };
-            let report = report(&place, &checks, event, generation).await;
-            {
-                let _admission = self.orchestrator.rewind_admission().await;
-                if generation != self.orchestrator.admission_generation() {
-                    return;
-                }
-                self.workflow.lock().await.ci_owed = Some(report);
-            }
-            self.deliver_ci_if_idle().await;
-            return;
-        }
-    }
-
-    /// Hand the agent what CI said, if the session is idle. A busy session gets it when its
-    /// turn ends. Past the workflow's turn budget, or without a prompt for the verdict, only
-    /// the user is told.
-    pub(super) async fn deliver_ci_if_idle(&self) {
-        if self.session_driver.lock().await.prompt_is_busy() {
-            return;
-        }
-        let (workflow, report, prompt) = {
-            let mut state = self.workflow.lock().await;
-            let Some(report) = state.ci_owed.take() else {
-                return;
-            };
-            if report.generation != self.orchestrator.admission_generation() {
-                return;
-            }
             let Some(workflow) = state.active.clone() else {
                 return;
             };
-            let prompt = workflow.hook_prompts(report.event).collect::<Vec<_>>();
-            let prompt = (!prompt.is_empty() && state.hook_turns < state.hook_budget())
-                .then(|| prompt.join("\n"));
-            if prompt.is_some() {
+            let prompt = |event| {
+                let prompts = workflow.hook_prompts(event).collect::<Vec<_>>();
+                (!prompts.is_empty()).then(|| prompts.join("\n"))
+            };
+            let (on_failed, on_passed) = (prompt(HookEvent::CiFailed), prompt(HookEvent::CiPassed));
+            // Past the workflow's turn budget its prompts are not sent; the verdict still is.
+            let within_budget = state.hook_turns < state.hook_budget();
+            let spent = within_budget && (on_failed.is_some() || on_passed.is_some());
+            if spent {
                 state.hook_turns += 1;
             }
-            (workflow, report, prompt)
-        };
-        let label = format!(
-            "Workflow \"{}\" · {} · {}",
-            workflow.name,
-            report.event.form(),
-            report.summary
-        );
-        match prompt {
-            Some(prompt) => {
-                self.send_hook_turn(
-                    report.generation,
-                    label,
-                    report.event,
-                    format!("{}\n{prompt}", report.text),
-                )
-                .await;
+            CiFollowUp {
+                workflow: workflow.name.clone(),
+                on_failed: on_failed.filter(|_| within_budget),
+                on_passed: on_passed.filter(|_| within_budget),
             }
-            None => notice(&self.backend_event_tx, report.summary).await,
-        }
-    }
-}
-
-/// The report of `checks` on the pushed commit: each failed check with the end of its log, or
-/// how many passed.
-async fn report(
-    place: &forge_tools::Place,
-    checks: &Checks,
-    event: HookEvent,
-    generation: i64,
-) -> CiReport {
-    let short = checks.sha.get(..7).unwrap_or(&checks.sha);
-    let failed: Vec<_> = checks.in_states(&[RunState::Failed]).collect();
-    if event == HookEvent::CiPassed || failed.is_empty() {
-        let passed = checks.in_states(&[RunState::Passed]).count();
-        let summary = format!("CI passed on {short}");
-        return CiReport {
-            generation,
-            event,
-            text: format!("{summary} (`{}`): {passed} checks passed.\n", place.branch),
-            summary,
         };
-    }
-    let names: Vec<&str> = failed.iter().map(|run| run.name.as_str()).collect();
-    let summary = format!("CI failed on {short}: {}", names.join(", "));
-    let logs = failed
-        .iter()
-        .filter_map(|run| run.job)
-        .take(LOGS_READ)
-        .map(|job| async move { (job, place.forge.job_log(job).await.ok()) });
-    let logs: std::collections::HashMap<i64, Option<String>> =
-        futures::future::join_all(logs).await.into_iter().collect();
-    let mut text = format!("CI failed on {short} (`{}`):\n", place.branch);
-    for run in &failed {
-        text.push_str(&format!("- {}", run.name));
-        if let Some(url) = &run.url {
-            text.push_str(&format!(" ({url})"));
+        // A pass nobody asked the agent to act on does not wake it; a failure always does.
+        let wake = if follow_up.on_passed.is_some() {
+            WakeMode::Immediate
+        } else {
+            WakeMode::Boundary
+        };
+        let source = Source::Ci {
+            sha: Some(pushed),
+            branch: None,
+            follow_up: Some(follow_up),
+        };
+        let spec = Spec {
+            label: LABEL.to_owned(),
+            wake,
+            limits: Limits {
+                timeout_seconds: source.default_timeout_seconds(),
+                max_events: 50,
+                batch_ms: source.default_batch_ms(),
+                digest_seconds: 30,
+            },
+            rules: Rules::default(),
+            source,
+        };
+        let armed = async {
+            let env = SourceEnv::prepare(&spec.source, &self.orchestrator, None, &self.cwd).await?;
+            self.orchestrator
+                .monitors()
+                .start(spec, env, true)
+                .await
+                .map(drop)
         }
-        text.push('\n');
-        if let Some(Some(log)) = run.job.and_then(|job| logs.get(&job)) {
-            text.push_str(&format!(
-                "```\n{}```\n",
-                nori_forge::log_excerpt(log, LOG_LINES)
-            ));
+        .await;
+        if let Err(error) = armed {
+            notice(&self.backend_event_tx, format!("CI watch: {error}")).await;
         }
-    }
-    CiReport {
-        generation,
-        event,
-        summary,
-        text,
     }
 }
 
@@ -260,58 +143,5 @@ mod tests {
         assert_eq!(hooks_ci(&workflow), false);
         workflow.hooks.push(hook(HookEvent::CiFailed));
         assert_eq!(hooks_ci(&workflow), true);
-    }
-
-    #[tokio::test]
-    async fn a_failure_report_names_each_failed_check_with_its_log() {
-        use wiremock::Mock;
-        use wiremock::MockServer;
-        use wiremock::ResponseTemplate;
-        use wiremock::matchers::path;
-
-        let server = MockServer::start().await;
-        Mock::given(path("/repos/o/r/actions/jobs/7/logs"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                "2026-11-16T10:00:00.0000001Z error[E0308]: mismatched types\n2026-11-16T10:00:01.0000001Z ##[error]Process completed with exit code 101.\n",
-            ))
-            .mount(&server)
-            .await;
-        let repo = nori_forge::ForgeRepo {
-            host: "github.com".to_owned(),
-            owner: "o".to_owned(),
-            name: "r".to_owned(),
-        };
-        let place = forge_tools::Place {
-            forge: std::sync::Arc::new(nori_forge::Forge::new(
-                repo,
-                server.uri(),
-                Some("t".to_owned()),
-            )),
-            branch: "topic".to_owned(),
-            head: None,
-            remote: "origin".to_owned(),
-            default_branch: None,
-            cwd: std::path::PathBuf::from("/tmp"),
-        };
-        let run = |name: &str, state, job| nori_forge::CheckRun {
-            name: name.to_owned(),
-            state,
-            url: Some(format!("https://ci/{name}")),
-            job,
-        };
-        let checks = Checks {
-            sha: "0123456789".to_owned(),
-            runs: vec![
-                run("test", RunState::Failed, Some(7)),
-                run("lint", RunState::Failed, None),
-                run("build", RunState::Passed, Some(8)),
-            ],
-        };
-        let report = report(&place, &checks, HookEvent::CiFailed, 0).await;
-        assert_eq!(report.summary, "CI failed on 0123456: test, lint");
-        assert_eq!(
-            report.text,
-            "CI failed on 0123456 (`topic`):\n- test (https://ci/test)\n```\nerror[E0308]: mismatched types\nerror: Process completed with exit code 101.\n```\n- lint (https://ci/lint)\n"
-        );
     }
 }
