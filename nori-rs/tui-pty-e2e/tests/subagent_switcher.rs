@@ -1,3 +1,4 @@
+use pretty_assertions::assert_eq;
 use tui_pty_e2e::Key;
 use tui_pty_e2e::TIMEOUT;
 use tui_pty_e2e::TIMEOUT_INPUT;
@@ -9,11 +10,11 @@ use tui_pty_e2e::TuiSession;
 #[test]
 fn ctrl_space_opens_the_switcher_and_closes_it_again() {
     let mut session = TuiSession::spawn(30, 120).unwrap();
+    session.start_output_capture();
     session
         .wait_for_text("›", TIMEOUT)
         .expect("Prompt did not appear");
     std::thread::sleep(TIMEOUT_INPUT);
-
     session.send_key(Key::Ctrl(' ')).unwrap();
     session
         .wait_for_text("No child conversations", TIMEOUT)
@@ -21,6 +22,22 @@ fn ctrl_space_opens_the_switcher_and_closes_it_again() {
     let open = session.screen_contents();
     assert!(open.contains("◇ Conversations"), "{open}");
     assert!(open.contains("main"), "{open}");
+    // Check what a real terminal receives after the picker redraw. Injecting
+    // mouse escape sequences alone would hide a disabled reporting mode.
+    let mut terminal = vt100::Parser::new(30, 120, 0);
+    let output = session.output_bytes().expect("terminal capture");
+    terminal.process(output);
+    let open_bytes = output.len();
+    assert_eq!(
+        (
+            terminal.screen().mouse_protocol_mode(),
+            terminal.screen().mouse_protocol_encoding(),
+        ),
+        (
+            vt100::MouseProtocolMode::AnyMotion,
+            vt100::MouseProtocolEncoding::Sgr
+        )
+    );
 
     session.send_key(Key::Escape).unwrap();
     session
@@ -29,6 +46,11 @@ fn ctrl_space_opens_the_switcher_and_closes_it_again() {
     session
         .wait_for_text("›", TIMEOUT)
         .expect("The prompt did not come back");
+    terminal.process(&session.output_bytes().expect("terminal capture")[open_bytes..]);
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
 
     session.send_key(Key::Ctrl(' ')).unwrap();
     session
@@ -72,9 +94,9 @@ fn the_switcher_takes_typing_and_enter_on_main_returns_to_the_chat() {
     );
 }
 
-/// Ctrl+Tab remains a modified Tab while the switcher uses the primary screen.
+/// Ctrl+Tab cycles through the transient switcher and restores native root scrolling.
 #[test]
-fn kitty_ctrl_tab_works_in_the_primary_screen_switcher() {
+fn kitty_ctrl_tab_returns_from_the_transient_switcher() {
     let mut session = TuiSession::spawn(30, 120).unwrap();
     session
         .wait_for_text("›", TIMEOUT)
@@ -101,36 +123,30 @@ fn kitty_ctrl_tab_works_in_the_primary_screen_switcher() {
             !output
                 .windows(sequence.len())
                 .any(|window| window == sequence),
-            "switcher changed terminal screen"
+            "switcher must stay on the primary screen and never emit alternate-screen escapes"
         );
     }
 }
 
-/// A narrow fresh session accepts wheel and composer tap input before any child exists.
+/// A narrow fresh chat leaves wheel and text-selection ownership with the terminal.
 #[test]
-fn narrow_fresh_session_accepts_wheel_and_composer_tap() {
+fn narrow_fresh_session_keeps_native_mouse_ownership_and_keyboard_editing() {
     let mut session = TuiSession::spawn(25, 30).unwrap();
+    session.start_output_capture();
     session
         .wait_for_text("›", TIMEOUT)
         .expect("prompt did not appear");
-    session.send_str("\x1b[<64;10;5M").unwrap();
-    session.send_str("abcd").unwrap();
+    session.type_input("abcd").expect("draft renders");
+    let mut terminal = vt100::Parser::new(25, 30, 0);
+    terminal.process(session.output_bytes().expect("terminal capture"));
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    session.send_key(Key::Left).unwrap();
+    session.send_key(Key::Left).unwrap();
+    session.type_input("X").expect("inserted character renders");
     session
-        .wait_for_text("abcd", TIMEOUT)
-        .expect("draft did not appear after wheel");
-    let screen = session.screen_contents();
-    let (row, line) = screen
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.contains("abcd"))
-        .expect("draft row");
-    let column = line.split("abcd").next().unwrap().chars().count() + 2;
-    let row = row + 1;
-    session
-        .send_str(&format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m"))
-        .unwrap();
-    session.send_str("X").unwrap();
-    session
-        .wait_for_text("aXbcd", TIMEOUT)
-        .expect("tap did not position the composer cursor");
+        .wait_for_text("abXcd", TIMEOUT)
+        .expect("keyboard editing remains available");
 }

@@ -7,11 +7,17 @@
 //! 4. Transcripts contain expected entries
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::Key;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
 
 /// Find transcript files in NORI_HOME.

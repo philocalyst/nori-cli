@@ -55,9 +55,32 @@ fn config(route_log: &std::path::Path, failure_kind: &str) -> SessionConfig {
         }
     });
     SessionConfig::new()
+        .with_extra_config_toml(
+            r#"
+[[agents]]
+name = "Disabled Claude"
+slug = "claude-code"
+[agents.distribution.local]
+command = "/usr/bin/false"
+[[agents]]
+name = "Disabled Codex"
+slug = "codex"
+[agents.distribution.local]
+command = "/usr/bin/false"
+[[agents]]
+name = "Disabled OpenCode"
+slug = "opencode"
+[agents.distribution.local]
+command = "/usr/bin/false"
+"#,
+        )
         .with_agent_models_json(catalog.to_string())
         .with_agent_env("MOCK_AGENT_VERSIONED_MODEL", "1")
         .with_agent_env("MOCK_AGENT_MODEL_VALUE", MODEL_VALUE)
+        .with_agent_env(
+            "MOCK_AGENT_MODEL_VALUE_MOCK_MODEL_ALT",
+            "provider-b/fixture-1.0",
+        )
         .with_agent_env("MOCK_AGENT_MODEL_DISPLAY", "Fixture 1.0")
         .with_agent_env("MOCK_AGENT_CONFIG_SET_LOG", route_log.display().to_string())
         .with_agent_env("MOCK_AGENT_CONFIG_SET_FAIL_VALUE", MODEL_VALUE)
@@ -72,6 +95,16 @@ fn select_shared_model(session: &mut TuiSession) {
     session
         .type_input("Fixture 1.0")
         .expect("filter to shared model");
+    session
+        .wait_for(
+            |screen| {
+                screen
+                    .lines()
+                    .any(|line| line.contains('⌕') && line.contains("Fixture 1.0"))
+            },
+            TIMEOUT,
+        )
+        .expect("full search query rendered");
     let screen = session.screen_contents();
     // The search field and the single filtered result each contain the label.
     assert_eq!(screen.matches("Fixture 1.0").count(), 2, "{screen}");
@@ -99,12 +132,12 @@ fn quota_rejection_tries_the_alternate_provider_for_one_versioned_row() {
         .wait_for_text("Test message 2", TIMEOUT)
         .expect("initial mock response");
     session
-        .wait_for_text("Mock Default Model", TIMEOUT)
+        .wait_for_text("Mock Default M", TIMEOUT)
         .expect("initial model config is ready");
     select_shared_model(&mut session);
     session
-        .wait_for_text("Fixture 1.0", TIMEOUT)
-        .expect("alternate model applied");
+        .wait_for_text("Mock ACP Alt", TIMEOUT)
+        .expect("alternate provider applied");
     session
         .submit_input("Exercise model route retry")
         .expect("submit prompt");
@@ -138,7 +171,7 @@ fn non_quota_rejection_does_not_try_the_alternate_provider() {
         .wait_for_text("Test message 2", TIMEOUT)
         .expect("initial mock response");
     session
-        .wait_for_text("Mock Default Model", TIMEOUT)
+        .wait_for_text("Mock Default M", TIMEOUT)
         .expect("initial model config is ready");
     select_shared_model(&mut session);
     session
@@ -190,6 +223,12 @@ command = {mock_agent}
 env = {{ MOCK_AGENT_MODEL_NAME = "codex", MOCK_AGENT_VERSIONED_MODEL = "1", MOCK_AGENT_MODEL_VALUE = "gpt-6-astra", MOCK_AGENT_MODEL_DISPLAY = "GPT-6 Astra", MOCK_AGENT_CONFIG_SET_LOG = {route_log_value}, MOCK_AGENT_PROMPT_LOG = {prompt_log_value}, MOCK_AGENT_EXHAUSTED_MODEL = "codex" }}
 [agents.model_override]
 env = "MOCK_AGENT_INJECTED_MODEL"
+
+[[agents]]
+name = "Disabled Claude"
+slug = "claude-code"
+[agents.distribution.local]
+command = "/usr/bin/false"
 "#
     );
     let refreshed_at: i64 = std::time::SystemTime::now()
@@ -209,7 +248,7 @@ env = "MOCK_AGENT_INJECTED_MODEL"
         .with_agent("opencode".to_owned())
         .with_extra_config_toml(extra_config)
         .with_agent_models_json(catalog.to_string());
-    let mut session = TuiSession::spawn_with_config(30, 100, config).unwrap();
+    let mut session = TuiSession::spawn_with_config(30, 140, config).unwrap();
     session.wait_for_text("›", TIMEOUT).unwrap();
     session
         .wait_for_text("OpenCode fixture", TIMEOUT)
@@ -221,7 +260,7 @@ env = "MOCK_AGENT_INJECTED_MODEL"
         .wait_for_text("Warm-up complete", TIMEOUT)
         .expect("initial OpenCode response");
     session
-        .wait_for_text("Mock Default Model", TIMEOUT)
+        .wait_for_text("Mock Default M", TIMEOUT)
         .expect("initial model config is ready");
     session.submit_input("/model").expect("open model picker");
     session
@@ -240,7 +279,12 @@ env = "MOCK_AGENT_INJECTED_MODEL"
         .expect("Codex route selected first");
     session
         .wait_for_text("GPT-6 Astra", TIMEOUT)
-        .expect("selected model activated");
+        .unwrap_or_else(|error| {
+            panic!(
+                "selected model activated: {error}; routes: {:?}",
+                std::fs::read_to_string(&route_log)
+            )
+        });
     session
         .submit_input("Exercise same-model provider fallback")
         .expect("submit prompt");
@@ -313,6 +357,12 @@ command = {mock_agent}
 env = {{ MOCK_AGENT_MODEL_NAME = "codex", MOCK_AGENT_VERSIONED_MODEL = "1", MOCK_AGENT_MODEL_VALUE = "gpt-6-astra", MOCK_AGENT_MODEL_DISPLAY = "GPT-6 Astra", MOCK_AGENT_CONFIG_SET_LOG = {route_log_value}, MOCK_AGENT_PROMPT_LOG = {prompt_log_value}, MOCK_AGENT_RESPONSE = "Codex replied: reply-silver-314", MOCK_AGENT_STARTUP_DELAY_MS_CODEX = "2500" }}
 [agents.model_override]
 env = "MOCK_AGENT_INJECTED_MODEL"
+
+[[agents]]
+name = "Disabled Claude"
+slug = "claude-code"
+[agents.distribution.local]
+command = "/usr/bin/false"
 "#
     );
     let refreshed_at: i64 = std::time::SystemTime::now()
@@ -346,29 +396,51 @@ env = "MOCK_AGENT_INJECTED_MODEL"
     session
         .wait_for_text("hidden-future-reply-990", TIMEOUT)
         .expect("future reply before rewind");
+    let journals_before_rewind = journal_paths(&session);
 
     // Focus the latest response, then move to A/replyA. Enter rolls back
     // through that response while preserving the earlier visible context.
+    session.send_str("\x1b[27u").expect("enter normal mode");
     session
-        .send_key(tui_pty_e2e::Key::Ctrl('h'))
-        .expect("focus latest response");
+        .wait_for_text("NORMAL", TIMEOUT)
+        .expect("normal mode");
+    session.send_str("[").expect("focus latest response");
     session
-        .send_key(tui_pty_e2e::Key::Ctrl('h'))
-        .expect("focus prior response");
+        .wait_for_text("↶", TIMEOUT)
+        .expect("response focus opened");
+    session.send_str("[").expect("focus prior response");
+    session
+        .wait_for_text("Turn 1 of 2", TIMEOUT)
+        .expect("prior response focused");
     session
         .send_key(tui_pty_e2e::Key::Enter)
         .expect("hide future turn");
     session
         .wait_for(
-            |screen| !screen.contains("hidden-future-reply-990"),
+            |_| journals_before_rewind.iter().any(|path| {
+                nori_conversation::ConversationLog::open(path).is_ok_and(|log| {
+                    let rewind = log.records().iter().rev().find_map(|record| {
+                        matches!(record.event, nori_conversation::Event::Rewind { .. }).then_some(record.id)
+                    });
+                    rewind.is_some_and(|rewind| log.projection().visible().iter().any(|record| {
+                        record.id > rewind && matches!(&record.event, nori_conversation::Event::Command { name, .. } if name == "backend-bound")
+                    }))
+                })
+            }),
             TIMEOUT,
         )
-        .expect("future response removed from visible history");
+        .unwrap_or_else(|error| panic!("rewind and binding: {error}; records: {:?}", journals_before_rewind.iter().map(|path| nori_conversation::ConversationLog::open(path).map(|log| log.records().to_vec())).collect::<Vec<_>>()));
     session
         .wait_for_text("OpenCode fixture", TIMEOUT)
         .expect("rewound OpenCode session is ready");
     let branch_journals = journal_paths(&session);
 
+    session
+        .send_str("i")
+        .expect("return composer to insert mode");
+    session
+        .wait_for_text("INSERT", TIMEOUT)
+        .expect("insert mode");
     session.submit_input("/model").expect("open model picker");
     session
         .wait_for_text("Select model", TIMEOUT)

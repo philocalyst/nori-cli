@@ -10,9 +10,13 @@
 //! Requires Chrome/Chromium installed and a display server (X11/Wayland).
 
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
 
 /// Verify Chrome is reachable and the page title was modified.

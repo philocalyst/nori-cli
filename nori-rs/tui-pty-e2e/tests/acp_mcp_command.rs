@@ -1,10 +1,13 @@
 //! E2E tests for /mcp slash command in ACP mode.
 
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
-
 /// Test that /mcp opens the MCP server management picker with configured servers.
 #[test]
 #[cfg(target_os = "linux")]

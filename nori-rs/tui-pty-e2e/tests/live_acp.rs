@@ -8,7 +8,9 @@
 //! - ANTHROPIC_API_KEY for claude-acp tests
 
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
 
 /// Longer timeout for live API tests (network latency, model processing)

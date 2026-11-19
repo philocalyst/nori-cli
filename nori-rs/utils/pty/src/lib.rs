@@ -113,14 +113,27 @@ pub async fn spawn_pty_process(
     env: &HashMap<String, String>,
     arg0: &Option<String>,
 ) -> Result<SpawnedPty> {
+    spawn_pty_process_sized(program, args, cwd, env, arg0, 24, 80).await
+}
+
+/// [`spawn_pty_process`] on a terminal of `rows` by `cols`.
+pub async fn spawn_pty_process_sized(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    arg0: &Option<String>,
+    rows: u16,
+    cols: u16,
+) -> Result<SpawnedPty> {
     if program.is_empty() {
         anyhow::bail!("missing program for PTY spawn");
     }
 
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
+        rows,
+        cols,
         pixel_width: 0,
         pixel_height: 0,
     })?;

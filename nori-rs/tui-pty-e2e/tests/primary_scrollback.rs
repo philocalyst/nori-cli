@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use pretty_assertions::assert_eq;
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
 use tui_pty_e2e::TuiSession;
@@ -31,7 +32,7 @@ fn widening_and_growing_keeps_one_composer_and_its_draft() {
 }
 
 #[test]
-fn primary_history_survives_child_views_resize_and_exit_without_alternate_screen() {
+fn primary_history_survives_child_views_resize_and_exit() {
     let response = (0..45)
         .map(|i| format!("native-history-line-{i:02}"))
         .collect::<Vec<_>>()
@@ -48,14 +49,54 @@ fn primary_history_survives_child_views_resize_and_exit_without_alternate_screen
     session
         .wait_for_text("native-history-line-44", Duration::from_secs(20))
         .expect("response");
+    let before = session.scrollback_contents(20);
+    assert!(before.contains("native-history-line-30"), "{before}");
     let main_output = session.output_bytes().expect("capture");
-    assert!(
-        !main_output
-            .windows(b"\x1b[?1000h".len())
-            .any(|part| part == b"\x1b[?1000h"),
-        "main view must leave native wheel scrolling enabled"
+    let mut terminal = vt100::Parser::new(25, 80, 0);
+    terminal.process(main_output);
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None,
+        "main view must leave wheel and selection to the terminal"
     );
-    session.send_key(Key::Ctrl('h')).expect("focus response");
+    session.submit_input("/model").expect("open model picker");
+    session
+        .wait_for_text("Select model", Duration::from_secs(20))
+        .expect("model picker");
+    let mut terminal = vt100::Parser::new(25, 80, 0);
+    terminal.process(session.output_bytes().expect("capture"));
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::AnyMotion
+    );
+    session.send_key(Key::Enter).expect("select model");
+    session
+        .wait_for(
+            |screen| !screen.contains("Select model"),
+            Duration::from_secs(10),
+        )
+        .expect("picker closed");
+    let mut terminal = vt100::Parser::new(25, 80, 0);
+    terminal.process(session.output_bytes().expect("capture"));
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert!(
+        session
+            .scrollback_contents(20)
+            .contains("native-history-line-30")
+    );
+    session
+        .send_str("\x1b[27u")
+        .expect("enter normal mode for focus-backwards");
+    session
+        .wait_for_text("NORMAL", Duration::from_secs(10))
+        .expect("normal mode");
+    session.send_str("[").expect("focus response");
+    session
+        .wait_for_text("Turn 1 of 1", Duration::from_secs(10))
+        .expect("focused");
     session.send_str(" ").expect("fork response");
     session
         .wait_for_text("History fork", Duration::from_secs(20))
@@ -69,6 +110,12 @@ fn primary_history_survives_child_views_resize_and_exit_without_alternate_screen
     session
         .wait_for_text("child-only draft", Duration::from_secs(20))
         .expect("child draft");
+    let mut terminal = vt100::Parser::new(25, 80, 0);
+    terminal.process(session.output_bytes().expect("capture"));
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::AnyMotion
+    );
     session.send_key(Key::Tab).expect("return to parent");
     session
         .wait_for(
@@ -76,10 +123,24 @@ fn primary_history_survives_child_views_resize_and_exit_without_alternate_screen
             Duration::from_secs(10),
         )
         .expect("parent view restored");
+    let after = session.scrollback_contents(20);
+    assert!(after.contains("native-history-line-30"), "{after}");
+    let mut terminal = vt100::Parser::new(25, 80, 0);
+    terminal.process(session.output_bytes().expect("capture"));
+    assert_eq!(
+        terminal.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
     session.resize(35, 100).expect("resize");
     session
         .wait_for_text("›", Duration::from_secs(10))
         .expect("parent prompt");
+    session
+        .send_str("i")
+        .expect("return parent composer to insert mode");
+    session
+        .wait_for_text("INSERT", Duration::from_secs(10))
+        .expect("insert mode");
     session.submit_input("/quit").expect("quit");
     assert!(
         session.wait_for_process_exit(Duration::from_secs(15)),
@@ -91,28 +152,19 @@ fn primary_history_survives_child_views_resize_and_exit_without_alternate_screen
         !output
             .windows(b"\x1b[?1049h".len())
             .any(|part| part == b"\x1b[?1049h"),
-        "entered alternate screen"
+        "child view must project inline on the primary screen without alternate screen"
     );
     assert!(
         !output
             .windows(b"\x1b[?1049l".len())
             .any(|part| part == b"\x1b[?1049l"),
-        "left an alternate screen"
+        "temporary view must stay on the primary screen without alt-screen leave sequences"
     );
     assert!(
         !output
             .windows(b"\x1b[3J".len())
             .any(|part| part == b"\x1b[3J"),
         "cleared native scrollback"
-    );
-    let found = [0, 10, 20, 30, 40, 50, 60, 80].into_iter().any(|offset| {
-        session
-            .scrollback_contents(offset)
-            .contains("native-history-line-30")
-    });
-    assert!(
-        found,
-        "visible history must move into native scrollback when the child view opens"
     );
 }
 

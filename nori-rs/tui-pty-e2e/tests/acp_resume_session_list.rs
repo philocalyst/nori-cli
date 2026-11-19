@@ -67,6 +67,7 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
         .with_agent("mock-model".to_owned())
         .with_agent_env("MOCK_AGENT_SUPPORT_SESSION_LIST", "1")
         .with_agent_env("MOCK_AGENT_SUPPORT_LOAD_SESSION", "1")
+        .with_agent_env("MOCK_AGENT_LOAD_SESSION_NOTIFICATION_COUNT", "1")
         .with_agent_env(
             "MOCK_AGENT_MODEL_DISPLAY",
             "Long resumed model display name",
@@ -89,6 +90,9 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
         .wait_for_text("Resuming session with", TIMEOUT)
         .expect("resume starts");
     session
+        .wait_for_text("replay chunk 0", TIMEOUT)
+        .expect("resumed widget receives provider history");
+    session
         .wait_for_text("INSERT", TIMEOUT)
         .expect("insert mode after resume");
     session
@@ -110,7 +114,7 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
         "resumed insert mode uses a bar cursor"
     );
     session.start_output_capture();
-    session.send_key(Key::Escape).expect("enter normal mode");
+    session.send_str("\x1b[27u").expect("enter normal mode");
     session
         .wait_for_text("NORMAL", TIMEOUT)
         .expect("normal mode after resume");

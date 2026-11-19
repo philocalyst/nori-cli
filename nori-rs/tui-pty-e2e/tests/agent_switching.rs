@@ -10,10 +10,15 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::Key;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
 use tui_pty_e2e::TuiSession;
 

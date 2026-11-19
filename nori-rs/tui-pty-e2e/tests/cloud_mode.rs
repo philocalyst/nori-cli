@@ -10,9 +10,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
 use tui_pty_e2e::TuiSession;
 

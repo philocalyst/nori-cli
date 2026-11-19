@@ -27,14 +27,20 @@
 //! Success: `"File written successfully"` + optional `"Verified content: ..."`
 //! Failure: `"Failed to write file: ..."` or `"Write restricted ..."`
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::normalize_for_input_snapshot;
-
 /// Test that an ACP agent can create a new file that doesn't exist
 ///
 /// This verifies:

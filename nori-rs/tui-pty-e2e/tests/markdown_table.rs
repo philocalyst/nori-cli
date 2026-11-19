@@ -5,13 +5,18 @@
 //! they stream must therefore withhold a table until it closes, or the finished transcript keeps
 //! a raw `| header |` line and separators of several different widths.
 
+#[cfg(target_os = "linux")]
 use insta::assert_snapshot;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::normalize_for_input_snapshot;
-
 const TABLE_RESPONSE: &str = concat!(
     "Here is a table:\n",
     "\n",

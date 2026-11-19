@@ -139,8 +139,11 @@ fn context_command_renders_unknown_usage_without_prompting_the_agent() {
         .wait_for_text("Waiting for context usage", TIMEOUT)
         .expect("unknown usage");
     session
-        .wait_for_text("Skills observed", TIMEOUT)
-        .expect("context inventory");
+        .wait_for(
+            |screen| screen.contains(PANEL_LAST_ROW) && screen.contains('›'),
+            TIMEOUT,
+        )
+        .expect("complete context inventory and composer");
     let screen = session.screen_contents();
     assert!(
         screen.contains("0 user turns"),

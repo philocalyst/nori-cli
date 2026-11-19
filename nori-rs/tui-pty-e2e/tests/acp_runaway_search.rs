@@ -8,15 +8,21 @@
 //! and presentation are consumer concerns, not behavior of the public boundary.
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tui_pty_e2e::Key;
+#[cfg(target_os = "linux")]
+use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
+use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
+use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
+use tui_pty_e2e::TuiSession;
 
 use pretty_assertions::assert_eq;
 use serde_json::Value;
-use tui_pty_e2e::Key;
-use tui_pty_e2e::SessionConfig;
-use tui_pty_e2e::TIMEOUT;
-use tui_pty_e2e::TIMEOUT_INPUT;
-use tui_pty_e2e::TuiSession;
 
 fn find_transcripts(nori_home: &Path) -> Vec<(String, String)> {
     let transcripts_dir = nori_home.join("transcripts").join("by-project");

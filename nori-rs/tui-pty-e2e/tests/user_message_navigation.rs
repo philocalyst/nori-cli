@@ -6,16 +6,17 @@ use tui_pty_e2e::TuiSession;
 
 fn header_before(screen: &str, marker: &str) -> bool {
     let lines = screen.lines().collect::<Vec<_>>();
-    let Some(header) = lines.iter().position(|line| line.contains("╭─ ‹")) else {
+    let Some(header) = lines.iter().position(|line| line.contains("↶ Turn ")) else {
         return false;
     };
-    let Some(message) = lines.iter().position(|line| line.contains(marker)) else {
+    let Some(message) = lines[header + 1..]
+        .iter()
+        .position(|line| line.contains(marker))
+        .map(|rel| header + 1 + rel)
+    else {
         return false;
     };
-    header < message
-        && lines[header + 1..message]
-            .iter()
-            .all(|line| line.trim().is_empty())
+    message <= header + 2
 }
 
 #[test]
@@ -39,42 +40,40 @@ fn ctrl_h_l_navigate_only_user_messages_and_restore_the_draft() {
             timeout,
         )
         .expect("second answer");
-    session.send_str("draft stays editable").expect("draft");
-    session
-        .wait_for_text("draft stays editable", timeout)
-        .expect("draft visible");
-    session.send_key(Key::Ctrl('h')).expect("latest user");
+    session.type_input("draft stays editable").expect("draft");
+    session.send_str("\x1b[27u").expect("normal mode");
+    session.wait_for_text("NORMAL", timeout).expect("normal");
+    session.send_str("[").expect("latest user");
     session
         .wait_for(
             |screen| header_before(screen, "SECOND-USER-MESSAGE"),
             timeout,
         )
         .expect("latest user selected");
-    session.send_key(Key::Ctrl('h')).expect("older user");
+    session.send_str("[").expect("older user");
     session
         .wait_for(
             |screen| header_before(screen, "FIRST-USER-MESSAGE"),
             timeout,
         )
         .expect("older user selected");
-    session.send_key(Key::Ctrl('l')).expect("newer user");
+    session.send_str("]").expect("newer user");
     session
         .wait_for(
             |screen| header_before(screen, "SECOND-USER-MESSAGE"),
             timeout,
         )
         .expect("newer user selected");
-    session
-        .send_key(Key::Ctrl('l'))
-        .expect("return to composer");
+    session.send_str("]").expect("return to composer");
     session
         .wait_for(
-            |screen| !screen.contains("╭─ ‹") && screen.contains("draft stays editable"),
+            |screen| !screen.contains("↶ Turn ") && screen.contains("draft stays editable"),
             timeout,
         )
         .expect("draft restored automatically");
-    session.send_str("!").expect("continue editing");
+    session.send_str("a!").expect("continue editing");
     session
         .wait_for_text("draft stays editable!", timeout)
         .expect("draft remains editable");
+    let _ = Key::Ctrl('l');
 }

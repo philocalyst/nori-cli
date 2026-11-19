@@ -11,7 +11,9 @@
 //! - `elizacp` for the ElizACP tests (cargo install elizacp)
 
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
 
 /// Longer timeout for live agent tests (subprocess spawn + init)

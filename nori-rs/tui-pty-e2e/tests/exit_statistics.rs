@@ -1,12 +1,19 @@
+#[cfg(target_os = "linux")]
 use insta::assert_snapshot;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::Key;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_INPUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::normalize_for_input_snapshot;
-
 /// Test that exit message appears when quitting with Ctrl+D
 #[test]
 #[cfg(target_os = "linux")]

@@ -5,7 +5,9 @@
 //! 2. The approval bridging infrastructure works correctly
 //! 3. Permission requests from ACP agents are properly displayed in the TUI
 
+#[cfg(target_os = "linux")]
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
 use tui_pty_e2e::TIMEOUT;

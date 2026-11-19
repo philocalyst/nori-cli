@@ -89,24 +89,6 @@ fn wait_for_hosted_session(port: u16) -> (Client, String) {
     }
 }
 
-fn wait_for_replaced_hosted_session(port: u16, previous_session_id: &str) -> (Client, String) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let (client, session_ids) = connect_and_list(port);
-        if let [session_id] = session_ids.as_slice()
-            && session_id != previous_session_id
-        {
-            return (client, session_id.clone());
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for a replacement hosted session; latest catalog: {session_ids:?}"
-        );
-        drop(client);
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 fn latest_loopback_acp_port(screen: &str) -> u16 {
     let regex = regex::Regex::new(r"ws://127\.0\.0\.1:(\d+)/acp").expect("URL regex");
     regex
@@ -257,8 +239,11 @@ fn startup_runtime_disable_reenable_and_agent_switch_share_one_remote_control_ow
         .wait_for_text("Mock Fast Model", Duration::from_secs(10))
         .expect("candidate provider model activation");
 
-    let (mut switched_client, switched_session_id) =
-        wait_for_replaced_hosted_session(runtime_port, &original_session_id);
+    let (mut switched_client, switched_session_id) = wait_for_hosted_session(runtime_port);
+    assert_eq!(
+        switched_session_id, original_session_id,
+        "a model handoff retains the conversation identity"
+    );
     let prompt_after_switch = "remote prompt after switch";
     let response = request(
         &mut switched_client,

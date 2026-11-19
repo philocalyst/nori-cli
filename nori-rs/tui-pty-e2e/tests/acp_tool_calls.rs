@@ -219,7 +219,7 @@ fn test_acp_tool_call_no_duplicate_messages() {
         normalize_for_input_snapshot(contents)
     );
 
-    session.send_key(tui_pty_e2e::Key::Ctrl('e')).unwrap();
+    session.send_str("\x1be").unwrap();
     session
         .wait_for_text("Exit code", Duration::from_secs(10))
         .expect("expanded completed tool shows its exit status");

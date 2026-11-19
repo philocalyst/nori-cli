@@ -34,8 +34,8 @@ fn ctrl_d_exits_from_composer_and_provider_picker_and_restores_terminal() {
         let output =
             String::from_utf8_lossy(session.output_bytes().expect("captured terminal output"));
         assert!(
-            !output.contains("\x1b[?1049"),
-            "quit must not switch terminal screens"
+            !output.contains("\x1b[?1049h") && !output.contains("\x1b[?1049l"),
+            "quit must never emit alternate-screen escape sequences"
         );
         assert!(
             output.contains("\x1b[?2004l"),

@@ -54,14 +54,18 @@ fn older_response_fork_keeps_drafts_and_nested_history_separate() {
         .wait_for_text("FUTURE-RESPONSE-MARKER", timeout)
         .expect("second response");
     session
-        .send_str("PARENT-DRAFT-MARKER")
+        .type_input("PARENT-DRAFT-MARKER")
         .expect("parent draft");
+    session.send_str("\x1b[27u").expect("normal mode");
+    session.wait_for_text("NORMAL", timeout).expect("normal");
+    session.send_str("[").expect("focus latest answer");
     session
-        .send_key(Key::Ctrl('h'))
-        .expect("focus latest answer");
+        .wait_for_text("Turn 2 of 2", timeout)
+        .expect("latest turn");
+    session.send_str("[").expect("focus older answer");
     session
-        .send_key(Key::Ctrl('h'))
-        .expect("focus older answer");
+        .wait_for_text("Turn 1 of 2", timeout)
+        .expect("older turn");
     session.send_str(" ").expect("fork older answer");
     session
         .wait_for_text("History fork", timeout)
@@ -106,10 +110,13 @@ fn older_response_fork_keeps_drafts_and_nested_history_separate() {
             timeout,
         )
         .expect("child answer");
-    session.send_str("CHILD-DRAFT-MARKER").expect("child draft");
     session
-        .send_key(Key::Ctrl('h'))
-        .expect("focus child answer");
+        .type_input("CHILD-DRAFT-MARKER")
+        .expect("child draft");
+    session.send_str("\x1b[27u").expect("normal mode");
+    session.wait_for_text("NORMAL", timeout).expect("normal");
+    session.send_str("[").expect("focus child answer");
+    session.wait_for_text("↶ Turn", timeout).expect("focused");
     session.send_str(" ").expect("nested fork");
     session
         .wait_for(

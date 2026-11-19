@@ -58,7 +58,12 @@ fn resizing_expands_inline_and_transcript_views_to_the_terminal() {
                 .any(|(row, line)| row >= 22 && line.contains("quit"))
     });
     assert!(
-        narrow[..2].iter().all(|row| row.trim().is_empty()),
+        narrow[0].contains("T R A N S C R I P T")
+            && narrow
+                .iter()
+                .filter(|row| row.contains("T R A N S C R I P T"))
+                .count()
+                == 1,
         "stale overlay rows: {narrow:#?}"
     );
     session.resize(43, 122).expect("expand transcript");
@@ -124,11 +129,15 @@ fn response_focus_and_draft_survive_a_resize_burst_returning_to_original_size() 
     session
         .wait_for_text("row-0999", Duration::from_secs(20))
         .expect("long response");
-    session.send_str("preserved draft").expect("type draft");
-    session.send_key(Key::Ctrl('h')).expect("focus response");
+    session.type_input("preserved draft").expect("type draft");
+    session.send_str("\x1b[27u").expect("normal mode");
+    session
+        .wait_for_text("NORMAL", Duration::from_secs(10))
+        .expect("normal mode");
+    session.send_str("[").expect("focus response");
     session
         .wait_for(
-            |screen| screen.contains("╭─ ‹") && screen.contains("large history probe"),
+            |screen| screen.contains("↶ Turn 1 of 1") && screen.contains("large history probe"),
             Duration::from_secs(10),
         )
         .expect("focused sent message");
@@ -138,7 +147,7 @@ fn response_focus_and_draft_survive_a_resize_burst_returning_to_original_size() 
     session
         .wait_for(
             |screen| {
-                screen.contains("╭─ ‹")
+                screen.contains("↶ Turn 1 of 1")
                     && screen.contains("large history probe")
                     && screen
                         .lines()
@@ -164,12 +173,16 @@ fn parent_draft_stays_visible_after_child_switch_and_resize() {
         .wait_for_text("fork source response", Duration::from_secs(20))
         .expect("response");
     session
-        .send_str("draft survives child switch")
+        .type_input("draft survives child switch")
         .expect("type draft");
+    session.send_str("\x1b[27u").expect("normal mode");
     session
-        .wait_for_text("draft survives child switch", Duration::from_secs(10))
-        .expect("draft visible");
-    session.send_key(Key::Ctrl('h')).expect("focus response");
+        .wait_for_text("NORMAL", Duration::from_secs(10))
+        .expect("normal mode");
+    session.send_str("[").expect("focus response");
+    session
+        .wait_for_text("Turn 1 of 1", Duration::from_secs(10))
+        .expect("focused");
     session.send_str(" ").expect("fork response");
     session
         .wait_for_text("History fork", Duration::from_secs(20))
@@ -178,8 +191,11 @@ fn parent_draft_stays_visible_after_child_switch_and_resize() {
         .send_str("\x1b[9;5u")
         .expect("focus fork with Ctrl+Tab");
     session
-        .wait_for_text(
-            "Continue from the conversation above",
+        .wait_for(
+            |screen| {
+                screen.contains("Continue from the conversation above")
+                    && !screen.contains("draft survives child switch")
+            },
             Duration::from_secs(20),
         )
         .expect("child history");

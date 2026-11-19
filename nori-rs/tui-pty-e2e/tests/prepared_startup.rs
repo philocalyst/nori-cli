@@ -352,6 +352,9 @@ fn slash_resume_uses_resume_capability_on_the_prepared_connection() {
         .expect("catalog");
     session.send_key(Key::Down).unwrap();
     session.send_key(Key::Enter).unwrap();
+    session
+        .wait_for(|screen| !screen.contains("First mock session"), TIMEOUT)
+        .expect("picker closed");
 
     let stderr = fake.wait_for_stderr("Mock agent: resume_session id=", TIMEOUT);
     assert_eq!(fake.pid_count(), 1);

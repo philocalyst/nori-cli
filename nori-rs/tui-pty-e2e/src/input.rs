@@ -53,7 +53,16 @@ impl TuiSession {
         self.send_str(input)
             .map_err(|error| format!("type {input:?}: {error}"))?;
         let expected = needle.clone();
+        let slash_command = input.starts_with('/');
         let rendered = move |screen: &str| {
+            if slash_command
+                && screen.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("/ ") && without_whitespace(line).contains(&expected)
+                })
+            {
+                return true;
+            }
             let visible = without_whitespace(screen);
             visible.matches(expected.as_str()).count() > before
         };

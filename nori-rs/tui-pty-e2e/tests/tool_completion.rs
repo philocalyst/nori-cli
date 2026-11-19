@@ -30,7 +30,8 @@ fn interleaved_tool_completes_in_place_and_expands_its_evidence() {
         contents.find("Ran test") < contents.find("Interleaved test done"),
         "{contents}"
     );
-    session.send_key(Key::Ctrl('e')).expect("expand tool");
+    session.send_str("\x1be").expect("expand tool with Alt+E");
+    let _ = Key::Tab;
     session
         .wait_for_text("Exit code", Duration::from_secs(10))
         .expect("expanded exit status");

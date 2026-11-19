@@ -5,10 +5,12 @@ use std::time::Instant;
 use tui_pty_e2e::Key;
 use tui_pty_e2e::SessionConfig;
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
 use tui_pty_e2e::TuiSession;
 use tui_pty_e2e::normalize_for_input_snapshot;
 
+#[cfg(target_os = "linux")]
 fn has_prompt_mode_placeholder(contents: &str) -> bool {
     [
         "? for shortcuts",
@@ -49,9 +51,12 @@ fn test_startup_error_for_unregistered_model() {
     // When acp.allow_http_fallback=false (default) and the model is not registered as an ACP agent,
     // the TUI should start and open the provider picker with the error as its
     // subtitle. History may be outside the viewport while the picker is open.
-    session.wait_for_text("Providers", TIMEOUT).unwrap();
-
-    std::thread::sleep(TIMEOUT_PRESNAPSHOT);
+    session
+        .wait_for(
+            |screen| screen.contains("Providers") && screen.contains("Unknown ACP agent"),
+            TIMEOUT,
+        )
+        .expect("complete recovery picker and startup error");
     let contents = session.screen_contents();
 
     let mut lines = contents.lines();
@@ -100,9 +105,16 @@ fn fresh_home_opens_the_composer_and_accepts_input() {
     session
         .wait_for_text("fresh start prompt", TIMEOUT)
         .expect("composer accepted input");
+    session
+        .wait_for_text("Mock Default Model", TIMEOUT)
+        .expect("agent options are visible for the startup snapshot");
     assert_snapshot!(
         "fresh_startup_composer",
         normalize_for_input_snapshot(session.screen_contents())
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     session
         .send_key(tui_pty_e2e::Key::Enter)

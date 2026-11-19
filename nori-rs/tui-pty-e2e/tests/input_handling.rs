@@ -269,7 +269,9 @@ fn selection_editor_emits_terminal_cursor_shapes() {
     }
 
     session.start_output_capture();
-    session.send_key(Key::Escape).expect("leave selection");
+    // Encode Escape as a complete key event; a bare ESC immediately followed
+    // by `i` is the terminal's encoding of Alt+i.
+    session.send_str("\x1b[27u").expect("leave selection");
     session.send_key(Key::Char('i')).expect("insert mode");
     session
         .wait_for_text("INSERT", TIMEOUT)

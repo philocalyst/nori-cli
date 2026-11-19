@@ -21,8 +21,13 @@ fn pageup_reaches_inherited_long_child_history() {
     session
         .wait_for_text("long-history-line-44", timeout)
         .expect("parent response");
-    session.send_str("ROOT-DRAFT-MARKER").expect("root draft");
-    session.send_key(Key::Ctrl('h')).expect("focus answer");
+    session.type_input("ROOT-DRAFT-MARKER").expect("root draft");
+    session.send_str("\x1b[27u").expect("normal mode");
+    session.wait_for_text("NORMAL", timeout).expect("normal");
+    session.send_str("[").expect("focus answer");
+    session
+        .wait_for_text("Turn 1 of 1", timeout)
+        .expect("focused");
     session.send_str(" ").expect("fork answer");
     session
         .wait_for_text("History fork", timeout)
@@ -33,7 +38,9 @@ fn pageup_reaches_inherited_long_child_history() {
             |screen| {
                 !screen.contains("ROOT-DRAFT-MARKER")
                     && screen.contains("long-history-line-44")
-                    && screen.lines().any(|line| line.contains("│○ History fork"))
+                    // Completed children leave the running-only strip while
+                    // their focused transcript and inherited history remain.
+                    && !screen.contains("History fork")
             },
             timeout,
         )

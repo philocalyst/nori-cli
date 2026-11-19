@@ -177,6 +177,9 @@ fn cloud_prompt_reports_cloud_mode_after_the_agent_connects() {
     session
         .wait_for_text("›", TIMEOUT)
         .expect("cloud prompt ready");
+    session
+        .wait_for_text("Nori Cloud · Mock Default", TIMEOUT)
+        .expect("cloud agent connected");
     assert!(requests.recv_timeout(Duration::from_millis(300)).is_err());
     session
         .submit_input("meaningful cloud work")
@@ -188,6 +191,57 @@ fn cloud_prompt_reports_cloud_mode_after_the_agent_connects() {
     let request = requests
         .recv_timeout(Duration::from_secs(3))
         .expect("cloud analytics request");
+    assert_eq!(
+        request.get("properties"),
+        Some(&serde_json::json!({ "session_mode": "cloud" }))
+    );
+    assert!(requests.recv_timeout(Duration::from_millis(400)).is_err());
+}
+
+#[test]
+fn cloud_prompt_before_connection_remains_an_editable_draft() {
+    let home = authenticated_home();
+    let (handroll_dir, handroll) = fake_handroll();
+    let release = handroll_dir.path().join("release");
+    let (analytics_url, requests) = analytics_server();
+    let config = SessionConfig::new()
+        .with_subcommand("cloud")
+        .with_arg("--onboard")
+        .with_agent_env("HOME", home.path().to_string_lossy())
+        .with_agent_env("NORI_ANALYTICS_URL", analytics_url)
+        .with_agent_env("NORI_HANDROLL_BIN", handroll.to_string_lossy())
+        .with_agent_env(
+            "MOCK_AGENT_NEW_SESSION_RELEASE_FILE",
+            release.to_string_lossy(),
+        );
+    let mut session = TuiSession::spawn_with_config(18, 80, config).expect("spawn Nori cloud");
+    session
+        .wait_for_text("Connecting to Nori Cloud", TIMEOUT)
+        .expect("connection starts");
+    session
+        .submit_input("early cloud draft")
+        .expect("attempt early submission");
+    session.type_input("x").expect("draft remains editable");
+    session
+        .wait_for_text("early cloud draftx", TIMEOUT)
+        .expect("draft preserved");
+    session
+        .send_key(tui_pty_e2e::Key::Backspace)
+        .expect("restore draft");
+    assert!(requests.recv_timeout(Duration::from_millis(300)).is_err());
+    std::fs::write(release, "ready").expect("release connection");
+    session
+        .wait_for_text("Nori Cloud · Mock Default", TIMEOUT)
+        .expect("cloud connected");
+    session
+        .send_key(tui_pty_e2e::Key::Enter)
+        .expect("submit preserved draft");
+    session
+        .wait_for_text("Test message 2", TIMEOUT)
+        .expect("cloud response");
+    let request = requests
+        .recv_timeout(Duration::from_secs(3))
+        .expect("cloud analytics");
     assert_eq!(
         request.get("properties"),
         Some(&serde_json::json!({ "session_mode": "cloud" }))

@@ -1,10 +1,15 @@
+#[cfg(target_os = "linux")]
 use insta::assert_snapshot;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::SessionConfig;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TIMEOUT_PRESNAPSHOT;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::TuiSession;
+#[cfg(target_os = "linux")]
 use tui_pty_e2e::normalize_for_input_snapshot;
-
 #[test]
 #[cfg(target_os = "linux")]
 fn test_footer_displays_git_branch() {
