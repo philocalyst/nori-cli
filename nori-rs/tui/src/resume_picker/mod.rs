@@ -1,26 +1,54 @@
-use std::collections::HashSet;
+//! `/resume`: pick a recorded session. One Helix picker ([`helix_overlay::ResumeOverlay`]) over
+//! the sessions of a project, searched by fuzzy fields and by full text from the on-disk index
+//! (see `nori_harness::session_index`), with a preview of the selected conversation.
+//!
+//! [`run_resume_picker`] hosts the picker before the app starts (`nori resume`); inside the app
+//! the same overlay is shown by the app's overlay machinery.
+
 use std::path::Path;
 use std::path::PathBuf;
 
-use chrono::DateTime;
-use chrono::Utc;
 use color_eyre::eyre::Result;
-use crossterm::event::KeyCode;
-use crossterm::event::KeyEvent;
-use crossterm::event::KeyEventKind;
 use nori_harness::transcript::SessionMetadata;
 use nori_harness::transcript::TranscriptLoader;
 use tokio_stream::StreamExt;
 
-use crate::tui::FrameRequester;
 use crate::tui::Tui;
-use crate::tui::TuiEvent;
 
-mod helpers;
-mod rendering;
-mod state;
-#[cfg(test)]
-mod tests;
+mod background;
+mod helix_entry;
+pub(crate) mod helix_overlay;
+mod preview;
+#[cfg(feature = "storybook")]
+pub mod specimen;
+
+/// A recorded session as the pickers list it.
+#[derive(Debug, Clone)]
+pub struct SessionPickerInfo {
+    pub session_id: String,
+    pub project_id: String,
+    /// When the session started (ISO 8601).
+    pub started_at: String,
+    /// Exact number of user turns, once known.
+    pub user_turn_count: Option<usize>,
+    /// The first user message, once known.
+    pub first_message_preview: Option<String>,
+    /// A delegated child: shown under its parent, never opened on its own.
+    pub delegated: bool,
+}
+
+impl From<SessionMetadata> for SessionPickerInfo {
+    fn from(session: SessionMetadata) -> Self {
+        Self {
+            session_id: session.session_id,
+            project_id: session.project_id,
+            started_at: session.started_at,
+            user_turn_count: None,
+            first_message_preview: None,
+            delegated: session.delegated,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResumeTarget {
@@ -34,106 +62,68 @@ pub struct ResumeTarget {
 pub enum ResumeSelection {
     StartFresh,
     Resume(ResumeTarget),
+    /// Ctrl-C in the picker: quit Nori.
     Exit,
 }
 
-struct TranscriptPage {
-    items: Vec<SessionMetadata>,
-    num_scanned_files: usize,
-}
-
-/// Interactive session picker that lists recorded Nori transcript sessions with simple
-/// search and pagination. Shows the first user input as the preview, relative
-/// time (e.g., "5 seconds ago"), and the absolute path.
+/// Interactive session picker for `nori resume`: lists the recorded sessions of the current
+/// project (or all with `show_all`), optionally of one agent.
 pub async fn run_resume_picker(
     tui: &mut Tui,
     nori_home: &Path,
     agent_filter: Option<&str>,
     show_all: bool,
 ) -> Result<ResumeSelection> {
-    let agent_filter = agent_filter.map(str::to_string);
     let filter_cwd = if show_all {
         None
     } else {
         std::env::current_dir().ok()
     };
+    let loader = TranscriptLoader::new(nori_home.to_path_buf());
+    let sessions: Vec<SessionPickerInfo> = loader
+        .list_resumable_session_metadata(filter_cwd.as_deref(), agent_filter)
+        .await?
+        .into_iter()
+        .map(SessionPickerInfo::from)
+        .collect();
+    let mut overlay = helix_overlay::ResumeOverlay::new_local(sessions, nori_home.to_path_buf());
 
-    let mut state = PickerState::new(
-        nori_home.to_path_buf(),
-        tui.frame_requester(),
-        agent_filter.clone(),
-        show_all,
-        filter_cwd,
-    );
-    state.load_initial_page().await?;
-    state.request_frame();
-
+    tui.frame_requester().schedule_frame();
     let mut tui_events = tui.event_stream().fuse();
-
-    while let Some(ev) = tui_events.next().await {
-        match ev {
-            TuiEvent::Key(key) => {
-                if matches!(key.kind, KeyEventKind::Release) {
-                    continue;
-                }
-                if let Some(sel) = state.handle_key(key).await? {
-                    return Ok(sel);
-                }
+    loop {
+        let Some(event) = tui_events.next().await else {
+            return Ok(ResumeSelection::StartFresh);
+        };
+        overlay.handle_event(tui, event)?;
+        match overlay.take_outcome() {
+            helix_overlay::ResumeOutcome::Pending => {}
+            helix_overlay::ResumeOutcome::Cancelled { .. } => {
+                return Ok(if overlay.was_interrupted() {
+                    ResumeSelection::Exit
+                } else {
+                    ResumeSelection::StartFresh
+                });
             }
-            TuiEvent::Draw => {
-                if let Ok(size) = tui.terminal.size() {
-                    let chrome_height = 6 + u16::from(state.search_active);
-                    let list_height = size.height.saturating_sub(chrome_height) as usize;
-                    state.update_view_rows(list_height);
+            helix_overlay::ResumeOutcome::Selected(action) => match action {
+                helix_overlay::ResumeAction::StartFresh
+                | helix_overlay::ResumeAction::Acp { .. }
+                | helix_overlay::ResumeAction::ViewOnly { .. }
+                | helix_overlay::ResumeAction::Reference { .. } => {
+                    return Ok(ResumeSelection::StartFresh);
                 }
-                rendering::draw_picker(tui, &state)?;
-            }
-            _ => {}
+                helix_overlay::ResumeAction::Local {
+                    nori_home,
+                    project_id,
+                    session_id,
+                } => {
+                    return Ok(ResumeSelection::Resume(ResumeTarget {
+                        nori_home,
+                        project_id,
+                        session_id,
+                        agent: agent_filter.map(str::to_owned),
+                    }));
+                }
+            },
         }
     }
-
-    // Fallback – treat as cancel/new
-    Ok(ResumeSelection::StartFresh)
-}
-
-async fn load_transcript_page(
-    nori_home: &Path,
-    cwd: Option<&Path>,
-    agent_filter: Option<&str>,
-) -> std::io::Result<TranscriptPage> {
-    let loader = TranscriptLoader::new(nori_home.to_path_buf());
-    let items = loader
-        .list_resumable_session_metadata(cwd, agent_filter)
-        .await?;
-    Ok(TranscriptPage {
-        num_scanned_files: items.len(),
-        items,
-    })
-}
-
-struct PickerState {
-    pub(super) nori_home: PathBuf,
-    pub(super) requester: FrameRequester,
-    pub(super) num_scanned_files: usize,
-    pub(super) all_rows: Vec<Row>,
-    pub(super) filtered_rows: Vec<Row>,
-    pub(super) seen_paths: HashSet<PathBuf>,
-    pub(super) selected: usize,
-    pub(super) scroll_top: usize,
-    pub(super) search_active: bool,
-    pub(super) query: String,
-    pub(super) view_rows: Option<usize>,
-    pub(super) agent_filter: Option<String>,
-    pub(super) show_all: bool,
-    pub(super) filter_cwd: Option<PathBuf>,
-}
-
-#[derive(Clone)]
-struct Row {
-    pub(super) target: ResumeTarget,
-    pub(super) preview: String,
-    pub(super) created_at: Option<DateTime<Utc>>,
-    pub(super) updated_at: Option<DateTime<Utc>>,
-    pub(super) cwd: Option<PathBuf>,
-    pub(super) git_branch: Option<String>,
 }
