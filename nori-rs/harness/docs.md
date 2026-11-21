@@ -622,6 +622,14 @@ their activity on their own session IDs; their turn completion marks them idle, 
 turn marks the same session running again while preserving its history. A child's file diffs
 are recorded in the root turn's journal.
 
+When the agent cannot reopen the session (`session/resume` or `session/load` fails, or it
+supports neither), the conversation continues in a new session of the same agent in the same
+directory: the history is painted from the transcript, a summary of it goes to the agent as a
+`<conversation-checkpoint>` with the first prompt (`compact::checkpoint`), and the model, effort
+and mode the transcript last had (`Transcript::last_config_options`) are put back where the new
+session offers them. The person gets one notice with the reason; the failed request's own error
+is not shown as well (`backend/resume_fallback.rs`).
+
 Resuming with the local transcript at hand prefers `session/resume`, which
 costs the same however long the session is, and paints the history from the
 transcript; `session/load` is used when there is no transcript. Transcripts

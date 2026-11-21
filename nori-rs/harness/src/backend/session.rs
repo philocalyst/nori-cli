@@ -230,6 +230,64 @@ impl AcpBackend {
         // its own events (SessionConfigured, Warning, etc.) to event_tx,
         // because the relay can fill the bounded channel and block
         // resume_session from sending.
+        let load_sid = acp_session_id.filter(|_| {
+            supports_load_session && !(supports_session_resume && transcript.is_some())
+        });
+        // Live reattach (`session/resume`) is tried first, so that a session the agent no longer
+        // knows (a different process, a deleted session, a world's scripted agent) can still be
+        // continued from the local transcript when there is one.
+        let mut resume_failure: Option<String> = None;
+        let mut resume_failure_request_id = None;
+        let live_resumed =
+            match acp_session_id.filter(|_| load_sid.is_none() && supports_session_resume) {
+                Some(sid) => {
+                    let mcp_servers = session_mcp_servers(
+                        config,
+                        &connection,
+                        &thread_goal_state,
+                        &backend_event_tx,
+                        &goal_mcp_connected,
+                        &goal_mcp_http_server,
+                        &orchestrator,
+                        &workflow,
+                    )
+                    .await?;
+                    let (request_started_tx, request_started_rx) = tokio::sync::oneshot::channel();
+                    let result = connection
+                        .resume_session_with_request_started(
+                            sid,
+                            &cwd,
+                            mcp_servers,
+                            Some(request_started_tx),
+                        )
+                        .await;
+                    let request_id = request_started_rx.await.ok();
+                    match result {
+                        Ok(session_id) => {
+                            debug!("ACP session resumed via session/resume: {sid}");
+                            Some(session_id)
+                        }
+                        // The conversation continues in a new session of the same agent, from
+                        // its transcript.
+                        Err(error) if transcript.is_some() => {
+                            warn!("Live session/resume failed: {error:#}");
+                            warn!("Falling back to a new session from the transcript");
+                            resume_failure = Some(resume_fallback::why(&error));
+                            resume_failure_request_id = request_id;
+                            None
+                        }
+                        // Without a transcript there is nothing to continue from, and a fresh
+                        // session would abandon the one the caller asked to reattach to.
+                        Err(error) => {
+                            let setup_events =
+                                drain_setup_session_events(&mut event_rx, &config.agent)?;
+                            forward_setup_session_events(&backend_event_tx, setup_events).await?;
+                            return Err(enhance_agent_error(error, &agent_config));
+                        }
+                    }
+                }
+                None => None,
+            };
         let (
             session_id,
             pending_summary,
@@ -239,11 +297,9 @@ impl AcpBackend {
             deferred_replay_client_events,
             mut deferred_replay_batches,
             event_rx,
-            session_driver_state,
+            mut session_driver_state,
             held_requests,
-        ) = if let Some(sid) = acp_session_id
-            .filter(|_| supports_load_session && !(supports_session_resume && transcript.is_some()))
-        {
+        ) = if let Some(sid) = load_sid {
             debug!("Agent supports session/load — using server-side resume");
 
             // Collect replay events into a buffer. The collector runs until
@@ -492,7 +548,7 @@ impl AcpBackend {
                             .await?;
                         return Err(enhance_agent_error(e, &agent_config));
                     };
-                    warn!("Falling back to client-side transcript replay");
+                    warn!("Falling back to a new session from the transcript");
 
                     let mcp_servers = session_mcp_servers(
                         config,
@@ -526,6 +582,13 @@ impl AcpBackend {
                         )
                         .await;
                     }
+                    resume_fallback::restore_dials(
+                        &connection,
+                        &session_id,
+                        transcript,
+                        &config.nori_home,
+                    )
+                    .await;
                     setup_session_events.extend(drain_setup_session_events(
                         &mut recovered_rx,
                         &config.agent,
@@ -557,7 +620,7 @@ impl AcpBackend {
                         session_id,
                         summary,
                         true,
-                        Some(e.to_string()),
+                        Some(resume_fallback::why(&e)),
                         setup_session_events,
                         replay_events,
                         replay_batches,
@@ -567,36 +630,11 @@ impl AcpBackend {
                     )
                 }
             }
-        } else if let Some(sid) = acp_session_id.filter(|_| supports_session_resume) {
-            debug!("Agent supports session/resume — using live reattach");
-
-            // Live reattach (`session/resume`) costs the same however long the session is: the
-            // agent keeps its context and replays nothing. When the local transcript is at hand
-            // the history is painted from it, which is preferred over `session/load` because the
-            // agent would otherwise stream the whole session back before anything is shown.
-            // Failures propagate instead of falling back to `session/new`,
-            // which would abandon the session the user selected.
-            let mcp_servers = session_mcp_servers(
-                config,
-                &connection,
-                &thread_goal_state,
-                &backend_event_tx,
-                &goal_mcp_connected,
-                &goal_mcp_http_server,
-                &orchestrator,
-                &workflow,
-            )
-            .await?;
-
-            let session_id = match connection.resume_session(sid, &cwd, mcp_servers).await {
-                Ok(session_id) => session_id,
-                Err(error) => {
-                    let setup_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
-                    forward_setup_session_events(&backend_event_tx, setup_events).await?;
-                    return Err(enhance_agent_error(error, &agent_config));
-                }
-            };
-            debug!("ACP session resumed via session/resume: {sid}");
+        } else if let Some(session_id) = live_resumed {
+            // Live reattach costs the same however long the session is: the agent keeps its
+            // context and replays nothing. When the local transcript is at hand the history is
+            // painted from it, which is preferred over `session/load` because the agent would
+            // otherwise stream the whole session back before anything is shown.
             let setup_session_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
             let history = transcript
                 .and_then(|transcript| {
@@ -649,7 +687,20 @@ impl AcpBackend {
                 session_defaults::apply_default_model(&connection, &session_id, default_model)
                     .await;
             }
-            let setup_session_events = drain_setup_session_events(&mut event_rx, &config.agent)?;
+            if let Some(transcript) = transcript {
+                resume_fallback::restore_dials(
+                    &connection,
+                    &session_id,
+                    transcript,
+                    &config.nori_home,
+                )
+                .await;
+            }
+            let mut setup_session_events =
+                drain_setup_session_events(&mut event_rx, &config.agent)?;
+            if let Some(request_id) = resume_failure_request_id {
+                resume_fallback::bracket_failed_resume(&mut setup_session_events, request_id);
+            }
 
             let (replay_events, replay_session_events, summary) = if let Some(t) = transcript {
                 let client_events = transcript_to_replay_client_events(t);
@@ -665,11 +716,17 @@ impl AcpBackend {
                 (Vec::new(), Vec::new(), None)
             };
 
+            // An agent that cannot reopen sessions at all also continues in a new one, and says so.
+            let continued_because = resume_failure.or_else(|| {
+                (acp_session_id.is_some() && transcript.is_some())
+                    .then(|| "this agent cannot reopen earlier sessions".to_owned())
+            });
+
             (
                 session_id,
                 summary,
                 true,
-                None,
+                continued_because,
                 setup_session_events,
                 replay_events,
                 ReplayBatch::new(
@@ -1166,15 +1223,11 @@ impl AcpBackend {
             .await
             .ok();
 
-        if let Some(ref fallback_error) = used_fallback {
+        if let Some(ref reason) = used_fallback {
             backend_event_tx
                 .send(BackendEvent::Public(SessionEvent::Nori(
                     nori_protocol::NoriEvent::Notice(nori_protocol::Notice {
-                        message: format!(
-                            "Server-side session restore failed ({fallback_error}). \
-                             Falling back to transcript replay. The restored session \
-                             will not have tool call information in the context."
-                        ),
+                        message: resume_fallback::notice(reason),
                     }),
                 )))
                 .await

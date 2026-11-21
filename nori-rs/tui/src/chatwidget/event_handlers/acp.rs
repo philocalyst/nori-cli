@@ -5,6 +5,15 @@ use super::*;
 
 impl ChatWidget {
     pub(super) fn handle_acp_event(&mut self, event: nori_protocol::AcpEvent) {
+        let resume_load_response = match &event {
+            nori_protocol::AcpEvent::Response { request_id, .. }
+                if self.resume_load_request_id.as_ref() == Some(request_id) =>
+            {
+                self.resume_load_request_id = None;
+                true
+            }
+            _ => false,
+        };
         match event {
             nori_protocol::AcpEvent::Notification(
                 nori_protocol::acp::v1::AgentNotification::SessionNotification(notification),
@@ -163,6 +172,9 @@ impl ChatWidget {
                     if !self.unpaired_prompt_error_ids.remove(&request_id) {
                         self.unpaired_prompt_error_ids.insert(request_id);
                     }
+                } else if resume_load_response {
+                    // The agent could not reopen its session; the conversation continues in a
+                    // new one, and the notice that follows says why.
                 } else if !self.unpaired_prompt_error_ids.remove(&request_id) {
                     self.on_error(message);
                 }

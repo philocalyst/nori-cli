@@ -468,6 +468,7 @@ pub(crate) mod queue_journal;
 pub(crate) use route_moves::RestoreAt;
 mod replay_integrity;
 mod replay_timing;
+mod resume_fallback;
 mod rewind;
 mod route_moves;
 mod session;

@@ -292,6 +292,11 @@ pub(crate) struct ChatWidget {
     effective_cwd_tracker: EffectiveCwdTracker,
     // Whether SessionConfigured has been received for this widget.
     session_configured_received: bool,
+    /// A resume that has the conversation's transcript: when the agent cannot reopen its own
+    /// session the harness continues in a new one, so a failed reopen is not shown as an error.
+    resume_can_fall_back: bool,
+    /// The one ACP load request whose failure can be hidden by the transcript fallback.
+    resume_load_request_id: Option<nori_protocol::acp::v1::RequestId>,
     // Typed handle for the active harness session.
     harness_handle: Option<HarnessHandle>,
     // True while /close awaits the agent's session/close response. Blocks

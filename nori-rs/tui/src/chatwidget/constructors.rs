@@ -135,6 +135,8 @@ impl ChatWidget {
             deferred_cells: Vec::new(),
             effective_cwd_tracker: EffectiveCwdTracker::with_initial_cwd(config.cwd),
             session_configured_received: false,
+            resume_can_fall_back: false,
+            resume_load_request_id: None,
             harness_handle: spawn_result.handle,
             session_close_in_flight: false,
             exiting: false,
@@ -237,6 +239,7 @@ impl ChatWidget {
         let restored_usage = transcript
             .as_ref()
             .and_then(nori_harness::transcript::Transcript::last_usage_update);
+        let resume_can_fall_back = transcript.is_some();
         let activating_prepared_cloud_session = cloud_mode && prepared_agent.is_some();
         let placeholder = session_placeholder();
         let session_generation = next_session_generation();
@@ -343,6 +346,8 @@ impl ChatWidget {
             deferred_cells: Vec::new(),
             effective_cwd_tracker: EffectiveCwdTracker::with_initial_cwd(config.cwd),
             session_configured_received: false,
+            resume_can_fall_back,
+            resume_load_request_id: None,
             harness_handle: spawn_result.handle,
             session_close_in_flight: false,
             exiting: false,

@@ -1187,6 +1187,18 @@ impl AcpConnection {
         cwd: &Path,
         mcp_servers: Vec<acp::McpServer>,
     ) -> Result<acp::SessionId> {
+        self.resume_session_with_request_started(session_id, cwd, mcp_servers, None)
+            .await
+    }
+
+    /// Resume a session, optionally reporting the ACP request ID before awaiting its response.
+    pub async fn resume_session_with_request_started(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: Vec<acp::McpServer>,
+        request_started: Option<oneshot::Sender<RequestId>>,
+    ) -> Result<acp::SessionId> {
         self.set_root_session(acp::SessionId::new(session_id));
         let request = self.cx.send_request(
             acp::ResumeSessionRequest::new(session_id.to_string(), cwd)
@@ -1194,6 +1206,9 @@ impl AcpConnection {
                 .meta(self.session_meta()),
         );
         let request_id = schema_request_id(request.id());
+        if let Some(request_started) = request_started {
+            let _ = request_started.send(request_id.clone());
+        }
         let response = request.block_task().await;
         let _ = self
             .event_tx

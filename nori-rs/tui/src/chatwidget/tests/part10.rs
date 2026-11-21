@@ -541,6 +541,46 @@ fn initialize_agent_with_session_close() -> nori_protocol::SessionEvent {
     })
 }
 
+#[test]
+fn transcript_resume_suppresses_only_the_failed_load_response() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    chat.resume_can_fall_back = true;
+    let generation = chat.session_generation;
+    let load_id = nori_protocol::acp::v1::RequestId::Str("load".to_string());
+
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionPhaseChanged(
+            nori_protocol::SessionPhase::Loading {
+                request_id: load_id.clone(),
+            },
+        )),
+    );
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+            request_id: nori_protocol::acp::v1::RequestId::Str("initialize".to_string()),
+            response: Err(nori_protocol::acp::v1::Error::new(
+                -32001,
+                "unrelated early failure",
+            )),
+        }),
+    );
+    assert!(history_text(&mut rx).contains("unrelated early failure"));
+
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Response {
+            request_id: load_id,
+            response: Err(nori_protocol::acp::v1::Error::new(
+                -32001,
+                "session load failed",
+            )),
+        }),
+    );
+    assert!(!history_text(&mut rx).contains("session load failed"));
+}
+
 fn session_started_event(acp_session_id: &str) -> nori_protocol::SessionEvent {
     nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::SessionStarted(
         nori_protocol::SessionStarted {

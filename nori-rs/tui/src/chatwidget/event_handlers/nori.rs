@@ -15,6 +15,11 @@ impl ChatWidget {
                 self.on_session_started(started);
             }
             nori_protocol::NoriEvent::SessionPhaseChanged(phase) => {
+                if self.resume_can_fall_back
+                    && let nori_protocol::SessionPhase::Loading { request_id } = &phase
+                {
+                    self.resume_load_request_id = Some(request_id.clone());
+                }
                 // A local request boundary separates statusless proactive output without completing it.
                 if self.proactive_turn_active
                     && matches!(
