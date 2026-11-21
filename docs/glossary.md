@@ -130,6 +130,9 @@ ACP v1 defines prompt turns but no agent-initiated turn primitive.
 | **ACP session ID**  | The opaque agent-issued identifier used in ACP requests for one session.                   | Conversation ID            |
 | **Conversation ID** | Nori's local UUID for a transcript-backed conversation, independent of its ACP session ID. | Session ID, ACP session ID |
 | **Continuity**      | Nori's preservation of prior work across session and context changes.                      | Persistence, replay        |
+| **Machine**         | One of the user's computers Nori may run commands on, by name; `local` is this computer.  | Host, server, remote       |
+| **Move**            | Taking a whole session (conversation, dials, permissions, jobs, monitors) to another machine and resuming it there live. | Migrate, fork, export |
+| **Session bundle**  | What a move ships: transcript, journal, dials, permission rules, job records, monitors and working-tree state; never credentials. | Archive, snapshot |
 
 ### Session lifecycle
 
@@ -153,7 +156,12 @@ ACP v1 defines prompt turns but no agent-initiated turn primitive.
 | **Branch at head**       | Nori forks the active ACP session and transcript, activates the child, and freezes the resumable parent. | Rewind, undo                             |
 | **Rewind to message**    | Nori's older-message `/fork` path starts fresh from a display summary and prefills that message.         | ACP fork, undo                           |
 | **Compaction**           | Nori reduces model context through agent-native compaction or summary-and-session-swap.                  | History deletion, replay                 |
-| **Undo**                 | Nori restores a Git ghost snapshot without changing agent context or transcript.                         | Rewind, rollback conversation            |
+| **Automatic compaction** | Nori compacts a session before the next prompt when the context the agent reported is past the `compaction` policy's trigger. | Auto-summarize, context trimming         |
+| **Prepared summary**     | A summary written while the context nears the trigger and the provider's cache is warm, kept for the swap that automatic compaction will ask for. | Background compaction, pre-compaction    |
+| **Loop nudge**           | The steer that interrupts an agent repeating the same tool call; a second loop in the same task cancels the turn. | Loop warning, doom-loop retry            |
+| **Goal judge**           | The fresh, tool-less reviewer Nori runs on the transcript before accepting a goal the agent calls complete; it answers done, not yet, blocked or paused, and when it cannot run the goal is accepted as unverified. See [workflows.md](workflows.md#goals). | Goal verifier, completion check          |
+| **Undo**                 | Nori restores the files a turn changed, from its **Turn snapshot** and the agent's reported edits, without changing agent context or transcript. | Rewind, rollback conversation            |
+| **Turn snapshot**        | The project's tree captured into a shadow Git repository under `$NORI_HOME/snapshots` before a turn's prompt is sent; **Undo** restores from it, so changes made by commands are covered. | Ghost snapshot, checkpoint               |
 
 ### Relationships
 
@@ -279,6 +287,38 @@ Agents Nori runs can hand work to each other in trees of any depth. This section
 | **Run handle**      | The live capability over a running program: subscribe to its envelopes, read its snapshot, signal, answer interrupts, cancel, wait.                                                    | Session, connection              |
 | **Host**            | The one trait through which a run acts on the world: start actors, deliver messages, call tools, apply session effects. The harness implements it.                                 | Backend, driver                  |
 
+### Plugin terms
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **Plugin** | A Pkl module that amends `nori:Plugin`: named **plugin commands**, each a typed list of **operations** on Nori itself. It is the person's (an agent never sees one) and is data, so what it may do is visible before it runs. See [pkl-runtime.md](pkl-runtime.md#plugins). | Extension, add-on, script |
+| **Plugin command** | One named action of a plugin, with declared parameters, run from the TUI (`/name`), over the remote-control channel (`_nori/plugin.run`) or by `nori plugin run`. | Subcommand, macro |
+| **Operation** | One typed thing a plugin command does to Nori (`session.move`, `job.start`, `notify`, ...), run in order; the first to fail stops the command. (A **program** has steps, not operations.) | Step (that is a program's), action (that is a monitor's) |
+| **Move request** | The `SessionMoveRequested` event a plugin's `session.move` raises: the harness asking the frontend that owns the terminal to move the session, which it does with its own move flow. | Move command |
+
+### Gate terms
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **Gate** | A Pkl module that amends `nori:Gate`: ordered **gate rules** consulted synchronously on the hot path for one event (`permission`, `host_tool` or `stop`). It is compiled once into a matcher, never evaluates Pkl when consulted, and every decision it makes is journaled. The synchronous counterpart of a **monitor**, which acts afterwards. See [pkl-runtime.md](pkl-runtime.md#gates). | Hook, interceptor, middleware |
+| **Gate rule** | One matcher and one decision of a gate; the first rule that matches decides, and no match leaves Nori's own behaviour as it is. | Policy rule (that is a saved permission rule or a workflow policy) |
+| **Gate decision** | What a gate rule did to one request, call or turn: `allow`, `deny` (with a reason), `ask`, `rewrite`, `continue` or `pass`. Journaled as a `gate` command; shown as one quiet line when it refused, rewrote or continued something. | Verdict (for permission rules) |
+
+### How the TUI names and counts subagents
+
+The conversation shows every actor except the root as a **subagent** (the user's word; the terms above name the kinds). One projection in the TUI (`tui/src/chatwidget/subagents/`) owns what a subagent is called and how many there are; the lanes, the summary cards, the switcher, the status line and the `Delegated to` / `Result from` rows all read it.
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **Subagent name** | What the subagent is called everywhere: its **alias** (a Nori actor), the provider's nickname (a Codex agent), else the first line of what it was asked to do (a Claude `Task`), else its type, else `subagent`. Never a session ID, and never only the agent kind when a name exists. The type (`Reviewer`, `Explore`) and the task appear beside the name, not instead of it. | Label (in prose), title |
+| **Census** | How many subagents there are by state: running, idle, finished, failed, cancelled. A subagent is counted once, at any depth, in the state the tree holds it in; one that finished and runs again counts as running only. | Tally, running count |
+| **Burst** | A stretch of work that starts when a subagent starts or resumes while none is running. The census counts the subagents that finished since the burst began, so the header does not carry last hour's checks. | Turn, wave |
+
+- A subagent that goes **idle** (its turn ended, its session can take more) is not a lane: the lanes show running subagents. Idle ones are counted as `○N` in the lanes' header and listed in the switcher with an open circle.
+- An actor whose last turn ran to its end, such as one that answered a sibling's message, is announced **ended**, not idle, so it gets its summary card; only an interrupted turn leaves an actor idle.
+- A **provider child** that reports its turn idle (`turn_idle`) follows the same rule: idle because its turn ended by itself, it finished and gets its summary card (and reactivates if it works again); idle with the stop reason `cancelled`, it was interrupted and stays idle with no card. The wire's `SubagentState::Idle { interrupted }` carries which.
+- A message that wakes the agent with delegated results is announced when its turn opens, before the agent's first word, so the `Result from <alias>` row is always above the reply it caused. A row that arrives while an answer streams goes in at the next paragraph break, or after the answer; never inside a paragraph.
+
 ### Delivery states
 
 | State            | Meaning                                                                                              |
@@ -314,7 +354,20 @@ A **session** runs on a place; when that place fails, a declared policy decides 
 | **Retry**           | Sending the same request on the same **route** again after a visible, cancellable backoff.                                                                                  | Resend, re-prompt                |
 | **Fallback**        | Moving the session to the next **route** of the plan; it emits a route-changed event, so a session never silently runs on a different model than it shows.                  | Failover, switch                 |
 | **Chain**           | The explicit, ordered **routes** a policy names. A ranked plan continues after it.                                                                                         | Fallback list                    |
-| **Handoff**         | A **fallback** to another **agent**: the harness starts that agent with a checkpoint of the visible conversation, retires the old one and sends the failed prompt again. The conversation keeps its **Conversation ID**. |                                  |
+| **Handoff**         | A **fallback** to another **agent**: the harness starts that agent with a checkpoint of the visible conversation (bounded to that agent's **context budget**), retires the old one and sends the failed prompt again. The conversation keeps its **Conversation ID**. |
+| **Context budget**  | How many bytes of earlier conversation Nori may inject into one prompt: a quarter of the target model's window at four bytes a token, within 32 KiB and 1 MiB. Whatever does not fit is left out with a marker. |                                  |
+
+### Model dials
+
+An **agent** exposes the knobs of its model as session config options. Nori reads three of them through one typed layer (`nori_protocol::model_controls`), so no client matches an agent's option ids or value strings itself.
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **Model mode** | How a model is served: `standard`, `fast`, `flex` or `priority` (`ModelMode`), or a mode Nori does not know, kept under the agent's own name. Each agent's option maps into it in one place: Claude Code's `fast` toggle, Codex's `service_tier`. Written with the model in the footer when it is not `standard`. | Speed, tier, service level |
+| **Effort** | The reasoning effort or thought level of a model, listed and stepped from least to most: `default`, then none, minimal, low, medium, high, xhigh, max, ultra, persistent as far as the agent offers them. | Thinking level, reasoning |
+| **Dial** | One of the three things a key steps through: the model, the **effort**, the **model mode**. A step past either end wraps around and says so. | Cycle target, axis |
+
+A **model mode** is not the **permission mode** (`Shift+Tab`, the agent's `mode` option: how it asks before it acts); say "model mode" and "permission mode".
 
 ### Relationships
 
@@ -327,13 +380,31 @@ A **session** runs on a place; when that place fails, a declared policy decides 
 
 - "Provider" names the vendor behind an agent (**Provider**); a place a session can run is a **route**.
 - "Fallback" is only the move to another route; waiting and trying again is **retry**.
+- "Mode" alone is ambiguous: a **model mode** says how the model is served, the permission mode says how the agent asks.
 
 ## TUI Surface
 
 - **Stage**: the part of the TUI that owns what the primary screen shows of the conversation and what leaves it for the scrollback. See [tui-stage.md](tui-stage.md).
-- **Tail**: the cells of the conversation that are not in the terminal's scrollback yet; drawn, and redrawable, in the live region.
+- **Tail**: the rows of the conversation that are not in the terminal's scrollback yet: the printed ones on screen, then the live tail.
+- **Printed**: a row of the conversation handed to the terminal for good, once its cell and every one before it has settled; never drawn again unless a view reclaims it.
+- **Live tail**: the rows of the conversation from the first cell that has not settled; drawn, and redrawable, in the region above the bottom block.
 - **Boundary**: the first row of the conversation that is not in the scrollback. Rows pass it exactly once.
-- **Focus**: the prompt a rewind is walking back to; one model for moving between prompts, editing in place, rewinding and forking.
+- **Focus**: the prompt a rewind is walking back to: the one the composer's walk has loaded (`↑` at the top of the draft), drawn highlighted with what a rewind would discard dimmed.
+- **Walk**: stepping back through the conversation's prompts from the composer with `↑`/`↓`, like shell history; the draft is set aside and comes back when the walk ends. See [tui-stage.md](tui-stage.md#walking-back-and-rewinding).
+- **Editor**: the one text editor of the TUI (`nori-editor`), used for the draft and every walked-back prompt; its **keymap** is Helix, Vim or modeless. See [editor.md](editor.md).
+- **Chip**: an atomic token in the editor's text, drawn as a label: a large paste, an image, a **directive**.
+- **Action**: something the user can make Nori do, defined once in the action registry and reached from the **palette**, a typed `/name value`, a key or a **directive**. See [actions.md](actions.md).
+- **Palette**: the searchable list of **actions** that opens over the composer (`Alt+X`, Helix `:`) without touching the draft.
+- **Directive**: an **action** put into the draft as a **chip** (`⚙ model: Opus`), applied when the draft is sent; not part of the sent text.
+
+## Terminal integration
+
+| Term | Definition | Aliases to avoid |
+| --- | --- | --- |
+| **Program status** | What Nori tells its terminal it is doing, through the Program Status Protocol (OSC 7501). See [terminal-integration.md](terminal-integration.md). | Title spinner, notification |
+| **Status record** | One entry the terminal holds for Nori, addressed by an id: the root record is the conversation, a child record (`s1`, `s1/s2`) is one **subagent**. | Badge, tab state |
+| **Blocked** | A **status record** whose owner cannot continue until the user acts; its `kind` is `permission`, `question` or `auth`. | Waiting, paused |
+| **Status outbox** | The queue of status sequences that leave inside the frame writer's next write, so one never lands inside a frame. | Escape buffer |
 
 ## Fake worlds
 
