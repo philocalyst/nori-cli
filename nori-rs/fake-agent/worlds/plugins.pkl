@@ -1,0 +1,43 @@
+/// Plugins: a `nori:Plugin` module in `$NORI_HOME/plugins/` runs operations on the session, and
+/// the agent only ever sees what they do to it. The world is a plain agent with two models and a
+/// scripted dev server (`serve-plugin-demo`) for the job module a test writes next to the plugin.
+///
+///   * `ping` is answered `pong`; any other prompt is echoed (`You said: ...`), which is how a
+///     plugin's `prompt` operation shows up in the transcript.
+///
+///     cargo test -p nori-world --test plugins
+amends "nori:World"
+
+name = "plugins"
+description = "A plain agent and a scripted dev server for plugin commands to act on."
+default_agent = "lead"
+
+processes {
+  new Process {
+    command = "^serve-plugin-demo"
+    output {
+      new Line { text = "listening on :5173" }
+    }
+    exit = null
+  }
+}
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models {
+      new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+      new Model { id = "fake-opus"; name = "Fake Opus 5"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "ping"
+        on = new Matching { pattern = "^ping$" }
+        steps { new Say { text = "pong" } }
+      }
+      new Scene {
+        steps { new Say { text = "You said: {{prompt}}\n" } }
+      }
+    }
+  }
+}
