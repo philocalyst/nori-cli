@@ -45,6 +45,8 @@ pub struct AppExitInfo {
     pub conversation_id: Option<ConversationId>,
     pub conversation_has_activity: bool,
     pub update_action: Option<UpdateAction>,
+    /// A moved session continues in this command, run in this terminal after Nori exits.
+    pub handover: Option<Vec<String>>,
 }
 
 fn session_summary(
@@ -125,6 +127,14 @@ pub(crate) struct App {
     pub(crate) child_focus_sequence: i64,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
+    /// A `/move` that waits for the running turn to end.
+    pending_move: Option<String>,
+    /// A move whose bundle is being shipped.
+    move_in_progress: bool,
+    /// When the agent last died under the session and was restarted: a loop of deaths stops.
+    recoveries: Vec<std::time::Instant>,
+    /// What this terminal runs once Nori exits, to continue a moved session.
+    pending_handover: Option<Vec<String>>,
 
     // One-shot suppression of the next world-writable scan after user confirmation.
     skip_world_writable_scan_once: bool,
@@ -247,8 +257,10 @@ mod lens;
 mod message_actions;
 pub(crate) mod model_routes;
 mod overlay;
+mod recover;
 mod reference_session;
 pub(crate) mod rewind;
+pub(crate) mod session_move;
 mod session_setup;
 mod session_view;
 mod subagent_overlay;
@@ -366,6 +378,10 @@ impl App {
             program_status: Default::default(),
             replay_painted_from: None,
             focus: None,
+            pending_move: None,
+            move_in_progress: false,
+            recoveries: Vec::new(),
+            pending_handover: None,
             pending_child_focus: None,
             child_focus_sequence: 0,
             pending_update_action: None,
@@ -576,6 +592,7 @@ impl App {
             conversation_id: app.chat_widget.conversation_id(),
             conversation_has_activity: app.chat_widget.session_stats().has_activity(),
             update_action: app.pending_update_action,
+            handover: app.pending_handover,
         })
     }
 

@@ -150,6 +150,9 @@ pub async fn run_main(
     // This updates ~/.nori/cli/.nori-install.json with launch metadata
     if let Ok(nori_home) = nori_config::find_nori_home() {
         nori_installed::track_launch(&nori_home);
+        // The user's other machines (Rex hosts, `[machines]`), for the `machine` of Nori's
+        // `bash`; read off the UI path, and waited for only by the first session's tools.
+        nori_machines::discover_in_background(nori_home);
     }
 
     // Note: Rolling file tracing is initialized in nori-cli main.rs before run_main() is called.
@@ -380,6 +383,7 @@ async fn run_ratatui_app(
                         conversation_id: None,
                         conversation_has_activity: false,
                         update_action: Some(action),
+                        handover: None,
                     });
                 }
             }
@@ -429,6 +433,7 @@ async fn run_ratatui_app(
                 conversation_id: None,
                 conversation_has_activity: false,
                 update_action: None,
+                handover: None,
             });
         }
         // Trust decisions are persisted by onboarding; reload explicitly so

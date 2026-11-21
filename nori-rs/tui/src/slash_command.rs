@@ -58,6 +58,7 @@ pub enum SlashCommand {
     SwitchSkillset,
     Fork,
     Browser,
+    Move,
 }
 
 impl SlashCommand {
@@ -96,6 +97,7 @@ impl SlashCommand {
             SlashCommand::SwitchSkillset => "switch between available skillsets",
             SlashCommand::Fork => "rewind conversation to a previous message",
             SlashCommand::Browser => "open a Chrome browser the agent can control via CDP",
+            SlashCommand::Move => "move this whole session to another of your machines",
         }
     }
 
@@ -140,7 +142,8 @@ impl SlashCommand {
             | SlashCommand::FirstPrompt
             | SlashCommand::Goal
             | SlashCommand::Quit
-            | SlashCommand::Exit => true,
+            | SlashCommand::Exit
+            | SlashCommand::Move => true,
         }
     }
 
@@ -153,7 +156,8 @@ impl SlashCommand {
             SlashCommand::SwitchSkillset
             | SlashCommand::Browse
             | SlashCommand::Diff
-            | SlashCommand::Browser => CommandScope::LocalOnly,
+            | SlashCommand::Browser
+            | SlashCommand::Move => CommandScope::LocalOnly,
             SlashCommand::Providers
             | SlashCommand::Model
             | SlashCommand::Config

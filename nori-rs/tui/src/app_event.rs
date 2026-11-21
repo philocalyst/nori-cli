@@ -183,6 +183,19 @@ pub(crate) enum AppEvent {
     /// What `/diff` found.
     DiffResult(crate::get_git_diff::GitChanges),
 
+    /// A click on one of Nori's own links (`nori://`), routed back by the terminal.
+    OpenNoriLink(String),
+
+    /// The agent died under the session: restart it and continue the conversation.
+    RecoverConversation,
+
+    /// `/move`: this session to the machine named.
+    MoveSession {
+        machine: String,
+    },
+    /// How a move went.
+    MoveFinished(Result<crate::app::session_move::Moved, String>),
+
     InsertHistoryCell(Box<dyn HistoryCell>),
     RevealUserQuestion,
     UpdateHistoryToolSnapshot {
