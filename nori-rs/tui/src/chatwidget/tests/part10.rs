@@ -2279,7 +2279,9 @@ fn conflated_deltas_render_exactly_like_the_originals() {
     }
 }
 
+/// Only where pastes are not bracketed (Windows) is a fast first keystroke held back.
 #[test]
+#[cfg(windows)]
 fn a_held_back_keystroke_is_drawn_in_the_frame_that_releases_it() {
     let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
 

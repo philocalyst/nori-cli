@@ -64,7 +64,9 @@ impl ChatWidget {
                 has_input_focus: true,
                 enhanced_keys_supported,
                 placeholder_text: placeholder,
-                disable_paste_burst: config.disable_paste_burst,
+                // Nori turns on bracketed paste, so a real paste arrives as one paste event and
+                // the keystroke-timing guess is only for terminals that cannot do that.
+                disable_paste_burst: config.disable_paste_burst || !cfg!(windows),
                 animations_enabled: config.animations,
                 custom_working_messages: config.custom_working_messages,
                 custom_working_message_list: config.custom_working_message_list.clone(),
@@ -271,7 +273,9 @@ impl ChatWidget {
                 has_input_focus: true,
                 enhanced_keys_supported,
                 placeholder_text: placeholder,
-                disable_paste_burst: config.disable_paste_burst,
+                // Nori turns on bracketed paste, so a real paste arrives as one paste event and
+                // the keystroke-timing guess is only for terminals that cannot do that.
+                disable_paste_burst: config.disable_paste_burst || !cfg!(windows),
                 animations_enabled: config.animations,
                 custom_working_messages: config.custom_working_messages,
                 custom_working_message_list: config.custom_working_message_list.clone(),
