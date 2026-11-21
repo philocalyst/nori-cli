@@ -201,7 +201,7 @@ async fn live_codex_gpt6_luna_delegation_and_checkpoint_fork_parity() {
                 && matches!(
                     update.state,
                     nori_protocol::Patch::Set(
-                        SubagentState::Idle
+                        SubagentState::Idle { .. }
                             | SubagentState::Ended(
                                 SubagentOutcome::Completed { .. } | SubagentOutcome::Failed { .. }
                             )
@@ -211,7 +211,7 @@ async fn live_codex_gpt6_luna_delegation_and_checkpoint_fork_parity() {
                 forked_ok = matches!(
                     update.state,
                     nori_protocol::Patch::Set(
-                        SubagentState::Idle
+                        SubagentState::Idle { .. }
                             | SubagentState::Ended(SubagentOutcome::Completed { .. })
                     )
                 );

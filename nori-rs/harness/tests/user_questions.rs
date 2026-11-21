@@ -276,7 +276,7 @@ async fn questions_round_trip_for_parent_and_namespaced_child_under_yolo() {
                 session.events.recv().await.unwrap()
                 && matches!(
                     update.state,
-                    Patch::Set(SubagentState::Idle | SubagentState::Ended(_))
+                    Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_))
                 )
             {
                 break update.session_id;
@@ -297,7 +297,7 @@ async fn questions_round_trip_for_parent_and_namespaced_child_under_yolo() {
                 && update.session_id != child
                 && matches!(
                     update.state,
-                    Patch::Set(SubagentState::Idle | SubagentState::Ended(_))
+                    Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_))
                 )
             {
                 break update.session_id;

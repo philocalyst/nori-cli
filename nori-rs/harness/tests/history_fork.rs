@@ -104,7 +104,7 @@ async fn wait_child_end(session: &mut LaunchedSession) -> acp::v1::SessionId {
                 SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update)))
                     if matches!(
                         update.state,
-                        Patch::Set(SubagentState::Idle | SubagentState::Ended(_))
+                        Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_))
                     ) =>
                 {
                     return update.session_id;
@@ -154,9 +154,9 @@ async fn history_fork_has_a_child_journal_with_source_and_replay_without_duplica
     let parent_path = loader.session_path(&parent_meta.project_id, &parent_id);
     let parent_log =
         ConversationLog::open(parent_path.with_extension("pkl")).expect("open parent journal");
-    let source = parent_log.projection().visible();
-    let start = source.first().expect("source has records").id;
-    let end = source.last().expect("source has records").id;
+    let source = parent_log.visible_ids();
+    let start = *source.first().expect("source has records");
+    let end = *source.last().expect("source has records");
 
     parent
         .handle
@@ -176,7 +176,7 @@ async fn history_fork_has_a_child_journal_with_source_and_replay_without_duplica
                 SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update)))
                     if matches!(
                         update.state,
-                        Patch::Set(SubagentState::Idle | SubagentState::Ended(_))
+                        Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_))
                     ) =>
                 {
                     break (update.session_id, updates);
@@ -239,9 +239,8 @@ async fn history_fork_has_a_child_journal_with_source_and_replay_without_duplica
         .find_map(|session| {
             let path = loader.session_path(&parent_meta.project_id, &session.session_id);
             let log = ConversationLog::open(path.with_extension("pkl")).ok()?;
-            log.projection()
-                .visible()
-                .iter()
+            log.visible()
+                .map(Result::unwrap)
                 .any(|record| {
                     matches!(&record.event, Event::Command { name, .. } if name == "fork-source")
                 })
@@ -252,16 +251,15 @@ async fn history_fork_has_a_child_journal_with_source_and_replay_without_duplica
     let child_log =
         ConversationLog::open(child_path.with_extension("pkl")).expect("open child journal");
     let source_payload = child_log
-        .projection()
         .visible()
-        .iter()
+        .map(Result::unwrap)
         .find_map(|record| match &record.event {
-            Event::Command { name, payload } if name == "fork-source" => Some(payload),
+            Event::Command { name, payload } if name == "fork-source" => Some(payload.clone()),
             _ => None,
         })
         .expect("fork source command");
     let source_payload: serde_json::Value =
-        serde_json::from_str(source_payload).expect("source payload JSON");
+        serde_json::from_str(&source_payload).expect("source payload JSON");
     assert_eq!(source_payload["session_id"], parent_id);
     assert_eq!(source_payload["start"], start);
     assert_eq!(source_payload["end"], end);
@@ -629,7 +627,7 @@ async fn child_response_actions_use_its_journal_and_leave_parent_history_alone()
     );
     let child_log = ConversationLog::open(recorder.transcript_path().with_extension("pkl"))
         .expect("child journal");
-    assert!(child_log.records().iter().any(|record| matches!(&record.event,
+    assert!(child_log.all().map(Result::unwrap).any(|record| matches!(&record.event,
         Event::Command { name, payload } if name == "fork-context" && payload.contains("discarded parent future")
     )), "discarded source events remain archived");
     child
@@ -645,7 +643,7 @@ async fn child_response_actions_use_its_journal_and_leave_parent_history_alone()
                 SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update)))
                     if matches!(
                         update.state,
-                        Patch::Set(SubagentState::Idle | SubagentState::Ended(_))
+                        Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_))
                     ) =>
                 {
                     assert_eq!(update.parent_session_id, child_view);
@@ -728,9 +726,8 @@ async fn child_response_actions_use_its_journal_and_leave_parent_history_alone()
             ConversationLog::open(path.with_extension("pkl"))
                 .ok()
                 .is_some_and(|log| {
-                    log.projection()
-                        .visible()
-                        .iter()
+                    log.visible()
+                        .map(Result::unwrap)
                         .any(|record| match &record.event {
                             Event::Command { name, payload } if name == "fork-source" => {
                                 serde_json::from_str::<serde_json::Value>(payload)
