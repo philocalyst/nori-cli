@@ -35,8 +35,12 @@ $NORI_HOME/transcripts/by-project/{project-id}/
   transcript and journal. A parent's transcript also records child events
   relayed into the parent session.
 - JSONL entries are queued to a writer, which appends one JSON object per line
-  and flushes each line. It does not `fsync`; the canonical journal is synced
-  after each append.
+  and flushes each line. It does not `fsync`. The canonical journal is written at
+  once, and a background thread flushes it to disk at most every 400 ms (a full disk
+  flush costs 5 to 150 ms on macOS, and one per event capped a streaming turn at a few
+  dozen events a second); a clean end of the session flushes it before returning. A
+  crash of Nori loses nothing, because the bytes are in the operating system's cache;
+  only a power loss or kernel panic can lose the last 400 ms.
 - A session resumed from its own transcript, whose history is replayed from
   that transcript, goes on recording into that file
   (`TranscriptRecorder::continue_session`): same `session_id`, no second
@@ -71,7 +75,7 @@ spacing, comments and field order do not affect decoding. Computed payloads for
 known events are rejected; future event kinds retain their original source.
 
 Streamed events append incrementally: the current reducer validates the change
-before writing and applies it after the durable append succeeds. Ordinary
+before writing and applies it after the append succeeds. Ordinary
 appends do not reload the journal or copy the existing transcript. File writers
 compare the byte version under an OS lock; a competing writer triggers a reload
 and revalidation of the expected head and stable command ID.
@@ -97,9 +101,37 @@ record operation results. Each program also records its final outcome, including
 evaluation failures and successful programs with no operations. Actor names
 created by a program keep their local binding for that program's follow-up
 commands; their recorded bindings remain available to later programs.
-Received session events are journaled before context
-observation and live reduction. Replay reduces recorded data only; it never
-evaluates a Pkl program or repeats an external effect.
+Each received session event is journaled once, as a `transcript-entry` record
+carrying the event and Nori's observation of it (its observation id and time,
+and whether the history was incomplete), after the context timeline observes it
+and before the frontend or the live reducer sees it. The entry is serialized
+once for the journal and the JSONL view. Replay reduces recorded data only; it
+never evaluates a Pkl program or repeats an external effect.
+
+### Opening a long journal
+
+Opening a journal indexes it without decoding it. Each line names its id and kind
+first, and an operation's or command's name at the start or end of its data, so
+one pass over the line ends finds every record's place, kind and name, and
+projects the visible branch from the rewinds and forks (the only records decoded).
+A record is decoded when it is read, and records next to each other are read
+together. Readers ask for what they need by kind and name (`visible_named`,
+`visible_where`), or for the records whose line mentions an id
+(`visible_containing`), so one command of a 300 MB conversation costs that
+command.
+
+The index is saved beside the journal (`<session>.pkx`) once an open indexed more
+than a megabyte itself. It records the last bytes it covers, and is used only
+while the journal still has them there; the next open then reads only what was
+appended since. A missing or stale index costs one full pass, never a wrong
+answer.
+
+A resume reads the newest turns only: about `RESUME_TAIL_BYTES` of entries,
+rounded back to the start of a turn (a turn many times longer is cut inside).
+`Transcript::left_out` counts the entries left on disk, and the conversation's
+first line says how many there are. Whole-history facts (the metadata, the
+backend binding, the setting changes and the last advertised options, a child's
+configuration) are read through the index without decoding the conversation.
 
 The JSONL file remains available for compatibility and transcript display. If
 the companion journal exists, `TranscriptLoader` reads visible entries and
@@ -113,6 +145,36 @@ handoff attempt and the new `backend-bound` value. A later transcript load
 therefore reports the latest visible ACP session binding while retaining the
 same Nori `session_id`. A delegated child session without a handoff gets its own
 Nori session ID and journal; its parent also records the events relayed to it.
+
+### Saved permission rules
+
+The harness, not any agent, owns the "always" decisions. Each "allow always" or "reject always"
+answer, and any rule the user saves, is one `permission-rule` command in the journal. The payload is
+JSON: `{scope, tool, pattern, decision, reason?, at}`. `scope` is `session` (the default), `project`
+or `host`. `tool` is the tool's own name when known (`_meta.nori.hostTool`), else the ACP tool kind,
+else the call's title. `pattern` is the command prefix for execute calls (the program and its
+subcommand, then `*`: `git status*`), the path for edits (project-relative inside the project, else
+absolute), or the host for fetches; a call that names none of these is covered by a `*` rule for its
+tool. A compound command saves one rule per command. `decision` is `allow` or `deny`, and `at` is the
+time it was saved.
+
+Opening a session or resuming one replays the visible `permission-rule` commands in order; the
+latest rule per (scope, tool, pattern) wins (`Transcript::permission_rules` returns the payloads,
+`RuleSet::from_payloads` folds them). A session that resumes into a new transcript, or forks into
+one, journals the rules in force again, so they always travel with the journal.
+
+The harness enforces the rules for every agent kind, where `session/request_permission` arrives
+(`AcpBackend::handle_permission_request`), before the approval policy and before the user. A deny rule
+matching any command, path or host the call touches denies it, and the user is told in a notice. An
+allow needs a matching allow rule for every command, path or host the call touches, so a rule for
+`git status*` does not admit `git status && rm -rf x`, and a command with substitutions,
+redirections or assignments is never admitted by an allow. The request is answered at once with the
+agent's `allow_once`/`allow_always` option (or `reject_once`/`reject_always` for a deny), and the
+journal records a `permission-auto-answered` command with the request, the rule and the option. A
+request the agent offers no matching option for is asked of the user as before.
+
+The rules also travel to in-process agents as `_meta.nori.permissionRules` (the array of payloads)
+in `session/new`, `load`, `resume` and `fork` (see [native-agents.md](native-agents.md)).
 
 ### Project IDs and `project.json`
 
@@ -141,6 +203,15 @@ and reading `project.json`.
 
 `git_remote` and `git_root` are `null` outside a Git repository. The file is
 rewritten when a new session starts in the project.
+
+A session belongs to the project it is filed under. A conversation that moved
+from another machine or Nori home (see [machines.md](machines.md#portable-sessions))
+was recorded under that home's project ID, which its journal's first record still
+carries; a reader takes the project ID from the directory the session is filed in.
+An import rewrites the JSONL `session_meta` line's `project_id` and `cwd` to the new
+home's and records `moved-in {from, from_cwd, cwd, at}` in the journal; the home it
+left records `moved-out {to, cwd, at}` and keeps `<session_id>.moved` beside the
+transcript (machine, ssh destination, directory, launcher) for the resume list.
 
 ## JSONL common line envelope
 
@@ -383,11 +454,8 @@ turn receives an unknown end reading rather than inheriting a later session's
 completion. Shrink, compaction, or changed context capacity breaks comparison
 with the previous baseline; this does not delete the recorded checkpoints.
 
-Provider-specific token statistics may also be read from the underlying
-agent's transcript by
-[`transcript_discovery.rs`](../nori-rs/harness/src/transcript_discovery.rs).
-Those third-party formats and latest-usage fallbacks are outside this schema
-and do not create ACP timeline observations.
+Token use comes only from what the agent reports (ACP usage updates). Nori does
+not read or search the agent's own transcript files for it.
 
 ## Reading transcripts programmatically
 
