@@ -206,22 +206,16 @@ impl AcpBackend {
                 .set_config_option(&session_id, option.id.clone(), value.clone())
                 .await?;
         }
+        // The model just chosen may offer other efforts and modes than the one before it.
+        let options = self.connection.config_options();
         for (setting, wanted) in &route.options {
-            let Some(option) = options
-                .iter()
-                .find(|option| option.id.to_string() == *setting)
-            else {
+            let Some(option) = nori_protocol::find_setting(&options, setting) else {
                 continue;
             };
-            let Some((_, values)) = select_values(option) else {
-                continue;
-            };
-            if let Some((value, _)) = values
-                .iter()
-                .find(|(value, name)| value == wanted || name.eq_ignore_ascii_case(wanted))
+            if let Some(value) = nori_protocol::value_for(option, wanted)
                 && let Err(error) = self
                     .connection
-                    .set_config_option(&session_id, option.id.clone(), value.clone())
+                    .set_config_option(&session_id, option.id.clone(), value)
                     .await
             {
                 warn!(%error, %setting, "route could not set an option");

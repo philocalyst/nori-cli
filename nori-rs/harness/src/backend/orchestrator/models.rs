@@ -34,15 +34,10 @@ impl Models {
             .and_then(Self::from_option)
     }
 
-    /// The select option `setting` names, by id or name, ignoring case and `_`, `-`, and spaces.
+    /// The select option `setting` names, by id or name, ignoring case and `_`, `-`, and spaces,
+    /// or by the typed names `model_mode` and `effort`.
     pub(super) fn named(options: &[acp::SessionConfigOption], setting: &str) -> Option<Self> {
-        let wanted = squash(setting);
-        options
-            .iter()
-            .find(|option| {
-                squash(&option.id.to_string()) == wanted || squash(&option.name) == wanted
-            })
-            .and_then(Self::from_option)
+        nori_protocol::find_setting(options, setting).and_then(Self::from_option)
     }
 
     /// Every select option other than the model, for `agent_capabilities`.
@@ -110,13 +105,6 @@ pub(super) fn describe(offered: &[Model]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn squash(name: &str) -> String {
-    name.chars()
-        .filter(|c| !matches!(c, '_' | '-' | ' '))
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 /// The model among `offered` that `requested` names: by value exactly, else by value or name
@@ -215,7 +203,13 @@ pub(super) async fn apply_options(
                 }
             ));
         };
-        let Some(choice) = choices.find(value) else {
+        // A mode is also asked for by what it is: `fast` finds the `on` of a fast toggle.
+        let spelled = nori_protocol::find_setting(advertised, setting)
+            .and_then(|option| nori_protocol::value_for(option, value));
+        let Some(choice) = choices
+            .find(value)
+            .or_else(|| spelled.as_deref().and_then(|spelled| choices.find(spelled)))
+        else {
             return Err(format!(
                 "`{setting}` has no value `{value}`; it takes {}",
                 choices.describe()
