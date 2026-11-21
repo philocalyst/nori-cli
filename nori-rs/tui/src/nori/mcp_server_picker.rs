@@ -300,6 +300,7 @@ fn question(
         verb,
         label: label.to_owned(),
         initial,
+        secret: false,
         then: Arc::new(move |text, tx| answer(text.trim().to_owned(), tx)),
     }
 }

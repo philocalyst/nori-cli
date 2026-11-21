@@ -1,0 +1,18 @@
+---
+source: tui/src/nori/providers_panel.rs
+expression: "overlay(page).render_text(120, 14)"
+---
+╭─ ◇ Gemini ───────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯   search                                                                                                     7 / 7 │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Account                                                                                                              │
+│ ▸ How to install  what to run, and what else works                                                                   │
+│ About                                                                                                                │
+│   Install with  brew install gemini-cli                                                                              │
+│   Personal Google account  Antigravity is installed and signed in: Google's Gemini models run there                  │
+│   API key or Vertex AI  once the CLI is installed, set GEMINI_API_KEY (or the Vertex AI variables) where Nori starts │
+│   Login lives in  where Gemini keeps its own                                                                         │
+│   Started by  the built-in agent                                                                                     │
+│   Agent  gemini                                                                                                      │
+│                                                                                                                      │
+╰─ not installed · brew install gemini-cli ────────────────────────────────────────────────────────────────────────────╯

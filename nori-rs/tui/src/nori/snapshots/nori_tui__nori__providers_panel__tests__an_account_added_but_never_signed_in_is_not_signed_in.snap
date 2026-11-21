@@ -1,0 +1,16 @@
+---
+source: tui/src/nori/providers_panel.rs
+expression: "overlay(page).render_text(100, 12)"
+---
+╭─ ◇ Claude · f ───────────────────────────────────────────────────────────────────────────────────╮
+│ ❯   search                                                                                 5 / 5 │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Account                                                                                          │
+│ ▸ Sign in  the ways this account can sign in                                                     │
+│ About                                                                                            │
+│   Status  no login found in this account's home                                                  │
+│   Login lives in  /nori/accounts/claude/claude@f                                                 │
+│   Started by  Nori, in its own process                                                           │
+│   Agent  claude@f                                                                                │
+│                                                                                                  │
+╰─ not signed in · no login found in this account's home · Enter to sign in ───────────────────────╯

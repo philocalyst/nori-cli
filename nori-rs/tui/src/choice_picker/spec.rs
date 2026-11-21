@@ -37,6 +37,8 @@ pub(crate) struct Ask {
     pub(crate) label: String,
     /// The text the prompt starts with.
     pub(crate) initial: String,
+    /// The answer is a credential: typed as dots.
+    pub(crate) secret: bool,
     pub(crate) then: AnswerAction,
 }
 

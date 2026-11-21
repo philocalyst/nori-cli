@@ -1,0 +1,20 @@
+---
+source: tui/src/nori/providers_panel.rs
+expression: "overlay(spec).render_text(100, 16)"
+---
+╭─ ◇ Providers ────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯   search                                                                                 7 / 7 │
+├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Claude                                                                                           │
+│ ▸ Claude Code ✓  robert@example.org · Max                                                        │
+│   Claude · f  f@example.org · Max                                                                │
+│   Claude · h  checking…                                                                          │
+│   Claude · g  not signed in · no login found in this account's home · Enter to sign in           │
+│   Claude · i  can't tell if it is signed in · `claude` is not installed                          │
+│   Add another Claude account  set up outside Nori · Enter says how                               │
+│ Routing                                                                                          │
+│   Fallback order  where a session goes when a request fails · Pkl                                │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰─ Enter opens an account: sign in, see its login, add another ────────────────────────────────────╯

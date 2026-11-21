@@ -16,6 +16,7 @@ use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 use super::spec::AnswerAction;
 use super::spec::Ask;
@@ -27,7 +28,6 @@ use super::spec::NoticeAction;
 use super::spec::StepAction;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::SelectionAction;
-use crate::helix_picker::clip;
 use crate::helix_picker::feed;
 use crate::style::component_theme;
 use crate::tui;
@@ -93,14 +93,14 @@ impl HelixItem for Row {
             spans.push(Span::styled(" ✓", cx.theme.accent_mint));
             used += 2;
         }
-        if let Some(detail) = &self.detail {
-            let room = width.saturating_sub(used + 2);
-            if room > 4 {
-                spans.push(Span::styled(
-                    format!("  {}", clip(detail, room)),
-                    cx.theme.faint.add_modifier(Modifier::empty()),
-                ));
-            }
+        // A note is said whole or not at all: half of "also on Claude" says something else.
+        if let Some(detail) = &self.detail
+            && used + 2 + detail.width() <= width
+        {
+            spans.push(Span::styled(
+                format!("  {detail}"),
+                cx.theme.faint.add_modifier(Modifier::empty()),
+            ));
         }
         vec![Line::from(spans)]
     }
@@ -113,6 +113,7 @@ struct Pending {
     then: AnswerAction,
     verb: &'static str,
     label: String,
+    secret: bool,
 }
 
 pub(crate) struct ChoiceOverlay {
@@ -239,10 +240,14 @@ impl ChoiceOverlay {
                     };
                     self.state
                         .begin_compose("ask", ask.verb, label.clone(), ask.initial, id);
+                    if ask.secret {
+                        self.state.mask_compose();
+                    }
                     self.pending = Some(Pending {
                         then: ask.then,
                         verb: ask.verb,
                         label,
+                        secret: ask.secret,
                     });
                 }
             }
@@ -280,6 +285,7 @@ impl ChoiceOverlay {
                         verb: ask.verb,
                         label: ask.label.clone(),
                         initial: ask.initial.clone(),
+                        secret: ask.secret,
                         then: ask.then.clone(),
                     });
                     self.follow(next);
@@ -320,6 +326,9 @@ impl ChoiceOverlay {
                                 text,
                                 id,
                             );
+                            if pending.secret {
+                                self.state.mask_compose();
+                            }
                         }
                         self.pending = Some(pending);
                     }
@@ -399,6 +408,34 @@ fn config_of(spec: &ChoiceSpec) -> HelixConfig {
     }
 }
 
+impl ChoiceOverlay {
+    /// The picker as plain text, `height` rows of `width` columns, for snapshot tests.
+    #[cfg(test)]
+    pub(crate) fn render_text(&mut self, width: u16, height: u16) -> String {
+        use ratatui::buffer::Buffer;
+
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        self.state.render(area, &mut buffer, &component_theme(), 0);
+        (0..height)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Type `text` into the open question, as the keyboard would.
+    #[cfg(test)]
+    pub(crate) fn type_into_question(&mut self, text: &str) {
+        self.state.on_paste(text);
+    }
+}
+
 /// The loop count picker, and a sectioned model list with an unavailable row, as plain text for
 /// the storybook (feature `storybook`).
 #[cfg(feature = "storybook")]
@@ -469,4 +506,33 @@ pub fn choice_specimen(width: u16) -> String {
     })
     .collect::<Vec<_>>()
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::choice_picker::ChoiceItem;
+
+    #[test]
+    fn a_secret_question_shows_dots_not_what_was_typed() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let spec = ChoiceSpec::new(
+            "Sign in",
+            vec![ChoiceItem::run("API key", Box::new(|_| {}))],
+        );
+        let mut overlay = ChoiceOverlay::new(spec, AppEventSender::new(tx));
+        // Drawn once, so the row the question is about is selected.
+        overlay.render_text(60, 6);
+        overlay.follow(Next::Ask(Ask {
+            verb: "API key",
+            label: "Claude · f".to_owned(),
+            initial: String::new(),
+            secret: true,
+            then: std::sync::Arc::new(|_, _| Ok(Next::Done)),
+        }));
+        overlay.type_into_question("sk-ant-api03-hunter2");
+        let drawn = overlay.render_text(60, 6);
+        assert!(drawn.contains("••••••••••••••••••••"), "{drawn}");
+        assert!(!drawn.contains("hunter2"), "{drawn}");
+    }
 }

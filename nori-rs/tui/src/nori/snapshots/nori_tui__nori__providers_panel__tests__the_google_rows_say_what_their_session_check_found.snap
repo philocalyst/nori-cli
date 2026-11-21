@@ -1,0 +1,16 @@
+---
+source: tui/src/nori/providers_panel.rs
+expression: "overlay(spec).render_text(110, 12)"
+---
+╭─ ◇ Providers ──────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ❯   search                                                                                           4 / 4 │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Antigravity                                                                                                │
+│ ▸ Antigravity ✓  not signed in · Authentication required · Enter to sign in                                │
+│ Gemini                                                                                                     │
+│   Gemini  not signed in · Gemini API key is missing or not configured. · Enter to sign in                  │
+│   Add another Gemini account  set up outside Nori · Enter says how                                         │
+│ Routing                                                                                                    │
+│   Fallback order  where a session goes when a request fails · Pkl                                          │
+│                                                                                                            │
+╰─ Enter opens an account: sign in, see its login, add another ──────────────────────────────────────────────╯

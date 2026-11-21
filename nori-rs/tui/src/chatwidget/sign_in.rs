@@ -8,13 +8,20 @@
 //! browser) while the panel waits. Either way "signed in" is said only once a fresh agent can
 //! open a session; until then the provider is not signed in, whatever the program printed.
 //!
-//! An agent that offers no method keeps the sign-in Nori knows for it (`/login`'s own table),
-//! unless it is an account with a home of its own, which that table cannot reach.
+//! Besides what its agent offers, an account is offered the provider's own ways
+//! (`nori_acp_host::accounts::methods_for`: Claude's subscription, email, SSO, Console, token and
+//! key; Codex's device code and key; OpenCode's login). A way that needs an answer asks first, in
+//! the picker (an email; a key or token, typed as dots); a code a browser shows is pasted into the
+//! sign-in panel's own input line. An agent that offers no method keeps the sign-in Nori knows for
+//! it (`/login`'s own table), unless it is an account with a home of its own, which that table
+//! cannot reach.
 //!
 //! Adding an account (`/providers`, "Add another account") creates it and goes straight on to
-//! signing it in.
+//! signing it in. The account is "signed in" only once its own login says so
+//! (`nori_acp_host::accounts::status`); a login that was abandoned leaves it "not signed in".
 
 use super::*;
+use nori_acp_host::accounts::Capture;
 use nori_acp_host::sign_in::SignInHow;
 use nori_acp_host::sign_in::SignInMethod;
 use nori_config::ProviderAccounts;
@@ -24,11 +31,26 @@ use nori_config::ProviderAccounts;
 pub(crate) struct SignInTarget {
     pub(crate) agent_name: String,
     pub(crate) display_name: String,
+    /// A token the sign-in program prints, for Nori to keep once it ends (`claude setup-token`).
+    pub(crate) capture: Option<Capture>,
 }
 
 impl ChatWidget {
     /// Sign in to `agent_name`: first ask its agent how.
     pub(crate) fn sign_in(&mut self, agent_name: &str) {
+        // A CLI that is not there cannot say how it signs in: say what to install (and what else
+        // works) instead of starting it through a package runner to find out.
+        let missing = nori_harness::list_available_agents()
+            .into_iter()
+            .any(|agent| {
+                agent.agent_name == agent_name
+                    && !agent.is_installed
+                    && nori_acp_host::accounts::install_command(agent.agent).is_some()
+            });
+        if missing {
+            self.handle_login_command_with_agent(agent_name);
+            return;
+        }
         let Ok(config) = nori_harness::get_agent_config(agent_name) else {
             self.handle_login_command_with_agent(agent_name);
             return;
@@ -36,6 +58,7 @@ impl ChatWidget {
         let target = SignInTarget {
             agent_name: agent_name.to_owned(),
             display_name: config.display_name.clone(),
+            capture: None,
         };
         self.login_terminal = Some(crate::login_terminal::LoginTerminal::waiting(
             target.display_name.clone(),
@@ -60,8 +83,8 @@ impl ChatWidget {
     ) {
         self.login_terminal = None;
         match methods {
-            Ok(methods) if methods.len() == 1 => {
-                if let Some(method) = methods.into_iter().next() {
+            Ok(mut methods) if methods.len() == 1 && methods[0].ask.is_none() => {
+                if let Some(method) = methods.pop() {
                     self.run_sign_in(target, method);
                 }
             }
@@ -72,23 +95,52 @@ impl ChatWidget {
                         let target = target.clone();
                         let detail = method.description.clone().unwrap_or_default();
                         let label = method.name.clone();
-                        crate::choice_picker::ChoiceItem::run(
-                            label,
-                            Box::new(move |tx| {
-                                tx.send(AppEvent::SignInWith {
-                                    target: target.clone(),
-                                    method: method.clone(),
-                                })
-                            }),
-                        )
-                        .detail(detail)
+                        let item = match method.ask.clone() {
+                            // A way that needs an answer asks it first; the answer completes it.
+                            Some(ask) => crate::choice_picker::ChoiceItem::ask(
+                                label,
+                                crate::choice_picker::Ask {
+                                    verb: ask.prompt,
+                                    label: target.display_name.clone(),
+                                    initial: String::new(),
+                                    secret: ask.secret,
+                                    then: std::sync::Arc::new(move |text, tx| {
+                                        tx.send(AppEvent::SignInWith {
+                                            target: target.clone(),
+                                            method: method.clone().answered(text),
+                                        });
+                                        Ok(crate::choice_picker::Next::Done)
+                                    }),
+                                },
+                            ),
+                            None => crate::choice_picker::ChoiceItem::run(
+                                label,
+                                Box::new(move |tx| {
+                                    tx.send(AppEvent::SignInWith {
+                                        target: target.clone(),
+                                        method: method.clone(),
+                                    })
+                                }),
+                            ),
+                        };
+                        item.detail(detail)
                     })
                     .collect();
                 let mut spec = crate::choice_picker::ChoiceSpec::new(
                     format!("Sign in to {}", target.display_name),
                     items,
                 );
-                spec.subtitle = Some("the way this account's agent offers".to_owned());
+                // Gemini's API key is read from its environment, not typed here: where it goes.
+                let key_note = (target.agent_name == "gemini").then(|| {
+                    format!(
+                        " · an API key goes in {}",
+                        nori_acp_host::accounts::gemini_cli::KEY_VARIABLE
+                    )
+                });
+                spec.subtitle = Some(format!(
+                    "choose how · it counts as signed in once its login is checked{}",
+                    key_note.unwrap_or_default()
+                ));
                 self.app_event_tx
                     .send(AppEvent::ShowChoicePicker(Box::new(spec)));
             }
@@ -144,9 +196,15 @@ impl ChatWidget {
 
     /// Sign in with `method`.
     pub(crate) fn run_sign_in(&mut self, target: SignInTarget, method: SignInMethod) {
-        self.sign_in_target = Some(target.clone());
         match method.how {
-            SignInHow::Terminal { command, args, env } => {
+            SignInHow::Terminal {
+                command,
+                args,
+                env,
+                capture,
+            } => {
+                let target = SignInTarget { capture, ..target };
+                self.sign_in_target = Some(target.clone());
                 let mut handler = LoginHandler::new();
                 handler.start_external_cli(target.display_name.clone());
                 self.start_external_cli_login_flow_with_env(
@@ -157,10 +215,15 @@ impl ChatWidget {
                     target.display_name,
                 );
             }
-            SignInHow::Agent => {
+            SignInHow::Agent { secret } => {
+                self.sign_in_target = Some(target.clone());
                 self.login_terminal = Some(crate::login_terminal::LoginTerminal::waiting(
                     target.display_name.clone(),
-                    "finish signing in in your browser",
+                    if secret.is_some() {
+                        "signing in with the key"
+                    } else {
+                        "finish signing in in your browser"
+                    },
                 ));
                 self.request_redraw();
                 let Ok(config) = nori_harness::get_agent_config(&target.agent_name) else {
@@ -169,15 +232,40 @@ impl ChatWidget {
                 let cwd = self.config.cwd.clone();
                 let tx = self.app_event_tx.clone();
                 tokio::spawn(async move {
-                    let result =
-                        match nori_acp_host::sign_in::authenticate(&config, &cwd, &method.id).await
-                        {
-                            Ok(()) => nori_acp_host::sign_in::verify(&config, &cwd).await,
-                            Err(error) => Err(error),
-                        }
-                        .map_err(|error| format!("{error:#}"));
+                    let result = match nori_acp_host::sign_in::authenticate(
+                        &config,
+                        &cwd,
+                        &method.id,
+                        secret.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => nori_acp_host::sign_in::verify(&config, &cwd).await,
+                        Err(error) => Err(error),
+                    }
+                    .map_err(|error| format!("{error:#}"));
+                    tx.send(AppEvent::AccountChecked {
+                        slug: target.agent_name.clone(),
+                    });
                     tx.send(AppEvent::SignInVerified { target, result });
                 });
+            }
+            SignInHow::StoreSetting { variable, value } => {
+                self.sign_in_target = Some(target.clone());
+                match nori_acp_host::accounts::store_claude_setting(
+                    &target.agent_name,
+                    variable,
+                    value.expose(),
+                ) {
+                    Ok(()) => self.verify_sign_in(target),
+                    Err(error) => {
+                        self.sign_in_target = None;
+                        self.add_error_message(format!(
+                            "Could not keep the {} credential: {error:#}",
+                            target.display_name
+                        ));
+                    }
+                }
             }
         }
     }
@@ -199,6 +287,9 @@ impl ChatWidget {
             let result = nori_acp_host::sign_in::verify(&config, &cwd)
                 .await
                 .map_err(|error| format!("{error:#}"));
+            tx.send(AppEvent::AccountChecked {
+                slug: target.agent_name.clone(),
+            });
             tx.send(AppEvent::SignInVerified { target, result });
         });
     }
@@ -209,8 +300,14 @@ impl ChatWidget {
         self.sign_in_target = None;
         match result {
             Ok(()) => {
+                // The check that passed also said who it is.
+                let who = nori_acp_host::accounts::identity_of(&target.agent_name)
+                    .map(|identity| identity.describe());
                 self.add_login_message(
-                    format!("Signed in to {}", target.display_name),
+                    match &who {
+                        Some(who) => format!("Signed in to {} as {who}", target.display_name),
+                        None => format!("Signed in to {}", target.display_name),
+                    },
                     Some("its models are in /model and /providers".to_owned()),
                 );
                 if target.agent_name == self.config.active_agent && !self.has_harness_session() {

@@ -43,6 +43,7 @@ pub(crate) fn loop_count_choices(current: Option<i32>) -> ChoiceSpec {
                 verb: "iterations",
                 label: String::new(),
                 initial: String::new(),
+                secret: false,
                 then: Arc::new(|text, tx| {
                     let count: i32 = text
                         .trim()
