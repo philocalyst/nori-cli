@@ -96,7 +96,14 @@ pub(crate) fn markdown_segments(input: &str) -> Vec<MarkdownSegment> {
 ///   Committing it renders the header as prose, and no later delta can take that back.
 ///
 /// Both close as soon as a blank line, a non-table line, or stream finalization follows.
+///
+/// A list is held back whole while it is tight (no blank line between its parts yet): a blank
+/// line still to come would make it loose, and a loose list puts a blank line between parts it
+/// already showed. Once loose it stays loose, and its lines are final as they come.
 pub(crate) fn committable_prefix_len(input: &str) -> usize {
+    if opens_with_list_item(input) && !has_interior_blank_line(input) {
+        return 0;
+    }
     if let Some(segment) = markdown_segments(input).last()
         && segment.is_table
         && segment.range.end >= input.len()
@@ -107,6 +114,42 @@ pub(crate) fn committable_prefix_len(input: &str) -> usize {
         Some(start) if input[start..].contains('|') => start,
         _ => input.len(),
     }
+}
+
+/// Whether the first line with content is a list item: `-`, `*` or `+`, or a number with `.` or
+/// `)`, then a space, after at most three spaces.
+fn opens_with_list_item(input: &str) -> bool {
+    let Some(line) = input.lines().find(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let marker = if digits > 0 && digits <= 9 {
+        rest[digits..].strip_prefix(['.', ')'])
+    } else {
+        rest.strip_prefix(['-', '*', '+'])
+    };
+    marker.is_some_and(|after| after.is_empty() || after.starts_with([' ', '\t']))
+}
+
+/// Whether a blank line comes between two lines with content.
+fn has_interior_blank_line(input: &str) -> bool {
+    let mut seen_content = false;
+    let mut blank_after_content = false;
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            blank_after_content |= seen_content;
+        } else if blank_after_content {
+            return true;
+        } else {
+            seen_content = true;
+        }
+    }
+    false
 }
 
 /// Start offset of the final line, ignoring one trailing newline. `None` when `input` has no line.
