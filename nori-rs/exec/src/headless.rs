@@ -448,7 +448,7 @@ fn subagent_line(run: &mut Run, wire: &SubagentWire) {
             if let nori_protocol::Patch::Set(state) = &update.state {
                 let state = match state {
                     nori_protocol::SubagentState::Running => "running".to_owned(),
-                    nori_protocol::SubagentState::Idle => "idle".to_owned(),
+                    nori_protocol::SubagentState::Idle { .. } => "idle".to_owned(),
                     nori_protocol::SubagentState::Ended(outcome) => {
                         format!("ended ({outcome:?})")
                     }
