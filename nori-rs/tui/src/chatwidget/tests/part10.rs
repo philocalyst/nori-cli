@@ -2289,6 +2289,23 @@ fn a_live_session_title_becomes_a_toast_and_replays_stay_quiet() {
     };
     assert_eq!(toasts(&mut rx), vec!["Greeting".to_string()]);
 
+    let derived_title = serde_json::json!({"nori": {"titleSource": "prompt"}})
+        .as_object()
+        .expect("metadata object")
+        .clone();
+    chat.handle_session_event(
+        generation,
+        session_info_update(
+            nori_protocol::acp::v1::SessionInfoUpdate::new()
+                .title("The first prompt")
+                .meta(derived_title),
+        ),
+    );
+    assert!(
+        toasts(&mut rx).is_empty(),
+        "a title derived from the first prompt is not a toast"
+    );
+
     chat.handle_session_event(
         generation,
         nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::ReplayStarted(

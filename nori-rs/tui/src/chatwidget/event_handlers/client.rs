@@ -86,7 +86,15 @@ impl ChatWidget {
                         }
                         // An ordinary update is a toast in the top right, or nothing when
                         // toasts are off.
+                        // A title Nori derived from the prompt the person just typed is not news.
+                        let derived_title = patch
+                            .meta
+                            .as_ref()
+                            .and_then(|meta| meta.get("nori"))
+                            .and_then(|nori| nori.get("titleSource"))
+                            .is_some();
                         if !display.reports_error()
+                            && !derived_title
                             && self.config.toasts
                             && origin == crate::nori::session_info::SessionInfoOrigin::Live
                             && let Some(text) = display.toast_text()

@@ -742,15 +742,28 @@ impl ChatWidget {
     /// Recompute and write the terminal title. Schedules the next animation
     /// frame if the spinner is active.
     pub(crate) fn refresh_terminal_title(&mut self) {
-        // The tab names the project, nothing more: activity shows in the prompt bar.
+        // The tab names the project and the conversation, the same title the footer and the
+        // pickers show: activity shows in the prompt bar.
         let spinner_frame: Option<&str> = None;
 
         let project = self.project_name();
         if project.is_empty() {
             return;
         }
+        let session = self.session_info_state.title().map(|title| {
+            crate::nori::session_info::sanitize(
+                title,
+                crate::nori::session_info::MAX_TITLE_DISPLAY_CHARS,
+            )
+            .trim()
+            .to_owned()
+        });
+        let label = match session.filter(|title| !title.is_empty()) {
+            Some(title) => format!("{project} · {title}"),
+            None => project,
+        };
 
-        let title = crate::terminal_title::compose_title(&project, spinner_frame);
+        let title = crate::terminal_title::compose_title(&label, spinner_frame);
 
         // Skip redundant writes.
         if self.last_terminal_title.as_deref() == Some(&title) {

@@ -37,6 +37,8 @@ impl ChatWidget {
             })
             .filter(|title| !title.is_empty());
         self.bottom_pane.set_session_title(title);
+        // The terminal's tab shows the same title.
+        self.refresh_terminal_title();
     }
 
     pub(crate) fn on_undo_snapshots_loaded(&mut self, snapshots: Vec<nori_harness::UndoSnapshot>) {
