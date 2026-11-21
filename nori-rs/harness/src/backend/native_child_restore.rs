@@ -14,7 +14,41 @@ pub(super) struct RestoredChild {
     pub(super) state: nori_protocol::SubagentState,
 }
 
+/// The import record is consumed once delegation recovery succeeds on this machine.
+const DELEGATION_RESTORED: &str = "delegation-restored-after-move";
+
+fn needs_move_restore(commands: &[(String, String)]) -> bool {
+    commands
+        .last()
+        .is_some_and(|(name, _)| name == crate::portable::MOVED_IN)
+}
+
 impl AcpBackend {
+    pub(super) async fn needs_moved_delegation_restore(&self) -> bool {
+        let Some(recorder) = self.transcript_recorder.read().await.clone() else {
+            return false;
+        };
+        match recorder
+            .journaled_commands_of(&[crate::portable::MOVED_IN, DELEGATION_RESTORED])
+            .await
+        {
+            Ok(commands) => needs_move_restore(&commands),
+            Err(error) => {
+                tracing::warn!(%error, "could not check whether delegation recovery is needed");
+                false
+            }
+        }
+    }
+
+    pub(super) async fn mark_moved_delegation_restored(&self) {
+        if let Some(recorder) = self.transcript_recorder.read().await.clone()
+            && let Err(error) = recorder
+                .record_command(DELEGATION_RESTORED, String::new())
+                .await
+        {
+            tracing::warn!(%error, "could not record completed delegation recovery");
+        }
+    }
     pub(super) async fn managed_child_ids(&self) -> Result<Vec<acp::SessionId>> {
         let Some(recorder) = self.transcript_recorder.read().await.clone() else {
             return Ok(Vec::new());
@@ -405,5 +439,20 @@ impl AcpBackend {
             });
         }
         Ok(restored)
+    }
+}
+
+#[cfg(test)]
+mod move_restore_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_new_unrestored_import_needs_delegation_recovery() {
+        let moved = (crate::portable::MOVED_IN.to_owned(), String::new());
+        let restored = (DELEGATION_RESTORED.to_owned(), String::new());
+        assert!(!needs_move_restore(&[]));
+        assert!(needs_move_restore(std::slice::from_ref(&moved)));
+        assert!(!needs_move_restore(&[moved.clone(), restored.clone()]));
+        assert!(needs_move_restore(&[moved.clone(), restored, moved]));
     }
 }

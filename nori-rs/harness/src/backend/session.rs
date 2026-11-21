@@ -1003,14 +1003,21 @@ impl AcpBackend {
         backend.serve_orchestrator(orchestrator_signals);
         let previous_root =
             transcript.and_then(crate::transcript::Transcript::latest_acp_session_id);
-        let mut restored = backend
-            .restore_native_children(previous_root.as_deref())
-            .await?;
-        restored.extend(
-            backend
-                .restore_managed_children(previous_root.as_deref())
-                .await?,
-        );
+        // An ordinary resume already has its local journals: do not rebuild every child and
+        // replay its history inside the connection deadline. A newly imported conversation needs
+        // this once on its new machine, and records completion so later resumes stay fast.
+        let mut restored = Vec::new();
+        if backend.needs_moved_delegation_restore().await {
+            restored = backend
+                .restore_native_children(previous_root.as_deref())
+                .await?;
+            restored.extend(
+                backend
+                    .restore_managed_children(previous_root.as_deref())
+                    .await?,
+            );
+            backend.mark_moved_delegation_restored().await;
+        }
         for child in restored {
             let id = child.id.clone();
             let related = |event: &SessionEvent| match event {
