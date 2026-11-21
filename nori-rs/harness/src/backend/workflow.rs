@@ -425,6 +425,8 @@ impl AcpBackend {
             ],
             QueuedPromptKind::WorkflowHook => &[HookEvent::AfterCommit, HookEvent::BeforeStop],
             QueuedPromptKind::GoalContinuation
+            | QueuedPromptKind::LoopNudge
+            | QueuedPromptKind::GateContinue
             | QueuedPromptKind::Compact
             | QueuedPromptKind::NativeCompact => return,
         };
