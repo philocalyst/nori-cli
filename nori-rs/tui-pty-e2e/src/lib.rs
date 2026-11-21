@@ -273,6 +273,28 @@ impl TuiSession {
             cmd.env("CODEX_HOME", codex_home.to_str().unwrap());
             // Also set NORI_HOME for nori-config feature support
             cmd.env("NORI_HOME", codex_home.to_str().unwrap());
+            // Nothing a test runs may reach the person's own agents: Nori finds installed agents
+            // and their sign-ins under the home directory (Claude's config, OpenCode's database,
+            // Codex's login, Antigravity's CLI), and a fallback would send them the test's
+            // prompts. The test's directory is the whole home.
+            let home = codex_home.join("home");
+            let _ = std::fs::create_dir_all(&home);
+            cmd.env("HOME", home.to_str().unwrap());
+            for variable in [
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "OPENCODE_CONFIG",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+            ] {
+                cmd.env_remove(variable);
+            }
+            cmd.env("CLAUDE_CODE_EXECUTABLE", "/nonexistent/claude");
+            cmd.env("CLAUDE_CLI_PATH", "/nonexistent/claude");
 
             // Write config.toml to CODEX_HOME (unless explicitly empty for first-launch testing)
             let config_path = codex_home.join("config.toml");
@@ -395,7 +417,7 @@ trust_level = "trusted"
         // Enable debug logging for nori_harness to capture timing information
         cmd.env(
             "RUST_LOG",
-            "codex_core=info,nori_tui=info,codex_rmcp_client=info,nori_harness=debug,nori_acp_host=debug",
+            "codex_core=info,nori_tui=info,codex_rmcp_client=info,nori_harness=debug,nori_acp_host=debug,nori_latency=warn",
         );
 
         let child = pair.slave.spawn_command(cmd)?;
