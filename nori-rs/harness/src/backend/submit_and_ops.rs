@@ -318,7 +318,9 @@ impl AcpBackend {
         admission: PromptAdmission,
         response_tx: oneshot::Sender<Result<acp::RequestId>>,
     ) {
-        let (_, cancellation) = tokio::sync::watch::channel(false);
+        // Nobody cancels this admission; the sender lives until it is decided, since a dropped one
+        // reads as a cancellation.
+        let (_never_cancelled, cancellation) = tokio::sync::watch::channel(false);
         self.submit_prompt_cancellable(content, prompt_meta, admission, cancellation, response_tx)
             .await;
     }
@@ -474,7 +476,8 @@ impl AcpBackend {
         config_id: impl Into<acp::SessionConfigId>,
         value: impl Into<acp::SessionConfigValueId>,
     ) -> Result<()> {
-        let session_id = self.session_id.read().await;
+        // The id is copied out: the lock is not held while the agent answers.
+        let session_id = self.session_id.read().await.clone();
         self.connection
             .set_config_option(&session_id, config_id, value)
             .await
