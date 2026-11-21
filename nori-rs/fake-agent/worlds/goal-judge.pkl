@@ -1,0 +1,147 @@
+/// The goal judge: an agent says its goal is complete, and an independent reviewer decides.
+///
+/// `lead` opens a goal, and each continuation Nori offers an active goal is where it says it is
+/// done, with `update_goal`. The world's `policy` makes `judge` (a second scripted agent, given
+/// none of Nori's tools) the reviewer, with three seconds of patience and two disagreements
+/// allowed. Which verdict `judge` gives depends on a marker word in the goal's objective, which
+/// the reviewer reads in its prompt:
+///
+///   TWICE      "not yet" the first time, "done" the second
+///   STUBBORN   "not yet" every time: the third claim pauses the goal instead of asking again
+///   BROKEN     the reviewer's session fails: the goal is accepted, marked unverified
+///   STALL      the reviewer never answers: after three seconds the goal is accepted, unverified
+///   GIBBERISH  an answer that is not a verdict, read as "not yet" until the goal is paused
+///
+/// Prompts to `lead`: `open twice`, `open stubborn`, `open broken`, `open stall`, `open gibberish`.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/goal-judge.pkl "open twice"
+amends "nori:World"
+
+name = "goal-judge"
+description = "An agent claims its goal is done; a scripted reviewer says not yet, then done, or fails."
+default_agent = "lead"
+
+policy = """
+  goals = new Dynamic {
+    judge_agent = "judge"
+    judge_timeout = 3.s
+    max_disagreements = 2
+  }
+  """
+
+local model = new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+
+local function setGoal(marker: String, objective: String): Scene = new Scene {
+  name = "open \(marker)"
+  on = new Matching { pattern = "open \(marker.toLowerCase())" }
+  steps {
+    new HostTool {
+      name = "create_goal"
+      title = "Set the goal"
+      arguments = new Dynamic { ["objective"] = "\(marker): \(objective)" }
+    }
+    new Say { text = "The goal is set.\n" }
+  }
+}
+
+/// `update_goal complete`: the agent's claim that it is done. `refused` says whether the world
+/// expects the call to fail, which is how a review that finds more to do reads to the agent.
+local function claim(refused: Boolean): Listing<Step> = new Listing {
+  new HostTool {
+    name = "update_goal"
+    title = "Mark the goal complete"
+    arguments = new Dynamic { ["status"] = "complete" }
+    expect_error = refused
+  }
+  new Say { text = if (refused) "The reviewer wants more.\n" else "The goal is closed.\n" }
+}
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models { model }
+    scenes {
+      // An active goal is offered a continuation after every turn that leaves it active, and a
+      // continuation is where this agent says it is done. The prompt carries the objective, so
+      // its marker word picks what the agent expects of the review.
+      new Scene {
+        name = "claim, accepted"
+        on = new Matching { pattern = "(?s)Continue working toward the active thread goal.*(BROKEN|STALL)" }
+        steps { ...claim(false) }
+      }
+      new Scene {
+        name = "claim, refused once"
+        on = new Matching { pattern = "(?s)Continue working toward the active thread goal.*TWICE" }
+        times = 1
+        steps { ...claim(true) }
+      }
+      new Scene {
+        name = "claim, then accepted"
+        on = new Matching { pattern = "(?s)Continue working toward the active thread goal.*TWICE" }
+        steps { ...claim(false) }
+      }
+      new Scene {
+        name = "claim, refused"
+        on = new Matching { pattern = "Continue working toward the active thread goal" }
+        steps { ...claim(true) }
+      }
+      setGoal("TWICE", "trim tokens in the parser and show the tests pass")
+      setGoal("STUBBORN", "make the parser trim tokens")
+      setGoal("BROKEN", "make the parser trim tokens")
+      setGoal("STALL", "make the parser trim tokens")
+      setGoal("GIBBERISH", "make the parser trim tokens")
+      new Scene { steps { new Say { text = "Noted.\n" } } }
+    }
+  }
+
+  // The reviewer. Nori starts it fresh for each claim; it is given none of Nori's tools.
+  ["judge"] {
+    title = "Judge"
+    models { new Model { id = "fake-haiku"; name = "Fake Haiku 5"; context_window = 200000 } }
+    scenes {
+      new Scene {
+        name = "stalls"
+        on = new Matching { pattern = "STALL" }
+        steps { new Hang {} }
+      }
+      new Scene {
+        name = "fails"
+        on = new Matching { pattern = "BROKEN" }
+        steps { new Fail { failure = "internal"; detail = "the reviewer's session fell over" } }
+      }
+      new Scene {
+        name = "unreadable"
+        on = new Matching { pattern = "GIBBERISH" }
+        steps { new Say { text = "I believe the goal is done, more or less.\n" } }
+      }
+      new Scene {
+        name = "stubborn"
+        on = new Matching { pattern = "STUBBORN" }
+        steps {
+          new Say {
+            text = "{\"verdict\":\"continue\",\"reason\":\"No test run appears in the record.\",\"next_step\":\"Run the tests and show the output.\"}\n"
+          }
+        }
+      }
+      new Scene {
+        name = "twice, not yet"
+        on = new Matching { pattern = "TWICE" }
+        times = 1
+        steps {
+          new Say {
+            text = "{\"verdict\":\"continue\",\"reason\":\"The record never shows the tests passing.\",\"next_step\":\"Run cargo test and show the result.\"}\n"
+          }
+        }
+      }
+      new Scene {
+        name = "twice, done"
+        on = new Matching { pattern = "TWICE" }
+        steps {
+          new Say {
+            text = "```json\n{\"verdict\":\"done\",\"reason\":\"The test run in the record passes.\"}\n```\n"
+          }
+        }
+      }
+    }
+  }
+}
