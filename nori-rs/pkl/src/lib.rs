@@ -6,13 +6,20 @@
 //!   `<repo>/.nori/nori.pkl`), deep-merged in that order.
 //! - [`recovery`] reads the shared `recovery` block shape used by policy files and programs.
 //! - [`machine`] captures the machine properties policies and programs may read.
+//! - [`schemas`] embeds the `nori:Job`, `nori:Monitor` and `nori:Plugin` schemas as virtual modules.
+//! - [`kinds`] holds one typed Rust binding per declarative kind (job, monitor, skill, plugin).
+//! - [`catalog`] finds, evaluates, validates and watches the modules of those kinds under
+//!   `$NORI_HOME` and `<repo>/.nori`.
 //!
 //! Evaluation produces data only. Programs themselves (`nori:Program`) are compiled and run by
 //! `nori-conduit`; replaying a journal inspects recorded data and never evaluates it.
+pub mod catalog;
+pub mod kinds;
 pub mod machine;
 pub mod native;
 mod policy;
 pub mod recovery;
+pub mod schemas;
 pub use native::EvaluatorOptions;
 pub use policy::global_policy_path;
 pub use policy::load_policy;
