@@ -410,7 +410,10 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
 - **Models and settings.** A model is chosen by value or name from the agent's
   model option. An agent that takes its model at spawn may run one it does not
   list. Other select settings, such as reasoning effort, are set with
-  `options`. A permission mode can be set only when the parent runs without
+  `options`, by option id or name, or by the typed names `effort` and
+  `model_mode`, which each agent's own option of that kind answers to (a
+  `model_mode` of `fast` finds the `on` of a fast toggle). A permission mode
+  can be set only when the parent runs without
   approvals. What each agent offered is remembered across runs in
   `<nori home>/agent-models.json` for `agent_capabilities`, and kept current
   by probes (`orchestrator/probe.rs`): an installed agent is started in a
@@ -422,7 +425,10 @@ the same `nori-client` server: `agent_capabilities`, `delegate_task`,
   calls `refresh_agent_catalog` when the user starts typing, which re-reads
   agents not read in ten minutes in the background. Each agent has at most one
   probe at a time, a refresh waits for a probe already running instead of
-  skipping it, and three run at once. `delegate_task` rejects a model before
+  skipping it, and three run at once. An agent whose probe failed is not
+  probed in the background again for 30 seconds, doubling after each failure
+  in a row up to ten minutes; a success clears it, and a user-visible re-check
+  (`reprobe`) is never held back. `delegate_task` rejects a model before
   starting the agent only when a reading under ten minutes old lacks it; with
   an older reading the started session decides.
 - **Progress.** While a task runs, its snapshot carries the child's latest tool
@@ -735,8 +741,10 @@ Client-side fallback after a failed server-side load is available only when
 emitted partial history, the harness emits an Agent replay batch followed by a
 distinct Transcript fallback batch; it never combines two sources under one
 marker. A resume without a local transcript must preserve the requested remote
-session identity, so load failure is terminal rather than calling
-`session/new`. Private v2 compatibility types remain in the transcript loader;
+session identity, so load failure is terminal rather than calling `session/new`.
+Rows from Nori's own `/resume` records have local transcripts; the picker can also
+show sessions listed by the agent that Nori never recorded, and those have no local
+transcript. Private v2 compatibility types remain in the transcript loader;
 storage enums are not exported. Public readers use `Transcript::records()` and
 `TranscriptRecord` for conversation events, or `Transcript::context_timeline()`
 for checkpoint history. A resume that has to start a new transcript (no local
