@@ -204,27 +204,6 @@ fn deferred_startup_input_preserves_prompt_and_image_only_semantics_for_resume()
 }
 
 #[test]
-fn session_started_records_queued_launch_prompt_in_composer_history() {
-    let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
-    chat.initial_user_message = Some(UserMessage {
-        text: "prompt that activated the session".to_string(),
-        image_paths: Vec::new(),
-    });
-    let generation = chat.session_generation;
-
-    chat.handle_session_event(generation, session_started_event("session-1"));
-    let _ = chat
-        .bottom_pane
-        .handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-
-    assert_eq!(
-        chat.composer_text(),
-        "prompt that activated the session",
-        "queued launch input should remain available to shell-style history"
-    );
-}
-
-#[test]
 fn follow_only_attachment_keeps_messages_in_the_composer_but_allows_agent_switching() {
     use crate::render::renderable::Renderable;
     use ratatui::buffer::Buffer;

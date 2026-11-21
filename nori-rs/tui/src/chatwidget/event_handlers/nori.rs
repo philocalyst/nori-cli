@@ -361,8 +361,6 @@ impl ChatWidget {
             self.active_cell.set(painted_prompt);
         }
         if let Some(user_message) = self.initial_user_message.take() {
-            self.bottom_pane
-                .record_local_history_submission(&user_message.text);
             self.submit_user_message(user_message);
         }
         if !self.suppress_session_configured_redraw {
