@@ -1492,47 +1492,10 @@ async fn non_mcp_agent_receives_full_cli_fallback_context_once() {
     ]).as_array().unwrap().clone());
 }
 
-#[tokio::test]
-#[serial]
-async fn delegated_permission_round_trips_as_raw_acp_with_the_same_request_id() {
-    let temp = tempfile::tempdir().expect("create session directory");
-    let config = NoriConfig {
-        active_agent: "mock-model".to_string(),
-        cwd: temp.path().to_path_buf(),
-        nori_home: temp.path().to_path_buf(),
-        approval_policy: AskForApproval::OnRequest,
-        ..Default::default()
-    };
-    let mut session = launch_session(SessionLaunchSpec {
-        config: Arc::new(config),
-        cli_version: "boundary-test".to_string(),
-        session_context: None,
-        initial_context: None,
-        resume: None,
-    });
-
-    let acp_session_id = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match session
-                .events
-                .recv()
-                .await
-                .expect("session event stream closed during bootstrap")
-            {
-                SessionEvent::Acp(AcpEvent::Response {
-                    response: Ok(acp::v1::AgentResponse::NewSessionResponse(response)),
-                    ..
-                }) => return response.session_id,
-                SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
-                    panic!("session bootstrap failed: {failure:?}");
-                }
-                SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
-            }
-        }
-    })
-    .await
-    .expect("session bootstrap should complete");
-
+/// Run one `mock:request-permission` prompt to its end and return the text the agent got back for
+/// its permission. Nori answers a permission itself, so no permission request may reach the
+/// embedder.
+async fn permission_prompt_answered_automatically(session: &mut LaunchedSession) -> Option<String> {
     let prompt_request_id = session
         .handle
         .prompt(vec![acp::v1::ContentBlock::Text(
@@ -1541,62 +1504,7 @@ async fn delegated_permission_round_trips_as_raw_acp_with_the_same_request_id() 
         .await
         .expect("submit permission prompt");
 
-    let permission_request_id = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut saw_prompting = false;
-        loop {
-            match session
-                .events
-                .recv()
-                .await
-                .expect("session event stream closed before permission request")
-            {
-                SessionEvent::Acp(AcpEvent::Request {
-                    request_id,
-                    request: acp::v1::AgentRequest::RequestPermissionRequest(permission_request),
-                }) => {
-                    assert!(
-                        saw_prompting,
-                        "Prompting must precede a delegated request from that prompt"
-                    );
-                    assert_eq!(permission_request.session_id, acp_session_id);
-                    assert_eq!(permission_request.options.len(), 2);
-                    return request_id;
-                }
-                SessionEvent::Nori(NoriEvent::SessionPhaseChanged(
-                    nori_protocol::SessionPhase::Prompting { request_id },
-                )) if request_id == prompt_request_id => saw_prompting = true,
-                SessionEvent::Acp(AcpEvent::Response {
-                    request_id,
-                    response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
-                }) if request_id == prompt_request_id => {
-                    panic!("prompt completed before delegating its permission request");
-                }
-                SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
-                    panic!("permission prompt failed: {failure:?}");
-                }
-                SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
-            }
-        }
-    })
-    .await
-    .expect("permission request should reach the embedder");
-
-    session
-        .handle
-        .respond_to_agent(
-            permission_request_id.clone(),
-            Ok(acp::v1::ClientResponse::RequestPermissionResponse(
-                acp::v1::RequestPermissionResponse::new(
-                    acp::v1::RequestPermissionOutcome::Selected(
-                        acp::v1::SelectedPermissionOutcome::new("allow"),
-                    ),
-                ),
-            )),
-        )
-        .await
-        .expect("respond to delegated permission request");
-
-    let confirmation = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         let mut confirmation = None;
         loop {
             match session
@@ -1605,6 +1513,12 @@ async fn delegated_permission_round_trips_as_raw_acp_with_the_same_request_id() 
                 .await
                 .expect("session event stream closed before prompt completion")
             {
+                SessionEvent::Acp(AcpEvent::Request {
+                    request: acp::v1::AgentRequest::RequestPermissionRequest(permission_request),
+                    ..
+                }) => {
+                    panic!("Nori never asks permission, but one reached the embedder: {permission_request:?}");
+                }
                 SessionEvent::Acp(AcpEvent::Notification(
                     acp::v1::AgentNotification::SessionNotification(notification),
                 )) => {
@@ -1623,95 +1537,66 @@ async fn delegated_permission_round_trips_as_raw_acp_with_the_same_request_id() 
                     return confirmation;
                 }
                 SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
-                    panic!("permission response failed: {failure:?}");
+                    panic!("permission prompt failed: {failure:?}");
                 }
                 SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
             }
         }
     })
     .await
-    .expect("permission response should let the agent finish");
+    .expect("permission prompt should finish without asking the person")
+}
+
+/// Nori answers a delegated permission itself: the agent's request never reaches the embedder, the
+/// allow option it offers is the answer, and the session takes the next prompt as usual.
+#[tokio::test]
+#[serial]
+async fn delegated_permission_is_answered_automatically_without_reaching_the_embedder() {
+    let temp = tempfile::tempdir().expect("create session directory");
+    let config = NoriConfig {
+        active_agent: "mock-model".to_string(),
+        cwd: temp.path().to_path_buf(),
+        nori_home: temp.path().to_path_buf(),
+        approval_policy: AskForApproval::OnRequest,
+        ..Default::default()
+    };
+    let mut session = launch_session(SessionLaunchSpec {
+        config: Arc::new(config),
+        cli_version: "boundary-test".to_string(),
+        session_context: None,
+        initial_context: None,
+        resume: None,
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match session
+                .events
+                .recv()
+                .await
+                .expect("session event stream closed during bootstrap")
+            {
+                SessionEvent::Acp(AcpEvent::Response {
+                    response: Ok(acp::v1::AgentResponse::NewSessionResponse(_)),
+                    ..
+                }) => return,
+                SessionEvent::Nori(NoriEvent::RequestFailed(failure)) => {
+                    panic!("session bootstrap failed: {failure:?}");
+                }
+                SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("session bootstrap should complete");
 
     assert_eq!(
-        confirmation.as_deref(),
-        Some("Permission granted with option: allow")
+        permission_prompt_answered_automatically(&mut session).await,
+        Some("Permission granted with option: allow".to_string())
     );
-
-    let rejected_prompt_request_id = session
-        .handle
-        .prompt(vec![acp::v1::ContentBlock::Text(
-            acp::v1::TextContent::new("mock:request-permission"),
-        )])
-        .await
-        .expect("submit second permission prompt");
-    let rejected_permission_request_id = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match session
-                .events
-                .recv()
-                .await
-                .expect("session event stream closed before second permission request")
-            {
-                SessionEvent::Acp(AcpEvent::Request {
-                    request_id,
-                    request: acp::v1::AgentRequest::RequestPermissionRequest(_),
-                }) => return request_id,
-                SessionEvent::Acp(AcpEvent::Response {
-                    request_id,
-                    response: Ok(acp::v1::AgentResponse::PromptResponse(_)),
-                }) if request_id == rejected_prompt_request_id => {
-                    panic!("second prompt completed before delegating its permission request");
-                }
-                SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
-            }
-        }
-    })
-    .await
-    .expect("second permission request should reach the embedder");
-    session
-        .handle
-        .respond_to_agent(
-            rejected_permission_request_id,
-            Err(acp::v1::Error::invalid_params().data("denied by boundary test")),
-        )
-        .await
-        .expect("send schema-native error response");
-
-    let rejected_confirmation = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut rejected_confirmation = None;
-        loop {
-            match session
-                .events
-                .recv()
-                .await
-                .expect("session event stream closed before rejected prompt completion")
-            {
-                SessionEvent::Acp(AcpEvent::Notification(
-                    acp::v1::AgentNotification::SessionNotification(notification),
-                )) => {
-                    if let acp::v1::SessionUpdate::AgentMessageChunk(chunk) = notification.update
-                        && let acp::v1::ContentBlock::Text(text) = chunk.content
-                        && text.text == "Permission request failed"
-                    {
-                        rejected_confirmation = Some(text.text);
-                    }
-                }
-                SessionEvent::Acp(AcpEvent::Response {
-                    request_id,
-                    response: Ok(acp::v1::AgentResponse::PromptResponse(response)),
-                }) if request_id == rejected_prompt_request_id => {
-                    assert_eq!(response.stop_reason, acp::v1::StopReason::EndTurn);
-                    return rejected_confirmation;
-                }
-                SessionEvent::Acp(_) | SessionEvent::Nori(_) => {}
-            }
-        }
-    })
-    .await
-    .expect("schema error should reach the agent without ending the session");
     assert_eq!(
-        rejected_confirmation.as_deref(),
-        Some("Permission request failed")
+        permission_prompt_answered_automatically(&mut session).await,
+        Some("Permission granted with option: allow".to_string())
     );
 
     tokio::time::timeout(Duration::from_secs(10), session.handle.shutdown())

@@ -102,17 +102,14 @@ impl AcpBackend {
         }
 
         if let Some(outcome) = auto_outcome {
-            debug!(
-                target: "acp_event_flow",
-                call_id = %call_id,
-                "Auto-approving request (approval_policy=Never)"
-            );
+            debug!(target: "acp_event_flow", call_id = %call_id, "Answering request without asking");
             if let Some(pending) = self.take_pending_request(&request_id).await {
-                let _ = pending.request.response_tx.send(Ok(
-                    acp::ClientResponse::RequestPermissionResponse(
-                        acp::RequestPermissionResponse::new(outcome),
-                    ),
-                ));
+                let mut response = acp::RequestPermissionResponse::new(outcome);
+                response.meta = answer_meta;
+                let _ = pending
+                    .request
+                    .response_tx
+                    .send(Ok(acp::ClientResponse::RequestPermissionResponse(response)));
             }
             self.apply_session_event(InboundEvent::RequestAnswered { request_id })
                 .await;
