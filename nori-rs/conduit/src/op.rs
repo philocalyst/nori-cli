@@ -16,8 +16,8 @@ use crate::program::model::GuardPhase;
 use crate::program::model::OnExhausted;
 use crate::program::model::World;
 use crate::schemas::Actor;
-use crate::schemas::SkillSpec;
 use crate::schemas::ToolSpec;
+use crate::schemas::ToolsetSpec;
 
 /// Who a `send` addresses.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,7 +241,7 @@ pub struct CompiledProgram {
     pub worlds: BTreeMap<String, World>,
     /// The world the whole program runs in, when it names one.
     pub world: Option<World>,
-    pub skills: Vec<SkillSpec>,
+    pub toolsets: Vec<ToolsetSpec>,
     pub tools: Vec<ToolSpec>,
     pub recovery: Option<RecoveryBlock>,
     pub budget_tokens: Option<i64>,

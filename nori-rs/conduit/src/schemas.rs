@@ -13,6 +13,7 @@ use crate::error::ConduitError;
 
 pub const WORKSPACE_SCHEMA_PKL: &str = include_str!("../schemas/Workspace.pkl");
 pub const TOOL_SCHEMA_PKL: &str = include_str!("../schemas/Tool.pkl");
+pub const TOOLSET_SCHEMA_PKL: &str = include_str!("../schemas/Toolset.pkl");
 pub const SKILL_SCHEMA_PKL: &str = include_str!("../schemas/Skill.pkl");
 pub const AGENT_SCHEMA_PKL: &str = include_str!("../schemas/Agent.pkl");
 pub const RECOVERY_SCHEMA_PKL: &str = include_str!("../schemas/Recovery.pkl");
@@ -87,7 +88,7 @@ pub struct ToolSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkillSpec {
+pub struct ToolsetSpec {
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -124,7 +125,7 @@ pub struct Actor {
     #[serde(default)]
     pub tools: Vec<String>,
     #[serde(default)]
-    pub skills: Vec<String>,
+    pub toolsets: Vec<String>,
     #[serde(default)]
     pub sandbox: Option<SandboxPolicy>,
     #[serde(default)]
@@ -140,6 +141,7 @@ pub fn builtin_virtual_modules() -> BTreeMap<String, String> {
     let entries = [
         ("Workspace", WORKSPACE_SCHEMA_PKL),
         ("Tool", TOOL_SCHEMA_PKL),
+        ("Toolset", TOOLSET_SCHEMA_PKL),
         ("Skill", SKILL_SCHEMA_PKL),
         ("Agent", AGENT_SCHEMA_PKL),
         ("Recovery", RECOVERY_SCHEMA_PKL),

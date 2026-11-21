@@ -1,0 +1,14 @@
+/// A toolset: instructions and the tools they allow, which a program's actors use by name.
+open module nori.Toolset
+
+import "nori:Tool" as Tool
+
+class ToolsetSpec {
+  name: String(!isEmpty)
+  description: String = ""
+  instructions: Listing<String>
+  allowed_tools: Listing<String>
+  required_tools: Listing<Tool.ToolSpec>
+}
+
+toolsets: Listing<ToolsetSpec>

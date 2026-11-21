@@ -190,15 +190,15 @@ pub(crate) async fn ensure_actor(
         sandbox = Some(narrow_sandbox(sandbox.as_ref(), policy));
     }
     let mut tools = declared.tools.clone();
-    let mut skill_instructions = Vec::new();
-    for skill in env
+    let mut toolset_instructions = Vec::new();
+    for toolset in env
         .program
-        .skills
+        .toolsets
         .iter()
-        .filter(|skill| declared.skills.contains(&skill.name))
+        .filter(|toolset| declared.toolsets.contains(&toolset.name))
     {
-        tools.extend(skill.allowed_tools.iter().cloned());
-        skill_instructions.extend(skill.instructions.iter().cloned());
+        tools.extend(toolset.allowed_tools.iter().cloned());
+        toolset_instructions.extend(toolset.instructions.iter().cloned());
     }
     tools.sort();
     tools.dedup();
@@ -208,7 +208,7 @@ pub(crate) async fn ensure_actor(
             alias: alias.to_owned(),
             actor: declared,
             tools,
-            skill_instructions,
+            toolset_instructions,
             sandbox,
             world,
         })

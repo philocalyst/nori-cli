@@ -8,6 +8,7 @@
 mod compile;
 mod locate;
 pub mod model;
+mod skill;
 pub mod template;
 
 use std::collections::BTreeMap;
@@ -39,11 +40,33 @@ pub fn load_source(
     path: Option<&Path>,
     properties: BTreeMap<String, String>,
 ) -> Result<CompiledProgram, ConduitError> {
+    load_source_with(source, path, properties, &BTreeMap::new())
+}
+
+/// [`load_source`] for a program that may be a skill (`nori:Skill`): `arguments` are the values of
+/// its `parameters`, put in place of each `{{parameter}}` before the program is checked, so a
+/// skill run with them is an ordinary program. Unknown arguments, and required parameters with no
+/// argument and no default, are errors that name them.
+pub fn load_source_with(
+    source: &str,
+    path: Option<&Path>,
+    properties: BTreeMap<String, String>,
+    arguments: &BTreeMap<String, String>,
+) -> Result<CompiledProgram, ConduitError> {
     let file = path.map_or_else(|| "<program>".to_owned(), |path| path.display().to_string());
+    // The arguments are also visible to the module while it evaluates, as `read?("prop:skill.<name>")`
+    // (null when absent), so a skill can shape its actors and steps from them and not only its text.
+    let mut properties = properties;
+    properties.extend(
+        arguments
+            .iter()
+            .map(|(name, value)| (format!("skill.{name}"), value.clone())),
+    );
     let options = program_evaluator_options().properties(properties);
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         nori_pkl::native::evaluate_source_at_path(source, path, &options)
             .map_err(|message| ConduitError::Compilation { message })?;
+    skill::apply_arguments(&mut value, arguments, &file)?;
     if value.get("steps").is_none() && value.get("name").is_none() {
         return Err(ConduitError::Compilation {
             message: format!(

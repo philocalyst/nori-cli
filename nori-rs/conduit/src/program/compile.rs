@@ -138,18 +138,18 @@ impl Compiler<'_> {
         for (alias, actor) in &program.actors {
             let path = format!("actors[\"{alias}\"]");
             self.recovery_block(&path, actor.recovery.as_ref());
-            for skill in &actor.skills {
+            for toolset in &actor.toolsets {
                 if !program
-                    .skills
+                    .toolsets
                     .iter()
-                    .any(|declared| &declared.name == skill)
+                    .any(|declared| &declared.name == toolset)
                 {
                     self.problem(
                         &path,
-                        Some(("skills", skill)),
+                        Some(("toolsets", toolset)),
                         format!(
-                            "actor `{alias}` uses skill `{skill}`, which the program does not declare; declared skills: {}",
-                            list(program.skills.iter().map(|declared| declared.name.as_str()))
+                            "actor `{alias}` uses toolset `{toolset}`, which the program does not declare; declared toolsets: {}",
+                            list(program.toolsets.iter().map(|declared| declared.name.as_str()))
                         ),
                     );
                 }
@@ -190,7 +190,7 @@ impl Compiler<'_> {
             actors: program.actors.clone(),
             worlds: program.worlds.clone(),
             world: program.world.clone(),
-            skills: program.skills.clone(),
+            toolsets: program.toolsets.clone(),
             tools: program.tools.clone(),
             recovery: program.recovery.clone(),
             budget_tokens: program.budget_tokens,

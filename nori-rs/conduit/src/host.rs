@@ -51,11 +51,11 @@ pub struct ActorRef {
 pub struct ActorSpec {
     pub alias: String,
     pub actor: Actor,
-    /// The Nori host tools the actor is given: its own `tools` and those of its skills.
+    /// The Nori host tools the actor is given: its own `tools` and those of its toolsets.
     /// Empty leaves the session's tool policy as it is.
     pub tools: Vec<String>,
-    /// What the actor's skills tell it about its tools.
-    pub skill_instructions: Vec<String>,
+    /// What the actor's toolsets tell it about its tools.
+    pub toolset_instructions: Vec<String>,
     /// What the actor's Nori `bash` and host tools may do: the sandbox of the scope it starts
     /// in, narrowed by its own. `None` restricts nothing.
     pub sandbox: Option<SandboxPolicy>,

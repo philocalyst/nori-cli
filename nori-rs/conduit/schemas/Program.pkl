@@ -18,7 +18,7 @@ open module nori.Program
 
 import "nori:Agent" as Agent
 import "nori:Recovery" as Recovery
-import "nori:Skill" as Skill
+import "nori:Toolset" as Toolset
 import "nori:Tool" as Tool
 
 /// A world a program, or part of one, runs in: its own worktree and optionally its own
@@ -246,8 +246,8 @@ actors: Mapping<String, Agent.Actor>
 worlds: Mapping<String, World>
 /// The world the whole program runs in; unset means the session's own.
 world: World?
-/// Skills actors can use by name.
-skills: Listing<Skill.SkillSpec>
+/// Toolsets actors can use by name.
+toolsets: Listing<Toolset.ToolsetSpec>
 /// Programs may call these tools by name; `wasm` tools run in the sandboxed tool runtime.
 tools: Listing<Tool.ToolSpec>
 /// Program-wide recovery overrides, applied over policy and under actor and step overrides.

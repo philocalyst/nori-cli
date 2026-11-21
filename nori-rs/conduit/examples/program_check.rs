@@ -8,6 +8,7 @@
 //!   --fail <alias>:<n>:<class> the first <n> sends to <alias> fail with failure class <class>
 //!   --approve <alias>:<turn>   <alias> replies APPROVED from its <turn>th turn on
 //!   --signal <topic>=<payload> send the run a signal as soon as it starts
+//!   --arg <name>=<value>       an argument of a skill (`nori:Skill`)
 //! ```
 
 use futures::StreamExt;
@@ -28,10 +29,22 @@ use nori_conduit::RunHandle;
 use nori_conduit::RunSnapshot;
 use nori_conduit::Transport;
 use nori_conduit::WireOp;
-use nori_conduit::load_file;
 use nori_workflow::FailureKind;
 
-const USAGE: &str = "usage: program_check <program.pkl> [--run] [--journal <dir>] [--json] [--fail alias:n:class] [--approve alias:turn]";
+const USAGE: &str = "usage: program_check <program.pkl> [--run] [--journal <dir>] [--json] [--fail alias:n:class] [--approve alias:turn] [--arg name=value]";
+
+/// The program (or skill, with its arguments) the options name.
+fn load(options: &Options) -> Result<nori_conduit::CompiledProgram, String> {
+    let source = std::fs::read_to_string(&options.path)
+        .map_err(|error| format!("cannot read {}: {error}", options.path.display()))?;
+    nori_conduit::load_source_with(
+        &source,
+        Some(&options.path),
+        BTreeMap::new(),
+        &options.arguments,
+    )
+    .map_err(|error| error.to_string())
+}
 
 #[derive(Default)]
 struct Options {
@@ -42,6 +55,8 @@ struct Options {
     failures: Vec<String>,
     approvals: Vec<String>,
     signals: Vec<String>,
+    /// A skill's arguments, `--arg name=value`.
+    arguments: BTreeMap<String, String>,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -61,6 +76,13 @@ fn parse_options() -> Result<Options, String> {
             "--fail" => options.failures.push(args.next().ok_or(USAGE)?),
             "--approve" => options.approvals.push(args.next().ok_or(USAGE)?),
             "--signal" => options.signals.push(args.next().ok_or(USAGE)?),
+            "--arg" => {
+                let argument = args.next().ok_or(USAGE)?;
+                let (name, value) = argument
+                    .split_once('=')
+                    .ok_or_else(|| format!("--arg expects name=value, got {argument}"))?;
+                options.arguments.insert(name.to_owned(), value.to_owned());
+            }
             other => return Err(format!("unknown option {other}\n{USAGE}")),
         }
     }
@@ -133,7 +155,7 @@ fn print_envelope(envelope: &Envelope) {
 }
 
 async fn dry_run(options: &Options) -> Result<(), String> {
-    let program = load_file(&options.path, BTreeMap::new()).map_err(|error| error.to_string())?;
+    let program = load(options)?;
     let host = Arc::new(LocalHost::new(std::env::temp_dir()));
     for (alias, script) in scripts(options)? {
         let seen = AtomicI64::new(0);
@@ -219,7 +241,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let program = match load_file(&options.path, BTreeMap::new()) {
+    let program = match load(&options) {
         Ok(program) => program,
         Err(error) => {
             eprintln!("{error}");

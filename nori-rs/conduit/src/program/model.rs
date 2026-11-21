@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::host::Delivery;
 use crate::schemas::Actor;
 use crate::schemas::Isolation;
-use crate::schemas::SkillSpec;
 use crate::schemas::ToolSpec;
+use crate::schemas::ToolsetSpec;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Program {
@@ -28,7 +28,7 @@ pub struct Program {
     #[serde(default)]
     pub world: Option<World>,
     #[serde(default)]
-    pub skills: Vec<SkillSpec>,
+    pub toolsets: Vec<ToolsetSpec>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
     #[serde(default)]

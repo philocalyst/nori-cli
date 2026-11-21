@@ -22,8 +22,8 @@ class Actor {
   /// Nori host tools the actor is given (`bash`, `git_status`, `delegate_task`, ...); empty
   /// leaves the session's tool policy as it is. Anything else the agent has of its own stays.
   tools: Listing<String>
-  /// Names of program `skills` the actor uses: each adds its instructions and tools.
-  skills: Listing<String>
+  /// Names of program `toolsets` the actor uses: each adds its instructions and tools.
+  toolsets: Listing<String>
   /// Narrows the tools and paths the actor's Nori `bash` and host tools may use, below the
   /// sandbox of the world it lives in.
   sandbox: Workspace.SandboxPolicy?

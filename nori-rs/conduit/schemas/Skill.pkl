@@ -1,14 +1,32 @@
-/// Canonical Nori Skill specification schema.
+/// A skill: a procedure an agent or a person runs by name. It is a program (actors, steps, a
+/// result) with a summary, the parameters it takes, and optionally the slash command that runs it.
+///
+///     amends "nori:Skill"
+///     name = "council"
+///     summary = "Several models answer, then one reconciles."
+///     parameters { ["question"] { description = "What to decide" } }
+///     actors { ["a"] { agent = "claude-code" }; ["b"] { agent = "codex" } }
+///     steps { new Send { to = "a"; message = "{{question}}"; bind = "first" } }
+///     result = "first"
+///
+/// `{{parameter}}` in any text of the program is the argument it was run with (a parameter that
+/// was not given takes its `default`).
 open module nori.Skill
 
-import "nori:Tool" as Tool
+extends "nori:Program"
 
-class SkillSpec {
-  name: String(!isEmpty)
+class Parameter {
   description: String = ""
-  instructions: Listing<String>
-  allowed_tools: Listing<String>
-  required_tools: Listing<Tool.ToolSpec>
+  /// Used when the skill is run without this argument.
+  default: String?
+  /// A run without it (and with no `default`) is refused.
+  required: Boolean = true
 }
 
-skills: Listing<SkillSpec>
+/// One line saying what the skill does, shown to agents in the `skill` tool and to people in the
+/// command list.
+summary: String = ""
+/// The arguments the skill takes, by name.
+parameters: Mapping<String, Parameter>
+/// The slash command that runs it (without the slash); the skill's `name` when absent.
+command: String?
