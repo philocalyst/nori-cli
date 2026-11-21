@@ -2,6 +2,9 @@
 //!
 //! Nothing here knows about Scheme: the harness applies these values directly.
 
+use crate::compaction::CompactionPolicy;
+use crate::goals::GoalsPolicy;
+use crate::loops::LoopPolicy;
 use crate::recovery::RecoveryPolicy;
 
 /// How an agent session should behave: its autonomy, the prompts Nori sends at
@@ -19,6 +22,12 @@ pub struct Workflow {
     pub commit_reviewer: Option<CommitAgent>,
     /// How a failed request is retried and which routes a session falls back to.
     pub recovery: RecoveryPolicy,
+    /// When a session compacts itself, and how a refused checkpoint is cut down.
+    pub compaction: CompactionPolicy,
+    /// What happens when the agent keeps repeating one tool call.
+    pub loops: LoopPolicy,
+    /// Whether an independent reviewer checks a goal the agent calls complete.
+    pub goals: GoalsPolicy,
     pub pr: Option<PrRules>,
     /// Free-form standing instructions, rendered verbatim.
     pub instructions: Vec<String>,

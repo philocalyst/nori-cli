@@ -2,10 +2,21 @@
 //!
 //! The ACP Pkl runtime uses these types without depending on a scripting engine.
 
+mod compaction;
+mod goals;
+mod loops;
 mod model;
 mod recovery;
 mod render;
 
+pub use compaction::CompactionOverride;
+pub use compaction::CompactionPolicy;
+pub use compaction::ContextPressure;
+pub use goals::GoalsOverride;
+pub use goals::GoalsPolicy;
+pub use loops::LoopAction;
+pub use loops::LoopOverride;
+pub use loops::LoopPolicy;
 pub use model::CommitAgent;
 pub use model::CommitBatch;
 pub use model::CommitRules;

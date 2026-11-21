@@ -8,6 +8,9 @@ fn land() -> Workflow {
         name: "land".to_string(),
         commit_reviewer: None,
         recovery: RecoveryPolicy::default(),
+        compaction: crate::compaction::CompactionPolicy::default(),
+        loops: crate::loops::LoopPolicy::default(),
+        goals: crate::goals::GoalsPolicy::default(),
         tools: None,
         max_turns: Some(3),
         hooks: vec![
