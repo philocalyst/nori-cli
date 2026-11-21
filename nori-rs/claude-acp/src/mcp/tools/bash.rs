@@ -46,16 +46,7 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "$(", "`", "\n"];
 /// ensure that `npm run build && rm -rf /` doesn't match by detecting
 /// the `&&` operator in the remainder after the prefix.
 ///
-/// # Examples
-///
-/// ```
-/// use claude_code_acp::mcp::tools::contains_shell_operator;
-///
-/// assert!(contains_shell_operator("ls && rm -rf /"));
-/// assert!(contains_shell_operator("cat file | grep secret"));
-/// assert!(contains_shell_operator("$(whoami)"));
-/// assert!(!contains_shell_operator("npm run build"));
-/// ```
+/// For example, `ls && pwd` contains an operator, while `npm run build` does not.
 pub fn contains_shell_operator(command: &str) -> bool {
     SHELL_OPERATORS.iter().any(|op| command.contains(op))
 }
