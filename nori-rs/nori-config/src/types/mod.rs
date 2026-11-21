@@ -351,6 +351,11 @@ pub struct NoriConfigToml {
     #[serde(default)]
     pub default_models: HashMap<String, String>,
 
+    /// Preferred account agent slugs per provider when ranking routes to one model.
+    /// Example: `claude = ["claude@work", "claude-code"]`.
+    #[serde(default)]
+    pub account_preferences: HashMap<String, Vec<String>>,
+
     /// Custom agent definitions
     #[serde(default)]
     pub agents: Vec<AgentConfigToml>,
@@ -2469,6 +2474,9 @@ pub struct NoriConfig {
     /// Default model overrides per agent (e.g., "claude-code" -> "haiku")
     pub default_models: HashMap<String, String>,
 
+    /// Preferred account agent slugs per provider when ranking routes to one model.
+    pub account_preferences: HashMap<String, Vec<String>>,
+
     /// Custom agent definitions from config
     pub agents: Vec<AgentConfigToml>,
 
@@ -2542,6 +2550,7 @@ impl Default for NoriConfig {
             async_pre_agent_response_hooks: Vec::new(),
             async_post_agent_response_hooks: Vec::new(),
             default_models: HashMap::new(),
+            account_preferences: HashMap::new(),
             agents: Vec::new(),
             cloud_broker_url: None,
         }

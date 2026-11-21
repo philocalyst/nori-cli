@@ -232,7 +232,8 @@ impl AcpBackend {
                             &fallback.chain,
                             &|agent| config.default_models.get(agent).cloned(),
                             &installed,
-                        );
+                        )
+                        .with_account_preferences(config.account_preferences.clone());
                         if fallback.prefer_headroom {
                             ranking = ranking
                                 .with_headroom(crate::recovery::AccountHeadroom::load(&home));

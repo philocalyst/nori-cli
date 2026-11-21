@@ -126,6 +126,13 @@ window was ever reported for has unknown room and counts as having plenty. Set
 `prefer_headroom = false` to keep the order below untouched. The route change
 names the accounts: `account primary → secondary`.
 
+`[account_preferences]` in `config.toml` can put one account first among sibling
+routes for a provider, for example `claude = ["claude@work", "claude-code"]`.
+The active route remains first; a configured account preference comes before
+headroom, except that a known-spent account still falls behind available siblings
+when `prefer_headroom` is on. This affects ranked routes only; the explicit
+fallback `chain` remains in its written order.
+
 ```pkl
 recovery = new Dynamic {
   retry = new Dynamic {

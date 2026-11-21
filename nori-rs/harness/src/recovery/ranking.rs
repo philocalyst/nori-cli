@@ -22,6 +22,7 @@
 
 use nori_workflow::Route;
 use nori_workflow::RouteRef;
+use std::collections::HashMap;
 
 use super::headroom::AccountHeadroom;
 use super::identity::ModelFamily;
@@ -57,6 +58,7 @@ pub struct RouteRanking {
     preferred: Vec<RouteRef>,
     agent_order: Vec<String>,
     headroom: Option<AccountHeadroom>,
+    account_preferences: HashMap<String, Vec<String>>,
 }
 
 impl RouteRanking {
@@ -97,7 +99,15 @@ impl RouteRanking {
             preferred,
             agent_order,
             headroom: None,
+            account_preferences: HashMap::new(),
         }
+    }
+
+    /// Prefer these account agent slugs within their provider when routes serve one model.
+    #[must_use]
+    pub fn with_account_preferences(mut self, preferences: HashMap<String, Vec<String>>) -> Self {
+        self.account_preferences = preferences;
+        self
     }
 
     /// Let the room each account has left decide between routes to one model.
@@ -138,7 +148,8 @@ impl RouteRanking {
             &chain,
             &|agent| config.default_models.get(agent).cloned(),
             &installed,
-        );
+        )
+        .with_account_preferences(config.account_preferences.clone());
         if prefer_headroom {
             ranking.with_headroom(AccountHeadroom::load(&config.nori_home))
         } else {
@@ -180,9 +191,10 @@ impl RouteRanking {
         route: impl Fn(&T) -> (RouteRef, Option<ModelFamily>),
     ) {
         self.sort(items, &route);
-        let Some(headroom) = &self.headroom else {
+        if self.account_preferences.is_empty() && self.headroom.is_none() {
             return;
-        };
+        }
+        let headroom = self.headroom.as_ref();
         // (provider, through a gateway): the accounts that may trade places.
         let peers: Vec<(String, bool)> = items
             .iter()
@@ -192,23 +204,34 @@ impl RouteRanking {
                 (provider_for(&route.agent, model), is_gateway(&route.agent))
             })
             .collect();
-        let standing: Vec<(bool, i64)> = items
+        let priority: Vec<(bool, bool, usize, i64)> = items
             .iter()
             .map(|item| {
                 let (route, _) = route(item);
-                // The route the session runs on is left only when its account is spent: a
-                // little less room than another account is no reason to change it.
-                let active = self.active.as_ref() == Some(&route);
-                headroom.room_for(&route).map_or((false, 0), |room| {
-                    (room.is_spent(), if active { 0 } else { room.tier() })
-                })
+                let room = headroom.and_then(|headroom| headroom.room_for(&route));
+                let spent = room.as_ref().is_some_and(|room| room.is_spent());
+                // Preserve the person's current account unless its usage is known to be spent.
+                let active = self.active.as_ref() == Some(&route) && !spent;
+                let provider =
+                    provider_for(&route.agent, route.model.as_deref().unwrap_or_default());
+                let account_preference = self
+                    .account_preferences
+                    .get(&provider)
+                    .and_then(|accounts| accounts.iter().position(|agent| agent == &route.agent))
+                    .unwrap_or(usize::MAX);
+                (
+                    spent,
+                    !active,
+                    account_preference,
+                    room.map_or(0, |room| room.tier()),
+                )
             })
             .collect();
         let mut wanted: Vec<usize> = (0..items.len()).collect();
         for peer in &peers {
             let places: Vec<usize> = (0..peers.len()).filter(|at| peers[*at] == *peer).collect();
             let mut members = places.clone();
-            members.sort_by_key(|member| standing[*member]);
+            members.sort_by_key(|member| priority[*member]);
             for (place, member) in places.into_iter().zip(members) {
                 wanted[place] = member;
             }
@@ -299,6 +322,13 @@ mod tests {
             .with_headroom(AccountHeadroom::new(limits, Utc::now()))
     }
 
+    fn claude_f_preference(ranking: RouteRanking) -> RouteRanking {
+        ranking.with_account_preferences(HashMap::from([(
+            "claude".to_owned(),
+            vec!["claude@f".to_owned()],
+        )]))
+    }
+
     #[test]
     fn accounts_of_one_provider_trade_places_by_room() {
         let ranking = ranking(vec![
@@ -333,6 +363,47 @@ mod tests {
         assert_eq!(
             order(&ranking, &["claude-code", "claude2"], "claude-opus-5-5"),
             ["claude-code", "claude2"]
+        );
+    }
+
+    #[test]
+    fn account_preferences_precede_headroom_only_within_their_provider() {
+        let ranking = claude_f_preference(ranking(vec![
+            used("claude@f", "claude", 80.0),
+            used("claude-code", "claude", 0.0),
+            used("openrouter", "claude", 0.0),
+        ]));
+        assert_eq!(
+            order(
+                &ranking,
+                &["claude-code", "openrouter", "claude@f"],
+                "claude-opus-5-5"
+            ),
+            ["claude@f", "openrouter", "claude-code"]
+        );
+    }
+
+    #[test]
+    fn account_preferences_preserve_the_active_route() {
+        let active = RouteRef::new("claude-code", Some("claude-opus-5-5".to_owned()));
+        let installed = ["claude-code", "claude@f"].map(str::to_owned).to_vec();
+        let ranking =
+            claude_f_preference(RouteRanking::new(Some(active), &[], &|_| None, &installed));
+        assert_eq!(
+            order(&ranking, &["claude@f", "claude-code"], "claude-opus-5-5"),
+            ["claude-code", "claude@f"]
+        );
+    }
+
+    #[test]
+    fn known_spent_preferred_account_falls_behind_its_sibling() {
+        let ranking = claude_f_preference(ranking(vec![
+            used("claude@f", "claude", 99.0),
+            used("claude-code", "claude", 90.0),
+        ]));
+        assert_eq!(
+            order(&ranking, &["claude-code", "claude@f"], "claude-opus-5-5"),
+            ["claude-code", "claude@f"]
         );
     }
 }

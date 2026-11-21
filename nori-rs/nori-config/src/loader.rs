@@ -285,6 +285,7 @@ impl NoriConfig {
             async_pre_agent_response_hooks,
             async_post_agent_response_hooks,
             default_models: toml.default_models,
+            account_preferences: toml.account_preferences,
             agents,
             cloud_broker_url: toml.cloud.broker_url,
         })
@@ -1153,6 +1154,32 @@ gemini = "flash"
 
         let config = NoriConfig::load_from_path(&config_path).unwrap();
         assert!(config.default_models.is_empty());
+    }
+
+    #[test]
+    fn test_account_preferences_loaded_from_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join(CONFIG_FILE);
+
+        std::fs::write(
+            &config_path,
+            r#"
+[account_preferences]
+claude = ["claude@work", "claude-code"]
+codex = ["codex@personal"]
+"#,
+        )
+        .unwrap();
+
+        let config = NoriConfig::load_from_path(&config_path).unwrap();
+        assert_eq!(
+            config.account_preferences.get("claude"),
+            Some(&vec!["claude@work".to_owned(), "claude-code".to_owned()])
+        );
+        assert_eq!(
+            config.account_preferences.get("codex"),
+            Some(&vec!["codex@personal".to_owned()])
+        );
     }
 
     // ========================================================================

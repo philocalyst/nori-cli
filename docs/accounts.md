@@ -61,6 +61,21 @@ the model picker see it like any other agent. A name is up to 32 letters, digits
 unknown provider, a provider with a single account, or a duplicate slug is a config error naming
 the entry.
 
+### Prefer an account when routes share a model
+
+`[account_preferences]` in `config.toml` orders account agent slugs within one provider, without
+changing another provider's route order:
+
+```toml
+[account_preferences]
+claude = ["claude@client", "claude-code"]
+```
+
+The session's active route remains first. When Nori ranks sibling accounts for the same model,
+the configured order comes before headroom; an account known to be spent still goes after available
+accounts when `prefer_headroom` is enabled. Explicit routes in the recovery chain keep their order.
+This is a routing preference, not a replacement for selecting the session's agent with `agent`.
+
 ## How a native account starts
 
 The account's home reaches the agent only through the agent's own spec, never the process

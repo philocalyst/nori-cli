@@ -47,6 +47,22 @@ known-good models the adapter does not advertise, so you can select one instead
 of typing its id; choosing one follows the same reject → persist-here → restart
 path.
 
+## Account routing preference: `[account_preferences]`
+
+List account agent slugs by provider to prefer them when ranking routes to the
+same model:
+
+```toml
+[account_preferences]
+claude = ["claude@work", "claude-code"]
+```
+
+The provider key scopes the order, and each value is an agent slug. An active
+route the user chose stays first. Otherwise the listed account order wins among
+that provider's routes, while an account known to be spent still falls behind
+available accounts when `recovery.fallback.prefer_headroom` is enabled. Other
+providers and the explicit fallback `chain` keep their own order.
+
 ## Code intelligence: `nudox`
 
 ```toml
