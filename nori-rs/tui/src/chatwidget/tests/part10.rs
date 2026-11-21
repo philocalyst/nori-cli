@@ -140,6 +140,38 @@ fn fallback_switch_notice_is_neutral() {
 }
 
 #[test]
+fn delivered_task_results_use_the_actor_name_when_present() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
+    let generation = chat.session_generation;
+
+    chat.handle_session_event(
+        generation,
+        nori_protocol::SessionEvent::Nori(nori_protocol::NoriEvent::TaskResultsDelivered(
+            nori_protocol::TaskResultsDelivered {
+                tasks: vec![
+                    nori_protocol::DeliveredTask {
+                        task_id: "task-1".to_owned(),
+                        title: "Review the change".to_owned(),
+                        agent: "nori-task-runner".to_owned(),
+                        name: Some("API reviewer".to_owned()),
+                    },
+                    nori_protocol::DeliveredTask {
+                        task_id: "task-2".to_owned(),
+                        title: "Check the docs".to_owned(),
+                        agent: "opencode".to_owned(),
+                        name: None,
+                    },
+                ],
+            },
+        )),
+    );
+
+    let rendered = history_text(&mut rx);
+    assert!(rendered.contains("Result from API reviewer"), "{rendered}");
+    assert!(rendered.contains("Result from opencode"), "{rendered}");
+}
+
+#[test]
 fn deferred_startup_input_preserves_prompt_and_image_only_semantics_for_resume() {
     let (mut chat, _rx, _unused_rx) = make_cloud_chatwidget_manual();
     chat.first_prompt_text = Some("Continue onboarding".to_string());

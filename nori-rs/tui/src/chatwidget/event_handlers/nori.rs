@@ -201,10 +201,8 @@ impl ChatWidget {
                 self.flush_answer_stream_with_separator();
                 // One quiet line per result, from whom and about what.
                 for task in delivered.tasks {
-                    self.add_info_message(
-                        format!("Result from {}", task.agent.to_lowercase()),
-                        Some(task.title),
-                    );
+                    let from = task.name.unwrap_or_else(|| task.agent.to_lowercase());
+                    self.add_info_message(format!("Result from {from}"), Some(task.title));
                 }
             }
             nori_protocol::NoriEvent::Monitor(wire) => self.on_monitor(wire),
