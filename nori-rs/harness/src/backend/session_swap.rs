@@ -10,6 +10,14 @@ use super::*;
 
 use crate::normalized::ClientEvent;
 
+/// A setting of the session being replaced, to apply to the one replacing it.
+struct CarriedSetting {
+    model: bool,
+    id: acp::SessionConfigId,
+    name: String,
+    value: String,
+}
+
 /// How [`AcpBackend::swap_active_session`] obtains the replacement session id.
 pub(super) enum SessionSwapMode {
     /// Create a brand-new session (summarize-and-swap `/compact`).
@@ -43,24 +51,24 @@ impl AcpBackend {
             self.session_driver.lock().await.is_fenced(),
             "internal error: a session swap must hold the turn ledger's fence"
         );
-        let prior_model = if matches!(&mode, SessionSwapMode::Rewind { .. }) {
-            self.connection
-                .config_options()
-                .into_iter()
-                .find_map(|option| {
-                    if option.category != Some(acp::SessionConfigOptionCategory::Model) {
-                        return None;
-                    }
-                    match option.kind {
-                        acp::SessionConfigKind::Select(select) => {
-                            Some(select.current_value.to_string())
-                        }
-                        _ => None,
-                    }
-                })
-        } else {
-            None
-        };
+        // The settings in force (model, mode, effort, ...) go with the conversation to the session
+        // that replaces it: a compaction or a rewind must not quietly drop plan mode or the model
+        // the person picked. The model goes first, since it decides which other settings exist.
+        let mut carried: Vec<CarriedSetting> = self
+            .connection
+            .config_options()
+            .into_iter()
+            .filter_map(|option| match option.kind {
+                acp::SessionConfigKind::Select(select) => Some(CarriedSetting {
+                    model: option.category == Some(acp::SessionConfigOptionCategory::Model),
+                    id: option.id,
+                    name: option.name,
+                    value: select.current_value.to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+        carried.sort_by_key(|setting| !setting.model);
         let cwd = self.cwd.clone();
         let mut mcp_servers = crate::connection::mcp::to_acp_mcp_servers(
             &self.mcp_servers,
@@ -134,29 +142,48 @@ impl AcpBackend {
 
         match swap_result {
             Ok(new_session_id) => {
-                if let Some(model) = prior_model {
-                    let option = self.connection.config_options().into_iter().find(|option| {
-                        option.category == Some(acp::SessionConfigOptionCategory::Model)
-                    });
-                    let result = match option {
-                        Some(option) if matches!(&option.kind, acp::SessionConfigKind::Select(select) if select.current_value.to_string() == model) => {
-                            Ok(())
+                let mut kept_default = Vec::new();
+                for setting in carried {
+                    let current = self
+                        .connection
+                        .config_options()
+                        .into_iter()
+                        .find(|option| option.id == setting.id);
+                    let result = match current {
+                        Some(option) if matches!(&option.kind, acp::SessionConfigKind::Select(select) if select.current_value.to_string() == setting.value) =>
+                        {
+                            continue;
                         }
                         Some(option) => {
                             self.connection
-                                .set_config_option(&new_session_id, option.id, model)
+                                .set_config_option(
+                                    &new_session_id,
+                                    option.id,
+                                    setting.value.clone(),
+                                )
                                 .await
                         }
                         None => Err(anyhow::anyhow!(
-                            "Replacement session does not advertise a model selector"
+                            "the replacement session does not offer {}",
+                            setting.name
                         )),
                     };
-                    if let Err(error) = result {
+                    let Err(error) = result else { continue };
+                    // A rewind continues on the model it rewound to, or not at all.
+                    if setting.model && matches!(&mode, SessionSwapMode::Rewind { .. }) {
                         if let Some(previous) = previous_goal_mcp_connected {
                             self.goal_mcp_connected.store(previous, Ordering::Relaxed);
                         }
                         return Err(error);
                     }
+                    kept_default.push(format!("{} ({error})", setting.name));
+                }
+                if !kept_default.is_empty() {
+                    self.notice(&format!(
+                        "The new session could not take over every setting, so these are the agent's defaults now: {}.",
+                        kept_default.join("; ")
+                    ))
+                    .await;
                 }
                 if let SessionSwapMode::Rewind {
                     head,
@@ -311,7 +338,6 @@ impl AcpBackend {
         if let Ok(conversation_id) = ConversationId::from_string(&new_conversation_id) {
             *self.conversation_id.write().await = conversation_id;
         }
-
         self.backend_event_tx
             .send(BackendEvent::Public(SessionEvent::Nori(
                 nori_protocol::NoriEvent::SessionForked(nori_protocol::SessionForked {

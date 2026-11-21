@@ -603,6 +603,11 @@ flag on failure. The mode selects how the replacement id is obtained:
 fallback), while `ForkFromHead { from }` calls `connection.fork_session` in
 `nori-acp-host`.
 
+Before committing the replacement, the swap reapplies the active session's
+select-valued settings, model first, then settings such as mode and effort. If
+the replacement cannot accept a setting, that setting stays at the agent's
+default and the user is told; a rewind fails if it cannot restore the model.
+
 `branch()` implements branch-at-head. It is capability-gated on
 `session_capabilities.fork` (errors "This agent does not support branching"
 otherwise), requires the session to be idle, then forks the current head and
