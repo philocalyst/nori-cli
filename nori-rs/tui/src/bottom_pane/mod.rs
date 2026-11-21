@@ -86,7 +86,7 @@ pub(crate) struct BottomPane {
     custom_working_messages: bool,
     custom_working_message_list: Vec<String>,
 
-    /// Inline status indicator shown above the composer while a task is running.
+    /// The running task's activity indicator, drawn on the prompt rail and at the prompt's right edge.
     status: Option<StatusIndicatorWidget>,
     /// Queued user messages to show above the composer while a turn is running.
     queued_user_messages: QueuedUserMessages,
@@ -380,8 +380,7 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    /// Update the animated header shown to the left of the brackets in the
-    /// status indicator. No-ops if the status indicator is not active.
+    /// Update the running task's working-message label. No-op if its activity indicator is inactive.
     pub(crate) fn update_status_header(&mut self, header: String) {
         if let Some(status) = self.status.as_mut() {
             status.update_header(header);
@@ -1631,7 +1630,7 @@ mod tests {
             agent_slug: String::new(),
         });
 
-        // Start a running task so the status indicator is active above the composer.
+        // Start a running task so activity appears on the prompt's top rail.
         pane.set_task_running(true);
 
         // Push an approval modal (e.g., command approval) which should hide the status view.
@@ -1643,14 +1642,14 @@ mod tests {
         use crossterm::event::KeyModifiers;
         pane.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        // After denial, since the task is still running, the status indicator should be
-        // visible above the composer. The modal should be gone.
+        // After denial, since the task is still running, prompt activity should be visible again.
+        // The modal should be gone.
         assert!(
             pane.view_stack.is_empty(),
             "no active modal view after denial"
         );
 
-        // Render and ensure the top row includes the status indicator and a composer line below.
+        // Render and ensure the prompt's top rail shows activity while the composer remains visible.
         // Give the animation thread a moment to tick.
         std::thread::sleep(Duration::from_millis(120));
         let area = Rect::new(0, 0, 40, 6);
@@ -1665,11 +1664,11 @@ mod tests {
             "expected status indicator visible after denial"
         );
         assert!(
-            row0.contains("•"),
-            "expected status indicator spinner on row 0: {row0:?}"
+            row0.contains('─'),
+            "expected the working sweep on the prompt's top rail, row 0: {row0:?}"
         );
 
-        // Composer placeholder should be visible somewhere below.
+        // The composer placeholder should still be visible.
         let mut found_composer = false;
         for y in 1..area.height {
             let mut row = String::new();
@@ -1683,7 +1682,7 @@ mod tests {
         }
         assert!(
             found_composer,
-            "expected composer visible under status line"
+            "expected composer placeholder to remain visible"
         );
     }
 
@@ -1711,7 +1710,7 @@ mod tests {
         // Begin a task: show initial status.
         pane.set_task_running(true);
 
-        // Use a height that allows the status line to be visible above the composer.
+        // Render the prompt with enough room for its activity rail.
         let area = Rect::new(0, 0, 40, 6);
         let mut buf = Buffer::empty(area);
         pane.render(area, &mut buf);
@@ -1723,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_composer_fill_height_without_bottom_padding() {
+    fn activity_and_composer_fill_height_without_bottom_padding() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1743,25 +1742,25 @@ mod tests {
             agent_slug: String::new(),
         });
 
-        // Activate spinner (status view replaces composer) with no live ring.
+        // Activity is drawn on the prompt, not in an extra row above it.
         pane.set_task_running(true);
         pane.update_status_header("Thinking really hard".to_string());
 
-        // Use height == desired_height; expect spacer + status + composer rows without trailing padding.
+        // At desired height, the prompt and its footer fit without trailing padding.
         let height = pane.desired_height(30);
         assert!(
             height >= 3,
-            "expected at least 3 rows to render spacer, status, and composer; got {height}"
+            "expected enough rows for the prompt and footer; got {height}"
         );
         let area = Rect::new(0, 0, 30, height);
         assert_snapshot!(
-            "status_and_composer_fill_height_without_bottom_padding",
+            "activity_and_composer_fill_height_without_bottom_padding",
             render_snapshot(&pane, area)
         );
     }
 
     #[test]
-    fn queued_messages_visible_when_status_hidden_snapshot() {
+    fn queued_messages_visible_when_activity_hidden_snapshot() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
@@ -1794,13 +1793,13 @@ mod tests {
         let height = pane.desired_height(width);
         let area = Rect::new(0, 0, width, height);
         assert_snapshot!(
-            "queued_messages_visible_when_status_hidden_snapshot",
+            "queued_messages_visible_when_activity_hidden",
             render_snapshot(&pane, area)
         );
     }
 
     #[test]
-    fn status_and_queued_messages_snapshot() {
+    fn activity_and_queued_messages_snapshot() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);
         let mut pane = BottomPane::new(BottomPaneParams {
