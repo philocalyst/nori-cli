@@ -64,7 +64,7 @@ pub(crate) enum HarnessAction {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Debug, strum_macros::IntoStaticStr)]
 pub(crate) enum AppEvent {
     ContextTimelineReady {
         generation: SessionGeneration,

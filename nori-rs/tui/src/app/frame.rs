@@ -34,7 +34,12 @@ impl App {
         app_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     ) -> Result<bool> {
         while let Ok(queued) = app_event_rx.try_recv() {
-            if !self.handle_event(tui, queued).await? {
+            // Timed one by one, like the events the loop takes itself (`crate::latency`).
+            let kind: &'static str = (&queued).into();
+            let started = std::time::Instant::now();
+            let keep_running = self.handle_event(tui, queued).await?;
+            crate::latency::handled(kind, started.elapsed());
+            if !keep_running {
                 return Ok(false);
             }
         }

@@ -159,6 +159,8 @@ pub(crate) struct App {
     pending_candidate_model: Option<(String, String)>,
     model_route_fallback: Option<model_routes::ModelRouteFallback>,
     next_model_route_token: i64,
+    /// The low-disk worktree notice is shown once per run, not on every system info refresh.
+    worktree_warning_shown: bool,
     manual_model_handoff: Option<session_setup::ManualModelHandoff>,
     /// Model presses made before the agent listed its models; they apply when it does.
     waiting_model_presses: crate::chatwidget::WaitingModelPresses,
@@ -263,6 +265,7 @@ pub(crate) mod rewind;
 pub(crate) mod session_move;
 mod session_setup;
 mod session_view;
+mod storage_notice;
 mod subagent_overlay;
 mod tool_gesture;
 mod tool_history;
@@ -344,6 +347,7 @@ impl App {
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         crate::terminal_status::rex_links::follow(app_event_tx.clone());
+        storage_notice::follow(app_event_tx.clone(), config.nori_home.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
@@ -394,6 +398,7 @@ impl App {
             pending_candidate_model: None,
             model_route_fallback: None,
             next_model_route_token: 0,
+            worktree_warning_shown: false,
             manual_model_handoff: None,
             waiting_model_presses: Default::default(),
             welcome_card_written: false,
@@ -551,18 +556,44 @@ impl App {
             .handle_tui_event_batched(tui, &mut app_event_rx, TuiEvent::Draw)
             .await?;
 
+        // Every handler is timed (see `crate::latency`): the loop does one thing at a time, so a
+        // slow handler is a stall of the whole interface.
         while keep_running
             && select! {
                 Some(event) = app_event_rx.recv() => {
-                    app.handle_event(tui, event).await?
+                    let kind: &'static str = (&event).into();
+                    let started = std::time::Instant::now();
+                    let keep_running = app.handle_event(tui, event).await?;
+                    crate::latency::handled(kind, started.elapsed());
+                    keep_running
                 }
                 Some(event) = tui_events.next() => {
-                    app.handle_tui_event_batched(tui, &mut app_event_rx, event).await?
+                    let kind = match &event {
+                        TuiEvent::Key(key) => {
+                            if key.kind == crossterm::event::KeyEventKind::Press {
+                                crate::latency::begin(crate::latency::Interaction::Key, true);
+                            }
+                            "terminal: key"
+                        }
+                        TuiEvent::Paste(_) => "terminal: paste",
+                        TuiEvent::Mouse(_) => "terminal: mouse",
+                        TuiEvent::Draw => "terminal: draw (events applied + frame)",
+                    };
+                    let draw = matches!(event, TuiEvent::Draw);
+                    let started = std::time::Instant::now();
+                    let keep_running =
+                        app.handle_tui_event_batched(tui, &mut app_event_rx, event).await?;
+                    crate::latency::handled(kind, started.elapsed());
+                    if draw {
+                        crate::latency::frame_drawn();
+                    }
+                    keep_running
                 }
             }
         {
             app.sync_program_status(tui);
         }
+        crate::latency::write_report();
 
         app.program_status.clear();
         tui.flush_status();

@@ -10,6 +10,7 @@ impl App {
     ) -> Result<bool> {
         match event {
             AppEvent::NewSession => {
+                crate::latency::begin(crate::latency::Interaction::SessionStart, false);
                 if matches!(self.candidate_agent, Some(CandidateAgent::Prepared { .. })) {
                     let Some(CandidateAgent::Prepared {
                         agent_name,
