@@ -51,8 +51,11 @@ impl NoticeCell {
             self.notices.push(notice);
         }
     }
+}
 
-    fn rows(&self, wrap: Option<usize>) -> Vec<Line<'static>> {
+impl HistoryCell for NoticeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
         let chrome = Chrome::live();
         let mut out = Vec::new();
         for notice in &self.notices {
@@ -73,34 +76,14 @@ impl NoticeCell {
             }
             let line = Line::from(spans);
             let indent = Line::from(vec![Span::styled(glyph, glyph_style), Span::raw(" ")]);
-            match wrap {
-                Some(width) => {
-                    let wrapped = word_wrap_lines(
-                        [line],
-                        RtOptions::new(width.max(GUTTER + 1))
-                            .initial_indent(indent)
-                            .subsequent_indent("  ".into()),
-                    );
-                    out.extend(wrapped);
-                }
-                None => {
-                    let mut spans = indent.spans;
-                    spans.extend(line.spans);
-                    out.push(Line::from(spans));
-                }
-            }
+            out.extend(word_wrap_lines(
+                [line],
+                RtOptions::new(width.max(GUTTER + 1))
+                    .initial_indent(indent)
+                    .subsequent_indent("  ".into()),
+            ));
         }
         out
-    }
-}
-
-impl HistoryCell for NoticeCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.rows(Some(usize::from(width)))
-    }
-
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        self.rows(None)
     }
 }
 

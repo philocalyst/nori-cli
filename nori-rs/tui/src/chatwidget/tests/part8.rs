@@ -273,7 +273,7 @@ fn noop_tool_updates_do_not_fragment_streaming_answer() {
 
     assert_eq!(
         rendered
-            .matches("• Scoped clippy fix is still running; waiting for it to finish.")
+            .matches("  Scoped clippy fix is still running; waiting for it to finish.")
             .count(),
         1,
         "{rendered}"

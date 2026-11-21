@@ -135,7 +135,7 @@ fn fallback_switch_notice_is_neutral() {
         None,
     );
     insta::assert_snapshot!(history_text(&mut rx), @r"
-    • Usage limit reached; switching to Mock ACP…
+    ◇ Usage limit reached; switching to Mock ACP…
     ");
 }
 
@@ -637,8 +637,9 @@ fn cloud_mode_disables_local_commands_when_load_session_is_supported() {
         "cloud launch origin must disable local-only commands"
     );
     let rendered = history_text(&mut rx);
+    let unwrapped = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        rendered
+        unwrapped
             .contains("/browse runs on the local machine and is unavailable in cloud sessions."),
         "the command error should explain the cloud boundary"
     );
@@ -874,9 +875,9 @@ fn nori_connection_status_updates_render_clear_messages() {
 
     let rendered = history_text(&mut rx);
     insta::assert_snapshot!(rendered, @r"
-• Cloud connection lost. Reconnecting…
+◇ Cloud connection lost. Reconnecting…
 
-• Cloud connection restored.
+◇ Cloud connection restored.
 ");
 }
 
@@ -1251,8 +1252,7 @@ fn proactive_turn_status_bounds_unowned_output_and_owned_prompt_broadcast_render
     insta::assert_snapshot!(observer_history, @r"
 › what's the status here so far?
 
-
-• No implementation work has started.
+  No implementation work has started.
 ");
 
     let (mut initiator, mut initiator_rx, _op_rx) = make_chatwidget_manual();
@@ -1616,14 +1616,11 @@ fn replayed_turns_render_as_separate_ordered_history() {
     insta::assert_snapshot!(message_cells.into_iter().cloned().collect::<String>(), @r"
 › First question
 
-
-• First answer
-
+  First answer
 
 › Second question
 
-
-• Second answer
+  Second answer
 ");
 }
 

@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/part10.rs
+assertion_line: 1856
 expression: history_text(&mut rx)
 ---
-■ Connection timed out. The agent did not respond.
+✗ Connection timed out. The agent did not respond.

@@ -1,5 +1,7 @@
 ---
 source: tui/src/chatwidget/tests/part10.rs
+assertion_line: 620
 expression: rendered
 ---
-• This session keeps running in the cloud. reattach later from the `nori cloud` picker
+◇ This session keeps running in the cloud. · reattach later from the `nori
+  cloud` picker

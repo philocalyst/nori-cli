@@ -442,6 +442,17 @@ impl ChatWidget {
             .map(|(_, key)| *key)
     }
 
+    /// Make each subagent drawn in the lanes a link that opens it, while clicks on Nori's links
+    /// reach Nori.
+    pub(crate) fn place_subagent_links(&self) {
+        if !crate::nori_link::routed() {
+            return;
+        }
+        for (area, key) in self.subagent_card_hits.borrow().iter() {
+            crate::hyperlink::place(*area, crate::nori_link::NoriLink::Subagent(*key).url());
+        }
+    }
+
     pub(crate) fn plan_drawer_contains(&self, column: u16, row: u16) -> bool {
         let pos = ratatui::layout::Position::new(column, row);
         self.pinned_plan_area
@@ -466,13 +477,17 @@ impl ChatWidget {
         self.bottom_pane.composer_cursor_style()
     }
 
-    /// The rows the chat keeps at rest: the composer and its status line, without any popup or
-    /// view, working indicator, running tool, streaming answer or live subagent lanes above it. Only these decide
-    /// what the conversation hands to the scrollback; everything else on top of them is
-    /// transient and clips the conversation instead, so nothing leaves the screen for good just
-    /// because something live was tall for a while.
-    pub(crate) fn resting_height(&self, width: u16) -> u16 {
-        self.bottom_pane.resting_height(width).max(1)
+    /// The rows of the chat that are a view the person has open for a while (a popup, a picker,
+    /// an approval, a sign-in program): they clip the conversation instead of pushing it into the
+    /// scrollback, so closing them gives the rows back. What the running turn shows (a running
+    /// tool, the rest of a streaming answer, subagent lanes, the plan) is output like any other
+    /// and pushes the conversation up, by the terminal's own scroll.
+    pub(crate) fn view_rows(&self, width: u16) -> u16 {
+        let sign_in = self
+            .login_terminal
+            .as_ref()
+            .map_or(0, |terminal| terminal.desired_height(width));
+        self.bottom_pane.view_rows(width).saturating_add(sign_in)
     }
 
     pub(crate) fn primary_composer_height(&self, width: u16) -> u16 {

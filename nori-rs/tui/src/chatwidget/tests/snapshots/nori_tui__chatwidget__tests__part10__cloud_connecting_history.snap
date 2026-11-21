@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/part10.rs
+assertion_line: 1833
 expression: history_text(&mut rx)
 ---
-• Connecting to Nori Cloud…
+◇ Connecting to Nori Cloud…

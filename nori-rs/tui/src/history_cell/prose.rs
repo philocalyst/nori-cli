@@ -34,53 +34,63 @@ impl UserHistoryCell {
     /// can paint one, behind a plain `›` where it cannot. `width` pads surface rows to a clean
     /// block; scrollback, which may reflow, passes `None`.
     fn framed(&self, lines: Vec<Line<'static>>, width: Option<usize>) -> Vec<Line<'static>> {
-        let chrome = Chrome::live();
-        let surface = chrome.theme.prompt_surface;
-        let strong = chrome.strong();
-        let body: Vec<Line<'static>> = lines
-            .into_iter()
-            .map(|mut line| {
-                for span in &mut line.spans {
-                    span.style = strong.patch(span.style);
-                }
-                line
-            })
-            .collect();
-        if surface.bg.is_none() {
-            // No surface to pad: the blank row between cells is the only space around it.
-            return prefix_lines(
-                body,
-                Span::styled("› ", chrome.muted().add_modifier(Modifier::BOLD)),
-                "  ".into(),
-            );
-        }
-        let rail = Span::styled("▌ ", chrome.violet());
-        let framed = |mut spans: Vec<Span<'static>>| {
-            if let Some(width) = width {
-                let used = spans_width(&spans);
-                if used < width {
-                    spans.push(Span::raw(" ".repeat(width - used)));
-                }
-            }
-            Line::from(spans).style(surface)
-        };
-        let mut out = vec![framed(vec![rail.clone()])];
-        out.extend(body.into_iter().map(|line| {
-            let mut spans = vec![rail.clone()];
-            spans.extend(line.spans);
-            framed(spans)
-        }));
-        out.push(framed(vec![rail]));
-        out
+        frame_prompt(lines, width).0
     }
 }
 
-impl HistoryCell for UserHistoryCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let lines = self.message.lines().map(|line| Line::from(line.to_owned()));
-        self.framed(lines.collect(), None)
+/// A prompt's rows as the conversation shows them: its text on the prompt surface behind a violet
+/// rail, with a row of the surface above and below, `width` wide when given. Returns the rows,
+/// the first row of the text, and the columns before it. A prompt walked back to is edited in
+/// these same rows (`stage::focus`).
+pub(crate) fn frame_prompt(
+    lines: Vec<Line<'static>>,
+    width: Option<usize>,
+) -> (Vec<Line<'static>>, usize, u16) {
+    let chrome = Chrome::live();
+    let surface = chrome.theme.prompt_surface;
+    let strong = chrome.strong();
+    let body: Vec<Line<'static>> = lines
+        .into_iter()
+        .map(|mut line| {
+            for span in &mut line.spans {
+                span.style = strong.patch(span.style);
+            }
+            line
+        })
+        .collect();
+    if surface.bg.is_none() {
+        // No surface to pad: the blank row between cells is the only space around it.
+        return (
+            prefix_lines(
+                body,
+                Span::styled("› ", chrome.muted().add_modifier(Modifier::BOLD)),
+                "  ".into(),
+            ),
+            0,
+            LIVE_PREFIX_COLS,
+        );
     }
+    let rail = Span::styled("▌ ", chrome.violet());
+    let framed = |mut spans: Vec<Span<'static>>| {
+        if let Some(width) = width {
+            let used = spans_width(&spans);
+            if used < width {
+                spans.push(Span::raw(" ".repeat(width - used)));
+            }
+        }
+        Line::from(spans).style(surface)
+    };
+    let mut out = vec![framed(vec![rail.clone()])];
+    out.extend(body.into_iter().map(|line| {
+        let mut spans = vec![rail.clone()];
+        spans.extend(line.spans);
+        framed(spans)
+    }));
+    out.push(framed(vec![rail]));
+    (out, 1, LIVE_PREFIX_COLS)
+}
 
+impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         // One column stays free on the right so a wrapped word never touches the edge.
         let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS + 1).max(1);
@@ -135,18 +145,6 @@ impl ReasoningSummaryCell {
 }
 
 impl HistoryCell for ReasoningSummaryCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        if self.transcript_only {
-            return Vec::new();
-        }
-        let chrome = Chrome::live();
-        prefix_lines(
-            self.quiet(None),
-            Span::styled("✦ ", chrome.violet()),
-            "  ".into(),
-        )
-    }
-
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         if self.transcript_only {
             Vec::new()
@@ -181,10 +179,6 @@ impl AgentMessageCell {
 }
 
 impl HistoryCell for AgentMessageCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        prefix_lines(self.lines.clone(), "  ".into(), "  ".into())
-    }
-
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         adaptive_wrap_lines(
             &self.lines,
@@ -196,6 +190,11 @@ impl HistoryCell for AgentMessageCell {
 
     fn is_stream_continuation(&self) -> bool {
         !self.is_first_line
+    }
+
+    /// The whole answer, laid out again, replaces its streamed pieces once it ends.
+    fn settled(&self) -> bool {
+        false
     }
 }
 
@@ -220,17 +219,6 @@ impl AgentMarkdownCell {
 }
 
 impl HistoryCell for AgentMarkdownCell {
-    fn native_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        crate::markdown::append_markdown_with_cwd(
-            &self.markdown_source,
-            None,
-            Some(&self.cwd),
-            &mut lines,
-        );
-        prefix_lines(lines, "  ".into(), "  ".into())
-    }
-
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut layout = self
             .layout

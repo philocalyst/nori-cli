@@ -61,7 +61,7 @@ mod tests {
         insta::assert_snapshot!(
             format!("Message rows: {backgrounds}\nComposer: {composer:?}"),
             @"
-        Message rows: Some(Reset), Some(Reset), Some(Reset)
+        Message rows: None
         Composer: Some(Reset)
         "
         );

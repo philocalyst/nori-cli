@@ -79,15 +79,17 @@ impl App {
                 .chat_widget
                 .desired_height(screen.width)
                 .min(screen.height);
-            let resting = self.chat_widget.resting_height(screen.width).min(height);
-            (height, height - resting)
+            let view = self.chat_widget.view_rows(screen.width);
+            (height, view.min(height.saturating_sub(1)))
         };
-        let focus = self.focus_view();
+        let focus = self.focus_view(screen.width);
         let shown = self.stage_cell_count();
-        let view = StageView::new(&self.transcript_cells[..shown], focus.as_ref());
+        let view = StageView::new(&self.transcript_cells[..shown], focus.as_ref())
+            .open(self.chat_widget.is_task_running());
         let chat_widget = &self.chat_widget;
         tui.draw_stage(&view, height, popup_rows, |frame| {
             chat_widget.render(frame.area(), frame.buffer);
+            chat_widget.place_subagent_links();
             if let Some((x, y)) = chat_widget.cursor_pos(frame.area()) {
                 frame.set_cursor_position((x, y));
             }

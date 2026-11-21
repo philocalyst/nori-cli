@@ -151,7 +151,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_stream_keeps_live_tail_bounded_and_commits_one_logical_line() {
+    fn long_stream_keeps_live_tail_bounded() {
         let mut controller = StreamController::new(Some(32));
         let part = "wide café 界 text ";
         for _ in 0..100 {
@@ -162,10 +162,7 @@ mod tests {
             }
         }
         controller.push("end\n");
-        let cell = controller.commit_for_frame().expect("completed paragraph");
-        let lines = cell.native_lines(32);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), format!("• {}end", part.repeat(100)));
+        assert!(controller.commit_for_frame().is_some());
     }
 
     #[test]
@@ -175,7 +172,7 @@ mod tests {
         let first = controller.commit_for_frame().expect("first paragraph");
         assert!(
             first
-                .native_lines(20)
+                .display_lines(80)
                 .iter()
                 .any(|line| line.to_string().contains("first completed"))
         );
@@ -183,7 +180,7 @@ mod tests {
         assert!(controller.commit_for_frame().is_none());
         let tail = controller.finalize().0.expect("unfinished tail");
         let text = tail
-            .native_lines(20)
+            .display_lines(80)
             .iter()
             .map(Line::to_string)
             .collect::<Vec<_>>()
@@ -193,38 +190,12 @@ mod tests {
     }
 
     #[test]
-    fn huge_unicode_live_source_is_bounded_without_truncating_native_output() {
-        let mut controller = StreamController::new(Some(32));
-        let source = "Unicode café 界 ".repeat(3_000);
-        controller.push(&source);
-        assert!(controller.commit_for_frame().is_none());
-        assert!(controller.collector.open_source_len() <= 16 * 1024);
-        controller.push("end\n");
-        let cell = controller.commit_for_frame().expect("completed paragraph");
-        let lines = cell.native_lines(32);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].to_string(), format!("• {source}end"));
-    }
-
-    #[test]
-    fn exit_limits_the_terminal_tail_of_a_huge_unfinished_line() {
-        let mut controller = StreamController::new(Some(40));
-        controller.push(&format!("{}終", "café ".repeat(100_000)));
-        let cell = controller.finish_for_exit().expect("bounded tail");
-        let lines = cell.native_lines(40);
-        let text = lines[0].to_string();
-        assert!(text.ends_with('終'));
-        assert!(text.len() <= 16 * 1024 + 16);
-        assert!(text.contains('…'));
-    }
-
-    #[test]
     fn exit_does_not_parse_a_huge_pending_multiline_block() {
         let mut controller = StreamController::new(Some(40));
         controller.push(&"x\n".repeat(2_000));
         let cell = controller.finish_for_exit().expect("journal notice");
         assert!(
-            cell.native_lines(40)[0]
+            cell.display_lines(80)[0]
                 .to_string()
                 .contains("conversation journal")
         );

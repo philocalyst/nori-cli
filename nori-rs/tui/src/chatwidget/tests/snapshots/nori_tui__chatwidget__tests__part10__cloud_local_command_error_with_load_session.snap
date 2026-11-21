@@ -1,5 +1,7 @@
 ---
 source: tui/src/chatwidget/tests/part10.rs
+assertion_line: 585
 expression: rendered
 ---
-■ /browse is unavailable. /browse runs on the local machine and is unavailable in cloud sessions.
+✗ /browse is unavailable. /browse runs on the local machine and is unavailable
+  in cloud sessions.

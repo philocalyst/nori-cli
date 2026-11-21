@@ -186,7 +186,7 @@ fn a_replayed_session_renders_as_it_did_live() {
     );
     assert_eq!(
         live.iter()
-            .filter(|cell| cell.contains("Read file0.rs"))
+            .filter(|cell| cell.contains("◈ src/file0.rs"))
             .count(),
         2,
         "{live:#?}"
@@ -197,19 +197,18 @@ fn a_replayed_session_renders_as_it_did_live() {
 fn a_replayed_separator_says_how_long_its_turn_ran() {
     let replayed = render_replayed(session(Some(65_000)));
 
-    let worked_for = format!(
-        "Worked for {}",
-        crate::status_indicator_widget::fmt_elapsed_compact(65)
-    );
+    let duration = crate::status_indicator_widget::fmt_elapsed_compact(65);
     assert!(
-        replayed.iter().any(|cell| cell.contains(&worked_for)),
+        replayed
+            .iter()
+            .any(|cell| cell.trim_start_matches('\n').starts_with('─') && cell.contains(&duration)),
         "{replayed:#?}"
     );
     assert!(
         !replayed
             .iter()
             .any(|cell| cell.trim_start_matches('\n').starts_with('─')
-                && !cell.contains("Worked for")),
+                && !cell.contains(&duration)),
         "a separator without its duration: {replayed:#?}"
     );
 }

@@ -46,6 +46,7 @@ pub(crate) use plan::render_plan_lines;
 pub(crate) use prose::AgentMarkdownCell;
 pub(crate) use prose::AgentMessageCell;
 pub(crate) use prose::UserHistoryCell;
+pub(crate) use prose::frame_prompt;
 pub(crate) use stopped::StopWhy;
 pub(crate) use stopped::StoppedTurnCell;
 
@@ -66,12 +67,6 @@ use unicode_width::UnicodeWidthStr;
 /// scrollable list.
 pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
-
-    /// Logical lines for terminal scrollback, which the terminal may reflow.
-    /// Structured cells keep their bounded layout unless they opt in.
-    fn native_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.display_lines(width)
-    }
 
     fn desired_height(&self, width: u16) -> u16 {
         Paragraph::new(Text::from(self.display_lines(width)))
@@ -99,6 +94,14 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     /// cached for such a cell goes stale between updates, so it is laid out again each frame.
     fn animated(&self) -> bool {
         false
+    }
+
+    /// Whether what the cell draws now is what it will always draw, so its rows can be handed to
+    /// the terminal for good (see `docs/tui-stage.md`). A cell still running or animating is not
+    /// settled, and neither is a piece of an answer still streaming, which the whole answer
+    /// replaces once it ends.
+    fn settled(&self) -> bool {
+        !self.animated()
     }
 
     /// `Some(expanded)` when the cell can show more than its collapsed form (a diff beyond its

@@ -100,7 +100,10 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(compact.contains("Ran test"), "{compact}");
+        assert!(
+            compact.contains("$ test") && compact.contains("exit 0"),
+            "{compact}"
+        );
         assert!(!compact.contains("Running"), "{compact}");
         assert!(expanded.contains("Command completed"), "{expanded}");
         assert!(expanded.contains('0'), "{expanded}");

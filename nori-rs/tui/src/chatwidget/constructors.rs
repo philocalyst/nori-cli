@@ -55,7 +55,6 @@ impl ChatWidget {
         };
 
         let first_prompt_text = initial_prompt.clone();
-        let acp_wire_recording_enabled = config.acp_proxy.enabled;
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -179,9 +178,6 @@ impl ChatWidget {
             user_shell_state: Default::default(),
         };
 
-        widget
-            .bottom_pane
-            .set_acp_wire_recording_enabled(acp_wire_recording_enabled);
         if activating_prepared_cloud_session {
             widget.show_connecting_status("Nori Cloud");
         }
@@ -266,7 +262,6 @@ impl ChatWidget {
         };
 
         let first_prompt_text = initial_prompt.clone();
-        let acp_wire_recording_enabled = config.acp_proxy.enabled;
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
             frame_requester: frame_requester.clone(),
@@ -390,9 +385,6 @@ impl ChatWidget {
             user_shell_state: Default::default(),
         };
 
-        widget
-            .bottom_pane
-            .set_acp_wire_recording_enabled(acp_wire_recording_enabled);
         if activating_prepared_cloud_session {
             widget.show_connecting_status("Nori Cloud");
         }

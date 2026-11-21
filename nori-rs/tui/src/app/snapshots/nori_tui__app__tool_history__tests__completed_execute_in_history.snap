@@ -1,12 +1,10 @@
 ---
 source: tui/src/app/tool_history.rs
-assertion_line: 54
+assertion_line: 110
 expression: "format!(\"{compact}\\n\\n{expanded}\")"
 ---
-▸ ● Ran test
-  └ Command completed
+$ test                                                                  exit 0
+  │ Command completed
 
-▾ ● Ran test
-  │ test
-  Exit code  0
+$ test                                                                  exit 0
   │ Command completed
