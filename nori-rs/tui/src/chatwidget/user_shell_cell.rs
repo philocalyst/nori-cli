@@ -97,6 +97,7 @@ impl HistoryCell for UserShellCell {
             elapsed: None,
             exit_code: Some(self.exit_code),
             cwd: (!cwd.is_empty()).then_some(cwd.as_str()),
+            machine: None,
             stdout: &self.stdout,
             stderr: &self.stderr,
         }

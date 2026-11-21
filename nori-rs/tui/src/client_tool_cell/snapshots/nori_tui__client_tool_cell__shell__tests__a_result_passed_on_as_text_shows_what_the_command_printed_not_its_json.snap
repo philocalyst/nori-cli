@@ -1,0 +1,8 @@
+---
+source: tui/src/client_tool_cell/shell.rs
+assertion_line: 293
+expression: text
+---
+$ wc -l src/*.rs                                    exit 0
+  │ === 13850
+  │   120 src/a.rs

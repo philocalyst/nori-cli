@@ -1,0 +1,7 @@
+---
+source: tui/src/client_tool_cell/shell.rs
+assertion_line: 330
+expression: text
+---
+$ cargo check -q; echo "exit=$?"                    exit 0
+  │ Finished dev

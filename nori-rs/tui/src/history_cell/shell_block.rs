@@ -52,6 +52,8 @@ pub(crate) struct ShellBlock<'a> {
     pub(crate) exit_code: Option<i32>,
     /// Where it ran, when that is worth saying (the user's shell moves; an agent's does not).
     pub(crate) cwd: Option<&'a str>,
+    /// The other machine it ran on; `None` for this computer.
+    pub(crate) machine: Option<&'a str>,
     pub(crate) stdout: &'a str,
     pub(crate) stderr: &'a str,
 }
@@ -128,6 +130,9 @@ impl ShellBlock<'_> {
             ))
         } else if self.progress == Progress::Cancelled {
             Some(Span::styled("cancelled", chrome.muted()))
+        } else if self.exit_code == Some(0) {
+            // A status the command reported is shown as one, at the right of the command.
+            Some(Span::styled("exit 0", chrome.mint()))
         } else {
             None
         };
@@ -146,6 +151,11 @@ impl ShellBlock<'_> {
         }
         if let Some(took) = took {
             facts.push(Span::styled(took, chrome.muted()));
+        }
+        // Kept over the time when space is short: a command on the wrong machine is the
+        // mistake that matters.
+        if let Some(machine) = self.machine {
+            facts.push(Span::styled(format!("on {machine}"), chrome.cyan()));
         }
         if let Some(chip) = chip.clone() {
             facts.push(chip);

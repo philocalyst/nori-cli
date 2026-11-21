@@ -1,0 +1,8 @@
+---
+source: tui/src/client_tool_cell/shell.rs
+assertion_line: 258
+expression: text
+---
+$ uname -sm && pwd                   on mothership  exit 0
+  │ Linux x86_64
+  │ /home/miles
