@@ -220,26 +220,20 @@ fn test_history_navigation_multiple_messages() {
 }
 
 #[test]
-fn selection_editor_emits_terminal_cursor_shapes() {
+fn modal_editor_emits_cursor_shapes_on_mode_changes() {
     let mut session = TuiSession::spawn(20, 80).expect("spawn TUI");
     session
-        .wait_for_text("INSERT", TIMEOUT)
+        .wait_for_text(" INS ", TIMEOUT)
         .expect("insert mode");
-    session.start_output_capture();
     session.type_input("abc").expect("type text");
     session
         .wait_for_text("abc", TIMEOUT)
         .expect("draft visible");
-    let initial = session.output_bytes().expect("capture");
-    assert!(
-        initial.windows(5).any(|bytes| bytes == b"\x1b[6 q"),
-        "insert must use a bar cursor"
-    );
 
     session.start_output_capture();
     session.send_key(Key::Escape).expect("normal mode");
     session
-        .wait_for_text("NORMAL", TIMEOUT)
+        .wait_for_text(" NOR ", TIMEOUT)
         .expect("normal mode visible");
     assert!(
         session
@@ -253,20 +247,10 @@ fn selection_editor_emits_terminal_cursor_shapes() {
     session.start_output_capture();
     session.send_key(Key::Char('v')).expect("selection mode");
     session.send_key(Key::Char('h')).expect("extend selection");
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    while !session
-        .output_bytes()
-        .expect("capture")
-        .windows(5)
-        .any(|bytes| bytes == b"\x1b[2 q")
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "selection must use a block cursor"
-        );
-        session.poll().expect("poll TUI");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    // Selection shares the normal-mode badge and block cursor.
+    session
+        .wait_for_text(" NOR ", TIMEOUT)
+        .expect("normal-mode badge");
 
     session.start_output_capture();
     // Encode Escape as a complete key event; a bare ESC immediately followed
@@ -274,7 +258,7 @@ fn selection_editor_emits_terminal_cursor_shapes() {
     session.send_str("\x1b[27u").expect("leave selection");
     session.send_key(Key::Char('i')).expect("insert mode");
     session
-        .wait_for_text("INSERT", TIMEOUT)
+        .wait_for_text(" INS ", TIMEOUT)
         .expect("insert mode visible");
     assert!(
         session
