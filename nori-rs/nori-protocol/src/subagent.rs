@@ -60,8 +60,13 @@ pub enum SubagentOutcome {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SubagentState {
     Running,
-    /// The current turn finished, but this session can receive more work.
-    Idle,
+    /// The current turn stopped, but this session can receive more work. `interrupted` says the
+    /// turn stopped because someone interrupted it; a turn that stopped on its own finished
+    /// its work, and the views report it like any other finished child.
+    Idle {
+        #[serde(default)]
+        interrupted: bool,
+    },
     Ended(SubagentOutcome),
 }
 
@@ -82,7 +87,9 @@ impl SubagentState {
         };
         Some(match name {
             "running" | "working" | "pending" => Self::Running,
-            "turn_idle" => Self::Idle,
+            "turn_idle" => Self::Idle {
+                interrupted: matches!(stop_reason.as_deref(), Some("cancelled" | "canceled")),
+            },
             "failed" | "errored" | "error" | "disconnected" | "timed_out" => {
                 Self::Ended(SubagentOutcome::Failed {
                     reason: stop_reason,
@@ -108,7 +115,14 @@ pub struct SubagentUpdate {
     /// Provider/model identifier reported by the child backend, when known.
     #[serde(default)]
     pub model: Patch<String>,
+    /// What the child is called: the alias a Nori actor answers to, a provider's nickname for it.
+    /// Absent for children their provider does not name; the views then derive a name from
+    /// `description`.
+    #[serde(default)]
+    pub name: Patch<String>,
+    /// The kind of child (`Reviewer`, `Explore`, a Codex role).
     pub title: Patch<String>,
+    /// What the child was asked to do.
     pub description: Patch<String>,
     pub state: Patch<SubagentState>,
 }
@@ -195,6 +209,10 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             session_id: session_field("sessionId")?,
             agent: Patch::Keep,
             model: text_field("model"),
+            name: match text_field("name") {
+                Patch::Keep => text_field("nickname"),
+                named => named,
+            },
             title: text_field("title"),
             description: text_field("description"),
             state: state_field(),
@@ -204,6 +222,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             session_id: session_field("subagentSessionId")?,
             agent: Patch::Keep,
             model: text_field("model"),
+            name: text_field("nickname"),
             title: text_field("name"),
             description: text_field("task"),
             state: Patch::Set(SubagentState::Running),
@@ -213,6 +232,7 @@ pub fn parse_subagent_update(params: &Value) -> Option<SubagentWire> {
             session_id: session_field("subagentSessionId")?,
             agent: Patch::Keep,
             model: text_field("model"),
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: state_field(),
@@ -330,6 +350,7 @@ mod tests {
                 session_id: SessionId::new("child"),
                 agent: Patch::Keep,
                 model: Patch::Set("anthropic/claude-sonnet-4".into()),
+                name: Patch::Keep,
                 title: Patch::Set("general-purpose".into()),
                 description: Patch::Set("Read a.txt contents".into()),
                 state: Patch::Set(SubagentState::Running),
