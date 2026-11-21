@@ -9,6 +9,7 @@ use crate::catalog::Gateway;
 
 /// The gateway's own address, when models.dev does not name one.
 const GATEWAY_API: &str = "https://opencode.ai/zen/v1";
+const GO_GATEWAY_API: &str = "https://opencode.ai/inference/go/openai/v1";
 
 /// One model, ready to connect to.
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +21,7 @@ pub(crate) struct ModelEntry {
     pub(crate) base_url: String,
     pub(crate) reasoning_field: Option<String>,
     release_date: String,
+    go_route: bool,
 }
 
 /// The wire an AI SDK package speaks.
@@ -48,18 +50,24 @@ fn default_efforts(wire: Wire, reasoning: bool) -> (Vec<String>, Option<String>)
 
 /// Every model an agent can run on the gateway, newest first. A model without tools cannot work
 /// as an agent, and a deprecated one is on its way out; neither is offered.
-pub(crate) fn models(gateway: &Gateway) -> Vec<ModelEntry> {
-    let mut models: Vec<ModelEntry> = gateway
-        .models
+pub(crate) fn models(gateways: &[Gateway]) -> Vec<ModelEntry> {
+    let mut models: Vec<ModelEntry> = gateways
         .iter()
-        .filter(|(_, model)| model.tool_call && !model.deprecated)
-        .map(|(key, model)| entry(gateway, key, model))
+        .flat_map(|gateway| {
+            gateway
+                .models
+                .iter()
+                .filter(|(_, model)| model.tool_call && !model.deprecated)
+                .map(|(key, model)| entry(gateway, key, model))
+        })
         .collect();
     models.sort_by(|left, right| {
-        right
-            .release_date
-            .cmp(&left.release_date)
-            .then_with(|| left.info.label.cmp(&right.info.label))
+        right.go_route.cmp(&left.go_route).then_with(|| {
+            right
+                .release_date
+                .cmp(&left.release_date)
+                .then_with(|| left.info.label.cmp(&right.info.label))
+        })
     });
     models
 }
@@ -76,7 +84,11 @@ fn entry(gateway: &Gateway, key: &str, model: &CatalogModel) -> ModelEntry {
         .api
         .as_deref()
         .or(gateway.api.as_deref())
-        .unwrap_or(GATEWAY_API)
+        .unwrap_or(if gateway.id == "opencode-go" {
+            GO_GATEWAY_API
+        } else {
+            GATEWAY_API
+        })
         .to_owned();
     let (efforts, default_effort) = if model.efforts.is_empty() {
         default_efforts(wire, model.reasoning)
@@ -90,7 +102,7 @@ fn entry(gateway: &Gateway, key: &str, model: &CatalogModel) -> ModelEntry {
     ModelEntry {
         info: ModelInfo {
             // As Nori's OpenCode always named the gateway's models, so a session keeps its own.
-            id: format!("opencode/{key}"),
+            id: format!("{}/{key}", gateway.id),
             label: model.name.clone(),
             description: None,
             context_window: model.context,
@@ -104,6 +116,7 @@ fn entry(gateway: &Gateway, key: &str, model: &CatalogModel) -> ModelEntry {
         base_url,
         reasoning_field: model.reasoning_field.clone(),
         release_date: model.release_date.clone(),
+        go_route: gateway.id == "opencode-go",
     }
 }
 
@@ -130,6 +143,7 @@ mod tests {
     #[test]
     fn each_model_speaks_its_packages_wire_and_the_newest_come_first() {
         let gateway = Gateway {
+            id: "opencode".to_owned(),
             name: "OpenCode Zen".to_owned(),
             package: Some("@ai-sdk/openai-compatible".to_owned()),
             api: Some("https://opencode.ai/zen/v1".to_owned()),
@@ -152,7 +166,7 @@ mod tests {
                 ),
             ]),
         };
-        let offered: Vec<(String, Wire, Option<String>)> = models(&gateway)
+        let offered: Vec<(String, Wire, Option<String>)> = models(&[gateway])
             .into_iter()
             .map(|entry| (entry.info.id, entry.wire, entry.info.default_effort))
             .collect();
@@ -172,5 +186,43 @@ mod tests {
                 ("opencode/kimi-x".to_owned(), Wire::OpenAiChat, None),
             ]
         );
+    }
+
+    #[test]
+    fn go_uses_its_provider_id_and_catalog_endpoint_before_models() {
+        let models = models(&[
+            Gateway {
+                id: "opencode".to_owned(),
+                name: "OpenCode Models".to_owned(),
+                package: Some("@ai-sdk/openai-compatible".to_owned()),
+                api: Some("https://opencode.ai/zen/v1".to_owned()),
+                models: BTreeMap::from([(
+                    "deepseek-v4.1-flash".to_owned(),
+                    model("deepseek-v4.1-flash", None, "2026-11-01"),
+                )]),
+            },
+            Gateway {
+                id: "opencode-go".to_owned(),
+                name: "OpenCode Go".to_owned(),
+                package: None,
+                api: None,
+                models: BTreeMap::from([(
+                    "deepseek-v4.1-flash".to_owned(),
+                    CatalogModel {
+                        api: Some("https://opencode.ai/inference/go/openai/v1".to_owned()),
+                        package: Some("@ai-sdk/openai".to_owned()),
+                        ..model("deepseek-v4.1-flash", Some("@ai-sdk/openai"), "2026-01-01")
+                    },
+                )]),
+            },
+        ]);
+        assert_eq!(models[0].info.id, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(models[0].wire_model, "deepseek-v4.1-flash");
+        assert_eq!(
+            models[0].base_url,
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(models[1].info.id, "opencode/deepseek-v4.1-flash");
+        assert_eq!(models[1].base_url, "https://opencode.ai/zen/v1");
     }
 }

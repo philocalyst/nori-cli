@@ -1,4 +1,4 @@
-//! The gateway's models, live, from models.dev (its `opencode` provider: OpenCode Zen).
+//! OpenCode Models and Go catalogs, live from models.dev and OpenCode's inference model API.
 //!
 //! The catalog in memory is the one served. It starts as Nori's last copy on disk
 //! (`<store>/models.json`), however old, and is asked for again in the background whenever a
@@ -21,6 +21,7 @@ use crate::env::Env;
 /// The provider of models.dev that is OpenCode's gateway.
 const GATEWAY: &str = "opencode";
 const DEFAULT_URL: &str = "https://models.dev";
+const GO_MODELS_URL: &str = "https://opencode.ai/inference/go/v1/models";
 /// How soon after one the opening of a session asks models.dev again.
 const REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often models.dev is asked while Nori runs, sessions opening or not.
@@ -30,6 +31,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The gateway as models.dev describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Gateway {
+    pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) package: Option<String>,
     pub(crate) api: Option<String>,
@@ -58,13 +60,14 @@ pub(crate) struct CatalogModel {
 
 impl Gateway {
     /// The gateway in a models.dev catalog (all of `api.json`, or the gateway's entry alone).
-    fn parse(value: &Value) -> Option<Self> {
-        let provider = value.get(GATEWAY)?.as_object()?;
+    fn parse(value: &Value, id: &str) -> Option<Self> {
+        let provider = value.get(id)?.as_object()?;
         Some(Self {
+            id: id.to_owned(),
             name: provider
                 .get("name")
                 .and_then(Value::as_str)
-                .unwrap_or("OpenCode")
+                .unwrap_or(id)
                 .to_owned(),
             package: provider
                 .get("npm")
@@ -83,6 +86,23 @@ impl Gateway {
                 .collect(),
         })
     }
+
+    fn parse_go(value: &Value) -> Option<Self> {
+        let models = value["data"].as_array()?;
+        Some(Self {
+            id: "opencode-go".to_owned(),
+            name: "OpenCode Go".to_owned(),
+            package: None,
+            api: None,
+            models: models
+                .iter()
+                .filter_map(|model| {
+                    let id = model["id"].as_str()?;
+                    Some((id.to_owned(), parse_go_model(id, model)))
+                })
+                .collect(),
+        })
+    }
 }
 
 /// The gateway's catalog, shared by every agent connection that keeps its copy at one place.
@@ -94,10 +114,11 @@ pub(crate) struct Catalog {
 struct Live {
     /// models.dev's `api.json`.
     url: String,
+    go_url: String,
     /// Nori's copy of the gateway's entry.
     file: PathBuf,
     /// The catalog served, once there is one.
-    gateway: tokio::sync::Mutex<Option<Arc<Gateway>>>,
+    gateway: tokio::sync::Mutex<Option<Arc<Vec<Gateway>>>>,
     /// When models.dev was last asked.
     asked: std::sync::Mutex<Option<Instant>>,
     /// How many times the catalog changed after it was first served.
@@ -117,6 +138,9 @@ impl Catalog {
                 .unwrap_or_else(|| DEFAULT_URL.to_owned())
                 .trim_end_matches('/')
         );
+        let go_url = env
+            .get("NORI_OPENCODE_GO_MODELS_URL")
+            .unwrap_or_else(|| GO_MODELS_URL.to_owned());
         let mut catalogs = CATALOGS
             .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
             .lock()
@@ -126,6 +150,7 @@ impl Catalog {
             .or_insert_with(|| Self {
                 live: Arc::new(Live {
                     url,
+                    go_url,
                     file,
                     gateway: tokio::sync::Mutex::new(None),
                     asked: std::sync::Mutex::new(None),
@@ -143,7 +168,7 @@ impl Catalog {
 
     /// The catalog to serve now: in memory, else Nori's copy on disk, else models.dev's, else
     /// none. models.dev is asked again behind it.
-    pub(crate) async fn models(&self) -> Arc<Gateway> {
+    pub(crate) async fn models(&self) -> Arc<Vec<Gateway>> {
         let mut gateway = self.live.gateway.lock().await;
         let served = match gateway.as_ref() {
             Some(current) => Arc::clone(current),
@@ -158,7 +183,7 @@ impl Catalog {
                         None => Value::Null,
                     },
                 };
-                let first = Arc::new(Gateway::parse(&first).unwrap_or_default());
+                let first = Arc::new(parse_catalogs(&first));
                 *gateway = Some(Arc::clone(&first));
                 first
             }
@@ -198,12 +223,22 @@ impl Catalog {
 
     /// Ask models.dev, and serve what it says when that differs from what is served.
     async fn refresh(&self) {
-        let Some(fetched) = self.fetch().await else {
+        let Some(mut fetched) = self.fetch().await else {
             return;
         };
-        let Some(parsed) = Gateway::parse(&fetched) else {
+        if let Some(previous) = read_copy(&self.live.file).await {
+            for id in [GATEWAY, "opencode-go"] {
+                if fetched.get(id).is_none()
+                    && let Some(catalog) = previous.get(id)
+                {
+                    fetched[id] = catalog.clone();
+                }
+            }
+        }
+        let parsed = parse_catalogs(&fetched);
+        if parsed.is_empty() {
             return;
-        };
+        }
         let mut gateway = self.live.gateway.lock().await;
         if gateway.as_deref() == Some(&parsed) {
             return;
@@ -220,29 +255,20 @@ impl Catalog {
     /// The gateway's entry of models.dev now, or `None` when it cannot be had.
     async fn fetch(&self) -> Option<Value> {
         let url = &self.live.url;
-        let fetched: Result<Value, String> = async {
-            let response = reqwest::Client::new()
-                .get(url)
-                .timeout(FETCH_TIMEOUT)
-                .send()
-                .await
-                .map_err(|error| format!("{url}: {error}"))?
-                .error_for_status()
-                .map_err(|error| format!("{url}: {error}"))?;
-            let mut all: Value = response
-                .json()
-                .await
-                .map_err(|error| format!("{url}: {error}"))?;
-            let gateway = all
-                .get_mut(GATEWAY)
-                .map(Value::take)
-                .ok_or_else(|| format!("{url} lists no `{GATEWAY}` provider"))?;
-            Ok(serde_json::json!({ GATEWAY: gateway }))
+        let go_url = &self.live.go_url;
+        let (models, go) = tokio::join!(fetch_json(url), fetch_json(go_url));
+        let mut catalogs = serde_json::Map::new();
+        if let Some(all) = models
+            && let Some(gateway) = all.get(GATEWAY)
+        {
+            catalogs.insert(GATEWAY.to_owned(), gateway.clone());
         }
-        .await;
-        fetched
-            .inspect_err(|error| tracing::debug!(%error, "no OpenCode model catalog"))
-            .ok()
+        if let Some(go) = go
+            && Gateway::parse_go(&go).is_some()
+        {
+            catalogs.insert("opencode-go".to_owned(), go);
+        }
+        (!catalogs.is_empty()).then_some(Value::Object(catalogs))
     }
 
     /// Keep `entry` as Nori's copy.
@@ -266,11 +292,149 @@ impl Catalog {
     }
 }
 
+async fn fetch_json(url: &str) -> Option<Value> {
+    let fetched: Result<Value, String> = async {
+        let response = reqwest::Client::new()
+            .get(url)
+            .timeout(FETCH_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| format!("{url}: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("{url}: {error}"))?;
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("{url}: {error}"))?;
+        Ok(value)
+    }
+    .await;
+    fetched
+        .inspect_err(|error| tracing::debug!(%error, "could not fetch OpenCode model catalog"))
+        .ok()
+}
+
+fn parse_catalogs(value: &Value) -> Vec<Gateway> {
+    [
+        Gateway::parse(value, GATEWAY),
+        Gateway::parse_go(&value["opencode-go"]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// Nori's copy at `file`, if it reads and names the gateway.
 async fn read_copy(file: &std::path::Path) -> Option<Value> {
     let bytes = tokio::fs::read(file).await.ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
-    value.get(GATEWAY).is_some().then_some(value)
+    (value.get(GATEWAY).is_some() || value.get("opencode-go").is_some()).then_some(value)
+}
+
+fn parse_go_model(id: &str, model: &Value) -> CatalogModel {
+    let api = &model["api"];
+    let protocol = ["responses", "messages", "chat-completions"]
+        .into_iter()
+        .find(|protocol| api[*protocol].is_object());
+    let endpoint = protocol.map(|protocol| &api[protocol]);
+    let package = endpoint.and_then(|endpoint| endpoint["sdk"]["aisdk"].as_str());
+    CatalogModel {
+        id: model["id"].as_str().unwrap_or(id).to_owned(),
+        name: model["name"].as_str().unwrap_or(id).to_owned(),
+        reasoning: model["capabilities"]["reasoning"]["supported"]
+            .as_bool()
+            .unwrap_or(false),
+        tool_call: model["capabilities"]["tools"]["supported"]
+            .as_bool()
+            .unwrap_or(true),
+        images: model["modalities"]["input"]
+            .as_array()
+            .is_some_and(|input| {
+                input
+                    .iter()
+                    .any(|kind| kind.as_str().is_some_and(|kind| kind.starts_with("image")))
+            }),
+        temperature: true,
+        context: model["limit"]["context"].as_i64(),
+        output: model["limit"]["output"].as_i64(),
+        package: package.map(ToOwned::to_owned),
+        api: endpoint
+            .and_then(|endpoint| endpoint["base_url"].as_str())
+            .map(ToOwned::to_owned),
+        efforts: model["capabilities"]["reasoning"]["effort"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        reasoning_field: endpoint
+            .and_then(|endpoint| endpoint["compatibility"]["reasoning_field"].as_str())
+            .map(ToOwned::to_owned),
+        deprecated: model["status"] == "deprecated",
+        release_date: model["release_date"].as_str().unwrap_or("").to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::parse_catalogs;
+
+    #[test]
+    fn go_catalog_keeps_its_provider_and_model_api_metadata() {
+        let catalogs = parse_catalogs(&json!({
+            "opencode": {"name": "OpenCode Models", "models": {}},
+            "opencode-go": {"data": [{
+                "id": "deepseek-v4.1-flash",
+                "name": "DeepSeek V4.1 Flash",
+                "release_date": "2026-11-01",
+                "limit": {"context": 1000000, "output": 64000},
+                "capabilities": {
+                    "tools": {"supported": true},
+                    "reasoning": {"supported": true, "effort": ["low", "high"]}
+                },
+                "modalities": {"input": ["text", "image/jpeg"]},
+                "api": {"responses": {
+                    "base_url": "https://opencode.ai/inference/go/openai/v1",
+                    "sdk": {"aisdk": "@ai-sdk/openai"},
+                    "compatibility": {"reasoning_field": "reasoning_content"}
+                }}
+            }]}
+        }));
+        let go = catalogs
+            .iter()
+            .find(|catalog| catalog.id == "opencode-go")
+            .unwrap();
+        let model = &go.models["deepseek-v4.1-flash"];
+        assert_eq!(go.name, "OpenCode Go");
+        assert_eq!(
+            model.api.as_deref(),
+            Some("https://opencode.ai/inference/go/openai/v1")
+        );
+        assert_eq!(model.package.as_deref(), Some("@ai-sdk/openai"));
+        assert_eq!(model.context, Some(1_000_000));
+        assert_eq!(model.output, Some(64_000));
+        assert_eq!(model.efforts, ["low", "high"]);
+        assert_eq!(model.reasoning_field.as_deref(), Some("reasoning_content"));
+        assert!(model.images);
+    }
+
+    #[test]
+    fn missing_go_catalog_does_not_hide_open_code_models() {
+        let catalogs = parse_catalogs(&json!({"opencode": {
+            "name": "OpenCode Models", "models": {"model": {"id": "model"}}
+        }}));
+        assert_eq!(
+            catalogs
+                .iter()
+                .map(|catalog| catalog.id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode"]
+        );
+    }
 }
 
 fn parse_model(id: &str, model: &Value) -> CatalogModel {

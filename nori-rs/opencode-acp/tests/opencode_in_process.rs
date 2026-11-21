@@ -23,8 +23,8 @@ use wiremock::matchers::header_exists;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
-/// models.dev's catalog: the gateway, with one Anthropic-wire and one OpenAI-wire model, at the
-/// fake server; and another provider, which OpenCode never offers.
+/// OpenCode Models' catalog: one Anthropic-wire and one OpenAI-wire model at the fake server, plus
+/// another provider, which OpenCode never offers.
 fn models_dev(gateway: &str) -> Value {
     json!({
         "opencode": {
@@ -148,6 +148,31 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
         )
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/inference/go/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{
+            "id": "claude-test", "name": "Claude Test Go", "release_date": "2026-10-01",
+            "limit": {"context": 200000, "output": 64000},
+            "capabilities": {"tools": {"supported": true}, "reasoning": {"supported": true}},
+            "modalities": {"input": ["text", "image/jpeg"]},
+            "api": {"messages": {
+                "base_url": format!("{}/go/v1", server.uri()),
+                "sdk": {"aisdk": "@ai-sdk/anthropic"}
+            }}
+        }]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/go/v1/messages"))
+        .and(header("x-api-key", "sk-zen-fixture"))
+        .and(header_exists("x-opencode-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_stream("Hello from Go.")),
+        )
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/zen/v1/messages"))
         .and(header("x-api-key", "sk-zen-fixture"))
@@ -160,12 +185,17 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
         .mount(&server)
         .await;
     let catalog = ("NORI_OPENCODE_MODELS_URL", server.uri());
+    let go_catalog = (
+        "NORI_OPENCODE_GO_MODELS_URL",
+        format!("{}/inference/go/v1/models", server.uri()),
+    );
 
     // Signing in keeps the key it was given for the account.
     let mut signing_in = connect(
         root,
         &[
             catalog.clone(),
+            go_catalog.clone(),
             ("OPENCODE_API_KEY", "sk-zen-fixture".to_owned()),
         ],
     );
@@ -187,7 +217,7 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
         .await;
 
     // A later connection of the account, with no key in its environment, uses the kept one.
-    let mut client = connect(root, &[catalog]);
+    let mut client = connect(root, &[catalog, go_catalog]);
     client
         .request(
             "initialize",
@@ -218,10 +248,14 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
             .filter_map(|choice| choice["value"].as_str().map(ToOwned::to_owned))
             .collect()
     };
-    // Only the gateway's models, newest first.
+    // Go routes are offered first and use their own provider-prefixed model IDs.
     assert_eq!(
         values(&option("model")),
-        vec!["opencode/claude-test", "opencode/gpt-test"]
+        vec![
+            "opencode-go/claude-test",
+            "opencode/claude-test",
+            "opencode/gpt-test"
+        ]
     );
     assert_eq!(
         values(&option("thought_level")),
@@ -263,7 +297,7 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
         .await
         .unwrap_or_default()
         .iter()
-        .find(|request| request.url.path() == "/zen/v1/messages")
+        .find(|request| request.url.path() == "/go/v1/messages")
         .and_then(|request| serde_json::from_slice(&request.body).ok())
         .unwrap_or_default();
     assert_eq!(sent["model"], json!("claude-test"));
@@ -278,4 +312,25 @@ async fn opencode_signs_in_with_a_key_and_answers_through_the_gateway() {
         .filter_map(|block| block["text"].as_str())
         .collect();
     assert!(system.contains("You are OpenCode") && system.contains("Always answer in haiku."));
+
+    client
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "model", "value": "opencode/claude-test"}),
+        )
+        .await;
+    client
+        .request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "try Models"}]}),
+        )
+        .await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path() == "/zen/v1/messages")
+    );
 }

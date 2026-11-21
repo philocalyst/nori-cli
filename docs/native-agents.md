@@ -99,8 +99,8 @@ engine replaces it for Codex too (see "Codex" below); Nori's host tools and `nor
 
 ### OpenCode
 
-`OpenCodeFlavor` (`nori-rs/opencode-acp/`) is OpenCode's model gateway (OpenCode Zen) reached with
-an API key, run by the engine. Nothing of the OpenCode program is read or run: not its
+`OpenCodeFlavor` (`nori-rs/opencode-acp/`) reaches OpenCode Models and OpenCode Go with an API key,
+run by the engine. Nothing of the OpenCode program is read or run: not its
 configuration, database, sign-ins (Claude subscriptions, Copilot, z.ai), plugins or agents. Other
 providers are Nori's own agents, never OpenCode's.
 
@@ -109,16 +109,19 @@ providers are Nori's own agents, never OpenCode's.
   only). Signing in is the ACP `opencode-api-key` method: the sign-in panel asks for the key and
   hands it to the agent, which keeps it; signing out removes it. The agent reports
   `_auth/status_update` (`OpenCode · API key`) or signed out.
-- **Catalog**: models.dev's `opencode` provider, live. The catalog served starts as Nori's last
-  copy (`<store>/models.json`), however old, and is asked for again in the background when a
-  session opens (at most every five minutes) and every half hour while Nori runs. A catalog that
-  differs replaces it, and open sessions are offered the new models at once (the engine's
-  `Flavor::workspace_changes`). Only a first run with no copy waits for models.dev.
-  `NORI_OPENCODE_MODELS_URL` moves it.
-- **Models**: the gateway's models that call tools and are not deprecated, newest first, as
-  `opencode/<model>`. A model's package picks the wire: `@ai-sdk/anthropic` is Anthropic Messages,
-  `@ai-sdk/openai` the Responses API, everything else Chat Completions. Every request names the
-  conversation in `x-opencode-session`, which the gateway routes and caches by.
+- **Catalog**: OpenCode Models from models.dev's `opencode` provider, and OpenCode Go from
+  `https://opencode.ai/inference/go/v1/models`. A temporary failure of one catalog does not hide
+  the other. The combined catalog served starts as Nori's last copy (`<store>/models.json`),
+  however old, and refreshes in the background when a session opens (at most every five minutes)
+  and every half hour while Nori runs. Changed catalogs are offered to open sessions at once via
+  `Flavor::workspace_changes`. `NORI_OPENCODE_MODELS_URL` and `NORI_OPENCODE_GO_MODELS_URL` can
+  point each catalog at a fixture or mirror.
+- **Models and routing**: tool-capable, non-deprecated Go models use `opencode-go/<model>` and are
+  ranked before OpenCode Models routes `opencode/<model>` by default. Explicit route preferences
+  and the current session model keep precedence. Go model metadata supplies its own SDK wire and
+  inference base URL, so Go requests use the Go endpoint rather than Zen. Both catalogs use the
+  account's `OPENCODE_API_KEY` or kept key. Every request names the conversation in
+  `x-opencode-session`, which the gateway routes and caches by.
 - **Effort** (`thought_level`): the efforts the catalog lists for the model, else for reasoning
   models `none`/`low`/`medium`/`high`/`max` on Anthropic (a thinking budget; `none` by default) and
   `low`/`medium`/`high` on the Responses API.

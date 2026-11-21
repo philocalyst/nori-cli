@@ -57,7 +57,7 @@ impl OpenCodeFlavor {
     }
 
     async fn models(&self) -> Vec<crate::models::ModelEntry> {
-        crate::models::models(&*self.catalog.models().await)
+        crate::models::models(&self.catalog.models().await)
     }
 }
 
