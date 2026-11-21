@@ -657,7 +657,9 @@ mod tests {
 
         let second = tools.call("bash", json!({"command": "hi && pwd"})).await;
         assert!(!second.is_error, "{}", second.text);
-        let parsed: Value = serde_json::from_str(&second.text).expect("json");
+        // The status line, then the JSON body.
+        let body = second.text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let parsed: Value = serde_json::from_str(&body).expect("json");
         assert_eq!(parsed["exit_code"], 0);
         assert_eq!(parsed["stdout"], format!("ok\n{}\n", sub.display()));
     }
