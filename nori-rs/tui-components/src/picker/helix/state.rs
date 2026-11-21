@@ -81,6 +81,8 @@ pub(super) struct Compose<Id> {
     pub(super) verb: &'static str,
     pub(super) target: String,
     pub(super) text: String,
+    /// What is typed is a credential: the prompt shows a dot for each character.
+    pub(super) masked: bool,
 }
 
 /// Asked of the host after the text of the query changed: search full text elsewhere (an index
@@ -257,6 +259,16 @@ impl<I: HelixItem> HelixState<I> {
         self.status = status;
     }
 
+    /// Replace the line shown on the bottom edge when there is no other status.
+    pub fn set_subtitle(&mut self, subtitle: Option<String>) {
+        self.config.subtitle = subtitle;
+    }
+
+    /// Replace what the list says when it is empty (no query).
+    pub fn set_empty_text(&mut self, text: String) {
+        self.config.empty_text = text;
+    }
+
     /// The items toggled in a multi-select picker, in the order they were toggled.
     pub fn checked(&self) -> &[I::Id] {
         &self.checked
@@ -282,7 +294,15 @@ impl<I: HelixItem> HelixState<I> {
             verb,
             target: label,
             text: initial,
+            masked: false,
         });
+    }
+
+    /// Show what is typed in the prompt now collecting text as dots, for a credential.
+    pub fn mask_compose(&mut self) {
+        if let Some(compose) = self.compose.as_mut() {
+            compose.masked = true;
+        }
     }
 
     /// Whether the prompt is collecting text for an action.

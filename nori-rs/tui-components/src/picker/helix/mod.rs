@@ -49,3 +49,6 @@ pub use state::HelixState;
 pub use state::ItemAction;
 pub use state::SearchRequest;
 pub use state::VisibleRow;
+
+#[cfg(test)]
+mod tests;

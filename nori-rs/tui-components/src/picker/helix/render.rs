@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::frame::FrameLayout;
 use super::frame::PANE_PAD;
+use super::frame::PREVIEW_MIN_WIDTH;
 use super::frame::draw_frame;
 use super::highlight::highlight_terms;
 use super::highlight::line_matches;
@@ -38,6 +39,11 @@ fn short(name: &str) -> String {
 const MARKER_WIDTH: u16 = 3;
 /// Columns the multi-select gutter (`◼ `) adds.
 const GUTTER_WIDTH: u16 = 2;
+/// Rows the box takes beside its list: the top border, the prompt, the rule under it and the
+/// bottom border.
+const CHROME_ROWS: u16 = 4;
+/// The fewest body rows a preview is given, so that it shows something when the list is short.
+const PREVIEW_MIN_ROWS: u16 = 8;
 
 impl<I: HelixItem> HelixState<I> {
     /// Draw the picker into `area`. `tick` is passed through to rows for animation.
@@ -75,6 +81,34 @@ impl<I: HelixItem> HelixState<I> {
         }
     }
 
+    /// The height of the box that shows every row at `width`: the rows of the list, or the
+    /// preview's least when a preview is drawn beside them, plus the chrome around them. A host
+    /// that draws the box at this height leaves no empty rows under a short list.
+    pub fn height_wanted(&mut self, width: u16) -> u16 {
+        self.refresh();
+        let filtered = !self.parsed.is_empty();
+        let mut list: u16 = 0;
+        let mut previous: Option<&str> = None;
+        for found in &self.matches {
+            let item = &self.items[found.index];
+            let section = item.section();
+            // A heading is drawn above each run of a section while the list is in natural order.
+            if !filtered && section.is_some() && section != previous {
+                list = list.saturating_add(1);
+            }
+            previous = section;
+            list = list.saturating_add(item.row_height().max(1));
+        }
+        let shows_preview =
+            self.config.preview && !self.preview_hidden && width >= PREVIEW_MIN_WIDTH;
+        let body = if shows_preview {
+            list.max(PREVIEW_MIN_ROWS)
+        } else {
+            list
+        };
+        body.max(1).saturating_add(CHROME_ROWS)
+    }
+
     fn render_prompt(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         if let Some(compose) = &self.compose {
             let mut spans: Vec<Span<'static>> = vec![
@@ -89,8 +123,12 @@ impl<I: HelixItem> HelixState<I> {
             // Show the end of what is being typed.
             let room = usize::from(area.width)
                 .saturating_sub(spans.iter().map(Span::width).sum::<usize>() + 2);
-            let tail: String = compose
-                .text
+            let shown: String = if compose.masked {
+                "•".repeat(compose.text.chars().count())
+            } else {
+                compose.text.clone()
+            };
+            let tail: String = shown
                 .chars()
                 .rev()
                 .scan(0, |used, character| {
