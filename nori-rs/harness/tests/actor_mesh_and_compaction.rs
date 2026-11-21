@@ -352,15 +352,26 @@ steps {
     let journal =
         ConversationLog::open(recorder.transcript_path().with_extension("pkl")).expect("open pkl");
     let mut alias_names: Vec<String> = Vec::new();
-    for record in journal.records() {
-        if let Event::Command { name, payload } = &record.event
-            && name.starts_with("actor-directory:")
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(payload)
-            && let Some(aliases) = val["aliases"].as_array()
-        {
+    for record in journal.all().map(Result::unwrap) {
+        let Event::Command { name, payload } = &record.event else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        // The directory is journaled as `actor-delta` changes (`actor_registered` carries the
+        // actor) and `actor-snapshot` trees.
+        let actors: Vec<&serde_json::Value> = match name.as_str() {
+            "actor-delta" if val["delta"] == "actor_registered" => vec![&val["actor"]],
+            "actor-snapshot" => val["actors"].as_array().into_iter().flatten().collect(),
+            _ => continue,
+        };
+        for actor in actors {
             alias_names.extend(
-                aliases
-                    .iter()
+                actor["aliases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
                     .filter_map(|alias| alias.as_str().map(str::to_owned)),
             );
         }
@@ -673,7 +684,8 @@ async fn checkpoint_fork_parity_without_native_session_fork() {
         subagent_states(events).iter().any(|(_, state)| {
             matches!(
                 state,
-                SubagentState::Idle | SubagentState::Ended(SubagentOutcome::Completed { .. })
+                SubagentState::Idle { .. }
+                    | SubagentState::Ended(SubagentOutcome::Completed { .. })
             )
         })
     })
@@ -683,7 +695,8 @@ async fn checkpoint_fork_parity_without_native_session_fork() {
         .find_map(|(id, state)| {
             matches!(
                 state,
-                SubagentState::Idle | SubagentState::Ended(SubagentOutcome::Completed { .. })
+                SubagentState::Idle { .. }
+                    | SubagentState::Ended(SubagentOutcome::Completed { .. })
             )
             .then(|| acp::SessionId::new(id))
         })

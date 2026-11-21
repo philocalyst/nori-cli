@@ -828,9 +828,9 @@ impl crate::backend::AcpBackend {
         // while the real root's actors waited, unrestored, in a journal nobody opened.
         let loader = crate::transcript::TranscriptLoader::new(self.nori_home.clone());
         if loader
-            .load_transcript(recorder.project_id(), recorder.session_id())
+            .load_session_meta(recorder.project_id(), recorder.session_id())
             .await
-            .is_ok_and(|transcript| transcript.meta.delegated)
+            .is_ok_and(|meta| meta.delegated)
         {
             tracing::warn!(
                 session = recorder.session_id(),
@@ -838,7 +838,13 @@ impl crate::backend::AcpBackend {
             );
             return Vec::new();
         }
-        let records = match recorder.visible_records().await {
+        let records = match recorder
+            .visible_records_where(|kind, name| {
+                kind == nori_conversation::Kind::Command
+                    && name.is_some_and(|name| name == SNAPSHOT || name == DELTA)
+            })
+            .await
+        {
             Ok(records) => records,
             Err(error) => {
                 tracing::warn!(%error, "could not read the delegation tree from the journal");
@@ -855,10 +861,10 @@ impl crate::backend::AcpBackend {
             let events = match &actor.journal {
                 Some((project, session)) => {
                     let recorder = async {
-                        let transcript = loader.load_transcript(project, session).await.ok()?;
+                        let meta = loader.load_session_meta(project, session).await.ok()?;
                         crate::transcript::TranscriptRecorder::continue_session(
                             loader.session_path(project, session),
-                            &transcript.meta,
+                            &meta,
                         )
                         .await
                         .ok()
