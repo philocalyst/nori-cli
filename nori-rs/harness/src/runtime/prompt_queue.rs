@@ -136,9 +136,7 @@ impl PromptQueue {
                         jobs.push(job);
                     }
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "prompt admission worker stopped unexpectedly");
-                }
+                Ok(Err(error)) => worker_ended(&error),
                 Err(_) => worker.abort(),
             }
         }
@@ -161,8 +159,19 @@ impl PromptQueue {
         if let Some(worker) = self.worker.take()
             && let Err(error) = worker.await
         {
-            tracing::warn!(%error, "prompt admission worker stopped unexpectedly");
+            worker_ended(&error);
         }
+    }
+}
+
+/// The admission worker ended without handing its queue back. Cancelled is the runtime shutting
+/// down under it (Nori exiting while the session closes), which loses nothing anyone still waits
+/// for; a panic is a bug.
+fn worker_ended(error: &tokio::task::JoinError) {
+    if error.is_cancelled() {
+        tracing::debug!(%error, "prompt admission worker cancelled by the runtime's shutdown");
+    } else {
+        tracing::warn!(%error, "prompt admission worker panicked");
     }
 }
 
