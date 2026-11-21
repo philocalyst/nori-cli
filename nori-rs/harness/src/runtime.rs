@@ -30,6 +30,7 @@ use crate::session_event_fanout::SessionEventFanout;
 use crate::transcript::Transcript;
 mod child_admission;
 mod child_control;
+mod config_lane;
 mod handoff;
 pub(crate) mod program;
 mod prompt_queue;
@@ -1193,10 +1194,8 @@ pub fn refresh_prepared_agent(
 }
 
 fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
-    let plugin_actions = crate::backend::plugins::PluginActionsFeed::default();
     let AgentPrepareSpec {
         config,
-        plugin_actions: plugin_actions.clone(),
         cli_version,
         session_context,
         initial_context,
@@ -1326,8 +1325,10 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         SessionStart::New => crate::context_timeline::ContextTimelineState::default(),
     };
     let context_timeline = Arc::new(tokio::sync::RwLock::new(initial_timeline));
+    let plugin_actions = crate::backend::plugins::PluginActionsFeed::default();
     let handle = HarnessHandle {
         command_tx: agent_cmd_tx,
+        plugin_actions: plugin_actions.clone(),
         first_prompt_started: None,
         context_timeline: Arc::clone(&context_timeline),
     };
@@ -1390,7 +1391,6 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
             result.map_err(|error| (failure_label, error))
         };
 
-        plugin_actions.follow(&backend);
         // Race backend init against shutdown requests and a timeout.
         // This ensures the user can always exit even if the backend hangs.
         let mut connect = std::pin::pin!(connect);
@@ -1523,12 +1523,14 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         let command_recorder_cell = Arc::clone(&recorder_cell);
         let command_recording_enabled = Arc::clone(&recording_enabled);
         backend.bind_program_runtime();
+        plugin_actions.follow(&backend);
         backend.publish_events_to_monitors(event_tx.clone());
         let (handoff_tx, mut handoff_rx) =
             unbounded_channel::<crate::recovery::handoff::HandoffRequest>();
         backend.bind_handoff(handoff_tx.clone());
         let mut backend_for_agent = Arc::clone(&backend);
         let mut prompt_queue = PromptQueue::start(Arc::clone(&backend));
+        let config_lane = config_lane::ConfigLane::start();
         let mut child_admissions = child_admission::ChildAdmissions::default();
         let event_fanout = event_tx.clone();
         tokio::spawn(async move {
@@ -2118,15 +2120,21 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         value,
                         response_tx,
                     } => {
-                        let result = backend_for_agent
-                            .set_config_option(config_id, value)
-                            .await
-                            .map(|()| backend_for_agent.config_options());
-                        let _ = response_tx.send(result);
+                        // The agent's answer can take a while; the loop goes on meanwhile.
+                        config_lane.submit(
+                            Arc::clone(&backend_for_agent),
+                            config_id,
+                            value,
+                            response_tx,
+                        );
                     }
                     HarnessCommand::ListSessions { cwd, response_tx } => {
-                        let result = backend_for_agent.connection().list_sessions(&cwd).await;
-                        let _ = response_tx.send(result);
+                        // A round trip to the agent that changes nothing: the loop goes on.
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ =
+                                response_tx.send(backend.connection().list_sessions(&cwd).await);
+                        });
                     }
                     HarnessCommand::CloseSession { response_tx } => {
                         let result = backend_for_agent.close_active_session().await;
@@ -2142,6 +2150,31 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     }
                     HarnessCommand::FlushTranscript { response_tx } => {
                         let _ = response_tx.send(backend_for_agent.flush_transcript().await);
+                    }
+                    HarnessCommand::Skills { response_tx } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx.send(Ok(backend.skills().await));
+                        });
+                    }
+                    HarnessCommand::Plugins { response_tx } => {
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx.send(backend.plugins().await);
+                        });
+                    }
+                    HarnessCommand::RunPlugin {
+                        plugin,
+                        command,
+                        arguments,
+                        response_tx,
+                    } => {
+                        // A run waits on what its operations wait on: never on the command loop.
+                        let backend = Arc::clone(&backend_for_agent);
+                        tokio::spawn(async move {
+                            let _ = response_tx
+                                .send(backend.run_plugin(&plugin, &command, arguments).await);
+                        });
                     }
                 }
             }
@@ -2340,6 +2373,7 @@ mod tests {
         let callback_count_for_handle = Arc::clone(&callback_count);
         let handle = HarnessHandle {
             command_tx,
+            plugin_actions: Default::default(),
             first_prompt_started: None,
             context_timeline: Arc::default(),
         }
