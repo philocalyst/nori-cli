@@ -938,6 +938,7 @@ impl AcpBackend {
             pending_approvals: Arc::clone(&pending_approvals),
             withdrawn_questions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             pending_prompt_submissions: Arc::new(Mutex::new(HashMap::new())),
+            pending_task_results: Arc::new(Mutex::new(HashMap::new())),
             user_notifier: Arc::clone(&user_notifier),
             idle_timer_abort: Arc::clone(&idle_timer_abort),
             nori_home: config.nori_home.clone(),

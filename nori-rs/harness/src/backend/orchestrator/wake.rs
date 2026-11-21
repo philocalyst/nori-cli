@@ -133,6 +133,7 @@ impl Orchestrator {
                     task_id: id.to_string(),
                     title: task.title.clone(),
                     agent: actor.agent_name.clone(),
+                    name: actor.aliases.first().cloned(),
                 });
             }
             for id in &owed {

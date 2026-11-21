@@ -68,6 +68,32 @@ impl AcpBackend {
             tracing::warn!(%error, "could not record completed delegation recovery");
         }
     }
+    /// How the user's view is told a restored child stands. It carries the name, title and task
+    /// the orchestrator announced for it live, in the same shape; a child the orchestrator does
+    /// not know keeps what the view already shows.
+    pub(super) fn restored_update(&self, child: &RestoredChild) -> nori_protocol::SubagentUpdate {
+        use nori_protocol::Patch;
+        match self
+            .orchestrator
+            .announcement_for_view(&child.id, child.state.clone())
+        {
+            Some(update) => nori_protocol::SubagentUpdate {
+                parent_session_id: child.parent.clone(),
+                ..update
+            },
+            None => nori_protocol::SubagentUpdate {
+                parent_session_id: child.parent.clone(),
+                session_id: child.id.clone(),
+                agent: Patch::Keep,
+                model: Patch::Keep,
+                name: Patch::Keep,
+                title: Patch::Keep,
+                description: Patch::Keep,
+                state: Patch::Set(child.state.clone()),
+            },
+        }
+    }
+
     pub(super) async fn managed_child_ids(&self) -> Result<Vec<acp::SessionId>> {
         let Some(recorder) = self.transcript_recorder.read().await.clone() else {
             return Ok(Vec::new());
@@ -202,7 +228,7 @@ impl AcpBackend {
                 parent,
                 events,
                 retired: vec![id],
-                state: nori_protocol::SubagentState::Idle,
+                state: nori_protocol::SubagentState::Idle { interrupted: true },
             });
         }
         // The rest of the tree: children, mail and task history of the previous run, dormant.
@@ -320,15 +346,7 @@ impl AcpBackend {
         restored.extend(self.restore_managed_children(None).await?);
         for child in restored {
             let id = child.id.clone();
-            let update = SubagentUpdate {
-                parent_session_id: child.parent,
-                session_id: id.clone(),
-                agent: Patch::Keep,
-                model: Patch::Keep,
-                title: Patch::Keep,
-                description: Patch::Keep,
-                state: Patch::Set(SubagentState::Idle),
-            };
+            let update = self.restored_update(&child);
             self.backend_event_tx
                 .send(super::BackendEvent::Public(SessionEvent::Nori(
                     NoriEvent::Subagent(SubagentWire::Update(update)),
@@ -454,7 +472,7 @@ impl AcpBackend {
                 parent,
                 events,
                 retired,
-                state: nori_protocol::SubagentState::Idle,
+                state: nori_protocol::SubagentState::Idle { interrupted: true },
             });
         }
         Ok(restored)

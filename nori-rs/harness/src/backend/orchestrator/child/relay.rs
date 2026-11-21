@@ -98,6 +98,7 @@ pub(super) async fn relay(
                             session_id: view.clone(),
                             agent: nori_protocol::Patch::Keep,
                             model: nori_protocol::Patch::Set(model),
+                            name: nori_protocol::Patch::Keep,
                             title: nori_protocol::Patch::Keep,
                             description: nori_protocol::Patch::Keep,
                             state: nori_protocol::Patch::Keep,
@@ -348,6 +349,7 @@ pub(super) async fn route_changed(
                         .model
                         .clone()
                         .map_or(nori_protocol::Patch::Keep, nori_protocol::Patch::Set),
+                    name: nori_protocol::Patch::Keep,
                     title: nori_protocol::Patch::Keep,
                     description: nori_protocol::Patch::Keep,
                     state: nori_protocol::Patch::Keep,

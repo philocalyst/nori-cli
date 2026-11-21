@@ -269,6 +269,9 @@ pub struct AcpBackend {
     /// Typed prompt callers waiting for the ACP transport request ID.
     pending_prompt_submissions:
         Arc<Mutex<HashMap<String, oneshot::Sender<Result<acp::RequestId>>>>>,
+    /// What each delegated-results turn announces, by the id of its prompt: said when the turn
+    /// opens, before the agent's first word, so the marker precedes the answer it introduces.
+    pending_task_results: Arc<Mutex<HashMap<String, nori_protocol::TaskResultsDelivered>>>,
     /// Notifier for OS-level notifications (approval waiting, idle)
     user_notifier: Arc<crate::UserNotifier>,
     /// Abort handle for the idle detection timer (if running)

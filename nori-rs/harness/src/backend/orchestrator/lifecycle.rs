@@ -115,37 +115,46 @@ impl Inner {
         ids
     }
 
+    /// What the user's view is told about the actor: its alias as the name, its agent's display
+    /// name as the title, and its task as the description.
+    pub(super) fn announcement(
+        &self,
+        id: &ActorId,
+        state: SubagentState,
+    ) -> Option<SubagentUpdate> {
+        let (session_id, announce_parent, agent, model, name, title, description) =
+            self.directory().with(|registry| {
+                registry.actor(id).map(|actor| {
+                    (
+                        actor.wire.clone(),
+                        actor.announce_parent.clone(),
+                        actor.agent.clone(),
+                        actor.model.clone(),
+                        actor.aliases.first().cloned(),
+                        actor.agent_name.clone(),
+                        actor.title.clone(),
+                    )
+                })
+            })?;
+        Some(SubagentUpdate {
+            parent_session_id: announce_parent.or_else(|| self.parent_session())?,
+            session_id,
+            agent: nori_protocol::Patch::Set(agent),
+            model: model.map_or(nori_protocol::Patch::Keep, nori_protocol::Patch::Set),
+            name: name.map_or(nori_protocol::Patch::Keep, nori_protocol::Patch::Set),
+            title: nori_protocol::Patch::Set(title),
+            description: nori_protocol::Patch::Set(description),
+            state: nori_protocol::Patch::Set(state),
+        })
+    }
+
     /// Tell the user's view where the actor stands.
     pub(super) async fn announce(&self, id: &ActorId, state: SubagentState) {
-        let announcement = self.directory().with(|registry| {
-            registry.actor(id).map(|actor| {
-                (
-                    actor.wire.clone(),
-                    actor.announce_parent.clone(),
-                    actor.agent.clone(),
-                    actor.model.clone(),
-                    actor.view_title(),
-                    actor.title.clone(),
-                )
-            })
-        });
-        let Some((session_id, announce_parent, agent, model, title, description)) = announcement
-        else {
-            return;
-        };
-        let Some(parent_session_id) = announce_parent.or_else(|| self.parent_session()) else {
+        let Some(update) = self.announcement(id, state) else {
             return;
         };
         self.emit(SessionEvent::Nori(NoriEvent::Subagent(
-            SubagentWire::Update(SubagentUpdate {
-                parent_session_id,
-                session_id,
-                agent: nori_protocol::Patch::Set(agent),
-                model: model.map_or(nori_protocol::Patch::Keep, nori_protocol::Patch::Set),
-                title: nori_protocol::Patch::Set(title),
-                description: nori_protocol::Patch::Set(description),
-                state: nori_protocol::Patch::Set(state),
-            }),
+            SubagentWire::Update(update),
         )))
         .await;
     }
@@ -246,8 +255,16 @@ impl Inner {
         if let Some(outcome) = finished.outcome {
             let state = if finished.another_active {
                 SubagentState::Running
-            } else if finished.wake_never && !matches!(outcome, SubagentOutcome::Failed { .. }) {
-                SubagentState::Idle
+            } else if finished.wake_never
+                && !matches!(
+                    outcome,
+                    SubagentOutcome::Failed { .. } | SubagentOutcome::Completed { .. }
+                )
+            {
+                // Only an interrupted turn leaves the child idle. A turn that ran to its end, such
+                // as one that answered a message from a sibling, ended the child's work, and
+                // the user's view says so.
+                SubagentState::Idle { interrupted: true }
             } else {
                 SubagentState::Ended(outcome)
             };
@@ -535,6 +552,20 @@ pub(super) fn is_delegation(actor: &Actor, sender: &ActorId) -> bool {
 }
 
 impl super::Orchestrator {
+    /// What the user's view is told about a restored actor, so it comes back with the name,
+    /// title and task it had before. `None` when the orchestrator does not know the actor.
+    pub(in crate::backend) fn announcement_for_view(
+        &self,
+        view: &acp::SessionId,
+        state: SubagentState,
+    ) -> Option<SubagentUpdate> {
+        let id = self
+            .inner
+            .directory()
+            .with(|registry| registry.by_session(view).cloned())?;
+        self.inner.announcement(&id, state)
+    }
+
     /// Whether the session's agents have work in flight, results not yet delivered, or mail
     /// queued for them: a rewind must wait for it, so nothing from the old conversation is
     /// delivered into the new one.

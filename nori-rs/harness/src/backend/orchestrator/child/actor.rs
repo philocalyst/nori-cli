@@ -240,7 +240,7 @@ pub(super) async fn run_actor(
                             SubagentState::Running => {
                                 delegations.insert(update.session_id.clone());
                             }
-                            SubagentState::Idle | SubagentState::Ended(_) => {
+                            SubagentState::Idle { .. } | SubagentState::Ended(_) => {
                                 delegations.remove(&update.session_id);
                                 if delegations.is_empty()
                                     && active.as_ref().is_some_and(|active| active.awaiting_children)
@@ -370,6 +370,7 @@ pub(super) async fn run_actor(
                         session_id,
                         agent: nori_protocol::Patch::Keep,
                         model: nori_protocol::Patch::Keep,
+                        name: nori_protocol::Patch::Keep,
                         title: nori_protocol::Patch::Keep,
                         description: nori_protocol::Patch::Keep,
                         state: nori_protocol::Patch::Set(SubagentState::Ended(
