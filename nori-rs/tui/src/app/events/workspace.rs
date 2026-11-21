@@ -66,8 +66,8 @@ impl App {
                 }
                 self.chat_widget.apply_system_info_refresh(info);
             }
-            AppEvent::RefreshSystemInfoForDirectory { dir, agent } => {
-                self.request_system_info_refresh(dir, agent, self.chat_widget.first_prompt_text());
+            AppEvent::RefreshSystemInfoForDirectory { dir } => {
+                self.request_system_info_refresh(dir);
             }
             other => unreachable!("routed to the wrong domain: {other:?}"),
         }

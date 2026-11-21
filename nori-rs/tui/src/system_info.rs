@@ -1,5 +1,3 @@
-use nori_harness::AgentKind;
-use nori_harness::TranscriptLocation;
 use std::env;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -40,8 +38,6 @@ pub(crate) struct SystemInfo {
     pub(crate) is_worktree: bool,
     /// The worktree directory name (last path component when parent is `.worktrees/`)
     pub(crate) worktree_name: Option<String>,
-    /// Current transcript location if running within an agent environment
-    pub(crate) transcript_location: Option<TranscriptLocation>,
     /// Warning about low disk space with worktrees present (session-start check)
     pub(crate) worktree_cleanup_warning: Option<WorktreeCleanupWarning>,
 }
@@ -51,15 +47,15 @@ impl SystemInfo {
     /// Only available in debug builds for E2E testing via NORI_SYNC_SYSTEM_INFO=1.
     #[cfg(debug_assertions)]
     pub fn collect_sync() -> Self {
-        Self::collect_fresh(None)
+        Self::collect_fresh()
     }
 
     /// The subset of system info worth blocking startup for: the git identity
     /// of `dir`, read in-process.
     ///
     /// Everything else a full collection does is too slow to run before the
-    /// first frame — the skillset version spawns Node, transcript discovery and
-    /// the worktree disk check walk the filesystem — so those fields stay at
+    /// first frame — the skillset version spawns Node and the worktree disk
+    /// check walks the filesystem — so those fields stay at
     /// their defaults until the background refresh overwrites this snapshot
     /// wholesale.
     pub(crate) fn seed(dir: &std::path::Path) -> Self {
@@ -83,68 +79,19 @@ impl SystemInfo {
         }
     }
 
-    /// Collect fresh system info. This is blocking and should be called from
-    /// a background thread to avoid blocking TUI startup.
-    ///
-    /// # Arguments
-    ///
-    /// * `agent_kind` - Optional agent kind to use for transcript discovery.
-    ///   If provided, searches for transcripts from that specific agent.
-    ///   If None, attempts to detect the agent from environment variables.
-    pub(crate) fn collect_fresh(agent_kind: Option<AgentKind>) -> Self {
-        Self::collect_impl(None, agent_kind, None)
+    /// Collect fresh system info for the current directory. Blocking: call it from a
+    /// background thread.
+    pub(crate) fn collect_fresh() -> Self {
+        Self::collect_impl(None)
     }
 
-    /// Collect system info for a specific directory. This is blocking and should
-    /// be called from a background thread to avoid blocking TUI.
-    ///
-    /// This is used when the agent is working in a different directory than the
-    /// TUI was launched from (e.g., a git worktree).
-    ///
-    /// # Arguments
-    ///
-    /// * `dir` - The directory to collect system info for
-    /// * `agent_kind` - Optional agent kind to use for transcript discovery.
-    ///   If provided, searches for transcripts from that specific agent.
-    ///   If None, attempts to detect the agent from environment variables.
-    #[cfg(test)]
-    pub(crate) fn collect_for_directory(
-        dir: &std::path::Path,
-        agent_kind: Option<AgentKind>,
-    ) -> Self {
-        Self::collect_impl(Some(dir), agent_kind, None)
+    /// Collect the footer's facts about `dir`: its git state, skillsets and the Nori version.
+    pub(crate) fn collect_for_directory(dir: &std::path::Path) -> Self {
+        Self::collect_impl(Some(dir))
     }
 
-    /// Collect system info for a specific directory with first-message matching.
-    ///
-    /// This is the preferred method for Claude Code transcript discovery as it
-    /// uses the first user message to accurately identify the correct transcript.
-    ///
-    /// # Arguments
-    ///
-    /// * `dir` - The directory to collect system info for
-    /// * `agent_kind` - Optional agent kind to use for transcript discovery.
-    /// * `first_message` - The first user message for transcript matching (used by Claude Code)
-    pub(crate) fn collect_for_directory_with_message(
-        dir: &std::path::Path,
-        agent_kind: Option<AgentKind>,
-        first_message: Option<&str>,
-    ) -> Self {
-        Self::collect_impl(Some(dir), agent_kind, first_message)
-    }
-
-    fn collect_impl(
-        dir: Option<&std::path::Path>,
-        agent_kind: Option<AgentKind>,
-        first_message: Option<&str>,
-    ) -> Self {
+    fn collect_impl(dir: Option<&std::path::Path>) -> Self {
         let (git_lines_added, git_lines_removed) = get_git_stats(dir);
-        let transcript_location = match dir {
-            Some(dir) => discover_transcript(dir, agent_kind, first_message),
-            None => env::current_dir()
-                .ok()
-                .and_then(|cwd| discover_transcript(&cwd, agent_kind, first_message)),
-        };
         let (nori_version, nori_version_source) = get_nori_version();
 
         #[cfg(unix)]
@@ -173,25 +120,9 @@ impl SystemInfo {
             } else {
                 None
             },
-            transcript_location,
             worktree_cleanup_warning,
         }
     }
-}
-
-/// Helper to discover transcript location for a specific agent kind.
-///
-/// Uses first-message matching for accurate transcript identification.
-/// For Claude Code, the first_message is required to find the correct transcript.
-/// For other agents (Codex, Gemini), the first_message is ignored.
-fn discover_transcript(
-    dir: &std::path::Path,
-    agent_kind: Option<AgentKind>,
-    first_message: Option<&str>,
-) -> Option<TranscriptLocation> {
-    agent_kind.and_then(|agent| {
-        nori_harness::discover_transcript_for_agent_with_message(dir, agent, first_message).ok()
-    })
 }
 
 /// Cached result of `nori-skillsets --version` / `nori-ai --version`.
@@ -561,7 +492,7 @@ mod tests {
         // Test that collect_for_directory runs git commands in the specified directory
         // We use the current repo directory which should be a valid git repo
         let current_dir = std::env::current_dir().expect("should have current dir");
-        let info = SystemInfo::collect_for_directory(&current_dir, None);
+        let info = SystemInfo::collect_for_directory(&current_dir);
 
         // The current directory is a git repo, so we should get branch info
         // (unless in detached HEAD state in CI)
@@ -574,7 +505,7 @@ mod tests {
     fn test_collect_for_directory_non_git_returns_none_branch() {
         // Test that a non-git directory returns None for git_branch
         let temp_dir = std::env::temp_dir();
-        let info = SystemInfo::collect_for_directory(&temp_dir, None);
+        let info = SystemInfo::collect_for_directory(&temp_dir);
 
         // /tmp is not a git repo, so git_branch should be None
         assert!(
@@ -602,13 +533,12 @@ mod tests {
                 seeded.worktree_name,
                 seeded.nori_version,
                 seeded.active_skillsets,
-                seeded.transcript_location,
                 seeded.git_lines_added,
                 seeded.git_lines_removed,
                 seeded.git_has_untracked,
                 seeded.worktree_cleanup_warning,
             ),
-            (false, None, None, Vec::new(), None, None, None, false, None),
+            (false, None, None, Vec::new(), None, None, false, None),
             "seeding must leave everything the background refresh collects at its default"
         );
     }

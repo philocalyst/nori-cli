@@ -1189,9 +1189,9 @@ subagent navigation:
 `footer_left` holds only self-hiding state — the cloud session id when attached
 through cloud mode, and the vim mode indicator when vim mode is on — so an
 ordinary local shell leaves that group empty. Approvals, skillset, skillset
-version, session title, and cumulative token usage are all off by default:
-they are static, restate the transcript, or belong to a workflow the user has
-not opted into. Every one of them still appears in `/status`, and each is one
+version, and session title are all off by default: they are static, restate the
+transcript, or belong to a workflow the user has not opted into. Every one of
+them still appears in `/status`, and each is one
 `[tui.footer_segments]` line away from returning to the footer. Those segments
 keep a default `footer_left` placement precisely so enabling them needs nothing
 more than that one line.
@@ -1329,8 +1329,8 @@ footer's information categories independent of the user's footer configuration:
 directory, session id (the conversation id, shown for every agent — cloud
 sessions append the broker title), title, summary, skillsets (with detected
 skillsets version), approvals, a git row (branch / worktree / +added −removed /
-untracked), a single consolidated context row (`% left (used / window)`), and
-cumulative token usage. Everything the agent decides then follows in its own
+untracked), and a single consolidated context row (`% left (used / window)`)
+when the agent reports usage. Everything the agent decides then follows in its own
 block: the provider on the `Agent` row and one indented row per advertised
 option, labelled and valued exactly as the agent reports them. Local full status
 also outlines every active instruction file with its token count; cloud status

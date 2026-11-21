@@ -121,11 +121,7 @@ impl App {
             self.pending_session_activation = Some(PendingSessionActivation::New);
             self.begin_agent_preparation(crate::app_event::AgentPrepareIntent::Idle);
         }
-        self.request_system_info_refresh(
-            self.config.cwd.clone(),
-            self.config.active_agent.clone().into(),
-            self.chat_widget.first_prompt_text(),
-        );
+        self.request_system_info_refresh(self.config.cwd.clone());
     }
 
     pub(super) fn apply_approval_preset(

@@ -27,10 +27,7 @@ impl ChatWidget {
 
                 if let Some(dir) = refresh_dir {
                     self.app_event_tx
-                        .send(AppEvent::RefreshSystemInfoForDirectory {
-                            dir,
-                            agent: Some(self.config.active_agent.clone()),
-                        });
+                        .send(AppEvent::RefreshSystemInfoForDirectory { dir });
                 }
             }
         }

@@ -657,11 +657,11 @@ same reducer over saved evidence. The runtime reduces each event before
 publishing it, so a consumer that receives a boundary can query its checkpoint.
 These are Harness read APIs, not a second usage protocol or an ACP extension.
 
-Transcript discovery remains a provider fallback for the TUI's latest-usage
-summary: `TranscriptTokenUsage.last_context_tokens` reports the latest context
-fill, while the detected `AgentKind` supplies the maximum window size. Those
-estimates never become ACP timeline observations. The footer's default and
-atomic context segments share their resolved latest-usage state.
+The TUI does not scan provider-owned transcript directories for usage. Its
+current context summary comes from the agent's ACP usage updates; it does not
+infer live context occupancy from cumulative token totals in an external
+transcript. `TranscriptTokenUsage` remains a data type for rendering a
+provider-supplied breakdown, but transcript discovery does not populate it.
 
 Transcript schema v3 records:
 

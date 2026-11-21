@@ -171,13 +171,9 @@ pub(crate) enum AppEvent {
 
     /// Request to refresh system info for a specific directory.
     /// This is triggered when the effective CWD changes during agent operations.
-    ///
-    /// The optional agent name is used to determine which agent's transcripts to search for.
     RefreshSystemInfoForDirectory {
         /// The directory to collect system info for
         dir: PathBuf,
-        /// Optional agent name (e.g., "claude-code", "gemini") to determine agent kind
-        agent: Option<String>,
     },
 
     /// What `/diff` found.

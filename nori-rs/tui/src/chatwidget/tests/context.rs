@@ -87,28 +87,6 @@ fn context_command_uses_reported_usage_and_prints_a_detached_snapshot() {
 }
 
 #[test]
-fn cumulative_billing_tokens_are_not_context_occupancy() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
-    chat.bottom_pane
-        .set_system_info(crate::system_info::SystemInfo {
-            transcript_location: Some(nori_harness::TranscriptLocation {
-                agent_kind: nori_harness::AgentKind::ClaudeCode,
-                transcript_path: PathBuf::from("/tmp/context-test.jsonl"),
-                session_id: "context-test".into(),
-                token_breakdown: Some(nori_harness::TranscriptTokenUsage {
-                    input_tokens: 800_000,
-                    output_tokens: 50_000,
-                    cached_tokens: 700_000,
-                    last_context_tokens: None,
-                }),
-                subagents_used: Vec::new(),
-            }),
-            ..Default::default()
-        });
-    assert_eq!(chat.bottom_pane.context_usage_snapshot().0.tokens, None);
-}
-
-#[test]
 fn context_query_results_from_another_session_are_discarded() {
     let (mut chat, mut rx, _op_rx) = make_cloud_chatwidget_manual();
     while rx.try_recv().is_ok() {}

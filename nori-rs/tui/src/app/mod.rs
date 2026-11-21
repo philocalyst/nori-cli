@@ -245,8 +245,6 @@ enum CandidateAgent {
 #[derive(Clone, Debug)]
 struct SystemInfoRefreshRequest {
     dir: PathBuf,
-    model: Option<String>,
-    first_message: Option<String>,
 }
 
 mod commit_changes;
@@ -546,11 +544,7 @@ impl App {
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
 
-        app.request_system_info_refresh(
-            app.config.cwd.clone(),
-            Some(app.config.active_agent.clone()),
-            app.chat_widget.first_prompt_text(),
-        );
+        app.request_system_info_refresh(app.config.cwd.clone());
 
         // The first frame is drawn here rather than requested: under load the scheduler task,
         // the broadcast and the event stream between a request and its draw can each wait to be
@@ -688,17 +682,8 @@ impl App {
         self.chat_widget.token_usage()
     }
 
-    fn request_system_info_refresh(
-        &self,
-        dir: PathBuf,
-        model: Option<String>,
-        first_message: Option<String>,
-    ) {
-        let request = SystemInfoRefreshRequest {
-            dir,
-            model,
-            first_message,
-        };
+    fn request_system_info_refresh(&self, dir: PathBuf) {
+        let request = SystemInfoRefreshRequest { dir };
         if self.system_info_tx.send(request).is_err() {
             tracing::error!("system info refresh channel is closed");
         }
@@ -715,15 +700,7 @@ impl App {
             // (message submit, task completion, tool-call cwd changes,
             // skillset install/switch). No periodic polling.
             while let Ok(request) = system_info_rx.recv() {
-                let agent_kind = request
-                    .model
-                    .as_ref()
-                    .and_then(|model| nori_harness::AgentKind::from_slug(model));
-                let info = crate::system_info::SystemInfo::collect_for_directory_with_message(
-                    &request.dir,
-                    agent_kind,
-                    request.first_message.as_deref(),
-                );
+                let info = crate::system_info::SystemInfo::collect_for_directory(&request.dir);
                 app_event_tx.send(AppEvent::SystemInfoRefreshed(info));
             }
         })

@@ -126,7 +126,6 @@ impl ChatWidget {
         self.app_event_tx
             .send(AppEvent::RefreshSystemInfoForDirectory {
                 dir: self.config.cwd.clone(),
-                agent: Some(self.config.active_agent.clone()),
             });
 
         if notify {

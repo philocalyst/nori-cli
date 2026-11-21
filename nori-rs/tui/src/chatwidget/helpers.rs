@@ -273,11 +273,6 @@ impl ChatWidget {
         self.bottom_pane.restore_composer_draft(draft);
     }
 
-    /// Returns the first prompt text for this session, used for transcript matching.
-    pub(crate) fn first_prompt_text(&self) -> Option<String> {
-        self.first_prompt_text.clone()
-    }
-
     pub(crate) fn take_initial_input(&mut self) -> (Option<String>, Vec<PathBuf>) {
         let Some(UserMessage { text, image_paths }) = self.initial_user_message.take() else {
             return (None, Vec::new());
