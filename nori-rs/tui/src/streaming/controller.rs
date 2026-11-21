@@ -16,6 +16,7 @@ pub(crate) struct StreamController {
     native_complete_line: bool,
     native_pending_work: bool,
     header_emitted: bool,
+    boundary: super::boundary::ParagraphBoundary,
 }
 
 impl StreamController {
@@ -27,11 +28,18 @@ impl StreamController {
             native_complete_line: false,
             native_pending_work: false,
             header_emitted: false,
+            boundary: super::boundary::ParagraphBoundary::default(),
         }
+    }
+
+    /// Whether the message so far ends a paragraph, where another cell may go in.
+    pub(crate) fn at_paragraph_end(&self) -> bool {
+        self.boundary.at_paragraph_end()
     }
 
     /// Append a delta. Costs the length of the delta.
     pub(crate) fn push(&mut self, delta: &str) {
+        self.boundary.push(delta);
         self.collector.push_delta(delta);
         if let Some(native) = &mut self.native_collector {
             native.push_delta(delta);
