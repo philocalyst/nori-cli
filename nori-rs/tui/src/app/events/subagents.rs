@@ -105,7 +105,7 @@ impl App {
                 if self.is_model_child_route(route_token, key, &config_id, &value) {
                     if let Err(why) = &result
                         && route_fallback_eligible
-                        && self.advance_model_route(why).await
+                        && self.advance_model_route(why)
                     {
                         return Ok(true);
                     }

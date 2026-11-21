@@ -13,7 +13,6 @@ use crate::tui;
 use crate::tui::TuiEvent;
 use crate::ui_types::TokenUsage;
 use crate::update_action::UpdateAction;
-use codex_ansi_escape::ansi_escape_line;
 use codex_login::AuthManager;
 use color_eyre::eyre::Result;
 use nori_config::AskForApproval;
@@ -159,8 +158,14 @@ pub(crate) struct App {
     /// activating candidate publishes `SessionStarted`.
     candidate_agent: Option<CandidateAgent>,
     pending_candidate_model: Option<(String, String)>,
+    /// A model on another agent chosen while a response was running: accepted at once, it is
+    /// switched to when the response ends (`App::run_deferred_agent_model`).
+    deferred_agent_model: Option<session_setup::DeferredAgentModel>,
     model_route_fallback: Option<model_routes::ModelRouteFallback>,
     next_model_route_token: i64,
+    /// The newest model switch to another agent whose conversation is being read; an older one's
+    /// answer is dropped.
+    model_handoff_token: i64,
     /// The low-disk worktree notice is shown once per run, not on every system info refresh.
     worktree_warning_shown: bool,
     manual_model_handoff: Option<session_setup::ManualModelHandoff>,
@@ -247,6 +252,7 @@ struct SystemInfoRefreshRequest {
     dir: PathBuf,
 }
 
+pub(crate) mod candidate_commit;
 mod commit_changes;
 mod config_persistence;
 mod events;
@@ -397,8 +403,10 @@ impl App {
             pending_session_activation,
             candidate_agent: None,
             pending_candidate_model: None,
+            deferred_agent_model: None,
             model_route_fallback: None,
             next_model_route_token: 0,
+            model_handoff_token: 0,
             worktree_warning_shown: false,
             manual_model_handoff: None,
             waiting_model_presses: Default::default(),
@@ -589,6 +597,7 @@ impl App {
             }
         {
             app.sync_program_status(tui);
+            app.run_deferred_agent_model();
         }
         crate::latency::write_report();
 

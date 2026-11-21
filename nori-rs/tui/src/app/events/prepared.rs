@@ -58,7 +58,7 @@ impl App {
                             let model_selection = self.model_route_fallback.is_some();
                             let why = error.to_string();
                             if crate::app::model_routes::eligible_error(&error)
-                                && self.advance_model_route(&why).await
+                                && self.advance_model_route(&why)
                             {
                                 return Ok(true);
                             }

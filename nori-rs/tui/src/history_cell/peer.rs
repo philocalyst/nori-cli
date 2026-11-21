@@ -383,7 +383,13 @@ impl HistoryCell for RouteNoticeCell {
                     ),
                     chip: Vec::new(),
                     meta: vec![
-                        chrome.fact(format!("{attempt}/{max_attempts}")),
+                        // `max_attempts` 0: Nori keeps trying until it works (an outage, a
+                        // usage limit's reset).
+                        chrome.fact(if *max_attempts > 0 {
+                            format!("{attempt}/{max_attempts}")
+                        } else {
+                            format!("attempt {attempt}")
+                        }),
                         chrome.fact(reason.clone()),
                     ],
                 },

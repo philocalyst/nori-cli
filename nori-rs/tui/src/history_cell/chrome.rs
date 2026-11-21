@@ -98,6 +98,12 @@ impl Chrome {
     /// where it ran: a model served through a gateway (`deepseek/v4 via opencode`) or no model
     /// at all.
     pub(crate) fn identity(&self, agent: Option<&str>, model: Option<&str>) -> Vec<Span<'static>> {
+        // Through a gateway the provider is part of the route: one model can be reached through
+        // two of them (`opencode` with Anthropic's key or with its own Go plan).
+        let provider = model
+            .and_then(|model| model.split_once('/'))
+            .map(|(provider, _)| provider.to_owned())
+            .filter(|provider| !provider.is_empty());
         let model = model.map(short_model).filter(|model| !model.is_empty());
         let model = model.as_deref();
         let agent = agent.filter(|agent| !agent.is_empty());
@@ -125,8 +131,15 @@ impl Chrome {
                     .or_else(|| agent.and_then(family))
                     .unwrap_or_else(|| self.muted());
                 let mut spans = vec![Span::styled(model.to_owned(), style)];
-                if let Some(gateway) = gateway {
-                    spans.push(Span::styled(format!(" via {gateway}"), self.faint()));
+                match (gateway, provider) {
+                    (Some(gateway), Some(provider)) => spans.push(Span::styled(
+                        format!(" via {gateway} · {provider}"),
+                        self.faint(),
+                    )),
+                    (Some(gateway), None) => {
+                        spans.push(Span::styled(format!(" via {gateway}"), self.faint()));
+                    }
+                    (None, _) => {}
                 }
                 spans
             }

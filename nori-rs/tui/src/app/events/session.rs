@@ -39,7 +39,7 @@ impl App {
                         self.pending_candidate_model = None;
                         if self.manual_model_handoff.is_some() {
                             let why = error.to_string();
-                            if self.advance_model_route(&why).await {
+                            if self.advance_model_route(&why) {
                                 return Ok(true);
                             }
                             self.end_model_choice(&why);
