@@ -241,7 +241,7 @@ async fn a_background_task_on_another_agent_wakes_the_parent_with_its_result() {
         tool_results(&events)
             .iter()
             .any(|result| result.contains("\"task_id\":\"task-1\"")
-                && result.contains("delivered to you")),
+                && result.contains("arrives as a new message")),
         "{:?}",
         tool_results(&events)
     );
@@ -406,7 +406,7 @@ async fn sibling_native_children_with_the_same_provider_id_route_independently()
                     if update.session_id.to_string().starts_with("nori-relay:")
                         && matches!(
                             &update.state,
-                            nori_protocol::Patch::Set(SubagentState::Idle)
+                            nori_protocol::Patch::Set(SubagentState::Idle { .. })
                         ) =>
                 {
                     Some(update.session_id.clone())
@@ -424,7 +424,7 @@ async fn sibling_native_children_with_the_same_provider_id_route_independently()
             && update.session_id.to_string().starts_with("nori-relay:")
             && matches!(
                 &update.state,
-                nori_protocol::Patch::Set(SubagentState::Idle)
+                nori_protocol::Patch::Set(SubagentState::Idle { .. })
             )
             && !children.iter().any(|(id, _)| id == &update.session_id)
         {
@@ -582,8 +582,8 @@ async fn typed_child_follow_up_preserves_text_image_and_embedded_resource() {
     let journal = ConversationLog::open(recorder.transcript_path().with_extension("pkl"))
         .expect("open canonical conversation journal");
     let recorded = journal
-        .records()
-        .iter()
+        .all()
+        .map(Result::unwrap)
         .find_map(|record| match &record.event {
             Event::Command { name, payload } if name == "send-subagent-message" => {
                 Some(serde_json::from_str::<serde_json::Value>(payload).expect("command JSON"))
