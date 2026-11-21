@@ -222,14 +222,6 @@ impl Actor {
         }
     }
 
-    /// The agent and model, shown next to the actor's title.
-    pub(super) fn view_title(&self) -> String {
-        match &self.model {
-            Some(model) => format!("{} · {model}", self.agent_name),
-            None => self.agent_name.clone(),
-        }
-    }
-
     pub(super) fn open_tasks(&self) -> impl Iterator<Item = &Task> {
         self.tasks.iter().filter(|task| !task.status.is_ended())
     }
