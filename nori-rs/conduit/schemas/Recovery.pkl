@@ -12,12 +12,24 @@ typealias FailureKind = "rate_limited"|"quota_exhausted"|"model_unavailable"|"ca
 
 typealias ReturnToPrimary = "never"|"after_reset"|"next_session"
 
+/// How a model is served: `flex` is cheaper and slower, `fast` and `priority` faster and dearer.
+/// Each agent maps its own option onto these (Claude Code's fast toggle, OpenAI's service tier);
+/// a route that names a mode the agent does not offer leaves the agent's setting alone.
+typealias ModelMode = "standard"|"fast"|"flex"|"priority"
+
 /// A place work can run. An unset `agent` means "the agent already running"; an unset
 /// `model` means "that agent's own default".
 class Route {
   agent: String(!isEmpty)?
   model: String(!isEmpty)?
-  /// Extra select settings applied on the route, by setting id (for example reasoning effort).
+  /// How the model is served on the route; the typed spelling of `options { ["model_mode"] = ... }`.
+  model_mode: ModelMode?
+  /// The reasoning effort on the route (`low`, `medium`, `high`, `xhigh`, `max`, as the agent
+  /// offers them); the typed spelling of `options { ["effort"] = ... }`.
+  effort: String?
+  /// Extra select settings applied on the route, by setting id or name (for example
+  /// `["service_tier"] = "flex"` or `["reasoning_effort"] = "high"`). `model_mode` and `effort`
+  /// are also accepted here as ids that every agent's matching option answers to.
   options: Mapping<String, String>
 }
 
