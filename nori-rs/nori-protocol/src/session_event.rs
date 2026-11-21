@@ -196,6 +196,9 @@ pub struct DeliveredTask {
     pub title: String,
     /// The display name of the agent the task ran on.
     pub agent: String,
+    /// What the actor that ran the task is called (its alias), when it has one.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Record identities in the source transcript, not presentation-cell indices.
