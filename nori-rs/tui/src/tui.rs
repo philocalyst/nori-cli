@@ -249,8 +249,12 @@ impl Tui {
             frame_schedule_tx,
             draw_tx,
             terminal,
-            presenter: present::Presenter::default(),
+            presenter: present::Presenter {
+                width_change: reflow::WidthChange::of_terminal(|name| std::env::var(name).ok()),
+                ..present::Presenter::default()
+            },
             resize_signal: Arc::new(present::ResizeSignal::default()),
+            resize_wait: None,
             first_frame_drawn: false,
             #[cfg(unix)]
             suspend_context: SuspendContext::new(),
