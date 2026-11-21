@@ -154,6 +154,45 @@ impl Orchestrator {
         crate::runtime::program::execute(&source, &backend, &backend.transcript_recorder_cell())
             .await
     }
+
+    /// Run the session's skill `name` with `arguments`.
+    pub(crate) async fn execute_skill(
+        &self,
+        name: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<crate::runtime::ConversationProgramResult> {
+        let backend = self
+            .inner
+            .program_backend
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| anyhow::anyhow!("conversation runtime is no longer available"))?;
+        let modules = self.modules().await;
+        let skill = modules.skill(name).ok_or_else(|| {
+            let known: Vec<&str> = modules
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect();
+            anyhow::anyhow!(
+                "there is no skill named {name}; the skills are: {}",
+                if known.is_empty() {
+                    "none".to_owned()
+                } else {
+                    known.join(", ")
+                }
+            )
+        })?;
+        let source = tokio::fs::read_to_string(&skill.path).await?;
+        crate::runtime::program::execute_source(
+            &source,
+            Some(skill.path.clone()),
+            &arguments,
+            &backend,
+            &backend.transcript_recorder_cell(),
+        )
+        .await
+    }
 }
 
 impl crate::backend::AcpBackend {

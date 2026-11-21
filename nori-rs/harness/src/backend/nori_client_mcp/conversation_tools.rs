@@ -23,6 +23,19 @@ pub(crate) struct ConversationContextRequest {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillRequest {
+    /// The skill to run. Leave it out to list the skills there are, with what each does and the
+    /// arguments it takes.
+    #[serde(default)]
+    name: Option<String>,
+    /// The skill's arguments by parameter name.
+    #[serde(default)]
+    arguments: std::collections::BTreeMap<String, String>,
+}
+
 #[tool_router(router = conversation_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
@@ -40,6 +53,51 @@ impl NoriClientService {
             .await
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
         Ok(tool_success(result))
+    }
+
+    #[tool(
+        description = "Run a skill: a procedure written in Pkl (`skills/*.pkl`) that may use several agents in steps and rounds, such as a council of models that answer independently and are reconciled (`council`), or the impact of a change on its users and tests, from nudox (`impact`: run it before you change a public declaration). Call it with no `name` to list the skills there are, each with its summary and parameters; then call it with `name` and `arguments` (by parameter name). It returns the skill's result when the procedure ends, and where its journal is. Prefer a skill over improvising the same procedure by hand.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub(crate) async fn skill(
+        &self,
+        Parameters(request): Parameters<SkillRequest>,
+    ) -> Result<CallToolResult, McpError> {
+        let orchestrator = &self.shared.orchestrator;
+        let Some(name) = request.name else {
+            let skills: Vec<serde_json::Value> = orchestrator
+                .modules()
+                .await
+                .skills
+                .iter()
+                .map(|skill| {
+                    serde_json::json!({
+                        "name": skill.name,
+                        "summary": skill.value.summary,
+                        "parameters": skill.value.parameters.iter().map(|(name, parameter)| {
+                            serde_json::json!({
+                                "name": name,
+                                "description": parameter.description,
+                                "required": parameter.required && parameter.default.is_none(),
+                                "default": parameter.default,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            return Ok(tool_success(serde_json::json!({ "skills": skills })));
+        };
+        let result = orchestrator
+            .execute_skill(&name, request.arguments)
+            .await
+            .map_err(|error| McpError::internal_error(format!("{error:#}"), None))?;
+        Ok(tool_success(serde_json::to_value(result).map_err(
+            |error| McpError::internal_error(error.to_string(), None),
+        )?))
     }
 
     #[tool(

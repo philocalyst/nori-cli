@@ -23,6 +23,7 @@ impl AcpBackend {
         mut signals: mpsc::UnboundedReceiver<Signal>,
     ) {
         self.serve_monitors();
+        self.load_pkl_modules();
         let backend = self.clone();
         tokio::spawn(async move {
             let wake_scheduled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

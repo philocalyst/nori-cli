@@ -120,6 +120,8 @@ impl Orchestrator {
                 polls: std::sync::Mutex::new(PollTracker::default()),
                 // Never armed through a provider-owned caller: its monitor tools are refused.
                 monitors: self.inner.monitors.clone(),
+                jobs: self.inner.jobs.clone(),
+                modules: self.inner.modules.clone(),
             }),
         };
         let backend = self

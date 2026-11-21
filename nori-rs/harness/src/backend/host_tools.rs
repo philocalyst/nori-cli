@@ -540,6 +540,7 @@ mod tests {
                 "monitor_rearm",
                 "monitor_start",
                 "monitor_stop",
+                "skill",
                 "task_cancel",
                 "task_list",
                 "task_send",
