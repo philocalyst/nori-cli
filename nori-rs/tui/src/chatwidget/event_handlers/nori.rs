@@ -65,8 +65,12 @@ impl ChatWidget {
                     nori_protocol::SessionEndReason::Closed => {
                         self.app_event_tx.send(AppEvent::SessionClosed);
                     }
-                    nori_protocol::SessionEndReason::ConnectionLost
-                    | nori_protocol::SessionEndReason::SpawnFailed
+                    // The agent died under the session: it is restarted and the conversation
+                    // continues, as a resume of it.
+                    nori_protocol::SessionEndReason::ConnectionLost => {
+                        self.app_event_tx.send(AppEvent::RecoverConversation);
+                    }
+                    nori_protocol::SessionEndReason::SpawnFailed
                     | nori_protocol::SessionEndReason::TimedOut => {}
                 }
             }
@@ -157,6 +161,8 @@ impl ChatWidget {
                     at: std::time::Instant::now(),
                 }));
             }
+            // The app answers it with its own move flow (`app::session_move`).
+            nori_protocol::NoriEvent::SessionMoveRequested { .. } => {}
             nori_protocol::NoriEvent::AgentHeard => {
                 if matches!(
                     self.bottom_pane.status_note(),

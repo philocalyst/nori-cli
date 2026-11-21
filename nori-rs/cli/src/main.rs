@@ -254,6 +254,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     if exit_info.immediate_exit {
         return Ok(());
     }
+    let handover = exit_info.handover.clone();
     let update_action = exit_info.update_action;
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
     for line in format_exit_messages(exit_info, color_enabled) {
@@ -261,6 +262,15 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
     }
     if let Some(action) = update_action {
         run_update_action(action)?;
+    }
+    // A moved session continues on its new machine, in this terminal.
+    if let Some(argv) = handover
+        && let Some((program, args)) = argv.split_first()
+    {
+        let status = std::process::Command::new(program).args(args).status()?;
+        if !status.success() {
+            anyhow::bail!("the session's new machine ended with {status}");
+        }
     }
     Ok(())
 }
@@ -788,6 +798,7 @@ mod tests {
                 .map(Result::unwrap),
             conversation_has_activity: conversation.is_some(),
             update_action: None,
+            handover: None,
         }
     }
 
@@ -799,6 +810,7 @@ mod tests {
             conversation_id: None,
             conversation_has_activity: false,
             update_action: None,
+            handover: None,
         };
         let lines = format_exit_messages(exit_info, false);
         assert!(lines.is_empty());
@@ -814,6 +826,7 @@ mod tests {
             ),
             conversation_has_activity: true,
             update_action: None,
+            handover: None,
         };
         let lines = format_exit_messages(exit_info, false);
         assert_eq!(
@@ -835,6 +848,7 @@ mod tests {
             ),
             conversation_has_activity: false,
             update_action: None,
+            handover: None,
         };
         let lines = format_exit_messages(exit_info, false);
         assert!(lines.is_empty());

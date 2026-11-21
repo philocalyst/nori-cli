@@ -85,6 +85,7 @@ mod helpers;
 mod key_handling;
 mod login;
 mod login_input;
+mod move_popup;
 mod sign_in;
 pub(crate) use sign_in::SignInTarget;
 mod pickers;

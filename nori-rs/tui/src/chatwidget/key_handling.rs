@@ -383,6 +383,7 @@ impl ChatWidget {
             SlashCommand::Goal => {
                 self.request_thread_goal_status();
             }
+            SlashCommand::Move => self.open_move_popup(),
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.begin_exit();
             }

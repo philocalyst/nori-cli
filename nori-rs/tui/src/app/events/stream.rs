@@ -14,6 +14,16 @@ impl App {
                     self.program_status.event(&event);
                 }
                 if self.chat_widget.session_generation() == generation
+                    && let nori_protocol::SessionEvent::Nori(
+                        nori_protocol::NoriEvent::SessionMoveRequested { machine },
+                    ) = &event
+                {
+                    self.begin_move(machine.clone());
+                }
+                if self.pending_move.is_some() {
+                    self.start_pending_move();
+                }
+                if self.chat_widget.session_generation() == generation
                     && let nori_protocol::SessionEvent::Acp(
                         nori_protocol::AcpEvent::ChildNotification(notification),
                     ) = &event

@@ -181,14 +181,39 @@ impl App {
             | AppEvent::RemoteControlRequested(..)
             | AppEvent::SessionCloseFailed { .. }
             | AppEvent::SessionClosed => self.handle_session_event(tui, event).await,
+            AppEvent::RecoverConversation => {
+                self.recover_conversation();
+                tui.frame_requester().schedule_frame();
+                Ok(true)
+            }
+            AppEvent::MoveSession { machine } => {
+                self.begin_move(machine);
+                tui.frame_requester().schedule_frame();
+                Ok(true)
+            }
+            AppEvent::MoveFinished(outcome) => {
+                self.finish_move(outcome);
+                tui.frame_requester().schedule_frame();
+                Ok(true)
+            }
             AppEvent::EditorClipboard { command, text } => {
                 self.chat_widget.paste_clipboard(command, &text);
                 tui.frame_requester().schedule_frame();
                 Ok(true)
             }
+            AppEvent::OpenNoriLink(url) => {
+                match crate::nori_link::NoriLink::parse(&url) {
+                    Some(crate::nori_link::NoriLink::Subagent(key)) => {
+                        self.focus_subagent_from_mouse(tui, key);
+                    }
+                    None => tracing::debug!(%url, "a link that is not this Nori's opens nothing"),
+                }
+                Ok(true)
+            }
             AppEvent::ConsolidateAgentMessage { .. }
             | AppEvent::DiffResult(..)
             | AppEvent::FinalizeHistoryTools { .. }
+            | AppEvent::FocusChanged { .. }
             | AppEvent::FocusSnapshotsLoaded { .. }
             | AppEvent::ForkToMessage { .. }
             | AppEvent::HistoryReplay(..)
