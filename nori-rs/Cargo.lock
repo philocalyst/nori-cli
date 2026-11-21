@@ -10515,6 +10515,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nori-tools"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "nori-tui"
 version = "0.0.0"
 dependencies = [

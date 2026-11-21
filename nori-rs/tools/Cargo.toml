@@ -1,0 +1,26 @@
+[package]
+name = "nori-tools"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+# The agent-facing file tools (read, write, edit, multi_edit, apply_patch), shared by every
+# agent path. A pure library: it depends on no harness, ACP or provider crate.
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync"] }
+tokio-util = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread", "sync", "time"] }

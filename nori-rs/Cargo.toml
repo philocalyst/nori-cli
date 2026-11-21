@@ -52,6 +52,7 @@ members = [
     "nori-protocol",
     "script",
     "tui-pty-e2e",
+    "tools",
 ]
 resolver = "2"
 
@@ -113,6 +114,7 @@ nori-pkl = { path = "pkl" }
 nori-conduit = { path = "conduit" }
 nori-bash = { path = "bash" }
 nori-antigravity-acp = { path = "antigravity-acp" }
+nori-tools = { path = "tools" }
 
 # External
 allocative = "0.3.3"
@@ -247,6 +249,7 @@ tree-sitter-bash = "0.25.1"
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
 ts-rs = "11"
 uds_windows = "1.1.0"
+unicode-normalization = "0.1.25"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"

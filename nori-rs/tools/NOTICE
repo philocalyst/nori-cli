@@ -1,0 +1,92 @@
+nori-tools: third-party text and algorithms
+
+This crate adapts the following. The crate itself is licensed under the workspace license
+(Apache-2.0).
+
+--------------------------------------------------------------------------------
+OpenCode (https://github.com/sst/opencode) - MIT License
+Copyright (c) 2025 opencode
+--------------------------------------------------------------------------------
+Reused (adapted) from packages/core/src/tool/plugin/{edit,read,write}.ts:
+  - src/spec/descriptions.rs: the wording of the `edit`, `read` and `write` contracts: omit the
+    line-number prefix and keep exact indentation; the match must be unique unless replaceAll;
+    add surrounding context to disambiguate; "Writes a file to the local filesystem, overwriting
+    if one exists. Missing parent directories are created automatically"; directory listing and
+    offset/limit paging of `read`; the 2000-line default and cap.
+  - src/edit/{matcher,fold,document}.rs: the design of the tiered edit match (exact, then
+    typographic-quote/dash/space normalised, then trailing-whitespace-insensitive), matching
+    against an LF view of a CRLF file, and keeping each untouched line's original ending.
+    Reimplemented in Rust, not translated line by line.
+  - src/edit/hint.rs: the idea of answering a miss with the closest lines, numbered like `read`
+    output, and noting when new_string is already in the file.
+  - src/patch/ and src/spec/descriptions.rs: the OpenCode `patch` tool description follows
+    Codex's (below).
+
+MIT License text (from the OpenCode repository):
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+  and associated documentation files (the "Software"), to deal in the Software without
+  restriction, including without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+OpenAI Codex (https://github.com/openai/codex) - Apache License 2.0
+Copyright 2025 OpenAI
+--------------------------------------------------------------------------------
+Reused verbatim or adapted:
+  - src/spec/descriptions.rs `APPLY_PATCH_GRAMMAR`: the Lark grammar of the freeform
+    `apply_patch` tool (core/assets/tools/apply_patch.lark), verbatim.
+  - src/spec/descriptions.rs `APPLY_PATCH`: adapted from the `apply_patch` tool instructions
+    (codex-apply-patch apply_patch_tool_instructions.md and the freeform tool description): the
+    envelope, the Add/Delete/Update headers, `*** Move to:`, `@@` context lines, three lines of
+    context, stacked `@@`, `*** End of File`, and the example patch.
+  - src/patch/{parse,chunks}.rs: the patch format and the strategy of locating a hunk by trying
+    exact, then trailing-whitespace-insensitive, then trim-both-sides comparison
+    (codex-apply-patch seek_sequence.rs), including anchoring `*** End of File` hunks at the end
+    of the file. Reimplemented, not copied.
+
+--------------------------------------------------------------------------------
+Gemini CLI (https://github.com/google-gemini/gemini-cli) - Apache License 2.0
+Copyright Google LLC
+--------------------------------------------------------------------------------
+Adapted guidance in src/spec/descriptions.rs: provide the exact literal text; never use omission
+placeholders such as "(rest of methods ...)" in new text; prefer surgical edits for existing files.
+
+--------------------------------------------------------------------------------
+Host tool descriptions (the tools Nori serves agents: bash, jobs, monitors, delegation)
+--------------------------------------------------------------------------------
+OpenCode (MIT License, Copyright (c) 2025 opencode; license text above), from
+packages/core/src/tool/plugin/{shell,subagent}.ts. Adapted:
+  - harness/src/backend/nori_client_mcp/bash_tool.rs (`bash` description): "Quote file paths
+    containing spaces or special characters" and "Prefer dedicated tools over shell commands when
+    possible"; the background-command contract ("you will be notified... do not poll... end your
+    response") shaped the `bash`, `job_*` and `monitor_*` wording.
+  - harness/src/backend/orchestrator/tools.rs (`delegate_task`): new child sessions start with
+    fresh context, so include all relevant context in the task.
+
+OpenAI Codex (Apache License 2.0, Copyright 2025 OpenAI), from the spawn_agent guidance in
+core/src/tools/handlers/multi_agents_spec.rs. Adapted:
+  - host-tools/src/lib.rs `DELEGATION_INSTRUCTIONS` and the `delegate_task` description: do not
+    delegate urgent blocking work whose result the very next step needs; give parallel
+    subtasks disjoint write sets; do not wait by reflex.
+
+--------------------------------------------------------------------------------
+Reviewed, no text or code reused
+--------------------------------------------------------------------------------
+  - Cline, Roo Code, Aider, Goose (Apache-2.0): tool descriptions read for ideas (line-range
+    reads, edit formats); nothing copied.
+  - Zed (GPL-3.0-or-later) and Crush (FSL-1.1-MIT): reference only. The behaviours implemented
+    here that those projects also have (whitespace-insensitive matching with re-indent, a
+    read-before-edit ledger keyed on file state, multi-edit, a result note when a forgiving match
+    was used) were written from scratch from the behaviour described in the research notes. None
+    of their text or code is used.
