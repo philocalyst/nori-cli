@@ -110,7 +110,9 @@ pub(crate) fn build(input: &PlanInput<'_>) -> Vec<Route> {
     } else {
         input
             .ranking
-            .sort(&mut equivalents, |(route, family)| (route.clone(), *family));
+            .sort_same_model_without_headroom(&mut equivalents, |(route, family)| {
+                (route.clone(), *family)
+            });
     }
     input
         .ranking
@@ -254,5 +256,46 @@ mod tests {
             false,
         );
         assert_eq!(plan, ["claude2", "codex"]);
+    }
+
+    #[test]
+    fn account_preferences_apply_when_headroom_is_disabled() {
+        let catalog = vec![
+            agent("claude-code", "claude-opus-5-5"),
+            agent("claude@f", "claude-opus-5-5"),
+            agent("codex", "gpt-6"),
+        ];
+        let current = RouteRef::new("openrouter", Some("claude-opus-5-5".to_owned()));
+        let installed: Vec<String> = catalog.iter().map(|agent| agent.agent.clone()).collect();
+        let ranking = RouteRanking::new(Some(current.clone()), &[], &|_| None, &installed)
+            .with_account_preferences(std::collections::HashMap::from([(
+                "claude".to_owned(),
+                vec!["claude@f".to_owned()],
+            )]))
+            .with_headroom(AccountHeadroom::new(
+                vec![used("claude@f", "claude", 100.0)],
+                Utc::now(),
+            ));
+        let policy = FallbackPolicy {
+            on: Default::default(),
+            chain: Vec::new(),
+            ranked: true,
+            prefer_headroom: false,
+            return_to_primary: nori_workflow::ReturnToPrimary::NextSession,
+        };
+
+        let plan = build(&PlanInput {
+            policy: &policy,
+            current: &current,
+            catalog: &catalog,
+            ranking: &ranking,
+            excluded: &[],
+        });
+        assert_eq!(
+            plan.into_iter()
+                .map(|route| route.agent.unwrap_or_default())
+                .collect::<Vec<_>>(),
+            ["claude@f", "claude-code", "codex"]
+        );
     }
 }

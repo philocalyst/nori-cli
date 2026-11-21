@@ -190,11 +190,29 @@ impl RouteRanking {
         items: &mut [T],
         route: impl Fn(&T) -> (RouteRef, Option<ModelFamily>),
     ) {
+        self.sort_same_model_inner(items, route, true);
+    }
+
+    /// [`Self::sort_same_model`] while ignoring quota headroom.
+    pub fn sort_same_model_without_headroom<T>(
+        &self,
+        items: &mut [T],
+        route: impl Fn(&T) -> (RouteRef, Option<ModelFamily>),
+    ) {
+        self.sort_same_model_inner(items, route, false);
+    }
+
+    fn sort_same_model_inner<T>(
+        &self,
+        items: &mut [T],
+        route: impl Fn(&T) -> (RouteRef, Option<ModelFamily>),
+        use_headroom: bool,
+    ) {
         self.sort(items, &route);
-        if self.account_preferences.is_empty() && self.headroom.is_none() {
+        let headroom = use_headroom.then_some(self.headroom.as_ref()).flatten();
+        if self.account_preferences.is_empty() && headroom.is_none() {
             return;
         }
-        let headroom = self.headroom.as_ref();
         // (provider, through a gateway): the accounts that may trade places.
         let peers: Vec<(String, bool)> = items
             .iter()
