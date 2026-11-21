@@ -10,6 +10,10 @@ tools: persistent in-process Bash (`bash`), goals (`get_goal`, `create_goal`,
 `git_diff`, `git_log`, `git_commit`) and forge (`ci_status`, `pull_request`; see
 [forge.md](forge.md)) wrappers are excluded from the default model-facing
 catalog and only exposed when explicitly opted in via workflow `tools.enabled`.
+Language-server tools (`lsp_diagnostics`, `lsp_definition`, `lsp_references`, `lsp_hover`,
+`lsp_symbols`, `lsp_rename`, `lsp_call_hierarchy`; see [lsp.md](lsp.md)) are in the default
+catalog, and the file tools (`read`, `write`, `edit`, `multi_edit`, `apply_patch`; see
+[tools.md](tools.md)) are opt-in like git and forge.
 An agent built into Nori's process gets them as **host tools**: plain function
 calls into Nori, with no MCP server, port, socket or process between them. Every
 other agent gets the same tools from the `nori-client` MCP server (see
@@ -26,9 +30,13 @@ writes and merges changed agent offers under a file lock, so concurrent harnesse
 cannot erase each other's remembered providers with an older snapshot.
 In-flight probes are shared only within the same Nori home and agent. Typing
 does not probe the active agent while its primary session is being prepared.
-The catalog and other injected harness context use a separate ACP content block
-annotated for the assistant. Human prompt bytes, visible user messages and user
-activity records remain unchanged; the model still receives the context.
+The catalog and other injected harness context use separate ACP content blocks
+annotated for the assistant, with the static header (session preamble, catalog,
+workflow rules) first so that a provider can cache it. Human prompt bytes, visible
+user messages and user activity records remain unchanged; the model still receives the
+context. The context is taken when the prompt is sent, not when it is admitted, so a
+prompt that is refused or dropped does not use it up (see
+[turn-lifecycle.md](turn-lifecycle.md#what-nori-says-along-with-a-prompt)).
 
 Both paths serve the same `#[tool]` methods (`nori-rs/harness/src/backend/`),
 so names, schemas, descriptions and replies are identical whichever way an
@@ -65,16 +73,12 @@ Nori (harness)                             built-in agent (codex-acp, claude-acp
 
 ## Per agent
 
-**Codex.** The specs go in as Codex dynamic tools (`StartThreadOptions.dynamic_tools`,
-loaded up front), and the tools' instructions as the thread's own instructions
-(a `ThreadInstructionsProvider`). A cold resume supplies both again. When the
-model calls one, core emits `DynamicToolCallRequest`; codex-acp runs the host
-tool and always answers with `Op::DynamicToolResponse`, an error included, so a
-turn never waits forever. Codex's native goal tools are disabled
-(`features.goals = false`), so the names cannot collide. Code Mode is enabled by
-default, and its JavaScript runtime is carried by the `nori` executable; no
-separate code-mode host installation is needed. Set `features.code_mode = false`
-in Codex configuration to disable it.
+**Codex and OpenCode.** Both run on Nori's own engine (`nori-engine`, see
+[native-agents.md](native-agents.md)), in Nori's process: the host tools are handed to the
+engine with the session and offered to the model beside the flavor's own tools, and Nori's
+`bash` takes the place of the flavor's shell tool. A host tool's answer, an error included,
+always goes back to the model, so a turn never waits forever. There is no Codex program and no
+vendored Codex core.
 
 **Claude.** The tools are an in-process SDK MCP server named `nori`. The CLI
 reaches it over the stream-json pipe it already has (`mcp_message`), and names
@@ -94,15 +98,47 @@ from the `nori-client` MCP server like any other subprocess agent. The opt-in in
 local `localharness` over WebSocket and Protobuf and consumes Nori's host tools directly as SDK
 function tools.
 
+## File and language server tools
+
+`nori-tools` and `nori-lsp` supply their tools as data (name, description, JSON schema), so the
+harness registers them as dynamic routes (`nori_client_mcp/file_tools.rs`, `lsp_tools.rs`)
+rather than `#[tool]` methods; the MCP server lists them and `host_tools::dispatch` calls them
+the same way, so both paths see the same names, schemas and replies.
+
+- **Language server tools** are default-on: no agent has them natively, and a session that
+  never calls one never starts a server. Paths may be relative to the session directory.
+- **File tools** are opt-in: every agent Nori runs already has its own read and edit tools (the
+  Claude adapter's `Read`/`Edit`/`Write` run on `nori-tools` itself), and a second set under
+  another name confuses the model. A workflow lists the ones an agent lacks in `tools.enabled`;
+  `tools.disabled` and `tools.descriptions` apply as for any tool.
+- One `nori_tools::Workspace` per caller (each agent keeps its own read ledger) and one
+  `nori_lsp::LspManager` per session, both created lazily in the session's `NoriClientShared`
+  with the session directory as root. A restricted actor's sandbox `allowed_paths` is enforced
+  on the paths of every call (and on the file headers of an `apply_patch`).
+- **Machines.** Each file tool takes `machine`, like `bash` (the enum and description are patched
+  into the schemas by `describe_machines`). `local` is the default; another machine's tools run
+  through `MachineToolFs` over its own connection, in a workspace per caller and machine rooted
+  where the caller's last `bash` there ended, else this project's path or the machine's
+  configured directory when it exists, else its home. Language server diagnostics are local
+  only, and a restricted actor stays on this computer.
+- A tool result is the model's text plus, for an `image` read, image content blocks, and for a
+  change to files, `structuredContent` `{ "changes": [{ path, kind, lines_added, lines_removed,
+  unified_diff }], "summary": ... }` (no file bodies).
+- **Diagnostics after an edit.** After a successful `write`, `edit`, `multi_edit` or
+  `apply_patch`, every changed file is announced to its language server
+  (`notify_file_changed`; a deleted file is closed), the diagnostics are awaited together
+  (`diagnostics_after_edit`, bounded by the server timing) and the rendered
+  `<diagnostic_summary>` is appended to the result text. It is empty, and so nothing is
+  appended, when no server serves the file. A session that disables `lsp_diagnostics` gets no
+  diagnostics after edits.
+
 ## Tool results and cancellation
 
 The in-process host boundary retains the complete MCP result as JSON, including
 content blocks, `structuredContent`, and `_meta`; its text view remains
 available to older callers. Claude's SDK server returns that MCP result as-is.
-OpenCode and Gemini receive Nori tools through MCP and their engines handle the
-MCP response. OpenCode preserves its complete tool event in ACP raw output,
-forwards valid ACP content blocks, and retains unknown blocks in raw output;
-replay retains the full persisted tool state. Codex dynamic tools support text, images, and audio: Nori passes media as
+Gemini receives Nori tools through MCP and its engine handles the MCP
+response; replay retains the full persisted tool state. Codex dynamic tools support text, images, and audio: Nori passes media as
 data URLs, represents resource and unknown blocks as JSON text, and
 includes structured content and metadata as JSON text. Conversation-program
 receipts retain the original MCP result along with the text view.

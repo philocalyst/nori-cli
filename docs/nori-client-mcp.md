@@ -37,7 +37,12 @@ journaled in the conversation, and each run keeps its own journal and snapshot
 under `.nori/runs/`. See [programs.md](programs.md) for the schema, recovery and
 replay guarantees. The read-only `conversation_context` tool returns bounded pages
 of canonical context with event IDs, visible bounds and the current head so an
-agent can select history for Pkl context, forks and rewinds.
+agent can select history for Pkl context, forks and rewinds. A page is bounded to a
+quarter of the agent's context-window budget (at most 256 KiB): long strings are cut where
+marked, and a page cut short by size says `truncated` and where to continue (`next_start`).
+The same tool is how a forked, restored or revived child reads the history its checkpoint
+left out. A child started by `delegate_task` always has fresh context and no way to inherit
+the caller's conversation.
 
 OpenCode calls carry the invoking provider session in transport metadata
 `_meta["ai.opencode/sessionID"]`. Nori validates it against this backend's root
@@ -50,6 +55,17 @@ root is busy. Direct host calls carrying a session ID use the same validation.
 Native child `conversation_context` reads that child's journal. Root goal tools
 and mutating Pkl `conversation` programs currently return an explicit unsupported
 caller-scope error for native children; they never operate on the root implicitly.
+
+## File and Language Server Tools
+
+The server also lists the `nori-lsp` tools (`lsp_diagnostics`, `lsp_definition`,
+`lsp_references`, `lsp_hover`, `lsp_symbols`, `lsp_rename`, `lsp_call_hierarchy`) by default, and
+the `nori-tools` file tools (`read`, `write`, `edit`, `multi_edit`, `apply_patch`) when a
+workflow opts them in with `tools.enabled`. They are registered from the crates' own catalogs as
+dynamic routes, are annotated read-only (the language server tools) or destructive (file tools),
+return text content plus `structuredContent` for file changes, and call the same code as the
+in-process host path. Edits append the language servers' `<diagnostic_summary>` to the result.
+Details: [host-tools.md](host-tools.md), [tools.md](tools.md), [lsp.md](lsp.md).
 
 ## Delegation Tools: Actors, Tasks and Messages
 
@@ -137,6 +153,13 @@ watchers whose events wake the agent instead of being polled for. They are serve
 `nori-client` tool, with the same sandbox and tool selection, and their guidance
 (`MONITOR_INSTRUCTIONS`) travels with the delegation instructions. A provider's own child session may
 not call them. See [monitors.md](monitors.md).
+
+## Job Tools
+
+`job_start`, `job_list`, `job_read` and `job_stop` run commands in the background, on this computer or
+a machine of the roster, and wake the agent when a job is ready, prints a matching line or exits. Served
+like the monitor tools (same sandbox, same tool selection); guidance is `JOB_INSTRUCTIONS`. See
+[pkl-runtime.md](pkl-runtime.md#jobs).
 
 ## Target Shape
 
@@ -241,6 +264,16 @@ When the requested work is verified complete, the agent must call Nori's
 A genuine impasse uses the exact status `blocked`. The instruction text names
 the tools without a server, because a built-in agent reaches them as host
 tools.
+
+A `complete` claim is reviewed before it is accepted (the **goal judge**, see
+[workflows.md](workflows.md#goals)). The tool result says what happened: the goal is
+`complete` and verified; or it stays `active` and the result, an error so it is not read as
+success, says what the review found missing and the next step; or the review set it `blocked` or
+`paused`; or the goal is `complete` but *not independently verified* because the review could not
+run or did not answer in time; or, after `goals.max_disagreements` reviews in a row that found it
+not done, it is `paused` and the person decides. `goals.judge = false` accepts the agent's word.
+`blocked` claims are not reviewed. The call returns when the review ends (at most `judge_timeout`),
+and the review is applied even if the agent's client gave up on the call.
 
 ## Goal Extension Bridge (`_session/goal`)
 
