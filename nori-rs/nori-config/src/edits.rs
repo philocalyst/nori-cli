@@ -22,6 +22,8 @@ use toml_edit::value;
 
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
+mod writer;
+
 enum ConfigEdit {
     Agent(String),
     DefaultModel {
@@ -120,9 +122,20 @@ impl NoriConfigEdits {
         self
     }
 
-    /// Apply the queued edits.
+    /// Apply the queued edits on the config writer (see [`writer`]) and wait for them to be on
+    /// disk. The calling task yields meanwhile; its thread never touches the file.
     pub async fn apply(self) -> Result<()> {
-        self.apply_blocking()
+        let (done, applied) = tokio::sync::oneshot::channel();
+        writer::submit(self, Some(done));
+        applied
+            .await
+            .context("the config writer stopped before applying the edit")?
+    }
+
+    /// Apply the queued edits on the config writer without waiting: for a choice that is in
+    /// effect at once, whose write must not hold up whoever made it. A failure is logged.
+    pub fn apply_in_background(self) {
+        writer::submit(self, None);
     }
 
     /// Apply the queued edits with a same-directory replacement of `config.toml`.
