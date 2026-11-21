@@ -1,0 +1,85 @@
+/// A provider that refuses what Nori hands it when it is too big: a forked history, a
+/// fallback checkpoint, a pasted file.
+///
+///   big-lead   answers `big...` with four megabytes, so three prompts make a twelve-megabyte
+///              history; fails `quota...` with a spent window. No request limit.
+///   big-codex  the same scenes behind OpenAI's limit: no text block over 10 MiB. A longer one is
+///              refused with the Responses API's own `string_above_max_length` body, which is what
+///              Codex children showed when Nori forked or handed over a long history unbounded.
+///   big-tiny   behind a 2000-byte (500-token) context budget with Anthropic's wording, for
+///              refusals the person must be told about in words.
+///
+/// The policy hands a spent `big-lead` over to `big-codex`, with the conversation as a checkpoint.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/oversize-context.pkl big big big "quota please"
+amends "nori:World"
+
+name = "oversize-context"
+description = "Provider request limits against Nori's fork, fallback and pasted-context prompts."
+default_agent = "big-lead"
+
+policy = """
+  recovery = new Dynamic {
+    retry = new Dynamic { max_attempts = 0 }
+    fallback = new Dynamic {
+      on = List("quota_exhausted")
+      chain = List(new Dynamic { agent = "big-codex"; model = "big-gpt" })
+      ranked = false
+      return_to_primary = "never"
+    }
+  }
+  """
+
+local line = "Line {{n}}: the quick brown fox jumps over the lazy dog, and the history grows by one more line."
+
+local bigScene = new Scene {
+  name = "big"
+  on = new Matching { pattern = "^big" }
+  steps {
+    new Say {
+      text = new Generated { unit = line; times = 40000; separator = "\n" }
+      chunk = new Chunking { size = 65536 }
+    }
+  }
+}
+
+local answerScene = new Scene {
+  name = "answer"
+  steps { new Say { text = "answered: {{prompt}}" } }
+}
+
+/// Every agent's scenes; only the lead's window is spent, so the route it falls back to answers.
+local sharedScenes = new Listing<Scene> {
+  bigScene
+  answerScene
+}
+
+local leadScenes = new Listing<Scene> {
+  bigScene
+  new Scene {
+    name = "quota"
+    on = new Matching { pattern = "^quota" }
+    steps { new Fail { failure = "quota"; detail = "You have reached your usage limit for this window."; resets_in = 3.h } }
+  }
+  answerScene
+}
+
+agents {
+  ["big-lead"] {
+    title = "Big Lead"
+    models { new Model { id = "big-opus"; context_window = 1000000 } }
+    scenes = leadScenes
+  }
+  ["big-codex"] {
+    title = "Big Codex"
+    models { new Model { id = "big-gpt"; context_window = 400000 } }
+    limits = new Limits { provider = "openai"; max_text_block_bytes = 10485760 }
+    scenes = sharedScenes
+  }
+  ["big-tiny"] {
+    title = "Big Tiny"
+    models { new Model { id = "big-small"; context_window = 500 } }
+    limits = new Limits { provider = "anthropic"; max_prompt_bytes = 2000 }
+    scenes = sharedScenes
+  }
+}
