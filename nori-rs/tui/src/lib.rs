@@ -58,6 +58,7 @@ mod helix_picker;
 mod history_cell;
 mod hyperlink;
 mod key_hint;
+mod latency;
 pub mod live_wrap;
 mod login_handler;
 mod login_terminal;
