@@ -679,3 +679,18 @@ impl Inner {
         }
     }
 }
+
+#[cfg(test)]
+mod fresh_context_tests {
+    use super::*;
+
+    /// A delegated child starts with its task and nothing of the caller's history; only a
+    /// history fork (the user's `/fork`, a program's `Fork`) carries a conversation prefix.
+    #[test]
+    fn a_delegation_inherits_no_history_unless_it_is_a_fork() {
+        for delegation in [Delegation::new("task"), Delegation::idle()] {
+            assert!(delegation.fork.is_none());
+            assert!(delegation.parent_view.is_none());
+        }
+    }
+}
