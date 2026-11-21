@@ -872,6 +872,10 @@ pub enum HotkeyAction {
     CommitChanges,
     /// Open the subagent switcher.
     SwitchSubagent,
+    /// Step to the next model mode (standard, fast, flex, priority) the agent offers.
+    NextModelMode,
+    /// Step to the previous model mode the agent offers.
+    PreviousModelMode,
 }
 
 impl HotkeyAction {
@@ -901,6 +905,8 @@ impl HotkeyAction {
             Self::PreviousEffort => "Previous Effort Level",
             Self::CommitChanges => "Commit Changes",
             Self::SwitchSubagent => "Switch Subagent",
+            Self::NextModelMode => "Next Model Mode",
+            Self::PreviousModelMode => "Previous Model Mode",
         }
     }
 
@@ -936,6 +942,10 @@ impl HotkeyAction {
             Self::SwitchSubagent => {
                 "Open the subagent switcher: find, preview and switch to a subagent"
             }
+            Self::NextModelMode => {
+                "Step to the next model mode the agent offers (flex, standard, fast, priority)"
+            }
+            Self::PreviousModelMode => "Step to the previous model mode the agent offers",
         }
     }
 
@@ -965,6 +975,8 @@ impl HotkeyAction {
             Self::PreviousEffort => "previous_effort",
             Self::CommitChanges => "commit_changes",
             Self::SwitchSubagent => "switch_subagent",
+            Self::NextModelMode => "next_model_mode",
+            Self::PreviousModelMode => "previous_model_mode",
         }
     }
 
@@ -994,6 +1006,8 @@ impl HotkeyAction {
             Self::PreviousEffort => "ctrl+k",
             Self::CommitChanges => "alt+g",
             Self::SwitchSubagent => "ctrl+space",
+            Self::NextModelMode => "alt+.",
+            Self::PreviousModelMode => "alt+,",
         }
     }
 
@@ -1023,6 +1037,8 @@ impl HotkeyAction {
             Self::PreviousEffort,
             Self::CommitChanges,
             Self::SwitchSubagent,
+            Self::NextModelMode,
+            Self::PreviousModelMode,
         ]
     }
 }
@@ -1156,6 +1172,10 @@ pub struct HotkeyConfigToml {
     pub commit_changes: Option<HotkeyBinding>,
     /// Hotkey for opening the subagent switcher.
     pub switch_subagent: Option<HotkeyBinding>,
+    /// Hotkey for stepping to the next model mode the agent offers.
+    pub next_model_mode: Option<HotkeyBinding>,
+    /// Hotkey for stepping to the previous model mode the agent offers.
+    pub previous_model_mode: Option<HotkeyBinding>,
 }
 
 /// Resolved hotkey configuration with defaults applied.
@@ -1207,6 +1227,10 @@ pub struct HotkeyConfig {
     pub commit_changes: HotkeyBinding,
     /// Hotkey for opening the subagent switcher.
     pub switch_subagent: HotkeyBinding,
+    /// Hotkey for stepping to the next model mode the agent offers.
+    pub next_model_mode: HotkeyBinding,
+    /// Hotkey for stepping to the previous model mode the agent offers.
+    pub previous_model_mode: HotkeyBinding,
 }
 
 impl Default for HotkeyConfig {
@@ -1264,6 +1288,10 @@ impl Default for HotkeyConfig {
             commit_changes: HotkeyBinding::from_str(HotkeyAction::CommitChanges.default_binding()),
             switch_subagent: HotkeyBinding::from_str(
                 HotkeyAction::SwitchSubagent.default_binding(),
+            ),
+            next_model_mode: HotkeyBinding::from_str(HotkeyAction::NextModelMode.default_binding()),
+            previous_model_mode: HotkeyBinding::from_str(
+                HotkeyAction::PreviousModelMode.default_binding(),
             ),
         }
     }
@@ -1351,6 +1379,14 @@ impl HotkeyConfig {
                 .switch_subagent
                 .clone()
                 .unwrap_or(defaults.switch_subagent),
+            next_model_mode: toml
+                .next_model_mode
+                .clone()
+                .unwrap_or(defaults.next_model_mode),
+            previous_model_mode: toml
+                .previous_model_mode
+                .clone()
+                .unwrap_or(defaults.previous_model_mode),
         }
     }
 
@@ -1380,6 +1416,8 @@ impl HotkeyConfig {
             HotkeyAction::PreviousEffort => &self.previous_effort,
             HotkeyAction::CommitChanges => &self.commit_changes,
             HotkeyAction::SwitchSubagent => &self.switch_subagent,
+            HotkeyAction::NextModelMode => &self.next_model_mode,
+            HotkeyAction::PreviousModelMode => &self.previous_model_mode,
         }
     }
 
@@ -1409,6 +1447,8 @@ impl HotkeyConfig {
             HotkeyAction::PreviousEffort => self.previous_effort = binding,
             HotkeyAction::CommitChanges => self.commit_changes = binding,
             HotkeyAction::SwitchSubagent => self.switch_subagent = binding,
+            HotkeyAction::NextModelMode => self.next_model_mode = binding,
+            HotkeyAction::PreviousModelMode => self.previous_model_mode = binding,
         }
     }
 
@@ -1444,6 +1484,8 @@ impl HotkeyConfig {
             (HotkeyAction::PreviousEffort, &self.previous_effort),
             (HotkeyAction::CommitChanges, &self.commit_changes),
             (HotkeyAction::SwitchSubagent, &self.switch_subagent),
+            (HotkeyAction::NextModelMode, &self.next_model_mode),
+            (HotkeyAction::PreviousModelMode, &self.previous_model_mode),
         ]
     }
 }
