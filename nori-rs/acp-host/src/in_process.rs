@@ -49,15 +49,6 @@ pub fn in_process_available(name: &str) -> bool {
     registration(name).is_some()
 }
 
-/// Why the built-in agent `name` cannot be used right now, if it knows without being started: for
-/// OpenCode, that the server its registration names has exited. Local state only, so it is safe to
-/// ask whenever agents are listed.
-pub fn in_process_unavailable(name: &str) -> Option<String> {
-    registration(name)
-        .and_then(|registration| registration.availability)
-        .and_then(|check| check())
-}
-
 /// Have the built-in agent `config` runs start a session for `cwd` ahead of time, so switching to
 /// it later is instant. Does nothing for an agent that is not built in or cannot prewarm.
 pub fn prewarm(
@@ -71,10 +62,33 @@ pub fn prewarm(
     let Some(registration) = registration(&spec.agent) else {
         return;
     };
-    let Some(prewarm) = registration.prewarm.clone() else {
-        return;
-    };
-    prewarm(with_environment(spec, &config.env), cwd, mcp_servers);
+    let spec = with_environment(spec, &config.env);
+    // An agent that can say who it is signed in as without starting does so now, so the
+    // providers panel shows its login before any session of it runs.
+    if let (Some(probe), Ok(runtime)) = (
+        registration.auth_probe.clone(),
+        tokio::runtime::Handle::try_current(),
+    ) {
+        let slug = config.provider_slug.clone();
+        let probed = spec.clone();
+        runtime.spawn(async move {
+            let status = probe(probed).await;
+            crate::accounts::record_identity(&slug, &status);
+        });
+    }
+    if let Some(prewarm) = registration.prewarm.clone() {
+        prewarm(spec, cwd, mcp_servers);
+    }
+}
+
+/// Who the built-in agent `config` runs is signed in as, from its stored sign-ins and without
+/// starting it. `None` when the agent is not built in or cannot say.
+pub async fn probe_auth(
+    config: &crate::registry::AcpAgentConfig,
+) -> Option<nori_acp_kit::AuthStatus> {
+    let spec = config.in_process.as_ref()?;
+    let probe = registration(&spec.agent)?.auth_probe?;
+    Some(probe(with_environment(spec, &config.env)).await)
 }
 
 /// `spec` with the environment an adapter would have read turned into explicit options, since a

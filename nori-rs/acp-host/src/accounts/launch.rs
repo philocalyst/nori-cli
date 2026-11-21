@@ -19,34 +19,33 @@ pub struct LoginProgram {
     pub env: HashMap<String, String>,
 }
 
-/// The executable an in-process agent of `provider` starts as a process, if it starts one. Claude's
-/// agent drives the `claude` CLI; the others run their engine, or talk to a server, in Nori.
-fn runs_executable(provider: &ProviderAccounts) -> Option<String> {
-    match provider.id {
-        "claude" => Some(
-            std::env::var("CLAUDE_CODE_EXECUTABLE")
-                .ok()
-                .filter(|path| !path.is_empty())
-                .unwrap_or_else(|| "claude".to_owned()),
-        ),
-        _ => None,
-    }
+/// The variable that hands an in-process agent of `provider` the executable it starts as a
+/// process, and that executable (the user's override, else the command's name). Only Claude's
+/// agent runs a program (the `claude` CLI); the others, OpenCode's included, run in Nori.
+pub(super) fn runs_executable(provider: &ProviderAccounts) -> Option<(&'static str, String)> {
+    let (variable, command) = match provider.id {
+        "claude" => ("CLAUDE_CODE_EXECUTABLE", "claude"),
+        _ => return None,
+    };
+    let executable = std::env::var(variable)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| command.to_owned());
+    Some((variable, executable))
 }
 
-/// The provider's own sign-in command: its executable and arguments. `None` for Codex, whose
-/// in-process agent signs in through ACP `authenticate`.
+/// The provider's own sign-in command: its executable and arguments. `None` for Codex and
+/// OpenCode, whose in-process agents sign in through ACP `authenticate`.
 fn login_command(provider: &ProviderAccounts) -> Option<(&'static str, &'static [&'static str])> {
     match provider.id {
         "claude" => Some(("claude", &["auth", "login", "--claudeai"])),
-        "gemini" => Some(("gemini", &["login"])),
-        "opencode" => Some(("opencode", &["auth", "login"])),
         _ => None,
     }
 }
 
 /// Why `provider`'s executable cannot be run by an account of its own, when it cannot.
 pub(super) fn executable_problem(provider: &ProviderAccounts) -> Option<String> {
-    let executable = runs_executable(provider)?;
+    let (_, executable) = runs_executable(provider)?;
     match unwrap_executable(provider, &executable) {
         Some(_) => None,
         None => Some(format!(
@@ -70,14 +69,11 @@ pub fn native_environment(
     if let Some(problem) = executable_problem(provider) {
         return Err(problem);
     }
-    if let Some(executable) = runs_executable(provider)
+    if let Some((variable, executable)) = runs_executable(provider)
         && let Some(Unwrapped { program, env, .. }) = unwrap_executable(provider, &executable)
     {
         environment.extend(env);
-        environment.insert(
-            "CLAUDE_CODE_EXECUTABLE".to_owned(),
-            program.to_string_lossy().into_owned(),
-        );
+        environment.insert(variable.to_owned(), program.to_string_lossy().into_owned());
     }
     environment.extend(provider.environment(home));
     Ok(environment)
@@ -88,7 +84,8 @@ pub fn native_environment(
 /// `CLAUDE_CONFIG_DIR`) is named, so the agent reads its settings and plans where its login
 /// actually lives instead of guessing `~/.claude`.
 pub fn default_environment(provider: &ProviderAccounts) -> HashMap<String, String> {
-    let Some(executable) = runs_executable(provider) else {
+    // Only Claude's agent runs a program whose launcher may force a home.
+    let Some((_, executable)) = runs_executable(provider) else {
         return HashMap::new();
     };
     super::wrapper::scan(provider.id, &executable, &HashMap::new())
@@ -108,7 +105,8 @@ pub fn login_program(slug: &str) -> Option<LoginProgram> {
         return None;
     };
     let (executable, args) = login_command(account.provider)?;
-    let executable = runs_executable(account.provider).unwrap_or_else(|| executable.to_owned());
+    let executable = runs_executable(account.provider)
+        .map_or_else(|| executable.to_owned(), |(_, executable)| executable);
     let unwrapped = unwrap_executable(account.provider, &executable)?;
     let mut env = unwrapped.env;
     env.extend(account.provider.environment(home));
@@ -117,4 +115,33 @@ pub fn login_program(slug: &str) -> Option<LoginProgram> {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         env,
     })
+}
+
+/// The program that answers "who is this account of Claude signed in as" (`claude auth status`)
+/// and the environment to run it with: where the account's own agent would run Claude, so the
+/// answer is about the login that agent uses. A native account runs the unwrapped executable
+/// with its home; the default account runs `claude` as the user has it (a launcher that pins a
+/// profile is that profile's login); a wrapper that pins a home runs the real program with it.
+pub(super) fn claude_status_program(
+    account: &super::Account,
+) -> Result<(String, HashMap<String, String>), String> {
+    let provider = account.provider;
+    let (_, executable) = runs_executable(provider)
+        .ok_or_else(|| format!("{} has no program to ask", provider.title))?;
+    match (&account.origin, &account.home) {
+        (Origin::Default, _) | (Origin::Wrapper { .. }, Home::Default) => {
+            Ok((executable, default_environment(provider)))
+        }
+        (Origin::Native | Origin::Wrapper { .. }, Home::At(home)) => {
+            let unwrapped = unwrap_executable(provider, &executable).ok_or_else(|| {
+                format!(
+                    "`{executable}` is a launcher Nori cannot follow safely, or is not installed"
+                )
+            })?;
+            let mut env = unwrapped.env;
+            env.extend(provider.environment(home));
+            Ok((unwrapped.program.to_string_lossy().into_owned(), env))
+        }
+        (Origin::Native, Home::Default) => Err("the account has no home of its own".to_owned()),
+    }
 }

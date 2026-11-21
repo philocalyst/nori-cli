@@ -96,6 +96,10 @@ pub fn identity_of(slug: &str) -> Option<AccountIdentity> {
 /// File what an agent just said, and keep it for the next launch. Nothing is written when it is
 /// what was already known.
 pub fn record_identity(slug: &str, status: &AuthStatus) {
+    // "I could not tell" says nothing about who the account is.
+    if status.kind == "unknown" {
+        return;
+    }
     let identity = AccountIdentity::from_status(status);
     let snapshot = with_store(|store| {
         if store.get(slug) == Some(&identity) {

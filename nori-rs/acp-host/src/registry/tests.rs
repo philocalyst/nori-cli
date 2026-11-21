@@ -384,12 +384,21 @@ fn test_get_gemini_config() {
 
     assert_eq!(config.provider_slug, "gemini");
     assert_eq!(config.agent, AgentKind::Gemini);
-    assert!(
-        config.command == "npx" || config.command == "bunx",
-        "Command should be npx or bunx, got: {}",
-        config.command
-    );
-    assert_eq!(config.args, ["@google/gemini-cli", "--acp"]);
+    match crate::accounts::gemini_cli::discover() {
+        // An installed CLI is started itself, wherever it was found.
+        Some(installed) => {
+            assert_eq!(config.command, installed.to_string_lossy());
+            assert_eq!(config.args, ["--acp"]);
+        }
+        None => {
+            assert!(
+                config.command == "npx" || config.command == "bunx",
+                "Command should be npx or bunx, got: {}",
+                config.command
+            );
+            assert_eq!(config.args, ["@google/gemini-cli", "--acp"]);
+        }
+    }
     assert_eq!(config.provider_info.name, "Gemini ACP");
 }
 

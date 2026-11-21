@@ -13,8 +13,11 @@
 //! routing): `codex@work` for a native account, the entry's own slug for the others.
 
 mod create;
+pub mod gemini_cli;
 mod identity;
 mod launch;
+mod login;
+pub mod status;
 mod unwrap;
 mod wrapper;
 
@@ -31,9 +34,18 @@ pub use identity::AccountIdentity;
 pub use identity::identity_of;
 pub use identity::record_identity;
 pub use launch::LoginProgram;
-pub use launch::login_program;
 pub use launch::default_environment;
+pub use launch::login_program;
 pub use launch::native_environment;
+pub use login::Answer;
+pub use login::Capture;
+pub use login::Secret;
+pub use login::SignInAsk;
+pub use login::SignInHow;
+pub use login::SignInMethod;
+pub use login::methods_for;
+pub use login::store_claude_setting;
+pub use status::AccountStatus;
 pub use unwrap::Unwrapped;
 pub use unwrap::unwrap_executable;
 
@@ -91,6 +103,17 @@ pub fn provider_of(kind: AgentKind) -> &'static ProviderAccounts {
         AgentKind::Antigravity => "antigravity",
     };
     ProviderAccounts::find(id).unwrap_or(&PROVIDERS[0])
+}
+
+/// The command that installs an agent's CLI, when Nori knows a better one than
+/// `npm install -g <package>`: the one that suits this machine.
+pub fn install_command(kind: AgentKind) -> Option<String> {
+    match kind {
+        AgentKind::Gemini => Some(gemini_cli::install_command()),
+        AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode | AgentKind::Antigravity => {
+            None
+        }
+    }
 }
 
 /// The kind of agent a provider's accounts run.

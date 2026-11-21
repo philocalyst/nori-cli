@@ -24,7 +24,7 @@ pub enum AgentKind {
     Codex,
     /// Google's Gemini CLI
     Gemini,
-    /// OpenCode's multi-provider coding agent.
+    /// OpenCode: its model gateway (OpenCode Zen), with an API key.
     OpenCode,
     /// Google's Antigravity agent.
     Antigravity,
@@ -241,7 +241,7 @@ pub enum Provider {
     OpenAI,
     /// Google
     Google,
-    /// OpenCode can connect to several providers.
+    /// OpenCode's gateway serves several model makers' models.
     OpenCode,
 }
 

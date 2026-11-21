@@ -284,20 +284,18 @@ pub struct AcpAgentInfo {
     pub is_installed: bool,
     /// Package manager used to manage this agent (if installed)
     pub managed_by: Option<PackageManager>,
-    /// Why a built-in agent that runs inside Nori cannot be used right now, such as its server
-    /// not running. Such an agent is not `is_installed`, but it is not missing either.
-    pub unavailable: Option<String>,
 }
 
 impl AcpAgentInfo {
     /// Create agent info from an AgentKind enum
     pub fn from_agent(agent: AgentKind) -> Self {
         // A built-in agent that runs inside Nori has no CLI to find, so it counts as installed.
+        // OpenCode's runs no OpenCode program at all (Nori's engine calls OpenCode's gateway
+        // with the account's key).
         let native =
             native_name(agent).filter(|name| crate::in_process::in_process_available(name));
-        let unavailable = native.and_then(crate::in_process::in_process_unavailable);
         let (is_installed, managed_by) = if native.is_some() {
-            (unavailable.is_none(), None)
+            (true, None)
         } else {
             detect_agent_installation(agent)
         };
@@ -310,7 +308,6 @@ impl AcpAgentInfo {
             provider_slug: agent.slug().to_string(),
             is_installed,
             managed_by,
-            unavailable,
         }
     }
 }
@@ -343,6 +340,11 @@ pub fn prewarm_installation_cache() {
 /// Uses PATH-based detection (fast `which` command) with caching.
 /// Agents not in PATH can still be launched via npx/bunx.
 fn detect_agent_installation(agent: AgentKind) -> (bool, Option<PackageManager>) {
+    // These two are found by looking at a few directories, and are installed while Nori runs
+    // (`agy update`, `npm install -g`): the panel must notice without a restart.
+    if matches!(agent, AgentKind::Gemini | AgentKind::Antigravity) {
+        return detect_agent_installation_uncached(agent);
+    }
     let cache = INSTALLATION_CACHE.get_or_init(|| {
         let mut map = HashMap::new();
         for kind in AgentKind::all() {
@@ -362,10 +364,11 @@ fn detect_agent_installation_uncached(agent: AgentKind) -> (bool, Option<Package
     let binary_name = match agent {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
-        AgentKind::Gemini => "gemini",
         AgentKind::OpenCode => "opencode",
         // The official CLI, on PATH or in Nori's side-by-side install directory.
         AgentKind::Antigravity => return (crate::antigravity_cli::is_installed(), None),
+        // On `PATH` or in a usual install location (`PATH` is often not the shell's).
+        AgentKind::Gemini => return (crate::accounts::gemini_cli::discover().is_some(), None),
     };
 
     // Look the binary up in PATH in-process: a `which` process per agent would hold up everything
@@ -557,7 +560,6 @@ fn list_available_agents_with_mock_binary(
             provider_slug: "mock-acp".to_string(),
             is_installed: true,
             managed_by: None,
-            unavailable: None,
         });
         agents.push(AcpAgentInfo {
             agent: AgentKind::ClaudeCode, // Dummy, not really used
@@ -567,7 +569,6 @@ fn list_available_agents_with_mock_binary(
             provider_slug: "mock-acp-alt".to_string(),
             is_installed: true,
             managed_by: None,
-            unavailable: None,
         });
     }
     #[cfg(not(debug_assertions))]
@@ -588,7 +589,6 @@ fn list_available_agents_with_mock_binary(
                 provider_slug: registered.slug,
                 is_installed: true,
                 managed_by: None,
-                unavailable: None,
             });
         }
     }
@@ -780,11 +780,19 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                 package_manager.command().to_string(),
                 vec![agent.acp_package().to_string()],
             ),
-            // Gemini starts its ACP agent with --acp.
-            AgentKind::Gemini => (
-                package_manager.command().to_string(),
-                vec![agent.acp_package().to_string(), "--acp".to_string()],
-            ),
+            // Gemini starts its ACP agent with --acp: the installed CLI itself, else a package
+            // runner fetching it (which fails to start where there is none, and the install hint
+            // says what to install).
+            AgentKind::Gemini => match crate::accounts::gemini_cli::discover() {
+                Some(path) => (
+                    path.to_string_lossy().into_owned(),
+                    vec!["--acp".to_string()],
+                ),
+                None => (
+                    package_manager.command().to_string(),
+                    vec![agent.acp_package().to_string(), "--acp".to_string()],
+                ),
+            },
             AgentKind::OpenCode => ("opencode".to_string(), vec!["acp".to_string()]),
             // The signed-in official CLI speaks ACP itself; its version decides whether it can.
             AgentKind::Antigravity => (
@@ -840,10 +848,10 @@ pub fn get_agent_config(agent_name: &str) -> Result<AcpAgentConfig> {
                     crate::antigravity_cli::MINIMUM_VERSION,
                     crate::antigravity_cli::UPGRADE_COMMAND
                 ),
-                AgentKind::ClaudeCode
-                | AgentKind::Codex
-                | AgentKind::Gemini
-                | AgentKind::OpenCode => format!("npm install -g {}", agent.npm_package()),
+                AgentKind::Gemini => crate::accounts::gemini_cli::install_command(),
+                AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::OpenCode => {
+                    format!("npm install -g {}", agent.npm_package())
+                }
             },
             model_injection: agent.model_injection(),
             advertise_subagents: true,
