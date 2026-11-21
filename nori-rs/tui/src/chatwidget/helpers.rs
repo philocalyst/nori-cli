@@ -185,6 +185,10 @@ impl ChatWidget {
         self.push_notice(history_cell::NoticeKind::Error, message);
     }
 
+    pub(crate) fn add_warning_message(&mut self, message: String) {
+        self.push_notice(history_cell::NoticeKind::Warning, message);
+    }
+
     /// Queue a plain text message to be submitted as a user turn. If no task
     /// is currently running the message is submitted immediately; otherwise
     /// it is appended to the pending queue.
