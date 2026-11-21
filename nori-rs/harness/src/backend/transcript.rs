@@ -186,7 +186,9 @@ fn replay_session_events(
                         )
                     {
                         update.state =
-                            nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle);
+                            nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle {
+                                interrupted: true,
+                            });
                     }
                     replay.push(nori_protocol::SessionEvent::Nori(
                         nori_protocol::NoriEvent::Subagent(wire),
@@ -642,6 +644,7 @@ mod tests {
             backend_binding: None,
             requires_fresh_binding: false,
             event_ids: Vec::new(),
+            left_out: 0,
         }
     }
 
@@ -913,15 +916,23 @@ mod tests {
             TranscriptEntry::SessionEvent(SessionEventEntry::new(raw_user_events[1].clone())),
         ]);
 
+        // The journal ends on this prompt with no answer, so (docs/turn-lifecycle.md, Resume) it
+        // is offered back after the one canonical user turn; no second user turn is synthesized.
+        let expected = raw_user_events
+            .into_iter()
+            .chain([nori_protocol::SessionEvent::Nori(
+                nori_protocol::NoriEvent::PromptUnanswered(nori_protocol::PromptUnanswered {
+                    text: "Stored question".into(),
+                }),
+            )])
+            .map(|event| serde_json::to_value(event).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
             transcript_to_replay_session_events(&transcript)
                 .into_iter()
                 .map(|event| serde_json::to_value(event).unwrap())
                 .collect::<Vec<_>>(),
-            raw_user_events
-                .into_iter()
-                .map(|event| serde_json::to_value(event).unwrap())
-                .collect::<Vec<_>>()
+            expected
         );
     }
 
