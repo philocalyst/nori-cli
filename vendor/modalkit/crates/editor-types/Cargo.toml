@@ -1,0 +1,31 @@
+[package]
+name = "editor-types"
+version = "0.0.7"
+homepage = "https://github.com/ulyssa/modalkit/tree/main/crates/editor-types"
+readme = "README.md"
+description = "A library for working with defunctionalized editor types"
+exclude = [".github", "CONTRIBUTING.md"]
+keywords = []
+categories = ["text-editors"]
+
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bitflags = { workspace = true }
+editor-types-macros = { workspace = true }
+editor-types-parser = { workspace = true }
+enum-map = { workspace = true }
+keybindings = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+proptest-derive = { workspace = true }
+
+[lints]
+workspace = true

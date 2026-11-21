@@ -350,6 +350,12 @@ incremental = false
 
 [patch.crates-io]
 v8 = { path = "../vendor/rusty-v8" }
+# modalkit is vendored (see ../vendor/modalkit/NORI.md): the prompt editor is built on it.
+modalkit = { path = "../vendor/modalkit/crates/modalkit" }
+keybindings = { path = "../vendor/modalkit/crates/keybindings" }
+editor-types = { path = "../vendor/modalkit/crates/editor-types" }
+editor-types-macros = { path = "../vendor/modalkit/crates/editor-types-macros" }
+editor-types-parser = { path = "../vendor/modalkit/crates/editor-types-parser" }
 claude-code-agent-sdk = { path = "claude-acp/vendor/claude-code-agent-sdk" }
 # What the upstream Codex crates (codex-acp) are built against; revisions follow openai/codex's own
 # [patch] section at the pinned tag.

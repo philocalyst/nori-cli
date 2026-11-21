@@ -5706,8 +5706,6 @@ dependencies = [
 [[package]]
 name = "editor-types"
 version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f674ce4e9257322235aba6dfef5001601a392d4d6a55ce5fee0b2f6ccc59f939"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -5721,8 +5719,6 @@ dependencies = [
 [[package]]
 name = "editor-types-macros"
 version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edea356fa2bc1811afa475bdcca520fcfbdd364da11b1aaa98a8a959d19fa599"
 dependencies = [
  "editor-types-parser",
  "proc-macro2",
@@ -5733,8 +5729,6 @@ dependencies = [
 [[package]]
 name = "editor-types-parser"
 version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866198f9356c6a256e272da4ff2c8305c0f2e2d5608a6e0e0b1416e67e1cca9e"
 dependencies = [
  "logos 0.16.1",
  "pomelo",
@@ -9209,8 +9203,6 @@ dependencies = [
 [[package]]
 name = "keybindings"
 version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5564033f75e66cfccdf9c33a8a409749d630b8cb3f7fe4c2991999229a0b64d"
 dependencies = [
  "textwrap 0.16.2",
  "unicode-segmentation",
@@ -9857,8 +9849,6 @@ dependencies = [
 [[package]]
 name = "modalkit"
 version = "0.0.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b65714e623849687ac7730864ca2e5ec08265f0e4666bb51a23c8ebe604cfce"
 dependencies = [
  "anyhow",
  "anymap2",

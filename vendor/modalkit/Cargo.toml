@@ -1,0 +1,62 @@
+[workspace]
+members = [ "crates/*" ]
+default-members = [ "crates/*" ]
+resolver = "2"
+
+[workspace.package]
+authors = ["Ulyssa <git@ulyssa.dev>"]
+repository = "https://github.com/ulyssa/modalkit"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies.keybindings]
+path = "crates/keybindings"
+version = "0.0.4"
+
+[workspace.dependencies.editor-types]
+path = "crates/editor-types"
+version = "0.0.7"
+
+[workspace.dependencies.editor-types-parser]
+path = "crates/editor-types-parser"
+version = "0.0.7"
+
+[workspace.dependencies.editor-types-macros]
+path = "crates/editor-types-macros"
+version = "0.0.7"
+
+[workspace.dependencies.modalkit]
+path = "crates/modalkit"
+version = "0.0.32"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+proptest = "1.11"
+proptest-derive = { version = "0.8", features = ["boxed_union"] }
+bitflags = "2.4.2"
+crossterm = "0.29"
+enum-map = "2.7.3"
+intervaltree = { version = "0.2.6" }
+libc = "0.2"
+nom = "8.0.0"
+rand = "0.10.0"
+regex = "^1.5"
+shellexpand = "3.1.1"
+temp-dir = "0.2.0"
+thiserror = "2.0.0"
+unicode-segmentation = "^1.7"
+unicode-width = "0.2.0"
+
+# Allow some overly pedantic warnings.
+[workspace.lints.clippy]
+bool_assert_comparison = "allow"
+bool_to_int_with_if = "allow"
+enum_variant_names = "allow"
+field_reassign_with_default = "allow"
+len_without_is_empty = "allow"
+manual_range_contains = "allow"
+match_like_matches_macro = "allow"
+needless_return = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
