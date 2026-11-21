@@ -244,6 +244,7 @@ impl AcpBackend {
             )
             .await;
         if !sent {
+            self.pending_task_results.lock().await.remove(&event_id);
             self.orchestrator.abort_wake(fence).await;
             return;
         }

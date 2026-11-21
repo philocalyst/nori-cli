@@ -22,6 +22,8 @@ use super::task::Wake;
 /// Results are inlined in a wake until together they reach this size; the rest are named, to be
 /// read with `task_status`.
 const INLINE_RESULT_BYTES: usize = 16 * 1024;
+/// A failed task's error is shown up to this size.
+const MAX_ERROR_BYTES: usize = 2 * 1024;
 
 /// The hidden prompt that hands an agent the results of tasks that finished unread.
 pub(super) fn wake_text(tasks: impl Iterator<Item = TaskSnapshot>) -> String {
@@ -54,6 +56,8 @@ pub(super) fn wake_text(tasks: impl Iterator<Item = TaskSnapshot>) -> String {
         }
         text.push_str(&format!("\n<task {attributes}>\n"));
         if let Some(error) = &task.error {
+            // A provider's error can carry the whole request it refused.
+            let error = crate::context_budget::clip(error, MAX_ERROR_BYTES, 4);
             text.push_str(&format!("Failed: {error}\n"));
         }
         if !task.files_changed.is_empty() {

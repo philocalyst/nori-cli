@@ -231,6 +231,14 @@ pub enum UserNotification {
         session_id: String,
         idle_duration_secs: u64,
     },
+
+    /// A monitor's `notify` action fired.
+    #[serde(rename_all = "kebab-case")]
+    Monitor {
+        label: String,
+        title: Option<String>,
+        body: String,
+    },
 }
 
 impl UserNotification {
@@ -240,6 +248,7 @@ impl UserNotification {
             UserNotification::AgentTurnComplete { .. } => "Nori: Task Complete",
             UserNotification::AwaitingApproval { .. } => "Nori: Approval Required",
             UserNotification::Idle { .. } => "Nori: Session Idle",
+            UserNotification::Monitor { .. } => "Nori: Monitor",
         }
     }
 
@@ -268,6 +277,10 @@ impl UserNotification {
                 format!("{truncated_command}\nin {cwd}")
             }
             UserNotification::Idle { .. } => "Session has been idle".to_string(),
+            UserNotification::Monitor { label, title, body } => {
+                let head = title.as_deref().unwrap_or(label);
+                truncate_string(&format!("{head}: {body}"), MAX_COMMAND_LENGTH)
+            }
         }
     }
 }

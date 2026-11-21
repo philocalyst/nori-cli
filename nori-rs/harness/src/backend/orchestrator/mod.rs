@@ -423,6 +423,8 @@ impl Orchestrator {
         self.inner.journal_snapshot().await;
         // Watchers end with the session; the journal keeps them armed, so a resume finds them dormant.
         self.inner.monitors.close();
+        // The jobs keep running: a resume adopts them.
+        self.inner.jobs.close();
         let scope = self.inner.scope().await;
         let children = self.inner.seed.tree.directory.with(|registry| {
             let mut children = Vec::new();
