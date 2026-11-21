@@ -1,0 +1,239 @@
+/// The ways Claude Code's adapter and the harness have fallen out of step, as one fake agent and
+/// a few that fail to start. One prompt keyword per failure.
+///
+/// `fake-claude` (the default, turn policy `replace` like the real adapter):
+///
+///   unknown-kind   updates of a kind ACP does not define (`tool_progress`, `rate_limit_event`), in
+///                  the middle of an answer
+///   unknown-block  a known update carrying a content block of a type from the future
+///   long           a long tool run that takes two seconds to notice a cancel (steer into it)
+///   ask            a permission request, then what the agent does when it is withdrawn
+///   eof            the CLI's stream ends in the middle of a tool call
+///   credit         the provider refuses with its own prose
+///   overloaded     the provider's JSON error body, nested inside a JSON-RPC internal error
+///   scout-dies     a child session the agent reports that fails mid-turn
+///   who            says which model it is running
+///
+/// Its settings misbehave: asking for `fake-opus` is acknowledged and the agent keeps running
+/// `fake-sonnet` (a model switch that silently did nothing), `fake-fable` is acknowledged and
+/// becomes `fake-opus`, and `fake-haiku` fails because the service cannot be reached.
+///
+/// The other agents each fail to start, or to be reopened, in one way:
+///
+///   fake-claude-late     lists no models at `session/new`; they arrive two seconds later
+///   fake-claude-mute     never answers `initialize` (the CLI started and stalled)
+///   fake-claude-stalled  never answers `session/new`
+///   fake-claude-missing  `session/new` says the CLI is not installed
+///   fake-claude-locked   `session/load` and `session/resume` fail
+///   fake-claude-nolist   `session/list` cannot reach its service
+///   fake-claude-noclose  does not offer `session/close`
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/claude-coordination.pkl "unknown-kind"
+amends "nori:World"
+
+name = "claude-coordination"
+description = "Claude-shaped adapter faults: new stream message kinds, a replaced turn, a model switch that does nothing, a dying CLI, nested provider errors, agents that never start."
+default_agent = "fake-claude"
+
+/// No retries: a capacity failure is reported at once instead of waiting out a backoff.
+policy = """
+  recovery = new Dynamic {
+    retry = new Dynamic { max_attempts = 0 }
+  }
+  """
+
+local claudeModels = new Listing<Model> {
+  new Model { id = "fake-sonnet"; name = "Fake Sonnet"; context_window = 200000 }
+  new Model { id = "fake-opus"; name = "Fake Opus"; context_window = 200000 }
+  new Model { id = "fake-haiku"; name = "Fake Haiku"; context_window = 200000 }
+  new Model { id = "fake-fable"; name = "Fake Fable"; context_window = 200000 }
+}
+
+local edit = new ToolSpec {
+  title = "Edit src/lib.rs"
+  tool_kind = "edit"
+  locations { new Location { path = "src/lib.rs" } }
+  content { new DiffContent { path = "src/lib.rs"; old_text = "fn old() {}\n"; new_text = "fn new() {}\n" } }
+}
+
+local plain = new Chunking { size = 0 }
+
+agents {
+  ["fake-claude"] {
+    title = "Fake Claude"
+    turn_policy = "replace"
+    models = claudeModels
+    efforts { "low"; "medium"; "high" }
+    config_faults {
+      new ConfigFault { option = "model"; value = "fake-opus"; effect = "ignore" }
+      new ConfigFault { option = "model"; value = "fake-fable"; effect = "substitute"; actual = "fake-opus" }
+      new ConfigFault {
+        option = "model"
+        value = "fake-haiku"
+        effect = "reject"
+        error = new ErrorSpec { failure = "network"; detail = "Could not reach the Claude API. Check your network and try again." }
+      }
+    }
+    scenes {
+      new Scene {
+        name = "unknown-kind"
+        on = new Matching { pattern = "^unknown-kind" }
+        steps {
+          new Say { text = "before. "; chunk = plain }
+          new RawUpdate { update = new Dynamic { sessionUpdate = "tool_progress"; toolCallId = "toolu_1"; elapsedTimeSeconds = 3 } }
+          new RawUpdate { update = new Dynamic { sessionUpdate = "rate_limit_event"; status = "allowed" } }
+          new Say { text = "after."; chunk = plain }
+        }
+      }
+      new Scene {
+        name = "unknown-block"
+        on = new Matching { pattern = "^unknown-block" }
+        steps {
+          new Say { text = "before. "; chunk = plain }
+          new RawUpdate { update = new Dynamic { sessionUpdate = "agent_message_chunk"; content = new Dynamic { type = "hologram"; payload = "?" } } }
+          new Say { text = "after."; chunk = plain }
+        }
+      }
+      new Scene {
+        name = "long"
+        on = new Matching { pattern = "^long" }
+        cancel = new CancelPolicy { after = 2.s }
+        steps {
+          new Say { text = "working. "; chunk = plain }
+          new Tool { id = "long-tool"; title = "sleep 60"; tool_kind = "execute"; input = new Dynamic { command = "sleep 60" }; duration = 60.s }
+          new Say { text = "finished the long job."; chunk = plain }
+        }
+      }
+      new Scene {
+        name = "ask"
+        on = new Matching { pattern = "^ask" }
+        steps {
+          new Say { text = "I need to edit a file. "; chunk = plain }
+          new Permission {
+            tool = edit
+            timeout = 10.min
+            on_cancelled { new Say { text = "the request was withdrawn."; chunk = plain } }
+            on_deny { new Say { text = "denied, leaving the file alone."; chunk = plain } }
+            on_allow { new Say { text = "edited."; chunk = plain } }
+          }
+        }
+      }
+      new Scene {
+        name = "eof"
+        on = new Matching { pattern = "^eof" }
+        steps {
+          new Say { text = "running the build. "; chunk = plain }
+          new Tool { id = "build"; title = "cargo build"; tool_kind = "execute"; status = "in_progress"; disorder = "never_ends" }
+          new Crash { exit_code = 1; message = "fake-claude: SDK background reader: stream ended unexpectedly" }
+        }
+      }
+      new Scene {
+        name = "credit"
+        on = new Matching { pattern = "^credit" }
+        steps {
+          new Fail {
+            failure = "raw"
+            code = -32603
+            message = "Internal error"
+            data = new Dynamic { detail = "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits." }
+          }
+        }
+      }
+      new Scene {
+        name = "overloaded"
+        on = new Matching { pattern = "^overloaded" }
+        steps {
+          new Fail {
+            failure = "raw"
+            code = -32603
+            message = "Internal error"
+            data = new Dynamic { detail = "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"},\"request_id\":\"req_011fake\"}" }
+          }
+        }
+      }
+      new Scene {
+        name = "scout-dies"
+        on = new Matching { pattern = "^scout-dies" }
+        steps {
+          new Say { text = "sending a scout. "; chunk = plain }
+          new Subagent {
+            id = "scout-1"
+            title = "Scout"
+            prompt = "look around"
+            steps {
+              new Say { text = "looking... "; chunk = plain }
+              new Tool { id = "scout-tool"; title = "grep -r TODO"; tool_kind = "search"; status = "in_progress"; disorder = "never_ends" }
+            }
+            ends = "failed"
+            reason = "the CLI exited with code 1"
+          }
+          new Say { text = "the scout failed; carrying on without it."; chunk = plain }
+        }
+      }
+      new Scene {
+        name = "who"
+        on = new Matching { pattern = "^who" }
+        steps { new Say { text = "model={{model}}"; chunk = plain } }
+      }
+      new Scene {
+        name = "answer"
+        steps { new Say { text = "answered: {{prompt}}"; chunk = plain } }
+      }
+    }
+  }
+  ["fake-claude-late"] {
+    title = "Fake Claude (late models)"
+    models = claudeModels
+    startup = new Startup { models_announced_after = 2.s }
+    scenes { new Scene { steps { new Say { text = "ready." } } } }
+  }
+  ["fake-claude-mute"] {
+    title = "Fake Claude (mute)"
+    startup = new Startup { hang_initialize = true }
+    models = claudeModels
+    scenes { new Scene { steps { new Say { text = "unreachable" } } } }
+  }
+  ["fake-claude-stalled"] {
+    title = "Fake Claude (stalled)"
+    startup = new Startup { hang_new_session = true }
+    models = claudeModels
+    scenes { new Scene { steps { new Say { text = "unreachable" } } } }
+  }
+  ["fake-claude-missing"] {
+    title = "Fake Claude (not installed)"
+    startup = new Startup {
+      new_session_error = new ErrorSpec {
+        failure = "executable_not_found"
+        detail = "Claude Code CLI not found. Please ensure 'claude' is in your PATH or set CLAUDE_CLI_PATH."
+      }
+    }
+    models = claudeModels
+    scenes { new Scene { steps { new Say { text = "unreachable" } } } }
+  }
+  ["fake-claude-nolist"] {
+    title = "Fake Claude (list unreachable)"
+    models = claudeModels
+    startup = new Startup {
+      list_error = new ErrorSpec { failure = "network"; detail = "error sending request for url (http://127.0.0.1:49374/api/info)" }
+    }
+    scenes { new Scene { steps { new Say { text = "unreachable" } } } }
+  }
+  ["fake-claude-noclose"] {
+    title = "Fake Claude (no session/close)"
+    models = claudeModels
+    capabilities { close = false }
+    scenes { new Scene { steps { new Say { text = "still here" } } } }
+  }
+  ["fake-claude-locked"] {
+    title = "Fake Claude (sessions locked)"
+    models = claudeModels
+    startup = new Startup {
+      load_error = new ErrorSpec { failure = "raw"; code = -32603; message = "Internal error"; data = new Dynamic { detail = "thread 019e-fake already has an active writer" } }
+      resume_error = new ErrorSpec { failure = "not_resumable"; detail = "the session is held by another process" }
+    }
+    scenes {
+      new Scene { name = "remember"; on = new Matching { pattern = "^remember" }; steps { new Say { text = "noted: {{prompt}}"; chunk = plain } } }
+      new Scene { steps { new Say { text = "answered: {{prompt}}"; chunk = plain } } }
+    }
+  }
+}
