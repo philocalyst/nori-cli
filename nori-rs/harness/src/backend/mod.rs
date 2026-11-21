@@ -486,6 +486,7 @@ mod transcript;
 mod turn;
 mod user_input;
 mod user_question;
+mod session_title;
 mod user_shell;
 pub use transcript::client_events_to_replay_client_events;
 pub(crate) use transcript::transcript_to_child_replay_session_events;

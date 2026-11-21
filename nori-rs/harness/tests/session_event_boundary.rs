@@ -2020,6 +2020,16 @@ async fn failed_load_preserves_response_order_and_separates_replay_sources() {
             SessionEvent::Acp(AcpEvent::Notification(
                 acp::v1::AgentNotification::SessionNotification(notification),
             )) => {
+                // The recorded title is announced again on resume (docs/pickers.md): a fact about
+                // the session now, not history, so it comes with the setup and not in a batch.
+                if active_batch.is_none()
+                    && matches!(
+                        notification.update,
+                        acp::v1::SessionUpdate::SessionInfoUpdate(_)
+                    )
+                {
+                    continue;
+                }
                 let (_, texts) = active_batch
                     .as_mut()
                     .expect("historical notifications must be inside replay markers");

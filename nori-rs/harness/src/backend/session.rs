@@ -861,6 +861,19 @@ impl AcpBackend {
                 _ => {}
             }
         }
+        // A resumed conversation keeps its name: the title it last had is said again once the
+        // session is up, whoever replays its history, and the next prompt does not rename it.
+        let recorded_title = transcript
+            .filter(|_| !config.delegation.is_child())
+            .and_then(super::session_title::recorded_title);
+        let is_first_prompt_val = is_first_prompt_val && recorded_title.is_none();
+        if let Some(title) = recorded_title {
+            deferred_setup_session_events.push(super::session_title::title_update(
+                session_id.clone(),
+                title,
+                super::session_title::TitleSource::Recorded,
+            ));
+        }
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
         let session_driver = Arc::new(Mutex::new(session_driver_state));
         let (session_event_tx, session_event_rx) = mpsc::channel(128);

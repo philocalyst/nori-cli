@@ -108,6 +108,9 @@ impl AcpBackend {
             let mut is_first = self.is_first_prompt.lock().await;
             if *is_first {
                 *is_first = false;
+                if !(cfg!(debug_assertions) && self.agent_name.starts_with("mock-")) {
+                    self.announce_derived_title(&prompt_text).await;
+                }
                 let skip_summary = cfg!(debug_assertions) && self.agent_name.starts_with("mock-");
                 if !skip_summary && (self.prompt_summary_enabled || self.auto_worktree.is_enabled())
                 {
