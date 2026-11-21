@@ -136,7 +136,7 @@ impl ProgramHost for HarnessProgramHost {
                 worktree,
                 scope: ActorScope {
                     tools: (!spec.tools.is_empty()).then(|| spec.tools.clone()),
-                    instructions: spec.skill_instructions.clone(),
+                    instructions: spec.toolset_instructions.clone(),
                     sandbox: spec.sandbox.clone(),
                     home: spec.world.as_ref().and_then(|world| world.home.clone()),
                 },

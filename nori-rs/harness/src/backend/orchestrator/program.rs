@@ -61,7 +61,7 @@ pub(crate) struct ActorScope {
     /// The Nori host tools the actor is given; `None` leaves the session's tool policy alone.
     #[serde(default)]
     pub(crate) tools: Option<Vec<String>>,
-    /// What the actor's skills tell it about its tools, appended to the tool instructions.
+    /// What the actor's toolsets tell it about its tools, appended to the tool instructions.
     #[serde(default)]
     pub(crate) instructions: Vec<String>,
     /// The tools and paths its `bash` and host tools may use.
