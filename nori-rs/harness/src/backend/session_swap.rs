@@ -66,6 +66,7 @@ impl AcpBackend {
             &self.mcp_servers,
             self.mcp_oauth_credentials_store_mode,
         );
+        nudox::add_to(&mut mcp_servers, &cwd, &self.mcp_servers, self.nudox).await;
         let (previous_goal_mcp_connected, host_tools) = {
             let goal_mcp_http_server = self.goal_mcp_http_server.lock().await;
             match goal_mcp_http_server.as_ref() {

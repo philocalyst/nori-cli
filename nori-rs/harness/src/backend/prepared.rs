@@ -63,6 +63,9 @@ impl PreparedAgent {
             config.default_model.as_deref(),
         );
         agent_config.advertise_subagents = config.subagent_sessions;
+        // Finding nudox's MCP entry takes a few milliseconds of its own; start it now so it is
+        // there when the session is created.
+        super::nudox::warm(&config.cwd, config.nudox);
         let (initialize_event_tx, mut initialize_event_rx) = mpsc::channel(1);
         let connection_result = AcpConnection::spawn_with_initialize_event_sender(
             &agent_config,

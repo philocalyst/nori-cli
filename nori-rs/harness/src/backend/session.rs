@@ -21,6 +21,13 @@ async fn session_mcp_servers(
         &config.mcp_servers,
         config.mcp_oauth_credentials_store_mode,
     );
+    nudox::add_to(
+        &mut mcp_servers,
+        &config.cwd,
+        &config.mcp_servers,
+        config.nudox,
+    )
+    .await;
     let nori_client_server = nori_client_mcp::register_for_session(
         connection,
         &mut mcp_servers,
@@ -990,6 +997,7 @@ impl AcpBackend {
             script_timeout: config.script_timeout,
             session_driver: Arc::clone(&session_driver),
             mcp_servers: config.mcp_servers.clone(),
+            nudox: config.nudox,
             mcp_oauth_credentials_store_mode: config.mcp_oauth_credentials_store_mode,
             is_shutting_down: Arc::new(AtomicBool::new(false)),
             prompt_task_abort: Arc::new(Mutex::new(None)),

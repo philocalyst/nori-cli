@@ -1244,6 +1244,7 @@ fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
         auto_worktree_repo_root,
         prompt_summary_enabled: config.footer_segment_config.prompt_summary,
         subagent_sessions: config.subagent_sessions,
+        nudox: config.nudox,
         session_start_hooks: config.session_start_hooks.clone(),
         session_end_hooks: config.session_end_hooks.clone(),
         pre_user_prompt_hooks: config.pre_user_prompt_hooks.clone(),

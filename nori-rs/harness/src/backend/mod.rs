@@ -186,6 +186,8 @@ pub struct AcpBackendConfig {
     pub prompt_summary_enabled: bool,
     /// Advertise subagent support to the agent during `initialize`.
     pub subagent_sessions: bool,
+    /// Give the session the nudox MCP server when `nudox` is installed (`nudox = false` opts out).
+    pub nudox: bool,
     /// Scripts to run when a session starts
     pub session_start_hooks: Vec<PathBuf>,
     /// Scripts to run when a session ends
@@ -364,6 +366,8 @@ pub struct AcpBackend {
     session_driver: Arc<Mutex<session_runtime_driver::SessionDriver>>,
     /// MCP server configuration forwarded to ACP agents at session creation.
     mcp_servers: HashMap<String, McpServerConfig>,
+    /// Whether sessions get the nudox MCP server (see [`nudox`]).
+    nudox: bool,
     /// OAuth credential store mode used when forwarding MCP auth to ACP agents.
     mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
     /// Set to true when Op::Shutdown is initiated, to avoid spurious disconnect errors
@@ -442,6 +446,7 @@ mod native_child_restore;
 mod native_child_sessions;
 mod nori_client_context;
 mod nori_client_mcp;
+mod nudox;
 mod builtin_modules;
 pub(crate) mod orchestrator;
 mod prewarm;

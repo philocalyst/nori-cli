@@ -384,11 +384,12 @@ impl ServerHandler for NoriClientService {
 /// What every agent is told about the tools, however it reaches them.
 pub(super) fn tool_instructions() -> String {
     format!(
-        "{}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
         thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
         super::orchestrator::TASK_INSTRUCTIONS,
         nori_host_tools::MONITOR_INSTRUCTIONS,
         bash_tool::BASH_INSTRUCTIONS,
+        super::nudox::INSTRUCTIONS,
     )
 }
 
