@@ -1,36 +1,75 @@
-//! Utility to compute the current Git diff for the working directory.
-//!
-//! Returns a PR-like diff: changes since the merge-base with the default
-//! branch, plus any untracked files. When the current directory is not inside
-//! a Git repository, the function returns `Ok((false, String::new()))`.
+//! The working tree's changes, for `/diff`: what a pull request of it would show (the changes
+//! since the merge-base with the default branch, plus untracked files), as both versions of every
+//! file, so they are drawn like any other edit.
 //!
 //! The repository is read in-process; nothing here starts `git`.
 
-use std::io;
+use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 
 use nori_config::GitRepo;
 
-/// Return value of [`get_git_diff`].
-///
-/// * `bool` – Whether the directory is inside a Git repo.
-/// * `String` – The concatenated diff (may be empty).
-pub(crate) async fn get_git_diff(dir: Option<&Path>) -> io::Result<(bool, String)> {
-    let dir = match dir {
-        Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir()?,
-    };
-    tokio::task::spawn_blocking(move || diff_in(&dir))
-        .await
-        .map_err(io::Error::other)
+use crate::ui_types::FileChange;
+
+/// What `/diff` found.
+#[derive(Debug)]
+pub(crate) enum GitChanges {
+    /// The directory is not inside a git work tree.
+    NotARepo,
+    /// The repository could not be read.
+    Failed(String),
+    /// The changed files by path, and the ones that are not text (named, not drawn).
+    Changes {
+        files: HashMap<PathBuf, FileChange>,
+        binary: Vec<String>,
+    },
 }
 
-fn diff_in(dir: &Path) -> (bool, String) {
-    let Some(repo) = GitRepo::discover(dir).filter(|repo| repo.work_dir().is_some()) else {
-        return (false, String::new());
+/// The changes of the work tree `dir` is in.
+pub(crate) async fn get_git_changes(dir: &Path) -> GitChanges {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || changes_in(&dir))
+        .await
+        .unwrap_or_else(|error| GitChanges::Failed(error.to_string()))
+}
+
+fn changes_in(dir: &Path) -> GitChanges {
+    let Some((repo, work_dir)) =
+        GitRepo::discover(dir).and_then(|repo| repo.work_dir().map(|work_dir| (repo, work_dir)))
+    else {
+        return GitChanges::NotARepo;
     };
-    let base = repo.pr_diff_base();
-    (true, repo.diff_text(&base, true).unwrap_or_default())
+    let Some(versions) = repo.file_versions_since(&repo.pr_diff_base()) else {
+        return GitChanges::Failed("the base of the diff is not a commit".to_owned());
+    };
+    let mut files = HashMap::new();
+    let mut binary = Vec::new();
+    // A side with a NUL byte in it, or that is not UTF-8, is not text.
+    let text = |bytes: Option<Vec<u8>>| match bytes {
+        Some(bytes) if bytes.contains(&0) => Err(()),
+        Some(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ()),
+        None => Ok(None),
+    };
+    for file in versions {
+        let change = match (text(file.old), text(file.new)) {
+            (Ok(None), Ok(Some(content))) => FileChange::Add { content },
+            (Ok(Some(content)), Ok(None)) => FileChange::Delete { content },
+            (Ok(Some(old_text)), Ok(Some(new_text))) => FileChange::Update {
+                old_text,
+                new_text,
+                first_line: 1,
+                move_path: None,
+            },
+            (Ok(None), Ok(None)) => continue,
+            (Err(()), _) | (_, Err(())) => {
+                binary.push(file.path);
+                continue;
+            }
+        };
+        files.insert(work_dir.join(&file.path), change);
+    }
+    GitChanges::Changes { files, binary }
 }
 
 #[cfg(test)]
@@ -55,6 +94,26 @@ mod tests {
         dir
     }
 
+    /// The changed files' names, relative to the repository.
+    async fn changed_paths(dir: &Path) -> Vec<String> {
+        let GitChanges::Changes { files, .. } = get_git_changes(dir).await else {
+            panic!("expected changes");
+        };
+        let root = std::fs::canonicalize(dir).unwrap();
+        let mut paths: Vec<String> = files
+            .keys()
+            .map(|path| {
+                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                path.strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
     async fn run_in(dir: &Path, args: &[&str]) {
         let status = tokio::process::Command::new(args[0])
             .args(&args[1..])
@@ -75,16 +134,7 @@ mod tests {
         // Modify the tracked file
         std::fs::write(path.join("file.txt"), "modified\n").unwrap();
 
-        let (is_git, diff_text) = get_git_diff(Some(path)).await.unwrap();
-        assert!(is_git, "should detect git repo");
-        assert!(
-            !diff_text.is_empty(),
-            "diff should be non-empty when there are changes"
-        );
-        assert!(
-            diff_text.contains("file.txt"),
-            "diff should mention the changed file"
-        );
+        assert_eq!(changed_paths(path).await, ["file.txt"]);
     }
 
     #[tokio::test]
@@ -95,20 +145,16 @@ mod tests {
         // Create an untracked file
         std::fs::write(path.join("new_file.txt"), "new content\n").unwrap();
 
-        let (is_git, diff_text) = get_git_diff(Some(path)).await.unwrap();
-        assert!(is_git);
-        assert!(
-            diff_text.contains("new_file.txt"),
-            "diff should include untracked files"
-        );
+        assert_eq!(changed_paths(path).await, ["new_file.txt"]);
     }
 
     #[tokio::test]
     async fn diff_with_non_git_dir_returns_not_git() {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let (is_git, diff_text) = get_git_diff(Some(dir.path())).await.unwrap();
-        assert!(!is_git, "non-git dir should return false");
-        assert!(diff_text.is_empty());
+        assert!(matches!(
+            get_git_changes(dir.path()).await,
+            GitChanges::NotARepo
+        ));
     }
 
     #[tokio::test]
@@ -126,16 +172,7 @@ mod tests {
         run_in(path, &["git", "commit", "-m", "feature change"]).await;
 
         // No uncommitted changes, but there's a committed diff vs main
-        let (is_git, diff_text) = get_git_diff(Some(path)).await.unwrap();
-        assert!(is_git);
-        assert!(
-            !diff_text.is_empty(),
-            "diff should show committed changes vs merge-base (PR-like diff)"
-        );
-        assert!(
-            diff_text.contains("file.txt"),
-            "diff should show the file changed on the feature branch"
-        );
+        assert_eq!(changed_paths(path).await, ["file.txt"]);
     }
 
     #[tokio::test]
@@ -144,11 +181,6 @@ mod tests {
         let path = dir.path();
         run_in(path, &["git", "branch", "-M", "main"]).await;
 
-        let (is_git, diff_text) = get_git_diff(Some(path)).await.unwrap();
-        assert!(is_git);
-        assert!(
-            diff_text.is_empty(),
-            "no changes on main should produce empty diff"
-        );
+        assert!(changed_paths(path).await.is_empty());
     }
 }

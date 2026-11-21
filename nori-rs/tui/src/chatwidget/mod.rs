@@ -34,7 +34,7 @@ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::client_tool_cell::ClientToolCell;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::effective_cwd_tracker::EffectiveCwdTracker;
-use crate::get_git_diff::get_git_diff;
+use crate::get_git_diff::get_git_changes;
 use crate::history_cell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;

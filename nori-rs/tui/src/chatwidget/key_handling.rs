@@ -423,17 +423,7 @@ impl ChatWidget {
                     .cloned()
                     .unwrap_or_else(|| self.config.cwd.clone());
                 tokio::spawn(async move {
-                    let text = match get_git_diff(Some(&dir)).await {
-                        Ok((is_git_repo, diff_text)) => {
-                            if is_git_repo {
-                                diff_text
-                            } else {
-                                "`/diff` - _not inside a git repository_".to_string()
-                            }
-                        }
-                        Err(e) => format!("Failed to compute diff: {e}"),
-                    };
-                    tx.send(AppEvent::DiffResult(text));
+                    tx.send(AppEvent::DiffResult(get_git_changes(&dir).await));
                 });
             }
             SlashCommand::Mention => {

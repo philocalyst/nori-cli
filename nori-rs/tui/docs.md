@@ -720,8 +720,19 @@ ids and uses the same collapsed and expanded renderers.
   search is `⌕ “query” in src · 12 matches`. Paths inside the working directory
   are always relative.
 - **Edits** (`client_tool_cell/edit.rs`): `● Edited path  +14 −4` over the diff,
-  two panes of one width and a single faint divider from 120 columns and unified
-  below, line numbers faint, the changed words on a stronger tint, at most 14 rows collapsed and `⋯ +N more lines`.
+  drawn the way a document editor shows suggestions (`diff_render/`): one column
+  of the new text, line numbers faint, every edited line merged in place (the words
+  it lost struck through where they stood, the words it gained marked), a line that
+  only appeared marked whole, one that only went struck through whole, and a bar in
+  the margin of each changed line (mint added, coral removed, amber edited). A line
+  rewritten more than it kept, or spread over several lines, is shown as what it was
+  and then what it became, removals first in each run of changes. Lines are paired
+  with the line they are an edit of by what they share, a little more when they keep
+  their first token and more again when they keep the name after it (`fn area`).
+  Colour sits behind text only, never to the edge of the row. At most 14 rows
+  collapsed and `⋯ +N more lines`. `/diff` shows the working tree's changes (since
+  the merge-base with the default branch, plus untracked files) with the same
+  renderer, `± Changed N files`, in the pager; binary files are named, not drawn.
 - **Shell** (`history_cell/shell_block.rs`, shared with `!` commands): `$ command`
   highlighted by brush-parser (`render/bash_highlight.rs`, the only shell
   highlighter: exec cells, `!` cells, lane activity, picker previews and fenced

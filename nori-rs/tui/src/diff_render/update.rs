@@ -1,17 +1,17 @@
-//! An edit's two texts diffed with disparate, and drawn as unified hunks.
+//! An edit's two texts diffed with disparate, and drawn the way a document editor shows
+//! suggestions: one column of the new text, with every edited line merged in place.
 //!
 //! In a language disparate has a grammar for, the texts are diffed structurally
-//! ([`Structural`]): code that was only re-indented is unchanged, code that was only rewrapped
-//! has nothing new in it, and code that moved is not new where it went. The structural diff's
-//! lines place the hunks, and its novel tokens are what is emphasised on any changed line.
-//! Otherwise lines are diffed, and a changed line paired with the line it is an edit of
-//! ([`View::rows_by`](disparate::View::rows_by), by [`EditPairing`]) has the words that differ
-//! emphasised, compared with all the lines it became when it was rewrapped too. A line that is
-//! new throughout is only tinted, as an added line is.
+//! ([`Structural`]): code that was only re-indented is unchanged, and code that moved is not new
+//! where it went. Otherwise lines are diffed. Either way a changed line is paired with the line it
+//! is an edit of ([`View::rows_by`](disparate::View::rows_by), by [`EditPairing`]), and the pair is
+//! diffed again by words: the words the line lost are struck through where they stood, the words
+//! it gained are marked, and the rest reads as it was. A line rewritten more than it was kept
+//! reads better as what it was and what it became, so it is drawn as both. A line that only
+//! appeared is marked whole, one that only went is struck through whole.
 //!
-//! Either way the cost is that of the changes: equal lines are compared as bytes and never
-//! split or highlighted, only the windows around the changes are parsed, and only the lines
-//! shown are highlighted.
+//! The cost is that of the changes: equal lines are compared as bytes and never split, only the
+//! windows around the changes are parsed, and only the lines shown are highlighted.
 
 use core::range::Range;
 use std::path::Path;
@@ -19,7 +19,6 @@ use std::path::Path;
 use disparate::Both;
 use disparate::Diff;
 use disparate::Differ;
-use disparate::Part;
 use disparate::Refiner;
 use disparate::Side;
 use disparate::Text;
@@ -31,13 +30,14 @@ use disparate::pair::THRESHOLD;
 use disparate::pair::Term;
 use disparate::syntax::Language;
 use disparate::syntax::Structural;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
 use ratatui::text::Line as RtLine;
 use ratatui::text::Span as RtSpan;
 
 use super::highlighted_diff_lines_for_path;
 use super::line::DiffLineLayout;
-use super::line::DiffLineType;
-use super::line::content_spans;
+use super::line::Mark;
 use super::line::diff_line_rows;
 use super::line::line_number_width;
 use super::style::DiffRenderStyleContext;
@@ -46,27 +46,21 @@ use super::style::style_gutter;
 /// Unchanged lines shown either side of a hunk; the rest fold away, `⋮` between the hunks.
 const CONTEXT_LINES: usize = 3;
 
-/// The two texts of an edit and their diff: the lines that changed and, for a structural
-/// diff, the novel bytes of each side.
+/// An edited line is merged when what it kept (counting the bytes that are not blank) is most of
+/// what it was and a fair part of what it became. One rewritten more, or spread over several
+/// lines, is drawn as what it was and what it became.
+const KEPT_OF_OLD: f32 = 0.6;
+const KEPT_OF_NEW: f32 = 0.4;
+
+/// The two texts of an edit and the lines that changed between them.
 pub(super) struct EditDiff<'a> {
     sources: Both<&'a str>,
     texts: Both<Text<&'a [u8]>>,
     lines: Diff,
-    /// The novel byte ranges of each side, sorted and disjoint, when the texts were diffed by
-    /// their grammar.
-    novel: Option<Both<Vec<Range<usize>>>>,
 }
 
-/// A line of an edit as it is shown.
-pub(super) struct Shown {
-    pub(super) kind: DiffLineType,
-    /// Its index in its own side's text: the old text for a removed line, else the new.
-    pub(super) line: usize,
-    /// The before-side line index (meaningful for `Context` lines in split diff).
-    pub(super) before_line: usize,
-    /// The byte ranges of the line, from its start, to emphasise.
-    pub(super) emphasis: Vec<Range<usize>>,
-}
+/// A line's highlighter colours, as the byte ranges they cover.
+type Classes = Vec<(Range<usize>, Style)>;
 
 impl<'a> EditDiff<'a> {
     /// The diff of `old_text` and `new_text`, read through the grammar `path` names when
@@ -81,25 +75,16 @@ impl<'a> EditDiff<'a> {
         let structural = Language::from_path(path)
             .and_then(|language| Structural::parse(language, bytes.before, bytes.after))
             .filter(|diff| !diff.has_errors())
-            .map(|diff| {
-                let novel = Both::new(
-                    diff.novel(Side::Before).collect(),
-                    diff.novel(Side::After).collect(),
-                );
-                (diff.lines(), novel)
-            })
+            .map(|diff| diff.lines())
             // Reading a diff through texts of other lengths panics; never risk it on the UI
             // thread.
-            .filter(|(lines, _)| lines.len() == lens);
-        let (lines, novel) = match structural {
-            Some((lines, novel)) => (lines, Some(novel)),
-            None => (Differ::new().diff_lines(bytes.before, bytes.after), None),
-        };
+            .filter(|lines| lines.len() == lens);
+        let lines =
+            structural.unwrap_or_else(|| Differ::new().diff_lines(bytes.before, bytes.after));
         Self {
             sources,
             texts,
             lines,
-            novel,
         }
     }
 
@@ -108,45 +93,27 @@ impl<'a> EditDiff<'a> {
         self.lines.changed()
     }
 
-    pub(super) fn sources(&self) -> Both<&'a str> {
-        self.sources
-    }
-
-    pub(super) fn texts(&self) -> &Both<Text<&'a [u8]>> {
-        &self.texts
-    }
-
     /// Draws the hunks into `out` within `width`, numbered from `first_line` and highlighted
-    /// as `path`'s language. Uses side-by-side split view when `split` is true.
+    /// as `path`'s language.
     pub(super) fn render(
         &self,
         first_line: usize,
         path: &Path,
         width: usize,
-        split: bool,
         ctx: &DiffRenderStyleContext,
         out: &mut Vec<RtLine<'static>>,
     ) {
-        let groups = self.shown();
-        if split {
-            super::split::render_split(self, &groups, first_line, path, width, ctx, out);
-            return;
-        }
-        let side_of = |kind: DiffLineType| match kind {
-            DiffLineType::Delete => Side::Before,
-            DiffLineType::Insert | DiffLineType::Context => Side::After,
-        };
-        let max_line_number = groups
-            .iter()
-            .flat_map(|(_, shown)| shown)
-            .map(|shown| shown.line + first_line)
-            .max()
-            .unwrap_or(0);
+        let view = self.lines.on(&self.texts.before, &self.texts.after);
+        let groups: Vec<_> = view.groups(CONTEXT_LINES).collect();
+        let last_line = groups
+            .last()
+            .map_or(0, |group| group.window().after.end + first_line);
         let layout = DiffLineLayout {
             width,
-            line_number_width: line_number_width(max_line_number),
+            line_number_width: line_number_width(last_line),
         };
-        for (index, (window, shown)) in groups.iter().enumerate() {
+        let mut words = Refiner::new(Words);
+        for (index, group) in groups.into_iter().enumerate() {
             if index > 0 {
                 let spacer = format!("{:width$} ", "", width = layout.line_number_width.max(1));
                 out.push(RtLine::from(vec![
@@ -154,208 +121,222 @@ impl<'a> EditDiff<'a> {
                     RtSpan::styled("⋮", style_gutter(ctx)),
                 ]));
             }
-            // Each side's lines in the window are highlighted together, in their own text,
-            // and only when some of them are shown.
+            let window = group.window();
+            // Each side's lines in the window are highlighted together, in their own text.
             let syntax = Both::new(Side::Before, Side::After).map(|side| {
-                let used = shown.iter().any(|line| side_of(line.kind) == side);
                 let span = self.texts[side].span(window[side]);
-                used.then(|| &self.sources[side][span.start..span.end])
-                    .and_then(|lines| highlighted_diff_lines_for_path(lines, path))
+                highlighted_diff_lines_for_path(&self.sources[side][span.start..span.end], path)
             });
-            for line in shown {
-                let side = side_of(line.kind);
-                let span = self.texts[side].span(Range::from(line.line..line.line + 1));
-                let text = self.sources[side][span.start..span.end].trim_end_matches(['\n', '\r']);
-                let spans = syntax[side]
+            let classes = |side: Side, line: usize| -> Classes {
+                let mut at = 0;
+                syntax[side]
                     .as_ref()
-                    .and_then(|lines| lines.get(line.line - window[side].start))
-                    .map(Vec::as_slice);
-                let content = content_spans(line.kind, text, spans, &line.emphasis, ctx);
-                out.extend(diff_line_rows(
-                    line.line + first_line,
-                    line.kind,
-                    content,
-                    layout,
-                    ctx,
-                ));
+                    .and_then(|lines| lines.get(line - window[side].start))
+                    .map_or_else(Vec::new, |spans| {
+                        spans
+                            .iter()
+                            .map(|span| {
+                                let start = at;
+                                at += span.content.len();
+                                (Range::from(start..at), span.style)
+                            })
+                            .collect()
+                    })
+            };
+            // A run of changed lines is drawn as a unified diff orders it: what went (and was not
+            // merged into a line that stayed) first, then the lines as they are now, edited ones
+            // merged in place.
+            let mut gone: Vec<RtLine<'static>> = Vec::new();
+            let mut now: Vec<RtLine<'static>> = Vec::new();
+            let flush = |gone: &mut Vec<RtLine<'static>>,
+                         now: &mut Vec<RtLine<'static>>,
+                         out: &mut Vec<RtLine<'static>>| {
+                out.append(gone);
+                out.append(now);
+            };
+            for row in group.rows_by(EditPairing::default()) {
+                let lines = row.tokens();
+                let (before, after) = (lines.before.start, lines.after.start);
+                let number = Some(after + first_line);
+                if !row.is_changed() {
+                    flush(&mut gone, &mut now, out);
+                    let text = self.line(Side::After, after);
+                    let content = spans(text, &classes(Side::After, after), &[], Style::default());
+                    out.extend(diff_line_rows(number, Mark::Kept, content, layout, ctx));
+                    continue;
+                }
+                let went = |gone: &mut Vec<RtLine<'static>>| {
+                    let text = self.line(Side::Before, before);
+                    let content = removed(text, &classes(Side::Before, before), ctx);
+                    gone.extend(diff_line_rows(None, Mark::Removed, content, layout, ctx));
+                };
+                let came = |now: &mut Vec<RtLine<'static>>| {
+                    let text = self.line(Side::After, after);
+                    let content = added(text, &classes(Side::After, after), ctx);
+                    now.extend(diff_line_rows(number, Mark::Added, content, layout, ctx));
+                };
+                match (lines.before.is_empty(), lines.after.is_empty()) {
+                    (false, false) => {
+                        let texts = Both::new(
+                            self.line(Side::Before, before),
+                            self.line(Side::After, after),
+                        );
+                        match merge(&mut words, texts, &classes(Side::After, after), ctx) {
+                            Some(content) => now.extend(diff_line_rows(
+                                number,
+                                Mark::Edited,
+                                content,
+                                layout,
+                                ctx,
+                            )),
+                            None => {
+                                went(&mut gone);
+                                came(&mut now);
+                            }
+                        }
+                    }
+                    (false, true) => went(&mut gone),
+                    (true, _) => came(&mut now),
+                }
             }
+            flush(&mut gone, &mut now, out);
         }
     }
 
-    /// The lines each hunk shows, with the window of lines it spans: unchanged lines as
-    /// context, its removed lines before its added ones, as a unified patch has them.
-    fn shown(&self) -> Vec<(Both<Range<usize>>, Vec<Shown>)> {
-        let view = self.lines.on(&self.texts.before, &self.texts.after);
-        let mut words = Refiner::new(Words);
-        view.groups(CONTEXT_LINES)
-            .map(|group| {
-                let rows: Vec<Part<'_>> = group.rows_by(EditPairing::default()).collect();
-                let mut emphasis = Vec::with_capacity(rows.len());
-                let mut index = 0;
-                while index < rows.len() {
-                    let (row_emphasis, rewrapped) =
-                        self.emphasis(&rows[index], &rows[index + 1..], &mut words);
-                    emphasis.push(row_emphasis);
-                    // The lines an edited line was rewrapped into have nothing new in them.
-                    emphasis.extend((0..rewrapped).map(|_| Both::default()));
-                    index += 1 + rewrapped;
-                }
-                let mut shown = Vec::new();
-                // Added lines wait for the end of their hunk, below the removed ones.
-                let mut added = Vec::new();
-                for (row, mut emphasis) in rows.iter().zip(emphasis) {
-                    let lines = row.tokens();
-                    if !row.is_changed() {
-                        shown.append(&mut added);
-                        shown.push(Shown {
-                            kind: DiffLineType::Context,
-                            line: lines.after.start,
-                            before_line: lines.before.start,
-                            emphasis: Vec::new(),
-                        });
-                        continue;
-                    }
-                    if !lines.before.is_empty() {
-                        shown.push(Shown {
-                            kind: DiffLineType::Delete,
-                            line: lines.before.start,
-                            before_line: lines.before.start,
-                            emphasis: std::mem::take(&mut emphasis.before),
-                        });
-                    }
-                    if !lines.after.is_empty() {
-                        added.push(Shown {
-                            kind: DiffLineType::Insert,
-                            line: lines.after.start,
-                            before_line: lines.before.start,
-                            emphasis: emphasis.after,
-                        });
-                    }
-                }
-                shown.append(&mut added);
-                (group.window(), shown)
-            })
-            .collect()
+    /// Line `line` of `side`'s text, without its line break.
+    fn line(&self, side: Side, line: usize) -> &'a str {
+        let span = self.texts[side].span(Range::from(line..line + 1));
+        self.sources[side][span.start..span.end].trim_end_matches(['\n', '\r'])
     }
+}
 
-    /// What changed in each line of a changed row, as byte ranges from the start of the line,
-    /// blanks at their ends left out: the novel tokens on it when the diff is structural, else,
-    /// when the row pairs a line with the line it is an edit of, the words that differ between
-    /// them. A line that is new throughout is left to its tint, as a line that was only added.
-    ///
-    /// A line edited and rewrapped at once (split in two, or joined with the next) is compared
-    /// with all it became: the lone lines of one side that `following` starts with. When those
-    /// have nothing new in them, the words that only moved onto them are not changed, and the
-    /// second value is how many of `following` the row so accounted for; their emphasis is
-    /// empty.
-    fn emphasis(
-        &self,
-        row: &Part<'_>,
-        following: &[Part<'_>],
-        words: &mut Refiner<Words>,
-    ) -> (Both<Vec<Range<usize>>>, usize) {
-        let (lines, span) = (row.tokens(), row.span());
-        let mut rewrapped = 0;
-        let changed: Both<Vec<Range<usize>>> = match &self.novel {
-            Some(novel) => novel.as_ref().zip(span).map(|(novel, line)| {
-                let from = novel.partition_point(|r| r.end <= line.start);
-                novel[from..]
-                    .iter()
-                    .take_while(|r| r.start < line.end)
-                    .map(|r| Range::from(r.start.max(line.start)..r.end.min(line.end)))
-                    .collect()
-            }),
-            None if !lines.before.is_empty() && !lines.after.is_empty() => {
-                // The side that lone lines go on, if the next row is one.
-                let side = following.first().and_then(|next| {
-                    let next = next.tokens();
-                    match (next.before.is_empty(), next.after.is_empty()) {
-                        (true, false) => Some(Side::After),
-                        (false, true) => Some(Side::Before),
-                        (true, true) | (false, false) => None,
-                    }
-                });
-                let merged = side.and_then(|side| {
-                    let other = match side {
-                        Side::Before => Side::After,
-                        Side::After => Side::Before,
-                    };
-                    let run = following
-                        .iter()
-                        .take_while(|next| {
-                            next.is_changed()
-                                && next.tokens()[other].is_empty()
-                                && !next.tokens()[side].is_empty()
-                        })
-                        .count();
-                    let mut whole = span;
-                    whole[side] =
-                        Range::from(span[side].start..following[run - 1].span()[side].end);
-                    let bytes = whole
-                        .zip(self.texts.as_ref())
-                        .map(|(whole, text)| &text.bytes()[whole]);
-                    let changed = words.highlight(bytes.before, bytes.after).zip(whole).map(
-                        |(ranges, whole)| {
-                            ranges
-                                .into_iter()
-                                .map(|r| Range::from(r.start + whole.start..r.end + whole.start))
-                                .collect::<Vec<_>>()
-                        },
-                    );
-                    let lone = Range::from(span[side].end..whole[side].end);
-                    let text = self.texts[side].bytes();
-                    let nothing_new = changed[side].iter().all(|r| {
-                        let (start, end) = (r.start.max(lone.start), r.end.min(lone.end));
-                        start >= end || text[start..end].iter().all(u8::is_ascii_whitespace)
-                    });
-                    nothing_new.then(|| {
-                        rewrapped = run;
-                        changed
-                    })
-                });
-                merged.unwrap_or_else(|| {
-                    let refined = words.refine(row);
-                    Both::new(
-                        refined.changed(Side::Before).collect(),
-                        refined.changed(Side::After).collect(),
-                    )
-                })
-            }
-            None => Both::default(),
-        };
-        let emphasis = changed
-            .zip(span)
-            .zip(self.texts.as_ref())
-            .map(|((ranges, line), text)| {
-                let bytes = &text.bytes()[line];
-                // A novel run joined across lines takes in the line break and indent between.
-                let trim = |mut start: usize, mut end: usize| {
-                    while start < end && bytes[start].is_ascii_whitespace() {
-                        start += 1;
-                    }
-                    while end > start && bytes[end - 1].is_ascii_whitespace() {
-                        end -= 1;
-                    }
-                    (start < end).then(|| Range::from(start..end))
-                };
-                // Ranges are cut to the line: a rewrapped line's reach past it.
-                let ranges: Vec<Range<usize>> = ranges
-                    .into_iter()
-                    .filter_map(|r| {
-                        trim(
-                            r.start.max(line.start) - line.start,
-                            r.end.min(line.end).saturating_sub(line.start),
-                        )
-                    })
-                    .collect();
-                if ranges.len() == 1 && ranges.first().copied() == trim(0, bytes.len()) {
-                    Vec::new()
-                } else {
-                    ranges
-                }
-            });
-        (emphasis, rewrapped)
+/// `text` drawn in its highlighter colours (`classes`, else the default colour), with the byte
+/// ranges `marked` (sorted, disjoint) patched with `mark`.
+fn spans(
+    text: &str,
+    classes: &Classes,
+    marked: &[Range<usize>],
+    mark: Style,
+) -> Vec<RtSpan<'static>> {
+    disparate::layout::segments(Range::from(0..text.len()), classes, marked)
+        .map(|segment| {
+            let style = segment.class.unwrap_or_default();
+            let style = if segment.changed {
+                style.patch(mark)
+            } else {
+                style
+            };
+            RtSpan::styled(slice(text, segment.range), style)
+        })
+        .collect()
+}
+
+/// The bytes `range` of `text`, as text: the word diff cuts at bytes.
+fn slice(text: &str, range: Range<usize>) -> String {
+    String::from_utf8_lossy(&text.as_bytes()[range.start..range.end]).into_owned()
+}
+
+/// The bytes of `text` from its first that is not blank: what marking a whole line covers, so
+/// its indent stays clear.
+fn from_indent(text: &str) -> Vec<Range<usize>> {
+    let start = text.len() - text.trim_start().len();
+    if start < text.len() {
+        vec![Range::from(start..text.len())]
+    } else {
+        Vec::new()
     }
+}
+
+/// A line that only appeared: marked whole.
+fn added(text: &str, classes: &Classes, ctx: &DiffRenderStyleContext) -> Vec<RtSpan<'static>> {
+    spans(text, classes, &from_indent(text), ctx.added())
+}
+
+/// A line that only went: struck through whole, its colours dimmed.
+fn removed(text: &str, classes: &Classes, ctx: &DiffRenderStyleContext) -> Vec<RtSpan<'static>> {
+    let dimmed: Classes = classes
+        .iter()
+        .map(|(range, style)| (*range, style.add_modifier(Modifier::DIM)))
+        .collect();
+    spans(text, &dimmed, &from_indent(text), ctx.removed())
+}
+
+/// An edited line merged in place: the new line in its colours, the words it gained marked, and
+/// the words it lost struck through where they stood, before what replaced them. `None` when it
+/// kept too little of itself to read as one line.
+fn merge(
+    words: &mut Refiner<Words>,
+    texts: Both<&str>,
+    classes: &Classes,
+    ctx: &DiffRenderStyleContext,
+) -> Option<Vec<RtSpan<'static>>> {
+    let view = words.refine_bytes(texts.map(str::as_bytes));
+    let solid = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .count()
+    };
+    let mut kept = 0;
+    let mut gained = Vec::new();
+    // Where in the new line each lost run stood, and the run in the old line.
+    let mut lost: Vec<(usize, Range<usize>)> = Vec::new();
+    for part in view.parts() {
+        let span = part.span();
+        if !part.is_changed() {
+            kept += solid(&texts.after.as_bytes()[span.after]);
+            continue;
+        }
+        if !texts.before[span.before.start..span.before.end]
+            .trim()
+            .is_empty()
+        {
+            lost.push((span.after.start, span.before));
+        }
+        // Blanks gained (an indent that changed) are not worth marking.
+        if !texts.after[span.after.start..span.after.end]
+            .trim()
+            .is_empty()
+        {
+            gained.push(span.after);
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let share = |of: &str| kept as f32 / solid(of.as_bytes()).max(1) as f32;
+    if share(texts.before) < KEPT_OF_OLD || share(texts.after) < KEPT_OF_NEW {
+        return None;
+    }
+    let text = texts.after;
+    let mut out = Vec::new();
+    let mut lost = lost.into_iter().peekable();
+    for segment in disparate::layout::segments(Range::from(0..text.len()), classes, &gained) {
+        let style = segment.class.unwrap_or_default();
+        let style = if segment.changed {
+            style.patch(ctx.gained())
+        } else {
+            style
+        };
+        let mut at = segment.range.start;
+        // A lost run that stood inside this segment cuts it there.
+        while let Some((cut, run)) = lost.next_if(|(cut, _)| *cut < segment.range.end) {
+            if cut > at {
+                out.push(RtSpan::styled(slice(text, Range::from(at..cut)), style));
+                at = cut;
+            }
+            out.push(RtSpan::styled(slice(texts.before, run), ctx.lost()));
+        }
+        if at < segment.range.end {
+            out.push(RtSpan::styled(
+                slice(text, Range::from(at..segment.range.end)),
+                style,
+            ));
+        }
+    }
+    // What the line lost at its very end.
+    for (_, run) in lost {
+        out.push(RtSpan::styled(slice(texts.before, run), ctx.lost()));
+    }
+    Some(out)
 }
 
 /// Pairs a changed line with the line it is an edit of, for a line diff.
@@ -372,31 +353,50 @@ struct EditPairing(Dice);
 /// What starting with the same token adds to a pairing's score.
 const SAME_HEAD: f32 = 0.1;
 
+/// What starting with the same token and then the same name adds (`fn area(` and `fn area(`, not
+/// `fn perimeter(`): a definition keeps its name when it is edited.
+const SAME_NAME: f32 = 0.2;
+
+/// A line's first two tokens: each a run of word characters or one other character, blanks
+/// between them skipped.
+fn heads(bytes: &[u8]) -> [Option<&[u8]>; 2] {
+    let token = |from: usize| -> Option<(&[u8], usize)> {
+        let start = from
+            + bytes[from..]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())?;
+        let rest = &bytes[start..];
+        let word = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count()
+            .max(1);
+        Some((&rest[..word], start + word))
+    };
+    let first = token(0);
+    let second = first.and_then(|(_, end)| token(end));
+    [
+        first.map(|(token, _)| token),
+        second.map(|(token, _)| token),
+    ]
+}
+
 impl Similarity for EditPairing {
-    type Line<'a> = (Profile<'a>, Option<&'a [u8]>);
+    type Line<'a> = (Profile<'a>, [Option<&'a [u8]>; 2]);
 
     fn line<'a>(&mut self, bytes: &'a [u8]) -> Self::Line<'a> {
-        // The first token: a run of word characters, or the first other character.
-        let head = bytes
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map(|start| {
-                let rest = &bytes[start..];
-                let word = rest
-                    .iter()
-                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
-                    .count();
-                &rest[..word.max(1)]
-            });
-        (self.0.line(bytes), head)
+        (self.0.line(bytes), heads(bytes))
     }
 
     fn score(&mut self, a: &Self::Line<'_>, b: &Self::Line<'_>) -> f32 {
         let score = self.0.score(&a.0, &b.0);
-        if score >= THRESHOLD && a.1.is_some() && a.1 == b.1 {
-            (score + SAME_HEAD).min(1.0)
-        } else {
+        let same = |index: usize| a.1[index].is_some() && a.1[index] == b.1[index];
+        if score < THRESHOLD || !same(0) {
             score
+        } else if same(1) {
+            (score + SAME_NAME).min(1.0)
+        } else {
+            (score + SAME_HEAD).min(1.0)
         }
     }
 

@@ -129,17 +129,40 @@ impl App {
             AppEvent::ConsolidateAgentMessage { source, cwd } => {
                 self.consolidate_agent_message(tui, source, &cwd);
             }
-            AppEvent::DiffResult(text) => {
-                // Clear the in-progress state in the bottom pane
+            AppEvent::DiffResult(changes) => {
                 self.chat_widget.on_diff_complete();
-                // Build the pager lines on the primary screen.
-                let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
-                    vec!["No changes detected.".italic().into()]
-                } else {
-                    text.lines().map(ansi_escape_line).collect()
+                // The changes are drawn like any edit, at whatever width the pager has.
+                let renderables: Vec<Box<dyn crate::render::renderable::Renderable>> = match changes
+                {
+                    crate::get_git_diff::GitChanges::NotARepo => {
+                        vec![Box::new("Not inside a git repository.".italic())]
+                    }
+                    crate::get_git_diff::GitChanges::Failed(error) => {
+                        vec![Box::new(format!("Couldn't read the changes: {error}"))]
+                    }
+                    crate::get_git_diff::GitChanges::Changes { files, binary } => {
+                        let mut renderables: Vec<Box<dyn crate::render::renderable::Renderable>> =
+                            Vec::new();
+                        if files.is_empty() && binary.is_empty() {
+                            renderables.push(Box::new("No changes.".italic()));
+                        }
+                        if !files.is_empty() {
+                            let cwd = self.chat_widget.config_ref().cwd.clone();
+                            renderables.push(Box::new(DiffSummary::new(
+                                files,
+                                cwd,
+                                crate::diff_render::ChangesShown::WorkingTree,
+                            )));
+                        }
+                        if !binary.is_empty() {
+                            renderables
+                                .push(Box::new(format!("Binary: {}", binary.join(", ")).dim()));
+                        }
+                        renderables
+                    }
                 };
-                self.overlay = Some(Overlay::new_static_with_lines(
-                    pager_lines,
+                self.overlay = Some(Overlay::new_static_with_renderables(
+                    renderables,
                     "D I F F".to_string(),
                 ));
                 tui.frame_requester().schedule_frame();

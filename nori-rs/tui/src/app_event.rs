@@ -180,8 +180,8 @@ pub(crate) enum AppEvent {
         agent: Option<String>,
     },
 
-    /// Result of computing a `/diff` command.
-    DiffResult(String),
+    /// What `/diff` found.
+    DiffResult(crate::get_git_diff::GitChanges),
 
     InsertHistoryCell(Box<dyn HistoryCell>),
     RevealUserQuestion,

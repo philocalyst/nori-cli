@@ -191,7 +191,8 @@ impl App {
                 };
 
                 if let Some(changes) = edit_changes {
-                    let diff_summary = DiffSummary::new(changes, cwd);
+                    let diff_summary =
+                        DiffSummary::new(changes, cwd, crate::diff_render::ChangesShown::Proposal);
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),

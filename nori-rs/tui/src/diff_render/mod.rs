@@ -1,19 +1,20 @@
-//! File changes drawn as diffs: a unified diff, or two panes when the terminal is wide, under a
-//! faint line-number gutter, with syntax colours, tinted lines and a stronger tint on the words
-//! that changed inside an edited line. Edits are diffed with disparate ([`update`]); [`line`]
-//! and [`split`] draw them and [`style`] takes every colour from the live theme.
+//! File changes drawn as diffs, the way a document editor shows suggestions: one column of the
+//! new text under a faint line-number gutter, in syntax colours, every edited line merged in place
+//! (what it lost struck through, what it gained marked) and a bar in the margin of each line that
+//! changed. Edits are diffed with disparate ([`update`]); [`line`] draws a line and [`style`]
+//! takes every colour from the live theme.
 //!
 //! The edit cell draws the one-line header itself and asks this module for the body: its rows,
 //! capped, and how many it left out.
 
 mod line;
-mod split;
 mod style;
 mod update;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use ratatui::style::Modifier;
 use ratatui::text::Line as RtLine;
 use ratatui::text::Span as RtSpan;
 use ratatui::widgets::Paragraph;
@@ -23,8 +24,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use self::line::DiffLineLayout;
-use self::line::DiffLineType;
-use self::line::content_spans;
+use self::line::Mark;
 use self::line::diff_line_rows;
 use self::line::line_number_width;
 use self::style::DiffRenderStyleContext;
@@ -57,8 +57,8 @@ pub(crate) struct DiffBody {
 }
 
 /// The changes as a header's counts and a body, from one diff of each file. The body is within
-/// `width`, split into two panes when the terminal is wide enough; several files each get a faint
-/// `± path +n −m` row first, and at most `cap` rows are returned when it is set.
+/// `width`; several files each get a faint `± path +n −m` row first, and at most `cap` rows are
+/// returned when it is set.
 pub(crate) fn render_changes(
     changes: &HashMap<PathBuf, FileChange>,
     cwd: &Path,
@@ -88,7 +88,6 @@ pub(crate) fn render_changes(
     };
     let prefix = chrome.body_prefix();
     let inner = width.saturating_sub(chrome.body_indent()).max(1);
-    let split = width >= split::SPLIT_DIFF_MIN_WIDTH;
     let several = rows.len() > 1;
     let mut lines: Vec<RtLine<'static>> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -106,7 +105,7 @@ pub(crate) fn render_changes(
             lines.push(RtLine::from(spans));
         }
         let mut body = Vec::new();
-        render_body_with_split(row, &mut body, inner, split, &ctx);
+        render_body(row, &mut body, inner, &ctx);
         lines.extend(prefix_lines(body, prefix.clone(), prefix.clone()));
         // Past the cap nothing more is needed; the rest of the files are not drawn.
         if cap.is_some_and(|cap| lines.len() > cap + 64) {
@@ -120,12 +119,22 @@ pub(crate) fn render_changes(
     (stats, DiffBody { lines, hidden })
 }
 
+/// What a set of changes shown on its own is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChangesShown {
+    /// What an edit would do, waiting for an approval.
+    Proposal,
+    /// What the working tree holds that its base does not (`/diff`).
+    WorkingTree,
+}
+
 /// The header and the whole body of a set of changes, for places that show a diff on its own
-/// (an approval, a transcript detail).
+/// (an approval, `/diff`, a transcript detail).
 pub(crate) fn create_diff_summary(
     changes: &HashMap<PathBuf, FileChange>,
     cwd: &Path,
     wrap_cols: usize,
+    shown: ChangesShown,
 ) -> Vec<RtLine<'static>> {
     let chrome = Chrome::live();
     let (stats, body) = render_changes(changes, cwd, wrap_cols, None);
@@ -133,15 +142,27 @@ pub(crate) fn create_diff_summary(
         Some(path) => Target::Path(path.clone()),
         None => Target::Text(format!("{} files", stats.files)),
     };
-    // Changes shown on their own are proposals: what the edit would do, waiting.
-    let verb = match stats.verb {
-        "Added" => "Add",
-        "Deleted" => "Delete",
-        _ => "Edit",
+    let (glyph, verb) = match shown {
+        ChangesShown::Proposal => (
+            chrome.glyph(Progress::Waiting, None, false),
+            match stats.verb {
+                "Added" => "Add",
+                "Deleted" => "Delete",
+                _ => "Edit",
+            },
+        ),
+        ChangesShown::WorkingTree => (
+            RtSpan::styled("±", chrome.faint()),
+            match stats.verb {
+                "Added" => "Added",
+                "Deleted" => "Deleted",
+                _ => "Changed",
+            },
+        ),
     };
     let mut lines = vec![chrome.header(
         Header {
-            glyph: chrome.glyph(Progress::Waiting, None, false),
+            glyph,
             verb: verb.to_owned(),
             target,
             chip: chrome.line_counts(stats.added, stats.removed),
@@ -157,22 +178,36 @@ pub(crate) fn create_diff_summary(
 pub struct DiffSummary {
     changes: HashMap<PathBuf, FileChange>,
     cwd: PathBuf,
+    shown: ChangesShown,
 }
 
 impl DiffSummary {
-    pub(crate) fn new(changes: HashMap<PathBuf, FileChange>, cwd: PathBuf) -> Self {
-        Self { changes, cwd }
+    pub(crate) fn new(
+        changes: HashMap<PathBuf, FileChange>,
+        cwd: PathBuf,
+        shown: ChangesShown,
+    ) -> Self {
+        Self {
+            changes,
+            cwd,
+            shown,
+        }
     }
 }
 
 impl Renderable for DiffSummary {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = create_diff_summary(&self.changes, &self.cwd, usize::from(area.width));
+        let lines = create_diff_summary(
+            &self.changes,
+            &self.cwd,
+            usize::from(area.width),
+            self.shown,
+        );
         Paragraph::new(lines).render(area, buf);
     }
 
     fn desired_height(&self, width: u16) -> u16 {
-        let lines = create_diff_summary(&self.changes, &self.cwd, usize::from(width));
+        let lines = create_diff_summary(&self.changes, &self.cwd, usize::from(width), self.shown);
         u16::try_from(lines.len()).unwrap_or(u16::MAX)
     }
 }
@@ -253,19 +288,19 @@ fn collect_rows(changes: &HashMap<PathBuf, FileChange>) -> Vec<Row<'_>> {
     rows
 }
 
-/// The lines of one file's change, within `width`.
-fn render_body_with_split(
+/// The lines of one file's change, within `width`. A file that is new or gone throughout is its
+/// code with the bar beside it, not a block of colour.
+fn render_body(
     row: &Row<'_>,
     out: &mut Vec<RtLine<'static>>,
     width: usize,
-    split: bool,
     ctx: &DiffRenderStyleContext,
 ) {
-    let (kind, content) = match &row.body {
-        Body::Added(content) => (DiffLineType::Insert, *content),
-        Body::Deleted(content) => (DiffLineType::Delete, *content),
+    let (mark, content) = match &row.body {
+        Body::Added(content) => (Mark::Added, *content),
+        Body::Deleted(content) => (Mark::Removed, *content),
         Body::Edited { diff, first_line } => {
-            return diff.render(*first_line, row.syntax_path, width, split, ctx, out);
+            return diff.render(*first_line, row.syntax_path, width, ctx, out);
         }
     };
     // A new file's every line is a change, and highlighting a long one is the cost of showing
@@ -289,12 +324,17 @@ fn render_body_with_split(
         line_number_width: line_number_width(total),
     };
     for (i, raw) in content.lines().enumerate() {
-        let syntax = syntax_lines
-            .as_ref()
-            .and_then(|lines| lines.get(i))
-            .map(Vec::as_slice);
-        let spans = content_spans(kind, raw, syntax, &[], ctx);
-        out.extend(diff_line_rows(i + 1, kind, spans, layout, ctx));
+        let spans = match syntax_lines.as_ref().and_then(|lines| lines.get(i)) {
+            Some(spans) if mark == Mark::Removed => spans
+                .iter()
+                .map(|span| span.clone().patch_style(Modifier::DIM))
+                .collect(),
+            Some(spans) => spans.clone(),
+            None if mark == Mark::Removed => vec![RtSpan::styled(raw.to_owned(), Modifier::DIM)],
+            None => vec![RtSpan::raw(raw.to_owned())],
+        };
+        let number = (mark == Mark::Added).then_some(i + 1);
+        out.extend(diff_line_rows(number, mark, spans, layout, ctx));
     }
     if shown < total {
         out.push(RtLine::from(RtSpan::styled(

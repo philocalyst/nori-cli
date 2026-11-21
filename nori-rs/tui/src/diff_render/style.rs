@@ -1,44 +1,64 @@
-//! The colours of a diff, taken from the live theme: line tints (`diff_add`, `diff_del`), the
-//! stronger emphasis the changed words of an edited line get (`diff_add_word`, `diff_del_word`),
-//! and the faint line-number gutter.
+//! The colours of a diff, taken from the live theme: the tints of lines that only appeared or
+//! went (`diff_add`, `diff_del`), the stronger marks of the words an edited line gained or lost
+//! (`diff_add_word`, `diff_del_word`), the accents of the bars in the margin, and the faint
+//! line-number gutter. Tints sit behind text only, never to the edge of the row.
 
 use nori_tui_components::Theme;
+
+use super::line::Mark;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 
 pub(super) struct DiffRenderStyleContext {
-    pub(super) add_bg: Option<Color>,
-    pub(super) del_bg: Option<Color>,
-    /// An added line: its tint, or (no backgrounds) its colour.
+    /// A line that only appeared: its tint behind its text, or (no backgrounds) its colour.
     add_line: Style,
     del_line: Style,
-    /// What the changed words of an added line that has a removed counterpart are drawn with,
-    /// over its syntax colours.
-    pub(super) add_emphasis: Style,
-    pub(super) del_emphasis: Style,
-    add_sign: Style,
-    del_sign: Style,
+    /// The words an edited line gained or lost, over its colours.
+    add_word: Style,
+    del_word: Style,
+    add_mark: Style,
+    del_mark: Style,
+    edit_mark: Style,
     gutter: Style,
 }
 
 impl DiffRenderStyleContext {
     pub(super) fn from_theme(theme: &Theme) -> Self {
         let mut context = Self {
-            add_bg: theme.diff_add.bg,
-            del_bg: theme.diff_del.bg,
             add_line: theme.diff_add,
             del_line: theme.diff_del,
-            add_emphasis: theme.diff_add_word,
-            del_emphasis: theme.diff_del_word,
-            add_sign: theme.accent_mint,
-            del_sign: theme.accent_coral,
+            add_word: theme.diff_add_word,
+            del_word: theme.diff_del_word,
+            add_mark: theme.accent_mint,
+            del_mark: theme.accent_coral,
+            edit_mark: theme.accent_amber,
             gutter: theme.faint,
         };
-        if context.add_bg.is_none() {
+        if theme.diff_add.bg.is_none() {
             context.use_indexed_tints();
         }
         context
+    }
+
+    /// A line that only appeared, from its indent on.
+    pub(super) fn added(&self) -> Style {
+        self.add_line
+    }
+
+    /// A line that only went, from its indent on: struck through.
+    pub(super) fn removed(&self) -> Style {
+        self.del_line.add_modifier(Modifier::CROSSED_OUT)
+    }
+
+    /// The words an edited line gained.
+    pub(super) fn gained(&self) -> Style {
+        self.add_word
+    }
+
+    /// The words an edited line lost, struck through where they stood.
+    pub(super) fn lost(&self) -> Style {
+        self.del_word.add_modifier(Modifier::CROSSED_OUT)
     }
 
     /// The context for the terminal the TUI is drawing on.
@@ -61,12 +81,10 @@ impl DiffRenderStyleContext {
         } else {
             (22, 52, 28, 88)
         };
-        self.add_bg = Some(Color::Indexed(add));
-        self.del_bg = Some(Color::Indexed(del));
         self.add_line = Style::default().bg(Color::Indexed(add));
         self.del_line = Style::default().bg(Color::Indexed(del));
-        self.add_emphasis = Style::default().bg(Color::Indexed(add_word));
-        self.del_emphasis = Style::default().bg(Color::Indexed(del_word));
+        self.add_word = Style::default().bg(Color::Indexed(add_word));
+        self.del_word = Style::default().bg(Color::Indexed(del_word));
     }
 }
 
@@ -75,25 +93,12 @@ pub(super) fn style_gutter(ctx: &DiffRenderStyleContext) -> Style {
     ctx.gutter
 }
 
-pub(super) fn style_context() -> Style {
-    Style::default()
-}
-
-/// An added line's own style: its tint, or its colour where there are no backgrounds.
-pub(super) fn style_add(ctx: &DiffRenderStyleContext) -> Style {
-    ctx.add_line
-}
-
-pub(super) fn style_del(ctx: &DiffRenderStyleContext) -> Style {
-    ctx.del_line
-}
-
-/// The `+` / `-` sign: the accent colour on the line's tint.
-pub(super) fn style_sign(ctx: &DiffRenderStyleContext, added: bool) -> Style {
-    let (sign, line) = if added {
-        (ctx.add_sign, ctx.add_line)
-    } else {
-        (ctx.del_sign, ctx.del_line)
-    };
-    line.patch(sign).add_modifier(Modifier::BOLD)
+/// The bar in the margin of a changed line: the accent of how it changed.
+pub(super) fn style_mark(ctx: &DiffRenderStyleContext, mark: Mark) -> Style {
+    match mark {
+        Mark::Added => ctx.add_mark,
+        Mark::Removed => ctx.del_mark,
+        Mark::Edited => ctx.edit_mark,
+        Mark::Kept => ctx.gutter,
+    }
 }
