@@ -284,6 +284,12 @@ async fn run_tool(
             no_arguments(name, &arguments)?;
             service.task_list().await
         }
+        // Data-defined tools: the file tools (opt-in) and the language server tools.
+        "read" | "write" | "edit" | "multi_edit" | "apply_patch" => {
+            Ok(service.call_file_tool(name, arguments).await)
+        }
+        "lsp_diagnostics" | "lsp_definition" | "lsp_references" | "lsp_hover" | "lsp_symbols"
+        | "lsp_rename" | "lsp_call_hierarchy" => Ok(service.call_lsp_tool(name, arguments).await),
         _ => return Err(format!("there is no Nori tool named {name}")),
     };
     result.map_err(|error| error.message.into_owned())
@@ -519,6 +525,17 @@ mod tests {
                 "create_goal",
                 "delegate_task",
                 "get_goal",
+                "job_list",
+                "job_read",
+                "job_start",
+                "job_stop",
+                "lsp_call_hierarchy",
+                "lsp_definition",
+                "lsp_diagnostics",
+                "lsp_hover",
+                "lsp_references",
+                "lsp_rename",
+                "lsp_symbols",
                 "monitor_list",
                 "monitor_rearm",
                 "monitor_start",
@@ -562,6 +579,11 @@ mod tests {
                 .call(&spec.name, json!({"no_such_argument": true}))
                 .await;
             assert!(output.is_error, "{}", spec.name);
+            if spec.name.starts_with("lsp_") {
+                // Data-defined tools check the session first: this one has no directory.
+                assert_eq!(output.text, "this session has no working directory");
+                continue;
+            }
             assert!(
                 output.text.starts_with("invalid arguments"),
                 "{}: {}",
@@ -637,5 +659,175 @@ mod tests {
         let parsed: Value = serde_json::from_str(&second.text).expect("json");
         assert_eq!(parsed["exit_code"], 0);
         assert_eq!(parsed["stdout"], format!("ok\n{}\n", sub.display()));
+    }
+
+    fn opted_in_files() -> Option<nori_host_tools::ToolSelection> {
+        Some(nori_host_tools::ToolSelection {
+            enabled: Some(
+                [
+                    "read",
+                    "write",
+                    "edit",
+                    "multi_edit",
+                    "apply_patch",
+                    "lsp_diagnostics",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn file_tools_are_opt_in_and_lsp_tools_are_default_on_both_paths() {
+        let default = tools(None);
+        let host: Vec<String> = default.specs().into_iter().map(|spec| spec.name).collect();
+        let mcp: Vec<String> = default
+            .service
+            .session_tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for name in ["read", "write", "edit", "multi_edit", "apply_patch"] {
+            assert!(!host.iter().any(|tool| tool == name), "{name} is opt-in");
+            assert!(!mcp.iter().any(|tool| tool == name), "{name} is opt-in");
+        }
+        for name in nori_lsp::tools::TOOL_NAMES {
+            assert!(host.iter().any(|tool| tool == name), "{name} on host path");
+            assert!(mcp.iter().any(|tool| tool == name), "{name} on MCP path");
+        }
+
+        let opted_in = tools_with_selection(None, opted_in_files());
+        let host: Vec<String> = opted_in.specs().into_iter().map(|spec| spec.name).collect();
+        let mcp: Vec<String> = opted_in
+            .service
+            .session_tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            host,
+            mcp.iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            host,
+            vec![
+                "apply_patch",
+                "edit",
+                "lsp_diagnostics",
+                "multi_edit",
+                "read",
+                "write"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_tools_run_through_the_host_path_and_report_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("write");
+        let tools = tools_with_selection(Some(root.clone()), opted_in_files());
+
+        let read = tools.call("read", json!({"file_path": "a.txt"})).await;
+        assert!(!read.is_error, "{}", read.text);
+        assert!(read.text.contains("two"), "{}", read.text);
+
+        let edit = tools
+            .call(
+                "edit",
+                json!({"file_path": "a.txt", "old_string": "two", "new_string": "2"}),
+            )
+            .await;
+        assert!(!edit.is_error, "{}", edit.text);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\n2\n"
+        );
+        let result = edit.as_mcp_result();
+        let changes = &result["structuredContent"]["changes"];
+        assert_eq!(changes[0]["lines_added"], 1);
+        assert_eq!(changes[0]["lines_removed"], 1);
+
+        let created = tools
+            .call(
+                "write",
+                json!({"file_path": "sub/b.txt", "content": "hi\n"}),
+            )
+            .await;
+        assert!(!created.is_error, "{}", created.text);
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/b.txt")).unwrap(),
+            "hi\n"
+        );
+
+        let patch = "*** Begin Patch\n*** Add File: c.txt\n+three\n*** End Patch";
+        let patched = tools.call("apply_patch", json!({"input": patch})).await;
+        assert!(!patched.is_error, "{}", patched.text);
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "three\n"
+        );
+
+        // An edit that never read the file is refused with how to recover.
+        std::fs::write(root.join("d.txt"), "x").expect("write");
+        let refused = tools
+            .call(
+                "edit",
+                json!({"file_path": "d.txt", "old_string": "x", "new_string": "y"}),
+            )
+            .await;
+        assert!(refused.is_error);
+        assert_eq!(std::fs::read_to_string(root.join("d.txt")).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn lsp_tools_answer_without_a_server() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        let tools = tools_with_selection(Some(root), None);
+        let overview = tools.call("lsp_diagnostics", json!({})).await;
+        assert!(!overview.is_error, "{}", overview.text);
+        let missing = tools
+            .call(
+                "lsp_hover",
+                json!({"path": "nope.zzz", "line": 1, "symbol": "x"}),
+            )
+            .await;
+        assert!(missing.is_error);
+    }
+
+    #[tokio::test]
+    async fn file_tools_take_a_machine_like_bash_does() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        std::fs::write(root.join("a.txt"), "one\n").expect("write");
+        let tools = tools_with_selection(Some(root), opted_in_files());
+
+        for spec in tools.specs() {
+            let machine = &spec.input_schema["properties"]["machine"];
+            let has_machine = ["read", "write", "edit", "multi_edit", "apply_patch", "bash"]
+                .contains(&spec.name.as_str());
+            assert_eq!(machine.is_object(), has_machine, "{}", spec.name);
+            if has_machine {
+                assert_eq!(machine["enum"][0], "local", "{}", spec.name);
+            }
+        }
+
+        let local = tools
+            .call("read", json!({"file_path": "a.txt", "machine": "local"}))
+            .await;
+        assert!(!local.is_error, "{}", local.text);
+        assert!(local.text.contains("one"), "{}", local.text);
+        let unknown = tools
+            .call("read", json!({"file_path": "a.txt", "machine": "nowhere"}))
+            .await;
+        assert!(unknown.is_error);
     }
 }

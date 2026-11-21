@@ -10398,6 +10398,7 @@ name = "nori-harness"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -10417,9 +10418,11 @@ dependencies = [
  "nori-conversation",
  "nori-forge",
  "nori-host-tools",
+ "nori-lsp",
  "nori-machines",
  "nori-pkl",
  "nori-protocol",
+ "nori-tools",
  "nori-workflow",
  "notify-rust",
  "oauth2",

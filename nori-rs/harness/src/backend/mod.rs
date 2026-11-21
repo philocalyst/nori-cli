@@ -429,6 +429,8 @@ mod forge_tools;
 mod git_tools;
 mod goal_ext;
 mod host_tools;
+#[allow(dead_code)] // Wired by the file tools when they take `machine`.
+mod machine_fs;
 mod monitor;
 mod native_child_archive;
 mod native_child_history;

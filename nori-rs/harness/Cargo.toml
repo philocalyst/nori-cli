@@ -8,6 +8,7 @@ license = { workspace = true }
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true, default-features = false, features = [
     "http1",
@@ -44,12 +45,14 @@ nori-config = { workspace = true }
 nori-conversation = { workspace = true }
 nori-forge = { workspace = true }
 nori-host-tools = { workspace = true }
-nori-machines = { workspace = true }
+nori-lsp = { workspace = true }
+nori-tools = { workspace = true }
 nori-workflow = { workspace = true }
 nori-pkl = { workspace = true }
 nori-actions = { workspace = true }
 nori-conduit = { workspace = true }
 nori-bash = { workspace = true }
+nori-machines = { workspace = true }
 notify-rust = { workspace = true }
 globset = "0.4"
 regex = { workspace = true }

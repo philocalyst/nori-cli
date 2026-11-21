@@ -21,7 +21,10 @@
 mod bash_report;
 mod bash_tool;
 mod caller;
+#[cfg(test)]
+mod catalog_budget;
 mod conversation_tools;
+mod file_tools;
 mod goal_tools;
 mod job_tools;
 mod lsp_tools;
@@ -97,7 +100,11 @@ pub(crate) struct NoriClientShared {
     pub(super) tool_selection: Option<nori_host_tools::ToolSelection>,
     /// Persistent per-caller in-process Bash sessions (keyed by caller session ID, or `""` for root).
     bash_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<nori_bash::BashSession>>>>>,
+    /// Where each caller's last command on each other machine ended: the next one starts there.
+    remote_dirs: Arc<Mutex<HashMap<(String, nori_machines::MachineName), String>>>,
     caller_key: String,
+    /// The file workspaces and language servers of the session, created on first use.
+    tooling: Arc<file_tools::SessionTooling>,
 }
 
 /// Where a session's tools work: its directory, and the workflow whose rules they apply.
@@ -128,7 +135,9 @@ impl NoriClientShared {
             workspace: None,
             tool_selection: None,
             bash_sessions: Arc::new(Mutex::new(HashMap::new())),
+            remote_dirs: Arc::new(Mutex::new(HashMap::new())),
             caller_key: String::new(),
+            tooling: Arc::default(),
         }
     }
 
@@ -178,8 +187,12 @@ impl NoriClientService {
             + Self::forge_tool_router()
             + Self::monitor_tool_router()
             + Self::job_tool_router()
-            + Self::conversation_tool_router();
+            + Self::conversation_tool_router()
+            + Self::file_tool_router()
+            + Self::lsp_tool_router();
+        file_tools::remove_unless_opted_in(&mut tool_router, shared.tool_selection.as_ref());
         bash_tool::apply_tool_selection(&mut tool_router, shared.tool_selection.as_ref());
+        bash_tool::describe_machines(&mut tool_router, &nori_machines::global());
         Self {
             shared,
             tool_router,
@@ -215,12 +228,14 @@ impl NoriClientService {
 
     /// Every default model-facing tool, as `tools/list` describes it.
     pub(super) fn all_tools() -> Vec<rmcp::model::Tool> {
-        let tool_router = Self::goal_tool_router()
+        let mut tool_router = Self::goal_tool_router()
             + Self::bash_tool_router()
             + Self::task_tool_router()
             + Self::monitor_tool_router()
             + Self::job_tool_router()
-            + Self::conversation_tool_router();
+            + Self::conversation_tool_router()
+            + Self::lsp_tool_router();
+        bash_tool::describe_machines(&mut tool_router, &nori_machines::global());
         tool_router.list_all()
     }
 }
