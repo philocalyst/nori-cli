@@ -295,3 +295,24 @@ v1 transport:
 Authentication, TLS, endpoint discovery, broker routing, Handroll federation,
 capability aggregation across hosts, Streamable HTTP/SSE, and reliable replay
 after disconnect are outside this spec.
+
+## 10. Plugin methods
+
+The remote surface answers two Nori extension methods (ACP's `_`-prefixed extension requests), so
+Rex or any other controller can list and run the commands of the session's plugins
+([pkl-runtime.md](pkl-runtime.md#plugins)) without a prompt. They are served by `HostedAgent::
+ext_request` (`nori-acp-host`), which the harness answers from `HarnessHandle::plugins` and
+`HarnessHandle::run_plugin`; an unknown method is `method not found`, and a connection that has not
+attached to a session gets the unknown-session error.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `_nori/plugins` | none | `{ plugins: [{ name, description, commands: [{ name, description, parameters: [{ name, description, required, default }] }] }] }` |
+| `_nori/plugin.run` | `{ plugin, command, arguments? }` (`arguments` maps parameter names to text) | `{ plugin, command, steps: [...] }`: one result per operation, each tagged `kind` by the operation's name (`session.move`, `job.start`, ...) |
+
+A run that does not start (unknown plugin or command, an unknown or missing argument) is an
+invalid-params error; one that stops at an operation is an internal error whose message is
+`commands.NAME.operations[N] (KIND): reason`. Either way `error.data` is the typed error
+(`{ error: "StepFailed", at, message, completed: [...] }`), so a client can show what ran before the
+failure. The call returns when the command has run; a `session.move` step returns as soon as the
+move is requested, and the move's own progress is what the person sees in the frontend.
