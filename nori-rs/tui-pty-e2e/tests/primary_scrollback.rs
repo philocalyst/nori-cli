@@ -49,7 +49,8 @@ fn primary_history_survives_child_views_resize_and_exit() {
     session
         .wait_for_text("native-history-line-44", Duration::from_secs(20))
         .expect("response");
-    let before = session.scrollback_contents(20);
+    // Fifteen rows back sits the middle of the answer, whatever the height of the bottom block.
+    let before = session.scrollback_contents(15);
     assert!(before.contains("native-history-line-30"), "{before}");
     let main_output = session.output_bytes().expect("capture");
     let mut terminal = vt100::Parser::new(25, 80, 0);
@@ -84,7 +85,7 @@ fn primary_history_survives_child_views_resize_and_exit() {
     );
     assert!(
         session
-            .scrollback_contents(20)
+            .scrollback_contents(15)
             .contains("native-history-line-30")
     );
     session
@@ -123,7 +124,7 @@ fn primary_history_survives_child_views_resize_and_exit() {
             Duration::from_secs(10),
         )
         .expect("parent view restored");
-    let after = session.scrollback_contents(20);
+    let after = session.scrollback_contents(15);
     assert!(after.contains("native-history-line-30"), "{after}");
     let mut terminal = vt100::Parser::new(25, 80, 0);
     terminal.process(session.output_bytes().expect("capture"));

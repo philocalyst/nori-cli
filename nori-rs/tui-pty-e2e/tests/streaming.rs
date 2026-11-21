@@ -67,10 +67,7 @@ fn test_escape_cancels_streaming() {
     // Verify cancellation completed
     // (exact behavior depends on TUI implementation)
     session
-        .wait_for_text(
-            "Conversation interrupted - tell the model what to do differently",
-            TIMEOUT,
-        )
+        .wait_for_text("▌ interrupted · /continue", TIMEOUT)
         .expect("No interrupt reported");
 
     // There are timing issues for when the "Streaming..." chunk shows up,
@@ -110,10 +107,7 @@ fn test_ctrl_c_cancels_streaming() {
     // Verify cancellation completed
     // (exact behavior depends on TUI implementation)
     session
-        .wait_for_text(
-            "Conversation interrupted - tell the model what to do differently",
-            TIMEOUT,
-        )
+        .wait_for_text("▌ interrupted · /continue", TIMEOUT)
         .expect("No interrupt reported");
 
     // There are timing issues for when the "Streaming..." chunk shows up,
@@ -145,10 +139,7 @@ fn test_prompt_submitted_during_cancelling_is_not_lost() {
     session.submit_input("queued follow up").unwrap();
 
     session
-        .wait_for_text(
-            "Conversation interrupted - tell the model what to do differently",
-            TIMEOUT,
-        )
+        .wait_for_text("▌ interrupted · /continue", TIMEOUT)
         .expect("Interrupted turn should finish before the queued prompt is sent");
     session
         .wait_for_text("queued follow up", TIMEOUT)
@@ -176,10 +167,7 @@ fn test_prompt_still_streams_after_interrupt() {
 
     session.send_key(Key::Escape).unwrap();
     session
-        .wait_for_text(
-            "Conversation interrupted - tell the model what to do differently",
-            TIMEOUT,
-        )
+        .wait_for_text("▌ interrupted · /continue", TIMEOUT)
         .expect("First prompt should report interrupt");
     session
         .wait_for_text("›", TIMEOUT)
@@ -192,9 +180,6 @@ fn test_prompt_still_streams_after_interrupt() {
 
     session.send_key(Key::Escape).unwrap();
     session
-        .wait_for_text(
-            "Conversation interrupted - tell the model what to do differently",
-            TIMEOUT,
-        )
+        .wait_for_text("▌ interrupted · /continue", TIMEOUT)
         .expect("Second prompt should also be interruptible");
 }

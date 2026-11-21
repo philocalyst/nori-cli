@@ -100,7 +100,7 @@ fn select_shared_model(session: &mut TuiSession) {
             |screen| {
                 screen
                     .lines()
-                    .any(|line| line.contains('⌕') && line.contains("Fixture 1.0"))
+                    .any(|line| line.contains('❯') && line.contains("Fixture 1.0"))
             },
             TIMEOUT,
         )
@@ -157,7 +157,7 @@ fn quota_rejection_tries_the_alternate_provider_for_one_versioned_row() {
 }
 
 #[test]
-fn non_quota_rejection_does_not_try_the_alternate_provider() {
+fn a_rejection_that_is_not_quota_also_tries_the_alternate_provider() {
     let _serial = ROUTE_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -174,16 +174,23 @@ fn non_quota_rejection_does_not_try_the_alternate_provider() {
         .wait_for_text("Mock Default M", TIMEOUT)
         .expect("initial model config is ready");
     select_shared_model(&mut session);
+    // The person chose the model, not a route: whatever keeps one route from running it says
+    // nothing about the next (see `model_routes::eligible_error`).
     session
-        .wait_for_text("Couldn't update Model", TIMEOUT)
-        .expect("original non-quota error is surfaced");
+        .wait_for_text("trying Mock ACP Alt", TIMEOUT)
+        .expect("the next route is tried");
+    session
+        .wait_for_text("Mock ACP Alt ·", TIMEOUT)
+        .expect("the alternate route runs the model");
 
     let attempts = std::fs::read_to_string(&log).expect("first route request was recorded");
     assert_eq!(
         attempts.lines().map(str::to_owned).collect::<Vec<_>>(),
-        [format!("mock-model\t{MODEL_VALUE}")]
+        [
+            format!("mock-model\t{MODEL_VALUE}"),
+            "mock-model-alt\tprovider-b/fixture-1.0".to_owned(),
+        ]
     );
-    assert!(!session.screen_contents().contains("Mock ACP Alt ·"));
     let _ = std::fs::remove_file(log);
 }
 
@@ -293,12 +300,11 @@ command = "/usr/bin/false"
         .expect("OpenCode route answers after Codex quota exhaustion");
 
     let routes = std::fs::read_to_string(&route_log).expect("model config route log");
+    // The OpenCode route starts on the model (it is handed over with the session), so only the
+    // Codex route sets it.
     assert_eq!(
         routes.lines().map(str::to_owned).collect::<Vec<_>>(),
-        [
-            "codex\tgpt-6-astra".to_owned(),
-            "opencode\topenai/gpt-6-astra".to_owned(),
-        ]
+        ["codex\tgpt-6-astra".to_owned()]
     );
     let prompts = std::fs::read_to_string(&prompt_log).expect("prompt route log");
     let prompts: Vec<_> = prompts
@@ -417,19 +423,32 @@ command = "/usr/bin/false"
         .expect("hide future turn");
     session
         .wait_for(
-            |_| journals_before_rewind.iter().any(|path| {
-                nori_conversation::ConversationLog::open(path).is_ok_and(|log| {
-                    let rewind = log.records().iter().rev().find_map(|record| {
-                        matches!(record.event, nori_conversation::Event::Rewind { .. }).then_some(record.id)
-                    });
-                    rewind.is_some_and(|rewind| log.projection().visible().iter().any(|record| {
-                        record.id > rewind && matches!(&record.event, nori_conversation::Event::Command { name, .. } if name == "backend-bound")
-                    }))
+            |_| {
+                journals_before_rewind.iter().any(|path| {
+                    nori_conversation::ConversationLog::open(path).is_ok_and(|log| {
+                        let rewind = (1..=i64::try_from(log.len()).unwrap_or(i64::MAX))
+                            .rev()
+                            .find(|id| log.kind(*id) == Some(nori_conversation::Kind::Rewind));
+                        rewind.is_some_and(|rewind| {
+                            log.visible_named(nori_conversation::Kind::Command, "backend-bound")
+                                .iter()
+                                .any(|id| *id > rewind)
+                        })
+                    })
                 })
-            }),
+            },
             TIMEOUT,
         )
-        .unwrap_or_else(|error| panic!("rewind and binding: {error}; records: {:?}", journals_before_rewind.iter().map(|path| nori_conversation::ConversationLog::open(path).map(|log| log.records().to_vec())).collect::<Vec<_>>()));
+        .unwrap_or_else(|error| {
+            panic!(
+                "rewind and binding: {error}; records: {:?}",
+                journals_before_rewind
+                    .iter()
+                    .map(|path| nori_conversation::ConversationLog::open(path)
+                        .map(|log| log.all().filter_map(Result::ok).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            )
+        });
     session
         .wait_for_text("OpenCode fixture", TIMEOUT)
         .expect("rewound OpenCode session is ready");
