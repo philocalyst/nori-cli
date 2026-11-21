@@ -225,7 +225,7 @@ impl ParsedRule {
             // Edit rule matches Edit, Write
             "Edit" => matches!(tool_name, "Edit" | "Write"),
             // Task rule matches Task, TaskOutput
-            "Task" => matches!(tool_name, "Task" | "TaskOutput"),
+            "Task" | "Agent" => matches!(tool_name, "Agent" | "Task" | "TaskOutput"),
             // Web rule matches WebSearch, WebFetch
             "Web" => matches!(tool_name, "WebSearch" | "WebFetch"),
             _ => false,
@@ -329,7 +329,7 @@ fn extract_tool_argument(tool_name: &str, input: &serde_json::Value) -> Option<S
             .and_then(|v| v.as_str())
             .map(String::from),
         // Task tool: extract subagent_type for permission control
-        "Task" => input
+        "Agent" | "Task" => input
             .get("subagent_type")
             .or_else(|| input.get("description"))
             .and_then(|v| v.as_str())
