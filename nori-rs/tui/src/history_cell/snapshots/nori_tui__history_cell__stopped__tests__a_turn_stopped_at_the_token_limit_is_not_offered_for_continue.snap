@@ -1,0 +1,6 @@
+---
+source: tui/src/history_cell/stopped.rs
+assertion_line: 85
+expression: text(&cell)
+---
+▌ stopped at the token limit

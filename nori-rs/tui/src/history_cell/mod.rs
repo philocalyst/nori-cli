@@ -20,6 +20,7 @@ mod peer;
 mod plan;
 mod prose;
 pub(crate) mod shell_block;
+mod stopped;
 
 pub(crate) use monitor::MonitorEventsCell;
 pub use notice::FinalMessageSeparator;
@@ -45,6 +46,8 @@ pub(crate) use plan::render_plan_lines;
 pub(crate) use prose::AgentMarkdownCell;
 pub(crate) use prose::AgentMessageCell;
 pub(crate) use prose::UserHistoryCell;
+pub(crate) use stopped::StopWhy;
+pub(crate) use stopped::StoppedTurnCell;
 
 use crate::render::renderable::Renderable;
 use crate::update_action::UpdateAction;

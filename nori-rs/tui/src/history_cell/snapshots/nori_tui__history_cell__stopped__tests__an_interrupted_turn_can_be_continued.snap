@@ -1,0 +1,6 @@
+---
+source: tui/src/history_cell/stopped.rs
+assertion_line: 76
+expression: text(&cell)
+---
+▌ interrupted · /continue
