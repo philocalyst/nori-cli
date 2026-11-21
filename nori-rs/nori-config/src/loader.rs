@@ -225,6 +225,7 @@ impl NoriConfig {
                 .unwrap_or(super::types::BrowserProfileMode::Throwaway),
             notify: toml.notify,
             subagent_sessions: toml.subagent_sessions.unwrap_or(true),
+            nudox: toml.nudox.unwrap_or(true),
             acp_proxy,
             animations: toml.tui.animations.unwrap_or(true),
             terminal_notifications: toml

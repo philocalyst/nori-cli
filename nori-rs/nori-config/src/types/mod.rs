@@ -323,6 +323,10 @@ pub struct NoriConfigToml {
     /// Turn this off for an adapter that misbehaves when it is advertised. Default: true.
     pub subagent_sessions: Option<bool>,
 
+    /// Give every session the nudox code-intelligence MCP server when `nudox` is installed.
+    /// Set `nudox = false` to turn it off. Default: true.
+    pub nudox: Option<bool>,
+
     /// ACP wire proxy logging settings
     #[serde(default)]
     pub acp_proxy: AcpProxyConfigToml,
@@ -2331,6 +2335,9 @@ pub struct NoriConfig {
     /// Advertise subagent support to agents during `initialize`.
     pub subagent_sessions: bool,
 
+    /// Give every session the nudox MCP server when `nudox` is installed.
+    pub nudox: bool,
+
     /// ACP wire proxy logging settings.
     pub acp_proxy: AcpProxyConfig,
 
@@ -2488,6 +2495,7 @@ impl Default for NoriConfig {
             browser_profile: BrowserProfileMode::default(),
             notify: None,
             subagent_sessions: true,
+            nudox: true,
             acp_proxy: AcpProxyConfig {
                 enabled: false,
                 log_dir: PathBuf::from(".nori/cli/acp-wire"),
