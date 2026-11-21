@@ -85,7 +85,7 @@ pub fn check_space(path: &std::path::Path) {
         }
         StorageHealth::Low { .. } if free > 2 * LOW_SPACE_BYTES => {
             *health = StorageHealth::Ok;
-            true
+            false
         }
         StorageHealth::Ok | StorageHealth::Low { .. } | StorageHealth::Failing { .. } => false,
     });
