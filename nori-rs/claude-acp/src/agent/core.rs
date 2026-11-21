@@ -12,6 +12,9 @@ pub struct ClaudeAcpAgent {
     pub(super) sessions: Arc<SessionManager>,
     /// Whether this connection has been told who the account is.
     pub(super) identity_announced: std::sync::atomic::AtomicBool,
+    /// Whether the client is Nori's own harness, the only client that knows Nori's extensions
+    /// (`_auth/status_update`). Another ACP client is never sent them.
+    pub(super) nori_host: std::sync::atomic::AtomicBool,
 }
 
 impl ClaudeAcpAgent {
@@ -20,6 +23,7 @@ impl ClaudeAcpAgent {
             config,
             sessions: Arc::new(SessionManager::new()),
             identity_announced: std::sync::atomic::AtomicBool::new(false),
+            nori_host: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

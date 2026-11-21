@@ -24,6 +24,9 @@ use super::session::Session;
 pub struct SessionManager {
     /// Active sessions keyed by session_id
     sessions: DashMap<String, Arc<Session>>,
+    /// Whether the client said it runs terminals (`clientCapabilities.terminal`). Only then do the
+    /// session's tools use the ACP `terminal/*` methods; Nori's own harness does not offer them.
+    client_terminal: std::sync::atomic::AtomicBool,
 }
 
 impl SessionManager {
@@ -31,6 +34,7 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            client_terminal: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -117,6 +121,18 @@ impl SessionManager {
             session.cleanup().await?;
         }
         Ok(())
+    }
+
+    /// Remember whether the client runs terminals, from its `initialize` request.
+    pub fn set_client_terminal(&self, supported: bool) {
+        self.client_terminal
+            .store(supported, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the client runs terminals.
+    pub fn client_terminal(&self) -> bool {
+        self.client_terminal
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Get all session IDs

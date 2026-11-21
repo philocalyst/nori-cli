@@ -4,21 +4,33 @@ use nori_acp_kit::schema::ListSessionsRequest;
 use nori_acp_kit::schema::ListSessionsResponse;
 use nori_acp_kit::schema::SessionInfo;
 
+use crate::types::AgentConfig;
 use crate::types::AgentError;
 use crate::types::Result;
 
 /// Handle session/list request
 ///
-/// Lists available sessions from the JSONL files in `~/.claude/projects/`.
-/// Supports pagination via cursor and filtering by cwd.
+/// Lists the sessions saved as JSONL files in the login's `projects/` directory (an account's
+/// `CLAUDE_CONFIG_DIR`, else `~/.claude`), newest first, a page at a time, optionally only those
+/// of one working directory. The directory is read on a blocking thread: a login with years of
+/// sessions must not hold up the connection.
 /// Reference: TS `unstable_listSessions` in acp-agent.ts
-pub(super) fn list_sessions(request: ListSessionsRequest) -> Result<ListSessionsResponse> {
-    const PAGE_SIZE: usize = 50;
+pub(super) async fn list_sessions(
+    request: ListSessionsRequest,
+    config: &AgentConfig,
+) -> Result<ListSessionsResponse> {
+    let config_dir = crate::utils::claude_config_dir(&config.environment)
+        .ok_or_else(|| AgentError::Internal("No home directory found".to_string()))?;
+    tokio::task::spawn_blocking(move || list_sessions_in(request, &config_dir.join("projects")))
+        .await
+        .map_err(AgentError::internal)?
+}
 
-    let claude_dir = dirs::home_dir()
-        .ok_or_else(|| AgentError::Internal("No home directory found".to_string()))?
-        .join(".claude")
-        .join("projects");
+fn list_sessions_in(
+    request: ListSessionsRequest,
+    claude_dir: &std::path::Path,
+) -> Result<ListSessionsResponse> {
+    const PAGE_SIZE: usize = 50;
 
     tracing::info!(
         claude_dir = ?claude_dir,
@@ -41,7 +53,7 @@ pub(super) fn list_sessions(request: ListSessionsRequest) -> Result<ListSessions
     let mut all_sessions: Vec<SessionInfo> = Vec::new();
 
     // Read project directories
-    let project_dirs = match std::fs::read_dir(&claude_dir) {
+    let project_dirs = match std::fs::read_dir(claude_dir) {
         Ok(dirs) => dirs,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read projects directory");
@@ -112,13 +124,14 @@ pub(super) fn list_sessions(request: ListSessionsRequest) -> Result<ListSessions
         0
     };
 
+    let total = all_sessions.len();
     let page = all_sessions
         .into_iter()
         .skip(start_index)
         .take(PAGE_SIZE)
         .collect::<Vec<_>>();
 
-    let has_more = start_index + PAGE_SIZE < page.len() + start_index; // Simplified check
+    let has_more = start_index + PAGE_SIZE < total;
 
     let mut response = ListSessionsResponse::new(page);
 

@@ -83,6 +83,13 @@ pub(crate) fn get_acp_replacement_tools() -> Vec<&'static str> {
     ]
 }
 
+/// Fast mode as a session has it: what was chosen, and whether the CLI has yet to be told.
+#[derive(Default)]
+struct FastModeState {
+    chosen: AtomicBool,
+    pending: AtomicBool,
+}
+
 /// An active Claude session
 ///
 /// Each session holds its own ClaudeClient instance and maintains
@@ -108,11 +115,17 @@ pub struct Session {
     ready: tokio::sync::Mutex<bool>,
     /// Permission checker for hooks
     permission_checker: Arc<RwLock<PermissionChecker>>,
-    /// Current model ID for this session (can be changed at runtime via setSessionModel)
+    /// Current model ID for this session: the one it launched with, then whatever it was
+    /// switched to.
     current_model: tokio::sync::RwLock<Option<String>>,
+    /// The models the session's Claude CLI said this account can use (its initialize
+    /// `models`), as it reported them; empty until the CLI has started.
+    reported_models: std::sync::RwLock<Vec<serde_json::Value>>,
     /// A chosen model the running CLI has not been told about yet. The CLI can only be told
     /// once a query exists, so a switch made between prompts waits for the next one.
     model_pending: std::sync::atomic::AtomicBool,
+    /// The chosen Fast mode, and whether the running CLI has been told about it yet.
+    fast_mode: FastModeState,
     /// ACP MCP server for tool execution with notifications
     acp_mcp_server: Arc<AcpMcpServer>,
     /// Nori's tools, which a session started ahead of time gets when it is claimed.
@@ -127,21 +140,43 @@ pub struct Session {
     /// can_use_tool callback uses this to get tool_use_id when CLI doesn't provide it
     /// Key: stable cache key of tool_input, Value: tool_use_id
     tool_use_id_cache: Arc<DashMap<String, String>>,
-    /// The session's turn lock. A newer prompt replaces the running one, and a cancel (from the
-    /// client or an MCP cancellation) cancels the turn that is running.
+    /// The session's turns. A prompt that arrives while a turn runs is admitted and waits its
+    /// place in [`Self::turn_order`]: it never cancels the work under way. A cancel (from the
+    /// client or an MCP cancellation) cancels the running turn and every one waiting.
     gate: Arc<TurnGate>,
+    /// Prompts reach the CLI one turn at a time, in the order they arrived.
+    turn_order: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A prompt's turn, once it is this prompt's turn to talk to the CLI. Dropping it lets the next
+/// waiting prompt go.
+pub struct PromptTurn {
+    turn: Turn,
+    _order: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PromptTurn {
+    pub fn is_cancelled(&self) -> bool {
+        self.turn.is_cancelled()
+    }
 }
 
 impl Session {
-    /// Begin a turn: a prompt that arrives while one runs cancels it and waits for it to end.
-    /// The turn ends when the returned value is dropped; its token is cancelled by
-    /// [`Session::cancel`] or by a newer prompt.
-    pub async fn begin_turn(&self) -> Result<Turn> {
+    /// Begin a turn: a prompt that arrives while one runs waits for it to end, then runs. The
+    /// turn ends when the returned value is dropped; [`Session::cancel`] cancels it whether it
+    /// runs or waits, and a cancelled turn that was waiting ends without reaching the CLI.
+    pub async fn begin_turn(&self) -> Result<PromptTurn> {
         let turn = self.gate.begin().await?;
-        if let Some(tools) = &self.host_tools {
+        let order = Arc::clone(&self.turn_order).lock_owned().await;
+        if !turn.is_cancelled()
+            && let Some(tools) = &self.host_tools
+        {
             tools.reset_cancelled();
         }
-        Ok(turn)
+        Ok(PromptTurn {
+            turn,
+            _order: order,
+        })
     }
 
     /// Wait until no turn is running and none has started for `quiet`: a moment when background
@@ -324,16 +359,30 @@ impl Session {
         }
     }
 
+    /// The models the session's CLI reported, once it has started.
+    pub fn reported_models(&self) -> Vec<serde_json::Value> {
+        self.reported_models
+            .read()
+            .map(|models| models.clone())
+            .unwrap_or_default()
+    }
+
+    /// Keep what the CLI reported about the account's models.
+    pub fn set_reported_models(&self, models: Vec<serde_json::Value>) {
+        if let Ok(mut reported) = self.reported_models.write() {
+            *reported = models;
+        }
+    }
+
     /// Get the current model ID
     pub async fn current_model(&self) -> Option<String> {
         self.current_model.read().await.clone()
     }
 
-    /// Set the model for this session
-    ///
-    /// Updates the model ID used for subsequent prompts. Also updates the
-    /// underlying SDK client's model option.
-    pub async fn set_model(&self, model_id: String) {
+    /// Choose the session's model. It is the session's model at once (the options say so, and
+    /// every CLI started from now on launches with it); the running CLI is told in the background,
+    /// so the choice never waits on a busy or silent CLI.
+    pub async fn set_model(self: &Arc<Self>, model_id: String) {
         // Update session model
         {
             let mut model = self.current_model.write().await;
@@ -345,7 +394,8 @@ impl Session {
         // Tell the running CLI now if it can be told, otherwise on the next prompt.
         self.model_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.apply_pending_model().await;
+        let session = Arc::clone(self);
+        tokio::spawn(async move { session.apply_pending_model().await });
     }
 
     /// Send a chosen model to the CLI if it has not had it yet.
@@ -371,6 +421,41 @@ impl Session {
                 tracing::debug!(%error, "Model not applied yet; it waits for the next prompt");
                 self.model_pending
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Whether Fast mode is chosen for this session.
+    pub fn fast_mode(&self) -> bool {
+        self.fast_mode.chosen.load(Ordering::SeqCst)
+    }
+
+    /// Choose Fast mode, telling the running CLI in the background if it can be told, otherwise
+    /// on the next prompt.
+    pub fn set_fast_mode(self: &Arc<Self>, enabled: bool) {
+        self.fast_mode.chosen.store(enabled, Ordering::SeqCst);
+        self.fast_mode.pending.store(true, Ordering::SeqCst);
+        let session = Arc::clone(self);
+        tokio::spawn(async move { session.apply_pending_fast_mode().await });
+    }
+
+    /// Send the chosen Fast mode to the CLI if it has not had it yet.
+    ///
+    /// Called right after a query is sent, like the model; a failure leaves it pending.
+    pub async fn apply_pending_fast_mode(&self) {
+        if !self.fast_mode.pending.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let enabled = self.fast_mode();
+        let client = self.client.read().await;
+        match client
+            .apply_flag_settings(serde_json::json!({ "fastMode": enabled }))
+            .await
+        {
+            Ok(()) => tracing::info!(enabled, "Fast mode applied to the CLI"),
+            Err(error) => {
+                tracing::debug!(%error, "Fast mode not applied yet; it waits for the next prompt");
+                self.fast_mode.pending.store(true, Ordering::SeqCst);
             }
         }
     }

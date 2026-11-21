@@ -21,15 +21,18 @@ use nori_acp_kit::schema::SessionUpdate;
 use crate::session::PermissionMode;
 use crate::session::Session;
 use crate::session::SessionManager;
-use crate::types::AgentConfig;
 use crate::types::AgentError;
 use crate::types::Result;
+
+/// The id of the Fast mode option.
+pub(super) const FAST: &str = "fast";
 
 /// The model id that means "whatever the Claude CLI picks for this account".
 /// Nothing is pinned to a dated model id, which would go stale.
 const DEFAULT_MODEL_ID: &str = "default";
 
-/// Aliases the Claude CLI resolves itself to its current model of each family.
+/// Aliases the Claude CLI resolves itself to its current model of each family: what is offered
+/// before the session's CLI has said which models the account can use.
 const MODEL_ALIASES: [(&str, &str, &str); 4] = [
     (
         DEFAULT_MODEL_ID,
@@ -41,31 +44,18 @@ const MODEL_ALIASES: [(&str, &str, &str); 4] = [
     ("haiku", "Haiku", "The fastest, for quick answers"),
 ];
 
-const MODES: [(&str, &str, &str); 5] = [
+/// Nori never asks permission: Claude works with every tool, or plans first and asks only
+/// whether the plan is ready.
+const MODES: [(&str, &str, &str); 2] = [
     (
-        "default",
-        "Default",
-        "Standard behavior, prompts for dangerous operations",
-    ),
-    (
-        "acceptEdits",
-        "Accept Edits",
-        "Auto-accept file edit operations",
+        "bypassPermissions",
+        "Build",
+        "Works with every tool; nothing asks first",
     ),
     (
         "plan",
-        "Plan Mode",
-        "Planning mode, no actual tool execution",
-    ),
-    (
-        "dontAsk",
-        "Don't Ask",
-        "Don't prompt for permissions, deny if not pre-approved",
-    ),
-    (
-        "bypassPermissions",
-        "Bypass Permissions",
-        "Bypass all permission checks",
+        "Plan",
+        "Reads and plans; changes nothing until you approve the plan",
     ),
 ];
 
@@ -78,29 +68,48 @@ pub(super) fn mode_state(current: &str) -> SessionModeState {
     SessionModeState::new(current.to_owned(), modes)
 }
 
-/// The mode and model as ACP config options.
+/// The mode, model and Fast mode as ACP config options.
 ///
 /// Clients that follow the stable protocol (Nori among them) read these, not the older `modes`
-/// field, so without them `/model` and the mode switch have nothing to open. The model offered
-/// is the configured one (a full id from settings or the environment is offered as it is), or
-/// `current` when the session has switched to another.
+/// field, so without them `/model` and the mode switch have nothing to open. The models are the
+/// ones the session's Claude CLI reported for this account (`reported`, its initialize `models`),
+/// so a model that ships is offered the day the CLI knows it; before the CLI has started they are
+/// the family aliases. The current model is always among them.
 pub(super) fn options(
-    config: &AgentConfig,
     mode: PermissionMode,
     current_model: Option<&str>,
+    fast: bool,
+    reported: &[serde_json::Value],
 ) -> Options {
-    let configured = config
-        .model
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok());
     let current = current_model
         .map(str::to_owned)
-        .or(configured)
         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned());
-    let models = MODEL_ALIASES
+    let mut models: Vec<Choice> = reported
         .iter()
-        .map(|(id, name, description)| Choice::new(*id, *name).describe(*description))
+        .filter_map(|model| {
+            let value = model.get("value")?.as_str()?;
+            let name = model
+                .get("displayName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(value);
+            let choice = Choice::new(value, name);
+            Some(
+                match model.get("description").and_then(serde_json::Value::as_str) {
+                    Some(description) => choice.describe(description),
+                    None => choice,
+                },
+            )
+        })
         .collect();
+    if models.is_empty() {
+        models = MODEL_ALIASES
+            .iter()
+            .map(|(id, name, description)| Choice::new(*id, *name).describe(*description))
+            .collect();
+    }
+    if !models.iter().any(|choice| choice.value == current) {
+        models.push(Choice::new(current.clone(), current.clone()));
+    }
     let modes = MODES
         .iter()
         .map(|(id, name, description)| Choice::new(*id, *name).describe(*description))
@@ -113,7 +122,7 @@ pub(super) fn options(
             modes,
             mode.as_str(),
         )
-        .describe("How Claude asks before it acts"),
+        .describe("Build, or plan first"),
         Select::new(
             MODEL,
             "Model",
@@ -122,18 +131,24 @@ pub(super) fn options(
             current,
         )
         .describe("The Claude model for the next prompt"),
+        Select::new(
+            FAST,
+            "Fast mode",
+            SessionConfigOptionCategory::Other("model_config".to_owned()),
+            vec![Choice::new("off", "Standard"), Choice::new("on", "Fast")],
+            if fast { "on" } else { "off" },
+        )
+        .describe("Faster responses on supported models"),
     ])
 }
 
 /// The options of `session` as they now stand.
-pub(super) async fn session_options(
-    config: &AgentConfig,
-    session: &Session,
-) -> Vec<SessionConfigOption> {
+pub(super) async fn session_options(session: &Session) -> Vec<SessionConfigOption> {
     options(
-        config,
         session.permission_mode().await,
         session.current_model().await.as_deref(),
+        session.fast_mode(),
+        &session.reported_models(),
     )
     .to_acp()
 }
@@ -149,14 +164,23 @@ pub(super) async fn set_mode(
     let mode = PermissionMode::parse(mode_id)
         .ok_or_else(|| AgentError::invalid(format!("Invalid mode: {mode_id}")))?;
     session.set_permission_mode(mode).await;
-    // The SDK client needs the mode too. A failure leaves the local mode in force.
-    if let Err(error) = session
-        .client()
-        .await
-        .set_permission_mode(mode.to_sdk_mode())
-        .await
+    // The CLI needs the mode too; it is told in the background, so the switch never waits on a
+    // busy or silent CLI. A failure leaves the local mode, which the permission hooks enforce, in
+    // force.
     {
-        tracing::warn!(session_id = %session_id.0, mode = %mode_id, %error, "SDK permission mode not set");
+        let session = Arc::clone(&session);
+        let session_id = session_id.clone();
+        let mode_id = mode_id.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = session
+                .client()
+                .await
+                .set_permission_mode(mode.to_sdk_mode())
+                .await
+            {
+                tracing::warn!(session_id = %session_id.0, mode = %mode_id, %error, "SDK permission mode not set");
+            }
+        });
     }
     if let Err(error) = Sink::new(cx, session_id.clone()).update(SessionUpdate::CurrentModeUpdate(
         CurrentModeUpdate::new(SessionModeId::new(mode_id)),

@@ -44,11 +44,12 @@ impl PermissionMode {
     /// Parse from string (ACP setMode request)
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "default" => Some(Self::Default),
-            "acceptEdits" => Some(Self::AcceptEdits),
+            // Nori never asks permission: the modes that ask, kept by older sessions and
+            // settings, are Build.
+            "default" | "acceptEdits" | "dontAsk" | "bypassPermissions" => {
+                Some(Self::BypassPermissions)
+            }
             "plan" => Some(Self::Plan),
-            "dontAsk" => Some(Self::DontAsk),
-            "bypassPermissions" => Some(Self::BypassPermissions),
             _ => None,
         }
     }
@@ -202,6 +203,15 @@ impl PermissionHandler {
             }
         }
 
+        // Tools that talk to the user or plan the work act on nothing, so every mode allows them
+        // (DontAsk included: there is nobody to ask about them, and nothing to protect).
+        if matches!(
+            tool_name,
+            "AskUserQuestion" | "Agent" | "Task" | "TodoWrite" | "SlashCommand"
+        ) {
+            return ToolPermissionResult::Allowed;
+        }
+
         // Use strategy for mode-specific logic
         let strategy_result = self.strategy.check_permission(tool_name, tool_input);
 
@@ -212,14 +222,6 @@ impl PermissionHandler {
             return ToolPermissionResult::Blocked {
                 reason: "Tool not pre-approved by settings rules in DontAsk mode".to_string(),
             };
-        }
-
-        // User interaction tools should always be allowed
-        if matches!(
-            tool_name,
-            "AskUserQuestion" | "Task" | "TodoWrite" | "SlashCommand"
-        ) {
-            return ToolPermissionResult::Allowed;
         }
 
         strategy_result
@@ -243,22 +245,49 @@ impl PermissionHandler {
 mod tests {
     use super::*;
 
+    /// DontAsk denies what no rule allows, but never the tools that plan the work or talk to the
+    /// person: they act on nothing.
+    #[tokio::test]
+    async fn dont_ask_still_lets_the_agent_plan_and_ask() {
+        let mut handler = PermissionHandler::default();
+        handler.set_mode(PermissionMode::DontAsk);
+        for tool in ["TodoWrite", "Task", "AskUserQuestion"] {
+            assert_eq!(
+                handler.check_permission(tool, &serde_json::json!({})).await,
+                ToolPermissionResult::Allowed,
+                "{tool}"
+            );
+        }
+        assert!(matches!(
+            handler
+                .check_permission("Bash", &serde_json::json!({"command": "rm -rf /"}))
+                .await,
+            ToolPermissionResult::Blocked { .. }
+        ));
+    }
+
     #[test]
     fn test_permission_mode_parse() {
+        // Every mode that would ask is Build; only Plan stays itself.
         assert_eq!(
-            PermissionMode::parse("default"),
-            Some(PermissionMode::Default)
+            [
+                "default",
+                "acceptEdits",
+                "dontAsk",
+                "bypassPermissions",
+                "plan",
+                "invalid"
+            ]
+            .map(PermissionMode::parse),
+            [
+                Some(PermissionMode::BypassPermissions),
+                Some(PermissionMode::BypassPermissions),
+                Some(PermissionMode::BypassPermissions),
+                Some(PermissionMode::BypassPermissions),
+                Some(PermissionMode::Plan),
+                None
+            ]
         );
-        assert_eq!(
-            PermissionMode::parse("acceptEdits"),
-            Some(PermissionMode::AcceptEdits)
-        );
-        assert_eq!(PermissionMode::parse("plan"), Some(PermissionMode::Plan));
-        assert_eq!(
-            PermissionMode::parse("bypassPermissions"),
-            Some(PermissionMode::BypassPermissions)
-        );
-        assert_eq!(PermissionMode::parse("invalid"), None);
     }
 
     #[test]

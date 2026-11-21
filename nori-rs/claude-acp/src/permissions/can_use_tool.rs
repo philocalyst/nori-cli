@@ -65,7 +65,7 @@ fn read_plan_file(plans_dir: &std::path::Path) -> Result<Option<String>, std::io
     }
 
     // Read the directory and find the most recently modified .md file
-    let entries = fs::read_dir(&plans_dir)?;
+    let entries = fs::read_dir(plans_dir)?;
     let mut most_recent_file: Option<PathBuf> = None;
     let mut most_recent_mtime: std::time::SystemTime = std::time::SystemTime::UNIX_EPOCH;
 
@@ -119,17 +119,14 @@ async fn send_exit_plan_mode_request(
     tool_use_id: &str,
     tool_input: &serde_json::Value,
     connection_cx: &Cx,
+    plans_dir: &std::path::Path,
 ) -> Result<ExitPlanModeOutcome, AgentError> {
-    // ExitPlanMode specific options matching TypeScript implementation
+    // The plan is the person's to approve: it is asked as a question (Nori answers every
+    // permission itself), and approving it goes on in Build.
     let options = vec![
         PermissionOption::new(
-            PermissionOptionId::new("acceptEdits"),
-            "Yes, and auto-accept edits",
-            PermissionOptionKind::AllowAlways,
-        ),
-        PermissionOption::new(
-            PermissionOptionId::new("default"),
-            "Yes, and manually approve edits",
+            PermissionOptionId::new("bypassPermissions"),
+            "Yes, build it",
             PermissionOptionKind::AllowOnce,
         ),
         PermissionOption::new(
@@ -152,8 +149,7 @@ async fn send_exit_plan_mode_request(
             )
         } else {
             // Try to read the most recent plan file
-            let plans_dir = session.permission().await.plans_dir().to_path_buf();
-            match read_plan_file(&plans_dir) {
+            match read_plan_file(plans_dir) {
                 Ok(Some(plan_content)) => {
                     info!("Read plan file content for ExitPlanMode display");
                     (
@@ -192,12 +188,14 @@ async fn send_exit_plan_mode_request(
             .raw_input(raw_input),
     );
 
-    // Build the request
+    let mut question = serde_json::Map::new();
+    question.insert("nori".to_owned(), serde_json::json!({ "question": true }));
     let request = RequestPermissionRequest::new(
         SessionId::new(session_id.to_string()),
         tool_call_update,
         options,
-    );
+    )
+    .meta(question);
 
     tracing::info!(
         session_id = %session_id,
@@ -222,13 +220,11 @@ async fn send_exit_plan_mode_request(
     // Parse the response
     match response.outcome {
         RequestPermissionOutcome::Selected(selected) => match &*selected.option_id.0 {
-            "acceptEdits" => {
-                info!("User selected: Yes, and auto-accept edits");
-                Ok(ExitPlanModeOutcome::Approve(PermissionMode::AcceptEdits))
-            }
-            "default" => {
-                info!("User selected: Yes, and manually approve edits");
-                Ok(ExitPlanModeOutcome::Approve(PermissionMode::Default))
+            "bypassPermissions" | "acceptEdits" | "default" => {
+                info!("User approved the plan");
+                Ok(ExitPlanModeOutcome::Approve(
+                    PermissionMode::BypassPermissions,
+                ))
             }
             "plan" => {
                 info!("User selected: No, keep planning");
@@ -277,8 +273,15 @@ async fn handle_exit_plan_mode(
     };
 
     // Send ExitPlanMode permission request
-    match send_exit_plan_mode_request(&session.session_id, tool_use_id, &tool_input, connection_cx)
-        .await
+    let plans_dir = session.permission().await.plans_dir().to_path_buf();
+    match send_exit_plan_mode_request(
+        &session.session_id,
+        tool_use_id,
+        &tool_input,
+        connection_cx,
+        &plans_dir,
+    )
+    .await
     {
         Ok(ExitPlanModeOutcome::Approve(mode)) => {
             info!(

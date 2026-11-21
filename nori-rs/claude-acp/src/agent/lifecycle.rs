@@ -87,8 +87,9 @@ pub(super) async fn new_session(
         let session = Arc::clone(&session);
         let cx = cx.clone();
         let next = plain.then(|| (key, cwd, config.clone(), tools.mcp_servers.clone()));
+        let client_terminal = sessions.client_terminal();
         tokio::spawn(async move {
-            if let Err(error) = prepare_session(&session, &cx).await {
+            if let Err(error) = prepare_session(&session, &cx, client_terminal).await {
                 tracing::debug!(session_id = %session.session_id, %error, "Warm-up did not finish");
             }
             if let Some((key, cwd, config, mcp_servers)) = next {
@@ -100,8 +101,10 @@ pub(super) async fn new_session(
     announce_commands(cx, &session_id);
 
     Ok(NewSessionResponse::new(session_id)
-        .modes(catalog::mode_state(PermissionMode::Default.as_str()))
-        .config_options(catalog::session_options(config, &session).await))
+        .modes(catalog::mode_state(
+            PermissionMode::BypassPermissions.as_str(),
+        ))
+        .config_options(catalog::session_options(&session).await))
 }
 
 pub(super) async fn load_session(
@@ -127,8 +130,10 @@ pub(super) async fn load_session(
     };
     announce_commands(cx, &request.session_id);
     Ok(LoadSessionResponse::new()
-        .modes(catalog::mode_state(PermissionMode::Default.as_str()))
-        .config_options(catalog::session_options(config, &session).await))
+        .modes(catalog::mode_state(
+            PermissionMode::BypassPermissions.as_str(),
+        ))
+        .config_options(catalog::session_options(&session).await))
 }
 
 pub(super) async fn resume_session(
@@ -155,8 +160,10 @@ pub(super) async fn resume_session(
     };
     announce_commands(cx, &request.session_id);
     Ok(ResumeSessionResponse::new()
-        .modes(catalog::mode_state(PermissionMode::Default.as_str()))
-        .config_options(catalog::session_options(config, &session).await))
+        .modes(catalog::mode_state(
+            PermissionMode::BypassPermissions.as_str(),
+        ))
+        .config_options(catalog::session_options(&session).await))
 }
 
 pub(super) async fn fork_session(
@@ -179,23 +186,31 @@ pub(super) async fn fork_session(
     let new_id = SessionId::new(new_id);
     announce_commands(cx, &new_id);
     Ok(ForkSessionResponse::new(new_id)
-        .modes(catalog::mode_state(PermissionMode::Default.as_str()))
-        .config_options(catalog::session_options(config, &session).await))
+        .modes(catalog::mode_state(
+            PermissionMode::BypassPermissions.as_str(),
+        ))
+        .config_options(catalog::session_options(&session).await))
 }
 
 /// Get a session ready to take its first query: wire up the ACP tools, connect external MCP
 /// servers, and start the Claude CLI. Idempotent, and serialized per session, so the work that
 /// starts when the session is created and the first prompt never do it twice.
-pub(super) async fn prepare_session(session: &Arc<Session>, cx: &Cx) -> Result<()> {
+pub(super) async fn prepare_session(
+    session: &Arc<Session>,
+    cx: &Cx,
+    client_terminal: bool,
+) -> Result<()> {
     let mut ready = session.ready().lock().await;
     if *ready {
         return Ok(());
     }
     let start = Instant::now();
-    // The ACP tools (Bash and the rest) send terminal updates through the connection.
-    let terminal_client = Arc::new(TerminalClient::new(cx.clone(), session.session_id.clone()));
+    // The ACP tools (Bash and the rest) run commands in the client's terminals only when the
+    // client runs terminals; otherwise they run them here and stream the output as updates.
+    let terminal_client = client_terminal
+        .then(|| Arc::new(TerminalClient::new(cx.clone(), session.session_id.clone())));
     session
-        .configure_acp_server(cx.clone(), Some(terminal_client))
+        .configure_acp_server(cx.clone(), terminal_client)
         .await;
     // The can_use_tool callback asks the client for permission through the connection.
     session.set_connection_cx(cx.clone());
@@ -204,6 +219,28 @@ pub(super) async fn prepare_session(session: &Arc<Session>, cx: &Cx) -> Result<(
     // and Nori's host tools are in this process.
     if !session.is_connected() {
         session.connect().await?;
+        // The CLI says which models this account can use, and the client hears of them at once:
+        // `/model` offers what the account has today, not a list Nori keeps.
+        let reported = session
+            .client()
+            .await
+            .get_server_info()
+            .await
+            .and_then(|info| {
+                // The control response keeps its payload under `response`.
+                info.pointer("/response/models")
+                    .or_else(|| info.get("models"))
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+            });
+        if let Some(models) = reported {
+            session.set_reported_models(models);
+            let options = catalog::session_options(session).await;
+            let sink = Sink::new(cx, SessionId::new(session.session_id.clone()));
+            if let Err(error) = sink.config_options(options) {
+                tracing::debug!(session_id = %session.session_id, %error, "Model list not sent");
+            }
+        }
     }
     *ready = true;
     tracing::info!(

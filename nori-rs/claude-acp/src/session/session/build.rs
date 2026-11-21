@@ -135,19 +135,24 @@ impl Session {
         // Create can_use_tool callback with OnceLock<Session>
         let can_use_tool_callback = create_can_use_tool_callback(session_lock.clone());
 
-        // Build ClaudeAgentOptions
-        //
-        // Note: We use AcceptEdits instead of BypassPermissions because
-        // BypassPermissions mode cannot be used with root/sudo privileges
-        // for security reasons (Claude CLI enforces this restriction).
-        // AcceptEdits allows tool execution without permission prompts while
-        // being compatible with root user environments.
+        // Nori never asks permission, so Claude bypasses its checks. The CLI refuses that mode as
+        // root; there it accepts edits, and the permission hooks allow the rest.
+        #[cfg(unix)]
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let as_root = unsafe { libc::geteuid() } == 0;
+        #[cfg(not(unix))]
+        let as_root = false;
+        let permission_mode = if as_root {
+            SdkPermissionMode::AcceptEdits
+        } else {
+            SdkPermissionMode::BypassPermissions
+        };
         let mut options = ClaudeAgentOptions::builder()
             .cwd(cwd.clone())
             .hooks(hooks_map)
             .mcp_servers(McpServers::Dict(mcp_servers_dict))
             .can_use_tool(can_use_tool_callback)
-            .permission_mode(SdkPermissionMode::AcceptEdits)
+            .permission_mode(permission_mode)
             // Using circular buffer (ringbuf) - auto-recycles old data, no need for large buffer
             .max_buffer_size(20 * 1024 * 1024) // 20MB 缓冲区
             // 允许读取用户级 settings (for API keys, etc.)
@@ -292,6 +297,7 @@ impl Session {
         }
 
         // Create the client
+        let launch_model = options.model.clone();
         let client = ClaudeClient::new(options);
 
         let elapsed = start_time.elapsed();
@@ -318,14 +324,17 @@ impl Session {
             connected: AtomicBool::new(false),
             ready: tokio::sync::Mutex::new(false),
             permission_checker,
-            current_model: tokio::sync::RwLock::new(None),
+            current_model: tokio::sync::RwLock::new(launch_model),
+            reported_models: std::sync::RwLock::new(Vec::new()),
             model_pending: std::sync::atomic::AtomicBool::new(false),
+            fast_mode: FastModeState::default(),
             acp_mcp_server,
             host_tools: tools.host_tools.clone(),
             background_processes,
             connection_cx_lock,
             tool_use_id_cache,
-            gate: Arc::new(TurnGate::new(TurnPolicy::Replace)),
+            gate: Arc::new(TurnGate::new(TurnPolicy::Steerable)),
+            turn_order: Arc::default(),
         };
 
         // Wrap in Arc

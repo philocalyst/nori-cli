@@ -21,6 +21,9 @@ use nori_acp_kit::schema::PromptResponse;
 use nori_acp_kit::schema::SessionInfoUpdate;
 use nori_acp_kit::schema::SessionUpdate;
 use nori_acp_kit::schema::StopReason;
+use nori_acp_kit::schema::ToolCallStatus;
+use nori_acp_kit::schema::ToolCallUpdate;
+use nori_acp_kit::schema::ToolCallUpdateFields;
 use serde_json::Value;
 
 use super::lifecycle::prepare_session;
@@ -35,6 +38,8 @@ type MessageStream<'a> =
 
 /// How long a cancelled turn may keep delivering the CLI's last messages before it stops waiting.
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
+/// How long a cancelled turn waits for the CLI to acknowledge its interrupt.
+const INTERRUPT_WAIT: Duration = Duration::from_secs(2);
 
 /// Run `request` to its end. A newer prompt, or a cancel, cancels the turn; the CLI is
 /// interrupted once and the turn ends `Cancelled` when its last messages are in.
@@ -55,11 +60,15 @@ pub(super) async fn run(
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
 
     let turn = session.begin_turn().await?;
+    // Cancelled while it waited for the turn before it: it never reaches the CLI.
+    if turn.is_cancelled() {
+        return Ok(PromptResponse::new(StopReason::Cancelled));
+    }
     session.set_converter_request_id(request_id.clone()).await;
 
     // Everything that must happen before the first query: usually already done, because it
     // starts as soon as the session exists. A prompt that arrives first waits for that work.
-    prepare_session(&session, cx).await?;
+    prepare_session(&session, cx, sessions.client_terminal()).await?;
 
     {
         let mut client = session.client_mut().await;
@@ -91,12 +100,17 @@ pub(super) async fn run(
     }
     // A model chosen since the last prompt goes to the CLI now that a query exists.
     session.apply_pending_model().await;
+    session.apply_pending_fast_mode().await;
 
     let client = session.client().await;
     let mut stream = client.receive_response();
     let mut interrupted_at: Option<Instant> = None;
     let mut last_result: Option<ResultMessage> = None;
     let mut quota_error: Option<AgentError> = None;
+    // Why the model last stopped writing at the top level (`end_turn`, `max_tokens`, `refusal`).
+    let mut model_stop: Option<String> = None;
+    // How the CLI ended, when it ended before the turn did.
+    let mut cli_exit: Option<ClaudeError> = None;
     let started = Instant::now();
 
     loop {
@@ -105,8 +119,16 @@ pub(super) async fn run(
         if turn.is_cancelled() {
             match interrupted_at {
                 None => {
-                    if let Err(error) = client.interrupt().await {
-                        tracing::warn!(%session_id, %error, "Failed to interrupt the CLI");
+                    // Bounded: a CLI that is slow to acknowledge must not hold up the messages it
+                    // is still sending, nor the end of the turn.
+                    match tokio::time::timeout(INTERRUPT_WAIT, client.interrupt()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%session_id, %error, "Failed to interrupt the CLI");
+                        }
+                        Err(_) => {
+                            tracing::warn!(%session_id, "The CLI did not acknowledge the interrupt");
+                        }
                     }
                     interrupted_at = Some(Instant::now());
                 }
@@ -127,22 +149,11 @@ pub(super) async fn run(
         let message = match next {
             Some(Ok(message)) => message,
             None => break,
-            Some(Err(error)) if error.to_string().contains("unknown variant") => {
-                // Preserve the raw payload even when a future CLI message type is not known to
-                // this SDK version.
-                if let ClaudeError::MessageParse(parse_error) = &error
-                    && let Some(raw_event) = parse_error.data.clone()
-                {
-                    let meta =
-                        serde_json::Map::from_iter([("_claude/rawEvent".to_owned(), raw_event)]);
-                    if let Err(error) = sink.update(SessionUpdate::SessionInfoUpdate(
-                        SessionInfoUpdate::new().meta(meta),
-                    )) {
-                        tracing::warn!(%session_id, %error, "Unknown Claude event not preserved");
-                    }
-                }
-                tracing::warn!(%session_id, %error, "Skipping a message type the SDK does not recognise");
-                continue;
+            // The CLI is gone: nothing more will come, and its replacement starts with the next
+            // query, resuming the conversation.
+            Some(Err(error @ ClaudeError::CliExited(_))) => {
+                cli_exit = Some(error);
+                break;
             }
             // An individual bad message does not fail the turn.
             Some(Err(error)) => {
@@ -175,6 +186,33 @@ pub(super) async fn run(
                 if let Some(usage) = &assistant.message.usage {
                     session.usage().record_context(usage);
                 }
+                if let Some(stop) = &assistant.message.stop_reason {
+                    model_stop = Some(stop.clone());
+                }
+            }
+            Message::StreamEvent(event) if event.parent_tool_use_id.is_none() => {
+                if let Some(stop) = event
+                    .event
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .filter(|_| event.event["type"] == "message_delta")
+                {
+                    model_stop = Some(stop.to_owned());
+                }
+            }
+            // A message kind newer than this adapter (`tool_progress`, say) reaches the client
+            // whole, for a client that knows it, and never breaks the turn.
+            Message::Unrecognized(raw_event) => {
+                let meta = serde_json::Map::from_iter([(
+                    "_claude/rawEvent".to_owned(),
+                    raw_event.clone(),
+                )]);
+                if let Err(error) = sink.update(SessionUpdate::SessionInfoUpdate(
+                    SessionInfoUpdate::new().meta(meta),
+                )) {
+                    tracing::warn!(%session_id, %error, "Unknown Claude event not forwarded");
+                }
+                continue;
             }
             Message::RateLimitEvent(event) => {
                 if session.usage().record_rate_limit(event) {
@@ -206,6 +244,27 @@ pub(super) async fn run(
 
     tracing::info!(%session_id, elapsed_ms = started.elapsed().as_millis(), "Prompt completed");
     report_usage(&session, &sink);
+    if cli_exit.is_some() {
+        // The tools the CLI was running when it went away will never finish: end them, so the
+        // client is not left with a call that spins forever.
+        let unfinished = session.converter().await.unfinished_tool_uses();
+        for tool_use_id in unfinished {
+            let update = ToolCallUpdate::new(
+                tool_use_id,
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Failed)
+                    .content(vec![
+                        ContentBlock::from(
+                            "Claude Code stopped before this tool finished.".to_owned(),
+                        )
+                        .into(),
+                    ]),
+            );
+            if let Err(error) = sink.tool_update(update) {
+                tracing::warn!(%session_id, %error, "A cut-short tool was not ended");
+            }
+        }
+    }
 
     // The connection delivers notifications asynchronously, so a response sent now could
     // overtake the last updates. A short pause keeps them ahead of the end of the turn.
@@ -219,30 +278,45 @@ pub(super) async fn run(
     if let Some(error) = quota_error {
         return Err(error);
     }
+    if let Some(exit) = cli_exit {
+        return Err(crate::types::from_sdk(exit));
+    }
     let Some(result) = last_result else {
-        return Err(AgentError::internal("Session did not end in result"));
+        return Err(AgentError::internal(
+            "Claude Code ended the turn without a result",
+        ));
     };
     if result.is_error {
+        // What the CLI reports is usually the provider's own failure (`API Error: 529 {...}`):
+        // the person reads the provider's sentence, and the class comes from its body.
         let detail = result
             .result
             .clone()
-            .unwrap_or_else(|| result.subtype.clone());
-        return Err(AgentError::provider(
-            None,
-            format!("Query failed: {detail} (subtype: {})", result.subtype),
-        ));
+            .filter(|detail| !detail.trim().is_empty())
+            .unwrap_or_else(|| format!("Claude Code ended the turn with {}", result.subtype));
+        return Err(AgentError::provider(None, detail));
     }
-    Ok(PromptResponse::new(stop_reason(&result.subtype)))
+    Ok(PromptResponse::new(stop_reason(
+        &result.subtype,
+        model_stop.as_deref(),
+    )))
 }
 
-fn stop_reason(subtype: &str) -> StopReason {
+/// Why a turn that ended without an error ended: the model's own stop reason where it says the
+/// answer was cut off (`max_tokens`) or declined (`refusal`), else what the CLI's result says.
+fn stop_reason(subtype: &str, model_stop: Option<&str>) -> StopReason {
+    match model_stop {
+        Some("max_tokens" | "model_context_window_exceeded") => return StopReason::MaxTokens,
+        Some("refusal") => return StopReason::Refusal,
+        _ => {}
+    }
     match subtype {
-        // An execution cut short without an error ends the turn like a success.
-        "success" | "error_during_execution" => StopReason::EndTurn,
         "error_max_budget_usd" | "error_max_turns" | "error_max_structured_output_retries" => {
             StopReason::MaxTurnRequests
         }
-        _ => StopReason::Refusal,
+        // A success, an execution cut short without an error, and a result this version does
+        // not know all end the turn normally: none of them is the model declining.
+        _ => StopReason::EndTurn,
     }
 }
 
@@ -333,4 +407,30 @@ async fn drain(session_id: &str, stream: &mut MessageStream<'_>) {
         }
     }
     tracing::warn!(%session_id, "Drain reached its maximum duration while messages kept arriving");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn the_models_own_stop_reason_says_when_an_answer_was_cut_off_or_declined() {
+        let cases = [
+            ("success", Some("max_tokens"), StopReason::MaxTokens),
+            ("success", Some("refusal"), StopReason::Refusal),
+            ("success", Some("end_turn"), StopReason::EndTurn),
+            ("success", None, StopReason::EndTurn),
+            ("error_max_turns", None, StopReason::MaxTurnRequests),
+            // A result kind this version does not know is not the model declining.
+            ("success_with_a_new_name", None, StopReason::EndTurn),
+        ];
+        for (subtype, model_stop, expected) in cases {
+            assert_eq!(
+                stop_reason(subtype, model_stop),
+                expected,
+                "{subtype} {model_stop:?}"
+            );
+        }
+    }
 }

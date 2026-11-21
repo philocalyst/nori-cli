@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 
-use nori_acp_kit::AuthAccount;
 use nori_acp_kit::AuthStatus;
 use nori_acp_kit::Cx;
 use nori_acp_kit::announce_auth_status;
@@ -42,7 +41,7 @@ pub(super) fn announce(cx: &Cx, config: &AgentConfig) {
         let Some(status) = std::str::from_utf8(&output.stdout)
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            .and_then(|json| status_of(&json))
+            .and_then(|json| AuthStatus::from_claude_cli(&json))
         else {
             return;
         };
@@ -50,31 +49,4 @@ pub(super) fn announce(cx: &Cx, config: &AgentConfig) {
             tracing::debug!(%error, "account identity not sent");
         }
     });
-}
-
-/// The status `claude auth status --json` describes.
-fn status_of(json: &Value) -> Option<AuthStatus> {
-    let text = |key: &str| json.get(key).and_then(Value::as_str).map(str::to_owned);
-    let logged_in = json.get("loggedIn")?.as_bool()?;
-    let api_key = text("apiKeySource");
-    if !logged_in && api_key.is_none() {
-        return Some(AuthStatus::signed_out());
-    }
-    if let Some(source) = api_key {
-        return Some(AuthStatus {
-            kind: "api_key".to_owned(),
-            label: "Anthropic API key".to_owned(),
-            detail: Some(source),
-            account: None,
-        });
-    }
-    let plan = text("subscriptionType")?;
-    Some(AuthStatus::account(
-        format!("Claude {plan}"),
-        AuthAccount {
-            email: text("email"),
-            organization: text("orgName"),
-            plan: Some(plan),
-        },
-    ))
 }
