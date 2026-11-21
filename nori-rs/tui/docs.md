@@ -442,8 +442,26 @@ effort option (the one it declares as its thought level, or named for effort or 
 through the same path, and the footer's model segment shows both (`Sonnet 5.5 · High`).
 `ctrl+shift+n` and `ctrl+shift+p` remain aliases where the terminal reports Shift; some
 terminals fold it into the letter and report plain ctrl+n, which is indistinguishable from
-Next Model. Recognized models are ranked by the configured model ordering;
-unrecognized models retain their advertised order (`agent_config_state::sort_models`).
+Next Model.
+
+The Next and Previous Model Mode hotkeys (`next_model_mode` and `previous_model_mode`, default
+`alt+.` and `alt+,`) step the agent's **model mode** option the same way (Claude Code's `fast`
+toggle, Codex's `service_tier`): the footer's model segment adds the mode when it is not the
+standard one (`Opus 5.5 · High · Fast`). An agent with no such option answers with a notice. Modes
+are rebindable under `[tui.hotkeys]` like the model and effort keys, and listed by `/hotkeys`.
+
+What the three keys step through is one thing, `nori_protocol::ladder` (`model_controls.rs`),
+and the pickers sort by the same `standing`: models in the order the agent advertises them, which
+is the order `/model` lists; effort from least to most (`default` first, then none, minimal, low,
+medium, high, xhigh, max, ultra, and persistent when offered, followed by other values in the
+agent's advertised order); modes from slowest to fastest (flex, standard, fast, priority, followed
+by other values in the agent's advertised order). A step past either end wraps around to the
+other and says so with a transient notice. A value the list does not contain (a model typed in by
+hand) is on neither end: forward lands on the first value and back on the last, so a step and its
+reverse always meet. Pressing never waits for a turn: the keys work while a turn runs. The agent's
+own `session/update` announcement of a config change is not adopted while a run of presses is
+unanswered (`ModelCycle::is_settling`); the answer to the last press settles the configuration, so
+an echo of an earlier press cannot put the footer back.
 
 The Next Model and Previous Model hotkeys (default `ctrl+n` and `ctrl+p`) step
 through the models the agent offers without a picker (`chatwidget/model_cycle.rs`,
@@ -1202,6 +1220,12 @@ group. Textarea corner segments are clamped to the composer and are skipped
 entirely when the composer is squeezed below its three-row minimum, so they
 never land on the prompt line.
 
+When the status line under the composer is too narrow, the model label drops
+whole parts first: the agent name, then the effort and any other options after
+the model. Only when the model name alone does not fit is it truncated with an
+ellipsis. The mode badge always stays. Right-side groups shed from the left, but
+only when they would push the model name out.
+
 `[tui.footer_layout]` accepts the same layout entries in `footer_left`,
 `footer_right`, and all four `textarea_*` corners. An entry is either a built-in
 segment name or an inline custom chunk:
@@ -1296,25 +1320,29 @@ header provides the branding; the first-launch welcome screen does not gate
 input or rewrite the user's configuration. The separate trust flow remains
 available when the resolved policy requires it.
 
-The startup status block is an unbordered two-row summary beneath a green
-prompt marker: system context on one row and agent identity on the next. The
-system row is the location (directory, or the cloud session id and title) and
-the approval mode. It deliberately carries no skillset: the welcome card is
-rendered to lines once and written into terminal scrollback before the
-background `list-active` refresh finishes, so a skillset there could never be
-kept current. The
-agent row reads provider, then the agent's model, then its thought level, then
-its remaining options in exactly the order the agent advertised them; boolean
-toggles read by presence (the label appears only when the toggle is on). Before
-the agent advertises any configuration the row is the provider name alone —
-nothing is guessed.
+The startup welcome is one unbordered line beneath a green prompt marker:
+`Nori CLI`, the version, and where the session is (the directory, or the cloud
+session id and title). It does not name the agent or its configuration, because
+the status line under the composer already does. The line never wraps. When the
+row is narrow the version goes first, then the separator narrows from `  ·  ` to
+` · `, and the location is cut to what is left. The front of a path is what goes:
+its last components stay, so a long path reads `…/mobileqa/work`. The welcome
+deliberately carries no skillset: the card is rendered to lines once and written
+into terminal scrollback before the background `list-active` refresh finishes,
+so a skillset there could never be kept current.
+
+The agent and its configuration are on the `/status` card. The `Agent` row names
+the provider, and one indented row per advertised option follows in the order
+the agent advertised them, with the model and then the thought level first.
+Boolean toggles read `On` or `Off`. Before the agent advertises any configuration
+the row is the provider name alone; nothing is guessed.
 
 The card is written at startup, not at `SessionStarted`. Startup now
 auto-activates the session, but the welcome card is still emitted immediately so
 it shows while the agent resolves its configuration rather than blanking until
 activation commits. `App::run` calls `ChatWidget::emit_welcome_card` once
-everything local is configured; the agent row is the provider name alone at that
-point, and when the session does start `on_session_started` updates the live
+everything local is configured; the welcome line says only where the session is
+at that point, and when the session does start `on_session_started` updates the live
 footer with the model and options without adding a history notice or second card.
 Two entries keep writing the card at session start instead: a cloud session,
 whose card names a broker session it only learns about once attached, and the
