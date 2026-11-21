@@ -1,6 +1,7 @@
 ---
 source: tui/src/status_indicator_widget.rs
+assertion_line: 393
 expression: terminal.backend()
 ---
-"• Thinking really hard (0s • esc to interrupt)                                  "
+"• Thinking really hard (0s)                                                     "
 "                                                                                "
