@@ -10,6 +10,22 @@ use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
+/// Every record of `log`, hidden branches included, read.
+fn all(log: &ConversationLog) -> Vec<crate::Record> {
+    log.all()
+        .map(|record| record.map(Arc::unwrap_or_clone))
+        .collect::<io::Result<_>>()
+        .unwrap()
+}
+
+/// The visible records of `log`, read.
+fn visible(log: &ConversationLog) -> Vec<crate::Record> {
+    log.visible()
+        .map(|record| record.map(Arc::unwrap_or_clone))
+        .collect::<io::Result<_>>()
+        .unwrap()
+}
+
 fn message(content: &str) -> Event {
     Event::Message {
         role: "user".into(),
@@ -66,13 +82,10 @@ fn rewind_keeps_history_and_replay_reconstructs_branch() {
     log.append(Event::Rewind { head: Some(1) }).unwrap();
     log.append(message("replacement\n\"quoted\"")).unwrap();
     let expected = log.projection().clone();
-    assert_eq!(
-        expected.visible().iter().map(|r| r.id).collect::<Vec<_>>(),
-        vec![1, 4]
-    );
+    assert_eq!(expected.visible().to_vec(), vec![1, 4]);
     let replay = ConversationLog::open(&path).unwrap();
     assert_eq!(replay.projection(), &expected);
-    assert_eq!(replay.records().len(), 4);
+    assert_eq!(replay.len(), 4);
     assert!(fs::read_to_string(path).unwrap().contains("hidden"));
 }
 
@@ -85,22 +98,18 @@ fn slices_are_inclusive_and_require_visible_ordered_boundaries() {
     }
     let reference = SliceRef { start: 1, end: 2 };
     assert_eq!(
-        log.projection()
-            .slice(reference)
+        log.slice(reference)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|record| record.id)
             .collect::<Vec<_>>(),
         vec![1, 2]
     );
-    assert!(
-        log.projection()
-            .slice(SliceRef { start: 2, end: 1 })
-            .is_none()
-    );
+    assert!(log.slice(SliceRef { start: 2, end: 1 }).unwrap().is_none());
     log.append(Event::Fork { source: reference }).unwrap();
     log.append(Event::Rewind { head: Some(1) }).unwrap();
-    assert!(log.projection().slice(reference).is_none());
+    assert!(log.slice(reference).unwrap().is_none());
     assert_eq!(
         log.slice_at(3, reference)
             .unwrap()
@@ -111,7 +120,7 @@ fn slices_are_inclusive_and_require_visible_ordered_boundaries() {
         vec![1, 2]
     );
     assert!(log.append(Event::Fork { source: reference }).is_err());
-    assert_eq!(log.records().len(), 5);
+    assert_eq!(log.len(), 5);
 }
 
 #[test]
@@ -120,10 +129,10 @@ fn partial_tail_and_unknown_events_are_safe_to_replay() {
     let path = dir.path().join("s.pkl");
     fs::write(&path, b"event_1 = new { kind = \"future-op\"; data = \"{}\" }\nevent_2 = new { kind = \"message\"").unwrap();
     let mut log = ConversationLog::open(&path).unwrap();
-    assert_eq!(log.records().len(), 1);
+    assert_eq!(log.len(), 1);
     log.append(message("recovered")).unwrap();
     let replay = ConversationLog::open(&path).unwrap();
-    assert_eq!(replay.records(), log.records());
+    assert_eq!(all(&replay), all(&log));
     assert_eq!(replay.projection(), log.projection());
     let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
     writeln!(file, "bad record").unwrap();
@@ -143,7 +152,7 @@ fn replay_ignores_unknown_fields_in_known_events() {
     )
     .unwrap();
     let log = ConversationLog::open(path).unwrap();
-    assert_eq!(log.projection().visible()[0].event, message("hello"));
+    assert_eq!(visible(&log)[0].event, message("hello"));
 }
 
 #[test]
@@ -159,7 +168,7 @@ fn replay_preserves_operations_as_data_without_running_them() {
     log.append(event.clone()).unwrap();
 
     let reopened = ConversationLog::open(path).unwrap();
-    assert_eq!(reopened.projection().visible()[0].event, event);
+    assert_eq!(visible(&reopened)[0].event, event);
     assert!(!effect.exists());
 }
 
@@ -194,7 +203,7 @@ fn shared_transport_checks_head_and_deduplicates_commands_across_reloads() {
             .is_err()
     );
     let reopened = ConversationLog::with_store(store).unwrap();
-    assert_eq!(reopened.records().len(), 2);
+    assert_eq!(reopened.len(), 2);
     assert_eq!(reopened.projection().head(), Some(2));
 }
 
@@ -233,7 +242,7 @@ fn file_store_atomically_compares_and_appends_across_instances() {
         vec![std::io::ErrorKind::WouldBlock]
     );
     let replay = ConversationLog::open(path).unwrap();
-    assert_eq!(replay.records().len(), 1);
+    assert_eq!(replay.len(), 1);
     assert_eq!(replay.projection().head(), Some(1));
 }
 
@@ -345,7 +354,7 @@ fn streamed_appends_do_not_reload_the_journal() {
     }
     assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
     let replay = ConversationLog::with_store(store).unwrap();
-    assert_eq!(replay.records(), log.records());
+    assert_eq!(all(&replay), all(&log));
     assert_eq!(replay.projection(), log.projection());
 }
 
@@ -362,7 +371,7 @@ fn contention_with_a_rewound_head_refreshes_ids_before_append() {
         .unwrap();
     assert_eq!(record.id, 4);
     let replay = ConversationLog::with_store(store).unwrap();
-    assert_eq!(stale.records(), replay.records());
+    assert_eq!(all(&stale), all(&replay));
     assert_eq!(stale.projection(), replay.projection());
 }
 
@@ -380,7 +389,7 @@ fn invalid_projection_change_does_not_write_or_mutate_the_branch() {
     );
     assert_eq!(log.projection(), &expected);
     let replay = ConversationLog::with_store(store).unwrap();
-    assert_eq!(log.records(), replay.records());
+    assert_eq!(all(&log), all(&replay));
     assert_eq!(log.append(message("next")).unwrap().id, 2);
 }
 
@@ -410,12 +419,203 @@ fn incomplete_append_requires_recovery_without_advancing_projection() {
     })
     .unwrap();
     assert!(log.append(message("partial")).is_err());
-    assert_eq!(log.records(), &[]);
+    assert!(log.is_empty());
     assert_eq!(log.projection().head(), None);
     assert!(log.append(message("must wait for recovery")).is_err());
     log.refresh().unwrap();
     assert_eq!(log.append(message("recovered")).unwrap().id, 1);
     let replay = ConversationLog::with_store(store).unwrap();
-    assert_eq!(replay.records(), log.records());
+    assert_eq!(all(&replay), all(&log));
     assert_eq!(replay.projection(), log.projection());
+}
+
+#[test]
+fn the_visible_branch_shares_the_records_of_the_log() {
+    let mut log = ConversationLog::with_store(crate::MemoryStore::default()).unwrap();
+    let appended = log.append(message("held once")).unwrap();
+    // One allocation: what the log appended is what it reads back.
+    assert!(Arc::ptr_eq(&appended, &log.record(1).unwrap()));
+    assert!(Arc::ptr_eq(
+        &appended,
+        &log.visible().next().unwrap().unwrap()
+    ));
+}
+
+#[test]
+fn a_reopened_log_knows_kinds_and_names_without_reading_and_reads_records_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log.pkl");
+    let mut log = ConversationLog::open(&path).unwrap();
+    log.append(message("one")).unwrap();
+    log.append(Event::Command {
+        name: "backend-bound".into(),
+        payload: "{\"agent\":\"codex\"}".into(),
+    })
+    .unwrap();
+    log.append_with_id(
+        Some(2),
+        "turn-1",
+        Event::Operation {
+            name: "transcript-entry".into(),
+            args: "{\"ts\":1,\"nested\":\"a \\\"quoted\\\" word\"}".into(),
+        },
+    )
+    .unwrap();
+    log.append(Event::Rewind { head: Some(2) }).unwrap();
+    log.append(message("after the rewind ☾")).unwrap();
+
+    let reopened = ConversationLog::open(&path).unwrap();
+    assert_eq!(
+        (
+            reopened.len(),
+            reopened.visible_ids().to_vec(),
+            reopened.kind(2),
+            reopened.name(2),
+            reopened.name(3),
+            reopened.visible_named(crate::Kind::Command, "backend-bound"),
+            reopened.visible_named(crate::Kind::Operation, "transcript-entry"),
+        ),
+        (
+            5,
+            vec![1, 2, 5],
+            Some(crate::Kind::Command),
+            Some("backend-bound"),
+            Some("transcript-entry"),
+            vec![2],
+            Vec::new(),
+        )
+    );
+    assert_eq!(all(&reopened), all(&log));
+    // Read backwards too, as a resume reads a conversation's last turns.
+    let newest_first = reopened
+        .records(reopened.visible_ids().iter().rev().copied())
+        .map(|record| record.unwrap().id)
+        .collect::<Vec<_>>();
+    assert_eq!(newest_first, vec![5, 2, 1]);
+    // The command id is known again, so a retry returns the recorded record.
+    let mut reopened = reopened;
+    assert_eq!(
+        reopened
+            .append_with_id(
+                Some(5),
+                "turn-1",
+                Event::Operation {
+                    name: "transcript-entry".into(),
+                    args: "{\"ts\":1,\"nested\":\"a \\\"quoted\\\" word\"}".into(),
+                },
+            )
+            .unwrap()
+            .id,
+        3
+    );
+}
+
+#[test]
+fn names_are_found_in_either_key_order() {
+    for (data, name) in [
+        (r#"{"name":"first","args":"x"}"#, "first"),
+        (r#"{"args":"x \"name\" y","name":"last"}"#, "last"),
+    ] {
+        let line = format!(
+            "event_1 = new {{ kind = \"operation\"; data = {} }}",
+            serde_json::to_string(data).unwrap()
+        );
+        assert_eq!(
+            crate::codec::locate(&line).and_then(|located| located.name),
+            Some(name)
+        );
+    }
+}
+
+#[test]
+fn a_scan_from_where_the_last_one_stopped_reads_only_what_was_appended() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log.pkl");
+    let mut log = ConversationLog::open(&path).unwrap();
+    log.append(message("one")).unwrap();
+    log.append(message("two")).unwrap();
+    let mut seen = Vec::new();
+    let offset = ConversationLog::scan_from(&path, 0, |record| {
+        seen.push(record.id);
+        std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(
+        (seen.clone(), offset),
+        (
+            vec![1, 2],
+            i64::try_from(fs::metadata(&path).unwrap().len()).unwrap()
+        )
+    );
+
+    log.append(message("three")).unwrap();
+    // A record still being written is left for the next scan.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"event_4 = new { kind")
+        .unwrap();
+    seen.clear();
+    let next = ConversationLog::scan_from(&path, offset, |record| {
+        seen.push(record.id);
+        std::ops::ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(seen, vec![3]);
+    assert_eq!(
+        ConversationLog::scan_from(&path, next, |_| std::ops::ControlFlow::Continue(())).unwrap(),
+        next
+    );
+}
+
+#[test]
+fn a_saved_index_is_used_while_it_matches_the_journal_and_ignored_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("long.pkl");
+    let big = "x".repeat(300 * 1024);
+    let mut log = ConversationLog::open(&path).unwrap();
+    for n in 0..4 {
+        log.append(message(&format!("{n} {big}"))).unwrap();
+    }
+    log.append(Event::Rewind { head: Some(2) }).unwrap();
+    log.append_with_id(Some(2), "after", message("after"))
+        .unwrap();
+    drop(log);
+
+    // The first open indexes more than a megabyte itself and saves the index beside the log.
+    let first = ConversationLog::open(&path).unwrap();
+    let saved = dir.path().join("long.pkx");
+    assert!(saved.exists());
+    let mut reopened = ConversationLog::open(&path).unwrap();
+    assert_eq!(
+        (reopened.visible_ids().to_vec(), all(&reopened)),
+        (first.visible_ids().to_vec(), all(&first))
+    );
+    // What is appended after the saved index is read on top of it.
+    reopened.append(message("newer")).unwrap();
+    let again = ConversationLog::open(&path).unwrap();
+    assert_eq!(again.visible_ids().to_vec(), vec![1, 2, 6, 7]);
+    assert_eq!(all(&again), all(&reopened));
+
+    // A journal that no longer has the bytes the index covered is indexed whole.
+    fs::write(
+        &path,
+        crate::codec::encode(&crate::Record {
+            id: 1,
+            command_id: None,
+            event: message("other"),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let replaced = ConversationLog::open(&path).unwrap();
+    assert_eq!(
+        visible(&replaced),
+        vec![crate::Record {
+            id: 1,
+            command_id: None,
+            event: message("other")
+        }]
+    );
 }

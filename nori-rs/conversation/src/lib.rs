@@ -12,9 +12,11 @@
 mod codec;
 mod log;
 mod projection;
+mod saved_index;
 mod store;
 
 pub use log::ConversationLog;
+pub use log::Records;
 pub use projection::Projection;
 pub use store::ConversationStore;
 pub use store::FileStore;
@@ -67,6 +69,68 @@ pub enum Event {
     Unknown {
         form: String,
     },
+}
+
+impl Event {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Event::Message { .. } => Kind::Message,
+            Event::ToolCall { .. } => Kind::ToolCall,
+            Event::ToolResult { .. } => Kind::ToolResult,
+            Event::Rewind { .. } => Kind::Rewind,
+            Event::Fork { .. } => Kind::Fork,
+            Event::Operation { .. } => Kind::Operation,
+            Event::Command { .. } => Kind::Command,
+            Event::SessionEvent { .. } => Kind::SessionEvent,
+            Event::Unknown { .. } => Kind::Unknown,
+        }
+    }
+
+    /// The name of an operation or command.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Event::Operation { name, .. } | Event::Command { name, .. } => Some(name),
+            Event::Message { .. }
+            | Event::ToolCall { .. }
+            | Event::ToolResult { .. }
+            | Event::Rewind { .. }
+            | Event::Fork { .. }
+            | Event::SessionEvent { .. }
+            | Event::Unknown { .. } => None,
+        }
+    }
+}
+
+/// What kind of event a record holds: known from its line without decoding the payload, so a
+/// long log is indexed by kind and name in one pass over its bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    Message,
+    ToolCall,
+    ToolResult,
+    Rewind,
+    Fork,
+    Operation,
+    Command,
+    SessionEvent,
+    /// A kind written by a later version.
+    Unknown,
+}
+
+impl Kind {
+    pub(crate) fn of(kind: &str) -> Self {
+        match kind {
+            "message" => Kind::Message,
+            "tool-call" => Kind::ToolCall,
+            "tool-result" => Kind::ToolResult,
+            "rewind" => Kind::Rewind,
+            "fork" => Kind::Fork,
+            "operation" => Kind::Operation,
+            "command" => Kind::Command,
+            "session-event" => Kind::SessionEvent,
+            _ => Kind::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

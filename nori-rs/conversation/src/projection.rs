@@ -1,13 +1,15 @@
 use crate::Event;
 use crate::EventId;
-use crate::Record;
 use crate::SliceRef;
 use std::io;
 
-/// The current visible branch, derived exclusively from the event log.
+/// The current visible branch, derived exclusively from the event log: the ids of its records,
+/// oldest first. Ids only ever grow along a branch (a rewind cuts it back to an earlier record,
+/// and what is appended after has a higher id), so the branch is sorted and a record's place on
+/// it is found by halving.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Projection {
-    visible: Vec<Record>,
+    visible: Vec<EventId>,
 }
 
 pub(crate) enum Change {
@@ -16,54 +18,41 @@ pub(crate) enum Change {
 }
 
 impl Projection {
-    pub fn visible(&self) -> &[Record] {
+    pub fn visible(&self) -> &[EventId] {
         &self.visible
     }
 
     pub fn head(&self) -> Option<EventId> {
-        self.visible.last().map(|record| record.id)
+        self.visible.last().copied()
     }
 
-    /// Resolve inclusive stable identifiers against the current branch.
-    pub fn slice(&self, reference: SliceRef) -> Option<Vec<Record>> {
-        let start = self.visible.iter().position(|r| r.id == reference.start)?;
-        let end = self.visible.iter().position(|r| r.id == reference.end)?;
-        (start <= end).then(|| self.visible[start..=end].to_vec())
+    /// Where on the branch the record `id` is.
+    pub(crate) fn position(&self, id: EventId) -> Option<usize> {
+        self.visible.binary_search(&id).ok()
     }
 
-    pub(crate) fn apply(&mut self, record: &Record) -> io::Result<()> {
-        let change = self.prepare(record)?;
-        self.commit(record, change);
-        Ok(())
+    /// The visible ids from `reference.start` to `reference.end`, inclusive, if both are on the
+    /// branch in that order.
+    pub(crate) fn slice(&self, reference: SliceRef) -> Option<&[EventId]> {
+        let start = self.position(reference.start)?;
+        let end = self.position(reference.end)?;
+        (start <= end).then(|| &self.visible[start..=end])
     }
 
     /// Validate before durable append without copying the visible transcript.
-    pub(crate) fn prepare(&self, record: &Record) -> io::Result<Change> {
-        match &record.event {
+    pub(crate) fn prepare(&self, event: &Event) -> io::Result<Change> {
+        match event {
             Event::Rewind { head } => {
                 let length = match head {
                     None => 0,
-                    Some(id) => self
-                        .visible
-                        .iter()
-                        .position(|r| r.id == *id)
-                        .map(|index| index + 1)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::InvalidData, "rewind head is not visible")
-                        })?,
+                    Some(id) => self.position(*id).map(|index| index + 1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "rewind head is not visible")
+                    })?,
                 };
                 Ok(Change::Truncate(length))
             }
             Event::Fork { source } => {
-                let start = self
-                    .visible
-                    .iter()
-                    .position(|record| record.id == source.start);
-                let end = self
-                    .visible
-                    .iter()
-                    .position(|record| record.id == source.end);
-                if !matches!((start, end), (Some(start), Some(end)) if start <= end) {
+                if self.slice(*source).is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "fork slice is not visible",
@@ -81,9 +70,9 @@ impl Projection {
         }
     }
 
-    pub(crate) fn commit(&mut self, record: &Record, change: Change) {
+    pub(crate) fn commit(&mut self, id: EventId, change: Change) {
         match change {
-            Change::Push => self.visible.push(record.clone()),
+            Change::Push => self.visible.push(id),
             Change::Truncate(length) => self.visible.truncate(length),
         }
     }

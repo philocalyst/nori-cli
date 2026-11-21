@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 nori-pkl = { path = "../pkl" }
+memchr = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
 [dev-dependencies]

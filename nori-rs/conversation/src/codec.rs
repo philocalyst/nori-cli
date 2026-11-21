@@ -1,4 +1,6 @@
 use crate::Event;
+use crate::EventId;
+use crate::Kind;
 use crate::Record;
 use crate::SliceRef;
 use nori_pkl::native::Entry;
@@ -88,7 +90,7 @@ pub(crate) fn decode(line: &str) -> io::Result<Record> {
     let command_id = literal_string(body, "commandId")?;
     let event = if KINDS.contains(&kind.as_str()) {
         let payload = literal_string(body, "data")?.ok_or_else(invalid)?;
-        event_of(&kind, &payload)?
+        event_of(Kind::of(&kind), &payload)?
     } else {
         Event::Unknown {
             form: line.to_owned(),
@@ -118,56 +120,82 @@ fn literal_string(body: &[Entry], name: &str) -> io::Result<Option<String>> {
     }
 }
 
+/// The fields a record's JSON payload may carry; which ones a kind needs is up to the kind.
+#[derive(serde::Deserialize)]
+struct Data {
+    role: Option<String>,
+    content: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<String>,
+    output: Option<String>,
+    args: Option<String>,
+    payload: Option<String>,
+}
+
 /// The event a record of `kind` carries in its JSON `payload`.
-fn event_of(kind: &str, payload: &str) -> io::Result<Event> {
-    let data: Value = serde_json::from_str(payload).map_err(|_| invalid())?;
-    let string = |key: &str| {
-        data.get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(invalid)
-    };
-    let integer = |key: &str| data.get(key).and_then(Value::as_i64).ok_or_else(invalid);
-    Ok(match kind {
-        "message" => Event::Message {
-            role: string("role")?,
-            content: string("content")?,
-        },
-        "tool-call" => Event::ToolCall {
-            id: string("id")?,
-            name: string("name")?,
-            input: string("input")?,
-        },
-        "tool-result" => Event::ToolResult {
-            id: string("id")?,
-            output: string("output")?,
-        },
-        "rewind" => Event::Rewind {
-            head: match data.get("head") {
-                Some(Value::Null) => None,
-                Some(value) => Some(value.as_i64().ok_or_else(invalid)?),
-                None => return Err(invalid()),
-            },
-        },
-        "fork" => Event::Fork {
-            source: SliceRef {
-                start: integer("start")?,
-                end: integer("end")?,
-            },
-        },
-        "operation" => Event::Operation {
-            name: string("name")?,
-            args: string("args")?,
-        },
-        "command" => Event::Command {
-            name: string("name")?,
-            payload: string("payload")?,
-        },
-        "session-event" => Event::SessionEvent {
-            payload: string("payload")?,
-        },
-        _ => return Err(invalid()),
-    })
+fn event_of(kind: Kind, payload: &str) -> io::Result<Event> {
+    match kind {
+        Kind::Rewind | Kind::Fork => {
+            let data: Value = serde_json::from_str(payload).map_err(|_| invalid())?;
+            let integer = |key: &str| data.get(key).and_then(Value::as_i64).ok_or_else(invalid);
+            Ok(if kind == Kind::Rewind {
+                Event::Rewind {
+                    head: match data.get("head") {
+                        Some(Value::Null) => None,
+                        Some(value) => Some(value.as_i64().ok_or_else(invalid)?),
+                        None => return Err(invalid()),
+                    },
+                }
+            } else {
+                Event::Fork {
+                    source: SliceRef {
+                        start: integer("start")?,
+                        end: integer("end")?,
+                    },
+                }
+            })
+        }
+        Kind::Message
+        | Kind::ToolCall
+        | Kind::ToolResult
+        | Kind::Operation
+        | Kind::Command
+        | Kind::SessionEvent => {
+            // Typed straight from the text: no map of values is built for the megabytes a
+            // record can carry.
+            let data: Data = serde_json::from_str(payload).map_err(|_| invalid())?;
+            let field = |value: Option<String>| value.ok_or_else(invalid);
+            Ok(match kind {
+                Kind::Message => Event::Message {
+                    role: field(data.role)?,
+                    content: field(data.content)?,
+                },
+                Kind::ToolCall => Event::ToolCall {
+                    id: field(data.id)?,
+                    name: field(data.name)?,
+                    input: field(data.input)?,
+                },
+                Kind::ToolResult => Event::ToolResult {
+                    id: field(data.id)?,
+                    output: field(data.output)?,
+                },
+                Kind::Operation => Event::Operation {
+                    name: field(data.name)?,
+                    args: field(data.args)?,
+                },
+                Kind::Command => Event::Command {
+                    name: field(data.name)?,
+                    payload: field(data.payload)?,
+                },
+                Kind::SessionEvent => Event::SessionEvent {
+                    payload: field(data.payload)?,
+                },
+                Kind::Rewind | Kind::Fork | Kind::Unknown => return Err(invalid()),
+            })
+        }
+        Kind::Unknown => Err(invalid()),
+    }
 }
 
 /// A line in exactly the shape [`encode`] writes, read without a Pkl parser:
@@ -175,55 +203,98 @@ fn event_of(kind: &str, payload: &str) -> io::Result<Event> {
 /// which the parser then reads. The data literal holds only `\\` and `\"` escapes, so it is a
 /// JSON string literal as well as a Pkl one.
 fn decode_canonical(line: &str) -> Option<io::Result<Record>> {
-    let rest = line.strip_prefix("event_")?;
-    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
-    let id: i64 = rest[..digits].parse().ok().filter(|id| *id > 0)?;
-    let rest = rest[digits..].strip_prefix(" = new { kind = \"")?;
-    let (kind, rest) = rest.split_once('"')?;
-    let rest = rest.strip_prefix("; data = ")?;
-    let literal_end = json_string_end(rest)?;
-    let (literal, rest) = rest.split_at(literal_end);
-    let (command_id, rest) = match rest.strip_prefix("; commandId = \"") {
-        Some(rest) => {
-            let (id, rest) = rest.split_once('"')?;
-            (Some(id.to_owned()), rest)
-        }
-        None => (None, rest),
-    };
-    if rest != " }" {
-        return None;
-    }
-    let payload: String = serde_json::from_str(literal).ok()?;
-    if !KINDS.contains(&kind) {
+    let located = locate(line)?;
+    let command_id = located.command_id.map(str::to_owned);
+    if located.kind == Kind::Unknown {
         // A future operation is kept as written.
         return Some(Ok(Record {
-            id,
+            id: located.id,
             command_id,
             event: Event::Unknown {
                 form: line.to_owned(),
             },
         }));
     }
-    Some(event_of(kind, &payload).map(|event| Record {
-        id,
+    let payload: String = serde_json::from_str(located.literal).ok()?;
+    Some(event_of(located.kind, &payload).map(|event| Record {
+        id: located.id,
         command_id,
         event,
     }))
 }
 
-/// The length of the JSON string literal `text` starts with, including both quotes.
-fn json_string_end(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    if bytes.first() != Some(&b'"') {
-        return None;
-    }
-    let mut index = 1;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            b'"' => return Some(index + 1),
-            _ => index += 1,
+/// What a record line says about itself, read without decoding its payload.
+pub(crate) struct Located<'a> {
+    pub(crate) id: EventId,
+    pub(crate) kind: Kind,
+    /// The operation's or command's name.
+    pub(crate) name: Option<&'a str>,
+    pub(crate) command_id: Option<&'a str>,
+    /// The data literal, quotes and escapes included.
+    pub(crate) literal: &'a str,
+}
+
+/// Read a line written in exactly the shape [`encode`] writes for its id, kind, name and command
+/// id, from its first and last few bytes: the payload is not read. `None` for any other shape,
+/// which [`decode`] then reads whole.
+///
+/// A name is the data's first or last key (`{"name":…,"args":…}` in insertion order,
+/// `{"args":…,"name":…}` sorted). A command id cannot be confused with the data: every quote in
+/// the data literal is escaped, so `= "` appears only after `commandId`.
+pub(crate) fn locate(line: &str) -> Option<Located<'_>> {
+    let rest = line.strip_prefix("event_")?;
+    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+    let id: EventId = rest[..digits].parse().ok().filter(|id| *id > 0)?;
+    let rest = rest[digits..].strip_prefix(" = new { kind = \"")?;
+    let (kind, rest) = rest.split_once('"')?;
+    let kind = Kind::of(kind);
+    let quoted = rest.strip_prefix("; data = ")?;
+    let data = quoted.strip_prefix('"')?;
+    let tail = &line[line.floor_char_boundary(line.len().saturating_sub(160))..];
+    let (data, command_id) = match tail.rfind("; commandId = \"") {
+        Some(at) => {
+            let id = tail[at + "; commandId = \"".len()..].strip_suffix("\" }")?;
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return None;
+            }
+            let end = data.len().checked_sub(tail.len() - at)?;
+            (&data[..end], Some(id))
         }
-    }
-    None
+        None => (data.strip_suffix(" }")?, None),
+    };
+    let data = data.strip_suffix('"')?;
+    let name = match kind {
+        Kind::Operation | Kind::Command => {
+            const KEY: &str = "\\\"name\\\":\\\"";
+            if let Some(rest) = data
+                .strip_prefix('{')
+                .and_then(|data| data.strip_prefix(KEY))
+            {
+                Some(&rest[..rest.find('\\')?])
+            } else {
+                let rest = data.strip_suffix("\\\"}")?;
+                let window = rest.floor_char_boundary(rest.len().saturating_sub(128));
+                let name = &rest[window + rest[window..].rfind(KEY)? + KEY.len()..];
+                (!name.contains('\\')).then_some(name)
+            }
+        }
+        Kind::Message
+        | Kind::ToolCall
+        | Kind::ToolResult
+        | Kind::Rewind
+        | Kind::Fork
+        | Kind::SessionEvent
+        | Kind::Unknown => None,
+    };
+    Some(Located {
+        id,
+        kind,
+        name,
+        command_id,
+        literal: &quoted[..data.len() + 2],
+    })
 }
