@@ -17,6 +17,9 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 gix = { workspace = true }
 thiserror = { workspace = true }
+# The config writer's answer to an awaiting caller (`NoriConfigEdits::apply`).
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 imara-diff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
