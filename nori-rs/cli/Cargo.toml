@@ -37,6 +37,7 @@ clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
 nori-acp-host = { workspace = true }
 nori-harness = { workspace = true }
+nori-machines = { workspace = true }
 nori-installed = { workspace = true }
 nori-exec = { workspace = true }
 nori-fake-agent = { workspace = true }

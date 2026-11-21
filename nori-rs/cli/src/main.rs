@@ -95,6 +95,9 @@ enum Subcommand {
 
     /// Serve a built-in agent (`claude`, `codex`, ...) over stdio ACP for any ACP client.
     Agent(nori_cli::agent_serve::AgentCommand),
+
+    /// Carry conversations between machines: export, import, move.
+    Session(nori_cli::session_command::SessionCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -570,6 +573,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         }
         Some(Subcommand::Agent(cmd)) => {
             nori_cli::agent_serve::run(cmd).await?;
+        }
+        Some(Subcommand::Session(cmd)) => {
+            nori_cli::session_command::run(cmd).await?;
         }
         Some(Subcommand::Completions(cmd)) => {
             clap_complete::generate(

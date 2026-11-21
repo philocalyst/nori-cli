@@ -10195,6 +10195,7 @@ dependencies = [
  "nori-gemini-acp",
  "nori-harness",
  "nori-installed",
+ "nori-machines",
  "nori-opencode-acp",
  "nori-tui",
  "owo-colors",
