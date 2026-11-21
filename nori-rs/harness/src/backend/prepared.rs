@@ -25,6 +25,10 @@ pub enum SessionCatalog {
     Unsupported,
     /// The agent advertised `session/list` and returned these rows.
     Listed(Vec<acp::SessionInfo>),
+    /// The agent advertised `session/list` and the request failed (its backing service is down,
+    /// say). The connection is still usable: a new session starts as usual, and there is just
+    /// nothing to offer for resuming. `reason` is available to callers and logged.
+    Unavailable { reason: String },
 }
 
 /// Unique ownership of an initialized ACP connection that has no active session.
@@ -129,9 +133,16 @@ impl PreparedAgent {
                 while let Ok(event) = event_rx.try_recv() {
                     handle_preparation_event(Some(event), &mut inspection_events).await?;
                 }
-                Ok(SessionCatalog::Listed(list_result.map_err(|error| {
-                    enhance_agent_error(error, &agent_config)
-                })?))
+                // A failing `session/list` is a missing catalog, not a failed start: the agent
+                // still answers `session/new` (OpenCode's `/api/info` being down is the case).
+                Ok(match list_result {
+                    Ok(sessions) => SessionCatalog::Listed(sessions),
+                    Err(error) => {
+                        let reason = format!("{:#}", enhance_agent_error(error, &agent_config));
+                        tracing::warn!(agent = %config.agent, %reason, "session/list failed; starting without a session catalog");
+                        SessionCatalog::Unavailable { reason }
+                    }
+                })
             } else {
                 Ok(SessionCatalog::Unsupported)
             }

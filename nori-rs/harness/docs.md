@@ -68,9 +68,10 @@ post-initialize request during activation. It returns an
 opaque, non-cloneable `PreparedAgent` that still owns that exact
 `AcpConnection`, its event receiver, resolved backend configuration, buffered
 initialize event, and a `SessionCatalog`. The catalog distinguishes
-`Unsupported` from a successful `Listed` result, including an empty list; an
-advertised list call that fails fails preparation rather than masquerading as
-either state. Preparation is implemented in
+`Unsupported` from a successful `Listed` result, including an empty list, and
+`Unavailable` when an advertised list call fails. An unavailable catalog has no
+resume rows, but the connection can still start a new session; the failure is
+not treated as either unsupported listing or failed preparation. Preparation is implemented in
 [`prepared.rs`](src/backend/prepared.rs).
 
 The frontend then chooses `SessionStart::New` or
