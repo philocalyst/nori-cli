@@ -477,3 +477,12 @@ fn a_row_is_not_final_while_a_closing_paren_follows_the_next_word() {
         styled(&one_shot_lines(&doc, Some(24)))
     );
 }
+
+#[test]
+fn a_fence_in_a_nested_list_item_followed_by_indented_code_is_not_doubled() {
+    let source = "- bullet one\n- bullet two\n  - nested bullet\n- bullet three\n  ```js\n  let x = 1;\n    nested\n  ```\n    indented code\n\n    still code\n";
+    let whole = one_shot(source, None);
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    assert_eq!(streamed(&lines, 1, None), whole);
+    assert_eq!(streamed(&[source], 1, None), whole);
+}
