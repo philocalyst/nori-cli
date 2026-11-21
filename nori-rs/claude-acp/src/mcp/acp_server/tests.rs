@@ -294,62 +294,16 @@ async fn test_execute_bash_without_terminal_client() {
 }
 
 #[tokio::test]
-async fn test_execute_glob_tool() {
+async fn search_tools_remain_claude_cli_builtins() {
     let server = AcpMcpServer::new("test-server", "1.0.0");
-
-    // Use the project's src directory for the glob test
-    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    server.set_cwd(&cwd);
-    server.set_session_id("test-session");
-
-    let result = server
-        .execute_tool(
-            "Glob",
-            serde_json::json!({
-                "pattern": "src/**/*.rs"
-            }),
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok(), "Glob should succeed");
-    let tool_result = result.unwrap();
-    assert!(!tool_result.is_error, "Should not be an error");
-    // Should find at least main.rs and lib.rs
-    assert!(
-        tool_result.content.contains(".rs"),
-        "Should find Rust files, got: {}",
-        tool_result.content
-    );
-}
-
-#[tokio::test]
-async fn test_execute_grep_tool() {
-    let server = AcpMcpServer::new("test-server", "1.0.0");
-
-    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    server.set_cwd(&cwd);
-    server.set_session_id("test-session");
-
-    let result = server
-        .execute_tool(
-            "Grep",
-            serde_json::json!({
-                "pattern": "AcpMcpServer",
-                "path": "src/mcp"
-            }),
-            None,
-        )
-        .await;
-
-    assert!(result.is_ok(), "Grep should succeed");
-    let tool_result = result.unwrap();
-    // Should find this file at least
-    assert!(
-        tool_result.content.contains("acp_server.rs") || !tool_result.is_error,
-        "Should find acp_server.rs or no error, got: {}",
-        tool_result.content
-    );
+    for name in ["Glob", "Grep"] {
+        let result = server
+            .execute_tool(name, serde_json::json!({"pattern": "example"}), None)
+            .await
+            .expect("tool lookup returns a result");
+        assert!(result.is_error, "{name} must remain a CLI builtin");
+        assert!(result.content.contains("Tool not found"), "{}", result.content);
+    }
 }
 
 // ============================================================
