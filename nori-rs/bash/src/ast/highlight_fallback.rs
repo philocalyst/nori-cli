@@ -50,12 +50,16 @@ pub(super) fn highlight_incomplete_fallback(input: &str) -> Vec<HighlightSpan> {
         if matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')') {
             let start = idx;
             idx += 1;
-            if idx < input.len()
-                && matches!(
-                    &input[start..=idx],
-                    "&&" | "||" | ">>" | "<<" | ">&" | "<&" | ";;"
-                )
-            {
+            if matches!(
+                (ch, input.as_bytes().get(idx)),
+                ('&', Some(b'&'))
+                    | ('|', Some(b'|'))
+                    | ('>', Some(b'>'))
+                    | ('<', Some(b'<'))
+                    | ('>', Some(b'&'))
+                    | ('<', Some(b'&'))
+                    | (';', Some(b';'))
+            ) {
                 idx += 1;
             }
             push_span(&mut spans, start, idx, HighlightKind::Operator);
@@ -95,4 +99,16 @@ pub(super) fn highlight_incomplete_fallback(input: &str) -> Vec<HighlightSpan> {
         push_span(&mut spans, start, idx, kind);
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn operator_before_unicode_stays_on_character_boundaries() {
+        let spans = highlight_incomplete_fallback("echo |…");
+        assert_eq!(spans.last().map(|span| span.end_byte), Some(9));
+    }
 }
