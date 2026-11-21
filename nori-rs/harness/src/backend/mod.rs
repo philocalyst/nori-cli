@@ -431,6 +431,7 @@ mod continuation_guard;
 mod forge_tools;
 mod git_tools;
 mod goal_ext;
+mod goal_judge;
 mod host_tools;
 #[allow(dead_code)] // Wired by the file tools when they take `machine`.
 mod machine_fs;
