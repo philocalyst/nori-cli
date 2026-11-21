@@ -55,9 +55,7 @@ impl ModelMode {
     pub fn from_choice(value: &str, label: &str) -> Self {
         Self::named(value)
             .or_else(|| Self::named(label))
-            .unwrap_or_else(|| {
-                Self::Other(if label.is_empty() { value } else { label }.to_owned())
-            })
+            .unwrap_or_else(|| Self::Other(if label.is_empty() { value } else { label }.to_owned()))
     }
 
     /// How the mode is written to the user.
@@ -219,13 +217,19 @@ pub fn ladder(dial: Dial, option: &acp::SessionConfigOption) -> Vec<Rung> {
             label: value.name.clone(),
         })
         .collect();
-    // The sorts are stable: values with the same standing stay in the agent's order.
-    match dial {
-        Dial::Model => {}
-        Dial::Effort => rungs.sort_by_key(|rung| effort_standing(&rung.value, &rung.label)),
-        Dial::Mode => rungs.sort_by_key(|rung| ModelMode::from_choice(&rung.value, &rung.label).rank()),
-    }
+    // The sort is stable: values with the same standing stay in the agent's order.
+    rungs.sort_by_key(|rung| standing(dial, &rung.value, &rung.label));
     rungs
+}
+
+/// Where a value of `dial`'s option stands in the order it is listed and stepped in. A client that
+/// lists the values itself (a picker, which has more to show than a [`Rung`]) sorts by this.
+pub fn standing(dial: Dial, value: &str, label: &str) -> (i32, i32) {
+    match dial {
+        Dial::Model => (0, 0),
+        Dial::Effort => effort_standing(value, label),
+        Dial::Mode => (ModelMode::from_choice(value, label).rank(), 0),
+    }
 }
 
 /// Where an effort value stands: the unset `default` first, then the known levels by strength,
@@ -298,9 +302,9 @@ pub fn find_setting<'a>(
     match wanted.as_str() {
         "modelmode" => options.iter().find(|option| is_mode_option(option)),
         "effort" => options.iter().find(|option| is_effort_option(option)),
-        _ => options
-            .iter()
-            .find(|option| squash(&option.id.to_string()) == wanted || squash(&option.name) == wanted),
+        _ => options.iter().find(|option| {
+            squash(&option.id.to_string()) == wanted || squash(&option.name) == wanted
+        }),
     }
 }
 
@@ -308,14 +312,11 @@ pub fn find_setting<'a>(
 /// for a mode option, the mode that name spells (`fast` finds the `on` of a fast toggle).
 pub fn value_for(option: &acp::SessionConfigOption, wanted: &str) -> Option<String> {
     let rungs = ladder(Dial::Model, option);
-    let spelled = rungs
-        .iter()
-        .find(|rung| rung.value == wanted)
-        .or_else(|| {
-            rungs
-                .iter()
-                .find(|rung| rung.value.eq_ignore_ascii_case(wanted) || rung.label.eq_ignore_ascii_case(wanted))
-        });
+    let spelled = rungs.iter().find(|rung| rung.value == wanted).or_else(|| {
+        rungs.iter().find(|rung| {
+            rung.value.eq_ignore_ascii_case(wanted) || rung.label.eq_ignore_ascii_case(wanted)
+        })
+    });
     if let Some(rung) = spelled {
         return Some(rung.value.clone());
     }
@@ -329,7 +330,9 @@ pub fn value_for(option: &acp::SessionConfigOption, wanted: &str) -> Option<Stri
         .map(|rung| rung.value)
 }
 
-fn select_values(options: &acp::SessionConfigSelectOptions) -> Vec<&acp::SessionConfigSelectOption> {
+fn select_values(
+    options: &acp::SessionConfigSelectOptions,
+) -> Vec<&acp::SessionConfigSelectOption> {
     match options {
         acp::SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
         acp::SessionConfigSelectOptions::Grouped(groups) => groups

@@ -3,6 +3,7 @@
 //! ACP owns agent/client semantics. Nori adds only the lifecycle and product
 //! notifications that ACP does not define.
 
+mod dial_effect;
 mod message_flow;
 mod model_controls;
 mod monitor;
@@ -12,6 +13,7 @@ mod subagent;
 mod usage;
 
 pub use agent_client_protocol_schema as acp;
+pub use dial_effect::*;
 pub use message_flow::*;
 pub use model_controls::*;
 pub use monitor::*;
