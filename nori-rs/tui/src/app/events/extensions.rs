@@ -115,7 +115,7 @@ impl App {
                 }
             },
             AppEvent::SaveMcpServers(servers) => {
-                self.persist_mcp_servers(servers).await;
+                self.persist_mcp_servers(servers);
             }
             AppEvent::McpOAuthLogin {
                 server_name,

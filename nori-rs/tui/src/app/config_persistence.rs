@@ -3,18 +3,23 @@ use crate::nori::config_picker::SettingsItem;
 use nori_config::NoriConfigEdits as ConfigEditsBuilder;
 use std::path::Path;
 
-async fn persist_acp_wire_recording_config(nori_home: &Path, enabled: bool) -> anyhow::Result<()> {
-    ConfigEditsBuilder::new(nori_home)
-        .set_path(&["acp_proxy", "enabled"], enabled)
-        .apply()
-        .await
+/// Whether `config_id` names the Model-category option among `config_options`.
+fn is_model_option(
+    config_id: &str,
+    config_options: &[nori_protocol::acp::v1::SessionConfigOption],
+) -> bool {
+    config_options.iter().any(|option| {
+        option.id.to_string() == config_id
+            && option.category == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
+    })
 }
 
 /// Persist a session config option selection as the agent's default model.
 ///
 /// Returns `Ok(true)` only when `config_id` names the agent's Model-category
 /// option and the selection was written to `[default_models]` in config.toml.
-/// Non-model options (mode, thought level, ...) are not persisted.
+/// Non-model options (mode, thought level, ...) are not persisted. The write (a file
+/// replacement and a disk flush) runs on a blocking thread.
 pub(super) async fn persist_default_model_selection(
     nori_home: &Path,
     agent: &str,
@@ -22,14 +27,9 @@ pub(super) async fn persist_default_model_selection(
     value: &str,
     config_options: &[nori_protocol::acp::v1::SessionConfigOption],
 ) -> anyhow::Result<bool> {
-    let is_model_option = config_options.iter().any(|option| {
-        option.id.to_string() == config_id
-            && option.category == Some(nori_protocol::acp::v1::SessionConfigOptionCategory::Model)
-    });
-    if !is_model_option {
+    if !is_model_option(config_id, config_options) {
         return Ok(false);
     }
-
     ConfigEditsBuilder::new(nori_home)
         .set_default_model(agent, value)
         .apply()
@@ -37,72 +37,95 @@ pub(super) async fn persist_default_model_selection(
     Ok(true)
 }
 
-/// Persist a model as the agent's default without inspecting the advertised
-/// config options. Used when the agent rejected a free-text custom model from
-/// its live picker: there is no options snapshot to categorize, but the value
-/// is a model by construction, and it will be forced through the agent's
-/// spawn-time injection channel on the next session start.
-pub(super) async fn persist_default_model_value(
-    nori_home: &Path,
-    agent: &str,
-    value: &str,
-) -> anyhow::Result<()> {
-    ConfigEditsBuilder::new(nori_home)
-        .set_default_model(agent, value)
-        .apply()
-        .await
-}
-
 impl App {
     fn sync_runtime_config(&mut self) {
         self.chat_widget.set_config(self.config.clone());
     }
 
-    pub(super) async fn persist_default_model_selection(
+    /// Remember the agent's chosen model as its default. The choice is in effect at once; the
+    /// write to config.toml happens in the background, so the event loop never waits for the
+    /// disk. A failed write is logged.
+    pub(super) fn persist_default_model_selection(
         &mut self,
         agent: &str,
         config_id: &str,
         value: &str,
         config_options: &[nori_protocol::acp::v1::SessionConfigOption],
-    ) -> anyhow::Result<bool> {
-        let persisted = persist_default_model_selection(
-            &self.config.nori_home,
-            agent,
-            config_id,
-            value,
-            config_options,
-        )
-        .await?;
-        if persisted {
-            self.config
-                .default_models
-                .insert(agent.to_string(), value.to_string());
-            self.sync_runtime_config();
-        }
-        Ok(persisted)
-    }
-
-    /// Persist a custom model as the agent's default, unconditionally.
-    ///
-    /// Used when the agent rejected the model from its live picker: there is no
-    /// config-options snapshot to categorize, but the model came from the
-    /// free-text custom-model input, so it is a model by construction. On the
-    /// next session start it is forced through the agent's spawn-time injection
-    /// channel. Returns `true` when the value was persisted.
-    pub(super) async fn persist_custom_default_model(&mut self, agent: &str, value: &str) -> bool {
-        if let Err(err) = persist_default_model_value(&self.config.nori_home, agent, value).await {
-            tracing::error!(error = %err, "failed to persist custom default model");
-            return false;
+    ) {
+        if !is_model_option(config_id, config_options) {
+            return;
         }
         self.config
             .default_models
             .insert(agent.to_string(), value.to_string());
         self.sync_runtime_config();
-        true
+        let nori_home = self.config.nori_home.clone();
+        let (agent, config_id, value) = (agent.to_owned(), config_id.to_owned(), value.to_owned());
+        let config_options = config_options.to_vec();
+        tokio::spawn(async move {
+            if let Err(error) = persist_default_model_selection(
+                &nori_home,
+                &agent,
+                &config_id,
+                &value,
+                &config_options,
+            )
+            .await
+            {
+                tracing::error!(%error, "failed to persist default model selection");
+            }
+        });
+    }
+
+    /// Make a custom model the agent's default and start a new session with it.
+    ///
+    /// Used when the agent rejected the model from its live picker: there is no
+    /// config-options snapshot to categorize, but the model came from the
+    /// free-text custom-model input, so it is a model by construction. The new
+    /// session forces it through the agent's spawn-time injection channel, so it
+    /// starts once the default is on disk; the event loop does not wait for that.
+    pub(super) fn persist_custom_default_model_and_restart(&mut self, agent: &str, value: &str) {
+        self.config
+            .default_models
+            .insert(agent.to_string(), value.to_string());
+        self.sync_runtime_config();
+        let edits = ConfigEditsBuilder::new(&self.config.nori_home).set_default_model(agent, value);
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            match edits.apply().await {
+                Ok(()) => tx.send(AppEvent::NewSession),
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist custom default model");
+                    tx.send(AppEvent::InsertHistoryCell(Box::new(
+                        crate::history_cell::new_error_event(format!(
+                            "Couldn't save the model selection ({error})."
+                        )),
+                    )));
+                }
+            }
+        });
+    }
+
+    /// Save `edits` to config.toml in the background, on the config writer. The setting is in
+    /// effect at once and the event loop never waits for the disk; a write that fails says so
+    /// in the transcript, since the change then lasts for this session only.
+    pub(super) fn save_config(&self, what: &str, edits: ConfigEditsBuilder) {
+        let tx = self.app_event_tx.clone();
+        let what = what.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = edits.apply().await {
+                tracing::error!(%error, "failed to save {what}");
+                tx.send(AppEvent::InsertHistoryCell(Box::new(
+                    crate::history_cell::new_error_event(format!(
+                        "Couldn't save {what} to config.toml ({error}); it applies to this session only."
+                    )),
+                )));
+            }
+        });
     }
 
     /// Persist a TUI config setting to config.toml and apply it immediately.
-    pub(super) async fn persist_config_setting(&mut self, setting_name: &str, enabled: bool) {
+    pub(super) fn persist_config_setting(&mut self, setting_name: &str, enabled: bool) {
         match setting_name {
             "vertical_footer" => {}
             _ => {
@@ -112,20 +135,11 @@ impl App {
         }
 
         // Persist to config.toml
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", setting_name], enabled)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                setting = %setting_name,
-                "failed to persist TUI config setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save {setting_name} setting: {err}"));
-            return;
-        }
+        self.save_config(
+            &format!("{setting_name} setting"),
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", setting_name], enabled),
+        );
 
         self.config.vertical_footer = enabled;
         self.sync_runtime_config();
@@ -139,25 +153,17 @@ impl App {
             .reopen_settings_focused(SettingsItem::VerticalFooter);
     }
 
-    pub(super) async fn persist_notify_after_idle_setting(
+    pub(super) fn persist_notify_after_idle_setting(
         &mut self,
         value: nori_config::NotifyAfterIdle,
     ) {
         let toml_str = value.toml_value();
 
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "notify_after_idle"], toml_str)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist notify_after_idle setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save notify_after_idle setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "notify_after_idle setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "notify_after_idle"], toml_str),
+        );
 
         self.config.notify_after_idle = value;
         self.sync_runtime_config();
@@ -175,47 +181,28 @@ impl App {
     /// every launch, so this only records the choice; the caller launches with
     /// it separately.
     #[cfg(unix)]
-    pub(super) async fn persist_browser_profile_setting(
+    pub(super) fn persist_browser_profile_setting(
         &mut self,
         value: nori_config::BrowserProfileMode,
     ) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["browser_profile"], value.toml_value())
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist browser_profile setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save browser_profile setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "browser_profile setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["browser_profile"], value.toml_value()),
+        );
 
         self.config.browser_profile = value;
         self.sync_runtime_config();
     }
 
-    pub(super) async fn persist_script_timeout_setting(
-        &mut self,
-        value: nori_config::ScriptTimeout,
-    ) {
+    pub(super) fn persist_script_timeout_setting(&mut self, value: nori_config::ScriptTimeout) {
         let toml_str = value.toml_value();
 
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "script_timeout"], toml_str)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist script_timeout setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save script_timeout setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "script_timeout setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "script_timeout"], toml_str),
+        );
 
         self.config.script_timeout = value.clone();
         self.sync_runtime_config();
@@ -244,24 +231,16 @@ impl App {
             .reopen_settings_focused(SettingsItem::LoopCount);
     }
 
-    pub(super) async fn persist_vim_mode_setting(
+    pub(super) fn persist_vim_mode_setting(
         &mut self,
         value: nori_config::VimEnterBehavior,
         from_settings: bool,
     ) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "vim_mode"], value.toml_value())
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist vim_mode setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save vim_mode setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "vim_mode setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "vim_mode"], value.toml_value()),
+        );
 
         // Update in-memory state and propagate to the chat widget
         self.config.vim_mode = value;
@@ -281,22 +260,14 @@ impl App {
         }
     }
 
-    pub(super) async fn persist_auto_worktree_setting(&mut self, value: nori_config::AutoWorktree) {
+    pub(super) fn persist_auto_worktree_setting(&mut self, value: nori_config::AutoWorktree) {
         let toml_str = value.toml_value();
 
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "auto_worktree"], toml_str)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist auto_worktree setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save auto_worktree setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "auto_worktree setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "auto_worktree"], toml_str),
+        );
 
         self.config.auto_worktree = value;
         self.sync_runtime_config();
@@ -311,17 +282,12 @@ impl App {
             .reopen_settings_focused(SettingsItem::AutoWorktree);
     }
 
-    pub(super) async fn persist_pinned_plan_drawer_setting(&mut self, enabled: bool) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "pinned_plan_drawer"], enabled)
-            .apply()
-            .await
-        {
-            tracing::error!(error = %err, "failed to persist pinned_plan_drawer setting");
-            self.chat_widget
-                .add_error_message(format!("Failed to save pinned_plan_drawer setting: {err}"));
-            return;
-        }
+    pub(super) fn persist_pinned_plan_drawer_setting(&mut self, enabled: bool) {
+        self.save_config(
+            "pinned_plan_drawer setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "pinned_plan_drawer"], enabled),
+        );
         self.config.pinned_plan_drawer = enabled;
         self.sync_runtime_config();
         let mode = if enabled {
@@ -338,35 +304,12 @@ impl App {
             .reopen_settings_focused(SettingsItem::PinnedPlanDrawer);
     }
 
-    pub(super) async fn persist_acp_wire_recording_setting(&mut self, enabled: bool) {
-        if let Err(err) = persist_acp_wire_recording_config(&self.config.nori_home, enabled).await {
-            tracing::error!(error = %err, "failed to persist acp wire recording setting");
-            self.chat_widget
-                .add_error_message(format!("Failed to save ACP wire recording setting: {err}"));
-            return;
-        }
-
-        self.config.acp_proxy.enabled = enabled;
-        self.sync_runtime_config();
-        self.chat_widget.set_acp_wire_recording_enabled(enabled);
-        self.chat_widget.replace_agent_popup(enabled);
-        let status = if enabled { "enabled" } else { "disabled" };
-        self.chat_widget
-            .add_info_message(format!("ACP wire recording {status}."), None);
-    }
-
-    pub(super) async fn persist_custom_working_messages_setting(&mut self, enabled: bool) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "custom_working_messages"], enabled)
-            .apply()
-            .await
-        {
-            tracing::error!(error = %err, "failed to persist custom_working_messages setting");
-            self.chat_widget.add_error_message(format!(
-                "Failed to save custom_working_messages setting: {err}"
-            ));
-            return;
-        }
+    pub(super) fn persist_custom_working_messages_setting(&mut self, enabled: bool) {
+        self.save_config(
+            "custom_working_messages setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "custom_working_messages"], enabled),
+        );
         self.config.custom_working_messages = enabled;
         self.sync_runtime_config();
         self.chat_widget.set_custom_working_messages(enabled);
@@ -377,16 +320,12 @@ impl App {
             .reopen_settings_focused(SettingsItem::CustomWorkingMessages);
     }
 
-    pub(super) async fn persist_skillset_per_session_setting(&mut self, enabled: bool) {
-        let builder = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "skillset_per_session"], enabled);
-        if let Err(err) = builder.apply().await {
-            tracing::error!(error = %err, "failed to persist skillset_per_session setting");
-            self.chat_widget.add_error_message(format!(
-                "Failed to save skillset_per_session setting: {err}"
-            ));
-            return;
-        }
+    pub(super) fn persist_skillset_per_session_setting(&mut self, enabled: bool) {
+        self.save_config(
+            "skillset_per_session setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "skillset_per_session"], enabled),
+        );
         self.config.skillset_per_session = enabled;
         self.sync_runtime_config();
         let status = if enabled { "enabled" } else { "disabled" };
@@ -398,24 +337,16 @@ impl App {
             .reopen_settings_focused(SettingsItem::PerSessionSkillsets);
     }
 
-    pub(super) async fn persist_footer_segment_setting(
+    pub(super) fn persist_footer_segment_setting(
         &mut self,
         segment: nori_config::FooterSegment,
         enabled: bool,
     ) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "footer_segments", segment.toml_key()], enabled)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                "failed to persist footer_segment setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save footer segment setting: {err}"));
-            return;
-        }
+        self.save_config(
+            "footer segment setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "footer_segments", segment.toml_key()], enabled),
+        );
 
         // Update the local config and apply to the widget
         self.footer_segment_config.set_enabled(segment, enabled);
@@ -433,17 +364,12 @@ impl App {
             .replace_footer_segments_picker(&self.footer_segment_config);
     }
 
-    pub(super) async fn persist_file_manager_setting(&mut self, value: nori_config::FileManager) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "file_manager"], value.command_name())
-            .apply()
-            .await
-        {
-            tracing::error!(error = %err, "failed to persist file_manager setting");
-            self.chat_widget
-                .add_error_message(format!("Failed to save file_manager setting: {err}"));
-            return;
-        }
+    pub(super) fn persist_file_manager_setting(&mut self, value: nori_config::FileManager) {
+        self.save_config(
+            "file_manager setting",
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "file_manager"], value.command_name()),
+        );
 
         self.config.file_manager = Some(value);
         self.sync_runtime_config();
@@ -455,7 +381,7 @@ impl App {
             .reopen_settings_focused(SettingsItem::FileManager);
     }
 
-    pub(super) async fn persist_notification_setting(&mut self, setting_name: &str, enabled: bool) {
+    pub(super) fn persist_notification_setting(&mut self, setting_name: &str, enabled: bool) {
         if !matches!(setting_name, "terminal_notifications" | "os_notifications") {
             tracing::warn!("Unknown notification setting: {setting_name}");
             return;
@@ -463,20 +389,11 @@ impl App {
         let enum_value = if enabled { "enabled" } else { "disabled" };
 
         // Persist to config.toml as a string enum value
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", setting_name], enum_value)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                setting = %setting_name,
-                "failed to persist TUI notification setting"
-            );
-            self.chat_widget
-                .add_error_message(format!("Failed to save {setting_name} setting: {err}"));
-            return;
-        }
+        self.save_config(
+            &format!("{setting_name} setting"),
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", setting_name], enum_value),
+        );
 
         match setting_name {
             "terminal_notifications" => {
@@ -507,7 +424,7 @@ impl App {
         self.chat_widget.reopen_settings_focused(focus);
     }
 
-    pub(super) async fn persist_hotkey_setting(
+    pub(super) fn persist_hotkey_setting(
         &mut self,
         action: nori_config::HotkeyAction,
         binding: nori_config::HotkeyBinding,
@@ -515,22 +432,11 @@ impl App {
         let toml_key = action.toml_key();
         let toml_val = binding.toml_value();
 
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .set_path(&["tui", "hotkeys", toml_key], toml_val)
-            .apply()
-            .await
-        {
-            tracing::error!(
-                error = %err,
-                action = %action.display_name(),
-                "failed to persist hotkey setting"
-            );
-            self.chat_widget.add_error_message(format!(
-                "Failed to save hotkey for {}: {err}",
-                action.display_name()
-            ));
-            return;
-        }
+        self.save_config(
+            &format!("the hotkey for {}", action.display_name()),
+            ConfigEditsBuilder::new(&self.config.nori_home)
+                .set_path(&["tui", "hotkeys", toml_key], toml_val),
+        );
 
         self.hotkey_config.set_binding(action, binding.clone());
         self.config.hotkeys = self.hotkey_config.clone();
@@ -547,20 +453,14 @@ impl App {
         );
     }
 
-    pub(super) async fn persist_mcp_servers(
+    pub(super) fn persist_mcp_servers(
         &mut self,
         servers: std::collections::BTreeMap<String, nori_config::McpServerConfig>,
     ) {
-        if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-            .replace_mcp_servers(&servers)
-            .apply()
-            .await
-        {
-            tracing::error!(error = %err, "failed to persist MCP servers");
-            self.chat_widget
-                .add_error_message(format!("Failed to save MCP servers: {err}"));
-            return;
-        }
+        self.save_config(
+            "MCP servers",
+            ConfigEditsBuilder::new(&self.config.nori_home).replace_mcp_servers(&servers),
+        );
 
         // Sync in-memory state so that ComputeMcpAuthStatuses (which reads
         // chat_widget.config_ref().mcp_servers) sees the newly added servers.
@@ -739,28 +639,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_custom_model_is_persisted_without_config_options() {
-        let temp = TempDir::new().expect("temp home");
-
-        persist_default_model_value(temp.path(), "claude-code", "claude-opus-4-6")
-            .await
-            .expect("persist rejected custom model");
-
-        let content = std::fs::read_to_string(temp.path().join("config.toml"))
-            .expect("read persisted config");
-        let parsed: toml::Value = toml::from_str(&content).expect("config toml");
-        assert_eq!(
-            parsed
-                .get("default_models")
-                .and_then(|section| section.get("claude-code"))
-                .and_then(toml::Value::as_str),
-            Some("claude-opus-4-6"),
-            "a custom model the agent rejected must still be saved as the default so the \
-             restart can inject it"
-        );
-    }
-
-    #[tokio::test]
     async fn non_model_selection_is_not_persisted() {
         let temp = TempDir::new().expect("temp home");
 
@@ -797,25 +675,5 @@ mod tests {
 
         assert!(!persisted, "unknown options should not be persisted");
         assert!(!temp.path().join("config.toml").exists());
-    }
-
-    #[tokio::test]
-    async fn persists_acp_wire_recording_to_top_level_acp_proxy_section() {
-        let temp = TempDir::new().expect("temp home");
-
-        persist_acp_wire_recording_config(temp.path(), true)
-            .await
-            .expect("persist recording enabled");
-
-        let content = std::fs::read_to_string(temp.path().join("config.toml"))
-            .expect("read persisted config");
-        let parsed: toml::Value = toml::from_str(&content).expect("config toml");
-        assert_eq!(
-            parsed
-                .get("acp_proxy")
-                .and_then(|section| section.get("enabled"))
-                .and_then(toml::Value::as_bool),
-            Some(true)
-        );
     }
 }

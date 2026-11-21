@@ -105,29 +105,33 @@ impl SlashCommand {
         self.into()
     }
 
-    /// Whether this command can be run while a task is in progress.
+    /// Whether this command can be run while a task is in progress. Changing how the session
+    /// runs (its model, effort, mode, settings, approvals, servers, the agent or account it runs
+    /// on) never waits for a turn: the change is accepted at once and applied at the next point
+    /// where it can be (an agent switch when the response ends). What replaces or rewrites the
+    /// conversation itself waits for the turn.
     pub fn available_during_task(self) -> bool {
         match self {
-            SlashCommand::Providers
-            | SlashCommand::New
+            SlashCommand::New
             | SlashCommand::Resume
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Undo
             | SlashCommand::Continue
-            | SlashCommand::Model
-            | SlashCommand::Config
-            | SlashCommand::Approvals
-            | SlashCommand::Settings
-            | SlashCommand::Vim
-            | SlashCommand::Mcp
             | SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::SwitchSkillset
             | SlashCommand::Fork
             | SlashCommand::Close
             | SlashCommand::Browser => false,
-            SlashCommand::Browse
+            SlashCommand::Providers
+            | SlashCommand::Model
+            | SlashCommand::Config
+            | SlashCommand::Approvals
+            | SlashCommand::Settings
+            | SlashCommand::Vim
+            | SlashCommand::Mcp
+            | SlashCommand::Browse
             | SlashCommand::Reference
             | SlashCommand::Diff
             | SlashCommand::Mention
@@ -206,6 +210,7 @@ pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     #[cfg(not(feature = "login"))]
@@ -285,11 +290,20 @@ mod tests {
     }
 
     #[test]
-    fn config_not_available_during_task() {
-        assert!(
-            !SlashCommand::Config.available_during_task(),
-            "/config should not be available while task is running"
-        );
+    fn changes_to_how_the_session_runs_never_wait_for_a_turn() {
+        let mid_turn: Vec<SlashCommand> = [
+            SlashCommand::Model,
+            SlashCommand::Config,
+            SlashCommand::Approvals,
+            SlashCommand::Settings,
+            SlashCommand::Vim,
+            SlashCommand::Mcp,
+            SlashCommand::Providers,
+        ]
+        .into_iter()
+        .filter(|command| command.available_during_task())
+        .collect();
+        assert_eq!(mid_turn.len(), 7, "{mid_turn:?}");
     }
 
     #[test]
@@ -305,14 +319,6 @@ mod tests {
     fn settings_has_description() {
         let desc = SlashCommand::Settings.description();
         assert!(!desc.is_empty(), "/settings should have a description");
-    }
-
-    #[test]
-    fn settings_not_available_during_task() {
-        assert!(
-            !SlashCommand::Settings.available_during_task(),
-            "/settings should not be available while task is running"
-        );
     }
 
     #[test]
@@ -333,7 +339,6 @@ mod tests {
                 .iter()
                 .any(|(_, command)| *command == SlashCommand::Vim)
         );
-        assert!(!SlashCommand::Vim.available_during_task());
         assert_eq!(SlashCommand::Vim.scope(), CommandScope::Universal);
     }
 
@@ -472,14 +477,6 @@ mod tests {
     fn resume_parses_from_string() {
         let cmd: SlashCommand = "resume".parse().expect("/resume should parse from string");
         assert_eq!(cmd, SlashCommand::Resume);
-    }
-
-    #[test]
-    fn mcp_not_available_during_task() {
-        assert!(
-            !SlashCommand::Mcp.available_during_task(),
-            "/mcp should not be available while task is running"
-        );
     }
 
     #[test]

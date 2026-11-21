@@ -311,7 +311,6 @@ impl App {
             | AppEvent::OpenSkillsetPerSessionWorktreeChoice
             | AppEvent::OpenVimModePicker
             | AppEvent::SetBrowserProfile(..)
-            | AppEvent::SetConfigAcpWireRecording(..)
             | AppEvent::SetConfigAutoWorktree(..)
             | AppEvent::SetConfigCustomWorkingMessages(..)
             | AppEvent::SetConfigFileManager(..)

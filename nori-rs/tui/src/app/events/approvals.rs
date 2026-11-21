@@ -129,34 +129,18 @@ impl App {
                     .set_world_writable_warning_acknowledged(ack);
             }
             AppEvent::PersistFullAccessWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-                    .set_path(&["notice", "hide_full_access_warning"], true)
-                    .apply()
-                    .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist full access warning acknowledgement"
-                    );
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to save full access confirmation preference: {err}"
-                    ));
-                }
+                self.save_config(
+                    "the full access confirmation preference",
+                    ConfigEditsBuilder::new(&self.config.nori_home)
+                        .set_path(&["notice", "hide_full_access_warning"], true),
+                );
             }
             AppEvent::PersistWorldWritableWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::new(&self.config.nori_home)
-                    .set_path(&["notice", "hide_world_writable_warning"], true)
-                    .apply()
-                    .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist world-writable warning acknowledgement"
-                    );
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to save Agent mode warning preference: {err}"
-                    ));
-                }
+                self.save_config(
+                    "the Agent mode warning preference",
+                    ConfigEditsBuilder::new(&self.config.nori_home)
+                        .set_path(&["notice", "hide_world_writable_warning"], true),
+                );
             }
             AppEvent::OpenApprovalsPopup => {
                 self.chat_widget.open_approvals_popup();
