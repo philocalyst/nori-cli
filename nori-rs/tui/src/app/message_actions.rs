@@ -85,26 +85,7 @@ impl App {
                     );
                 }
             }
-            MessageChoice::ForkSubagent => {
-                let cut = end_of_message(&self.transcript_cells, action.cell);
-                let context = self.transcript_cells[..cut]
-                    .iter()
-                    .flat_map(|cell| cell.display_lines(u16::MAX))
-                    .map(|line| {
-                        line.spans
-                            .iter()
-                            .map(|span| span.content.as_ref())
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let source = self
-                    .transcript_cells
-                    .get(action.cell)
-                    .and_then(|cell| response_source(&self.response_boundaries, cell));
-                self.app_event_tx
-                    .send(AppEvent::ForkResponseSubagent { context, source });
-            }
+            MessageChoice::ForkSubagent => self.fork_subagent_from(action.cell),
             MessageChoice::Rewind => {
                 let prompts = (action.cell..self.transcript_cells.len())
                     .filter_map(prompt_at)
@@ -117,6 +98,31 @@ impl App {
                 });
             }
         }
+    }
+}
+
+impl App {
+    /// A subagent goes on from the response at `cell`: it is given the conversation up to the
+    /// end of that response.
+    pub(super) fn fork_subagent_from(&mut self, cell: usize) {
+        let cut = end_of_message(&self.transcript_cells, cell);
+        let context = self.transcript_cells[..cut]
+            .iter()
+            .flat_map(|cell| cell.display_lines(u16::MAX))
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source = self
+            .transcript_cells
+            .get(cell)
+            .and_then(|cell| response_source(&self.response_boundaries, cell));
+        self.app_event_tx
+            .send(AppEvent::ForkResponseSubagent { context, source });
     }
 }
 

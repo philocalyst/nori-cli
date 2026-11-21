@@ -54,6 +54,16 @@ pub(super) struct TranscriptWindow {
     ends: Vec<usize>,
 }
 
+/// Which rows of a transcript of `count` cells to lay out at `width`: `rows` rows starting
+/// `offset` rows above the newest line.
+#[derive(Clone, Copy)]
+pub(super) struct Viewport {
+    pub(super) count: usize,
+    pub(super) width: u16,
+    pub(super) rows: usize,
+    pub(super) offset: usize,
+}
+
 pub(super) struct Window {
     pub(super) projection: ToolProjection,
     /// Only known after scanning all the way to the start.
@@ -81,15 +91,18 @@ impl TranscriptWindow {
 
     pub(super) fn render(
         &mut self,
-        count: usize,
-        width: u16,
-        rows: usize,
-        offset: usize,
+        viewport: Viewport,
         source: Version,
         expanded: &HashSet<String>,
         mut version: impl FnMut(usize) -> Option<Version>,
         mut project: impl FnMut(usize) -> Option<(ToolProjection, bool)>,
     ) -> Window {
+        let Viewport {
+            count,
+            width,
+            rows,
+            offset,
+        } = viewport;
         if self.width != Some(width) {
             self.cells.clear();
             self.order.clear();
@@ -260,10 +273,12 @@ mod tests {
             let expanded = HashSet::new();
             let mut render = |width, rows| {
                 cache.render(
-                    count,
-                    width,
-                    rows,
-                    0,
+                    Viewport {
+                        count,
+                        width,
+                        rows,
+                        offset: 0,
+                    },
                     Version::Child(1),
                     &expanded,
                     |index| Some(Version::Child(i64::try_from(index).unwrap())),
@@ -297,10 +312,12 @@ mod tests {
         let mut cache = TranscriptWindow::default();
         let expanded = HashSet::new();
         let window = cache.render(
-            2,
-            30,
-            3,
-            1,
+            Viewport {
+                count: 2,
+                width: 30,
+                rows: 3,
+                offset: 1,
+            },
             Version::Child(1),
             &expanded,
             |index| Some(Version::Child(i64::try_from(index).unwrap())),
@@ -347,10 +364,12 @@ mod tests {
         let expanded = HashSet::new();
         let mut render = || {
             cache.render(
-                10_000,
-                80,
-                24,
-                16_000,
+                Viewport {
+                    count: 10_000,
+                    width: 80,
+                    rows: 24,
+                    offset: 16_000,
+                },
                 Version::Child(7),
                 &expanded,
                 |index| {
@@ -375,7 +394,6 @@ mod tests {
         let second = render();
         assert_eq!(second.projection.lines, first.projection.lines);
         assert_eq!((versions.get(), layouts.get()), before);
-        drop(render);
         assert!(cache.cells.len() <= MAX_CACHED_CELLS);
     }
 
@@ -384,10 +402,12 @@ mod tests {
         let mut cache = TranscriptWindow::default();
         let expanded = HashSet::new();
         let first = cache.render(
-            1,
-            80,
-            10,
-            0,
+            Viewport {
+                count: 1,
+                width: 80,
+                rows: 10,
+                offset: 0,
+            },
             Version::Child(1),
             &expanded,
             |_| Some(Version::Child(1)),
@@ -402,10 +422,12 @@ mod tests {
             },
         );
         let second = cache.render(
-            1,
-            80,
-            10,
-            0,
+            Viewport {
+                count: 1,
+                width: 80,
+                rows: 10,
+                offset: 0,
+            },
             Version::Child(2),
             &expanded,
             |_| Some(Version::Child(2)),
@@ -429,10 +451,12 @@ mod tests {
         let expanded = HashSet::new();
         let render = |cache: &mut TranscriptWindow, label: &'static str| {
             cache.render(
-                2,
-                80,
-                10,
-                0,
+                Viewport {
+                    count: 2,
+                    width: 80,
+                    rows: 10,
+                    offset: 0,
+                },
                 Version::Child(1),
                 &expanded,
                 |index| Some(Version::Child(index as i64)),
@@ -470,12 +494,10 @@ mod tests {
         let mut cache = TranscriptWindow::default();
         let expanded = HashSet::new();
         let layouts = Cell::new(0);
-        let mut render = || {
-            cache.render(
-                10_000,
-                122,
-                43,
-                0,
+        let mut render =
+            || {
+                cache.render(
+                Viewport { count: 10_000, width: 122, rows: 43, offset: 0 },
                 Version::Child(1),
                 &expanded,
                 |index| Some(Version::Child(i64::try_from(index).unwrap())),
@@ -492,7 +514,7 @@ mod tests {
                     ))
                 },
             )
-        };
+            };
         render();
         let cold_layouts = layouts.get();
         let start = std::time::Instant::now();

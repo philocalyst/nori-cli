@@ -25,7 +25,6 @@ pub(crate) struct SessionView {
     child_output: HashMap<SubagentKey, String>,
     main_scrolling: bool,
     drag_row: Option<u16>,
-    strip_drag: Option<(u16, u16, Option<SubagentKey>, bool)>,
     expanded_tools: HashMap<Target, HashSet<String>>,
     windows: HashMap<Target, super::transcript_window::TranscriptWindow>,
     controlled_configs: HashMap<SubagentKey, AgentConfigState>,
@@ -46,7 +45,6 @@ impl Default for SessionView {
             child_output: HashMap::new(),
             main_scrolling: false,
             drag_row: None,
-            strip_drag: None,
             expanded_tools: HashMap::new(),
             windows: HashMap::new(),
             controlled_configs: HashMap::new(),
@@ -199,44 +197,6 @@ impl SessionView {
 
     pub(crate) fn end_drag(&mut self) {
         self.drag_row = None;
-    }
-
-    pub(crate) fn start_strip_drag(&mut self, column: u16, row: u16, key: Option<SubagentKey>) {
-        self.strip_drag = Some((column, row, key, false));
-    }
-
-    pub(crate) fn strip_drag(&mut self, column: u16, row: u16) -> isize {
-        let Some((previous_column, previous_row, _, dragged)) = self.strip_drag.as_mut() else {
-            return 0;
-        };
-        let column_delta = isize::try_from(column).unwrap_or(isize::MAX)
-            - isize::try_from(*previous_column).unwrap_or(isize::MAX);
-        let row_delta = isize::try_from(row).unwrap_or(isize::MAX)
-            - isize::try_from(*previous_row).unwrap_or(isize::MAX);
-        if column_delta.abs() < 3 && row_delta.abs() < 3 {
-            return 0;
-        }
-        *previous_column = column;
-        *previous_row = row;
-        *dragged = true;
-        if row_delta.abs() >= 3 {
-            return 0;
-        }
-        -column_delta.signum()
-    }
-
-    pub(crate) fn end_strip_drag(&mut self) -> Option<SubagentKey> {
-        self.strip_drag
-            .take()
-            .and_then(|(_, _, key, dragged)| if dragged { None } else { key })
-    }
-
-    pub(crate) fn cancel_strip_drag(&mut self) {
-        self.strip_drag = None;
-    }
-
-    pub(crate) fn is_strip_dragging(&self) -> bool {
-        self.strip_drag.is_some()
     }
 
     pub(crate) fn controls_loaded(&self, key: SubagentKey) -> bool {
@@ -491,10 +451,12 @@ impl super::App {
             );
             let expanded = self.session_view.expanded_tools.entry(target).or_default();
             let window = self.session_view.windows.entry(target).or_default().render(
-                cells.len(),
-                size.width,
-                usize::from(rows),
-                offset,
+                super::transcript_window::Viewport {
+                    count: cells.len(),
+                    width: size.width,
+                    rows: usize::from(rows),
+                    offset,
+                },
                 source,
                 expanded,
                 |index| {
@@ -566,10 +528,12 @@ impl super::App {
         let offset = self.session_view.scroll_offset();
         let expanded = self.session_view.expanded_tools.entry(target).or_default();
         let window = self.session_view.windows.entry(target).or_default().render(
-            count,
-            size.width,
-            usize::from(rows),
-            offset,
+            super::transcript_window::Viewport {
+                count,
+                width: size.width,
+                rows: usize::from(rows),
+                offset,
+            },
             source,
             expanded,
             |index| {
@@ -646,33 +610,6 @@ mod tests {
     use crate::subagent_switcher::Entry;
     use crate::subagent_switcher::Status;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn strip_swipe_scrolls_without_activating_a_pill() {
-        let mut view = SessionView::default();
-        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
-        assert_eq!(view.strip_drag(10, 2), 1);
-        assert_eq!(view.end_strip_drag(), None);
-        view.start_strip_drag(1, 2, Some(SubagentKey(3)));
-        assert_eq!(view.end_strip_drag(), Some(SubagentKey(3)));
-    }
-
-    #[test]
-    fn vertical_strip_drag_cancels_click_without_scrolling() {
-        let mut view = SessionView::default();
-        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
-        assert_eq!(view.strip_drag(15, 8), 0);
-        assert_eq!(view.end_strip_drag(), None);
-    }
-
-    #[test]
-    fn cancelling_strip_drag_discards_pending_click() {
-        let mut view = SessionView::default();
-        view.start_strip_drag(15, 2, Some(SubagentKey(4)));
-        view.cancel_strip_drag();
-        assert!(!view.is_strip_dragging());
-        assert_eq!(view.end_strip_drag(), None);
-    }
 
     fn roster(now: Instant) -> Roster {
         let entry = |target| Entry {
