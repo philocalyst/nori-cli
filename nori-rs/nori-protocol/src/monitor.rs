@@ -27,6 +27,10 @@ pub struct MonitorsState {
     pub dormant: i64,
     /// The labels of the running monitors, oldest first.
     pub labels: Vec<String>,
+    /// Background jobs the session follows that have not ended (running, or running on a machine
+    /// that does not answer right now).
+    #[serde(default)]
+    pub jobs: i64,
 }
 
 /// One delivery of monitor events to the agent that armed them.
