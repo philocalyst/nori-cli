@@ -302,7 +302,11 @@ async fn search_tools_remain_claude_cli_builtins() {
             .await
             .expect("tool lookup returns a result");
         assert!(result.is_error, "{name} must remain a CLI builtin");
-        assert!(result.content.contains("Tool not found"), "{}", result.content);
+        assert!(
+            result.content.contains("Tool not found"),
+            "{}",
+            result.content
+        );
     }
 }
 
