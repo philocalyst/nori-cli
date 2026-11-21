@@ -107,7 +107,7 @@ pub(crate) fn highlight_shell(cmd: &str, styles: &ShellStyles) -> Vec<Span<'stat
 }
 
 /// A script highlighted as a whole (so heredocs and multi-line strings parse) and split into one
-/// row of spans per line.
+/// row of spans per line. A trailing newline ends the last line; it does not start an empty one.
 pub(crate) fn highlight_shell_lines(script: &str, styles: &ShellStyles) -> Vec<Vec<Span<'static>>> {
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     for span in highlight_shell(script, styles) {
@@ -122,6 +122,9 @@ pub(crate) fn highlight_shell_lines(script: &str, styles: &ShellStyles) -> Vec<V
                 rows.push(Vec::new());
             }
         }
+    }
+    if script.ends_with('\n') {
+        rows.pop();
     }
     rows
 }
@@ -168,5 +171,32 @@ mod tests {
         assert_eq!(style_of("cargo"), Some(styles.command));
         assert_eq!(style_of("-p"), Some(styles.flag));
         assert_eq!(style_of("&&"), Some(styles.operator));
+    }
+
+    #[test]
+    fn a_trailing_newline_ends_the_last_row_without_adding_one() {
+        let styles = styles();
+        let rows_text = |script: &str| {
+            highlight_shell_lines(script, &styles)
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            (
+                rows_text("ls -la\n"),
+                rows_text("ls -la\npwd\n"),
+                rows_text("ls -la\n\n"),
+            ),
+            (
+                vec!["ls -la".to_owned()],
+                vec!["ls -la".to_owned(), "pwd".to_owned()],
+                vec!["ls -la".to_owned(), String::new()],
+            )
+        );
     }
 }
