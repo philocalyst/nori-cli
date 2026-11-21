@@ -1043,7 +1043,7 @@ mod tests {
 
         let params = config_picker_params(&config, tx, None);
 
-        assert_eq!(params.items.len(), 15);
+        assert_eq!(params.items.len(), 14);
         // Find the vim mode item
         let vim_mode_item = params
             .items

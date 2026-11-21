@@ -122,6 +122,18 @@ fn make_chatwidget_manual_for_mode(
     (widget, event_rx, unused_rx)
 }
 
+/// The labels of the rows of the last choice picker the chat asked the app to show. Pickers
+/// are overlays drawn by the app, so a test reads what they were given.
+fn shown_choice_labels(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Vec<String> {
+    let mut labels = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::ShowChoicePicker(spec) = event {
+            labels = spec.items.iter().map(|item| item.label.clone()).collect();
+        }
+    }
+    labels
+}
+
 mod agent_status;
 mod burst;
 mod context;

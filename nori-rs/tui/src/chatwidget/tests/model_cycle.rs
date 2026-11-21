@@ -351,27 +351,33 @@ fn model_picker_shows_advertised_models_across_providers() {
         home.path().join("agent-models.json"),
         r#"{"mock-model-alt":{"models":[{"value":"fast","name":"Fast"}],"settings":[],"refreshed_at":1}}"#,
     ).expect("cached advertised model");
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     chat.bottom_pane
         .set_composer_placeholder_for_test("! for shell commands");
     chat.config.nori_home = home.path().to_path_buf();
     chat.config.active_agent = "mock-model".to_string();
     chat.sync_acp_session_config_snapshot(&models("sonnet"));
     chat.open_model_popup();
-    let rendered = screen(&chat)
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("Fast"), "{rendered}");
-    assert!(!rendered.contains("Mock ACP Alt"), "{rendered}");
-    assert!(!rendered.contains("Use custom model"), "{rendered}");
-    insta::assert_snapshot!("unified_provider_model_picker", rendered);
+    let labels = shown_choice_labels(&mut rx);
+    assert!(
+        labels.iter().any(|label| label.contains("Fast")),
+        "{labels:?}"
+    );
+    assert!(
+        labels.iter().all(|label| !label.contains("Mock ACP Alt")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .all(|label| !label.contains("Use custom model")),
+        "{labels:?}"
+    );
 }
 
 #[test]
 fn opencode_model_picker_shows_clean_model_names() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     chat.bottom_pane
         .set_composer_placeholder_for_test("! for shell commands");
     chat.config.active_agent = "opencode".to_string();
@@ -386,18 +392,26 @@ fn opencode_model_picker_shows_clean_model_names() {
     )
     .category(acp::SessionConfigOptionCategory::Model)]);
     chat.open_model_popup();
-    let rendered = screen(&chat);
-    let popup = rendered.split('╰').next().unwrap_or(&rendered);
-    assert!(popup.contains("Big Pickle"), "{rendered}");
-    assert!(popup.contains("Coder"), "{rendered}");
-    assert!(!popup.contains("opencode/"), "{rendered}");
-    assert!(!popup.contains("local/"), "{rendered}");
-    insta::assert_snapshot!("opencode_model_picker", rendered);
+    let labels = shown_choice_labels(&mut rx);
+    assert!(
+        labels.iter().any(|label| label.contains("Big Pickle")),
+        "{labels:?}"
+    );
+    assert!(
+        labels.iter().any(|label| label.contains("Coder")),
+        "{labels:?}"
+    );
+    assert!(
+        labels
+            .iter()
+            .all(|label| !label.contains("opencode/") && !label.contains("local/")),
+        "{labels:?}"
+    );
 }
 
 #[test]
 fn provider_picker_shows_opencode_identity() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     chat.bottom_pane
         .set_composer_placeholder_for_test("! for shell commands");
     let mut params = crate::nori::agent_picker::provider_picker_params();

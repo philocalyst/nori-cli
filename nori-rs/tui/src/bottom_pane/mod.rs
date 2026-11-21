@@ -94,9 +94,6 @@ pub(crate) struct BottomPane {
     agent_display_name: String,
     /// Agent slug (e.g., "claude-code") used as prefix for agent commands.
     agent_slug: String,
-    /// Whether vim mode is enabled, used to configure selection view behavior.
-    /// Whether ACP wire JSONL recording is enabled for future child subprocesses.
-    acp_wire_recording_enabled: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -160,7 +157,6 @@ impl BottomPane {
             custom_working_message_list,
             agent_display_name,
             agent_slug,
-            acp_wire_recording_enabled: false,
         };
 
         // Set description overrides for the slash command popup so that
@@ -476,12 +472,6 @@ impl BottomPane {
 
     pub(crate) fn agent_display_name(&self) -> &str {
         &self.agent_display_name
-    }
-
-    pub(crate) fn set_acp_wire_recording_enabled(&mut self, enabled: bool) {
-        self.acp_wire_recording_enabled = enabled;
-        self.refresh_agent_command_descriptions();
-        self.request_redraw();
     }
 
     fn refresh_agent_command_descriptions(&mut self) {
@@ -1128,9 +1118,20 @@ mod tests {
         assert!(left < label && label < right, "{row}");
     }
 
+    /// The picker the pane asked the app to show: lists are drawn by the choice picker overlay,
+    /// not by the pane.
+    fn shown_picker(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) -> crate::choice_picker::ChoiceSpec {
+        match rx.try_recv() {
+            Ok(AppEvent::ShowChoicePicker(spec)) => *spec,
+            Ok(_) | Err(_) => panic!("expected the pane to ask for a choice picker"),
+        }
+    }
+
     #[test]
-    fn settings_selection_uses_the_shared_searchable_picker() {
-        let mut pane = test_bottom_pane();
+    fn settings_selection_is_shown_as_a_searchable_choice_picker() {
+        let (mut pane, mut rx) = test_bottom_pane_with_events();
         let (tx, _rx) = unbounded_channel();
         pane.show_selection_view(crate::nori::config_picker::config_picker_params(
             &nori_config::NoriConfig::default(),
@@ -1138,61 +1139,50 @@ mod tests {
             None,
         ));
 
-        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_selected_row_has_symmetric_rails(&rendered, "Pinned Plan Drawer");
-        assert!(!rendered.contains("/ search"), "{rendered}");
-        assert_snapshot!("shared_settings_picker", rendered);
-
-        for character in "resize reflow".chars() {
-            pane.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-        }
-        let filtered = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(filtered.contains("Resize Reflow"), "{filtered}");
-        assert!(!filtered.contains("Pinned Plan Drawer"), "{filtered}");
-        assert_snapshot!("shared_settings_picker_search", filtered);
+        let spec = shown_picker(&mut rx);
+        assert!(!pane.has_active_view(), "the picker is the app's overlay");
+        assert!(spec.searchable);
+        let labels: Vec<&str> = spec.items.iter().map(|item| item.label.as_str()).collect();
+        assert!(labels.contains(&"Pinned Plan Drawer (off)"), "{labels:?}");
+        assert!(labels.contains(&"Vim Mode (off)"), "{labels:?}");
     }
 
     #[test]
     fn providers_picker_shows_connection_state() {
-        let mut pane = test_bottom_pane();
+        let (mut pane, mut rx) = test_bottom_pane_with_events();
         let mut params = crate::nori::agent_picker::provider_picker_params();
         params.items.retain(|item| item.name == "Mock ACP");
         pane.show_selection_view(params);
-        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 12))
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("sign-in status unknown"), "{rendered}");
-        assert_snapshot!("providers_picker", rendered);
+
+        let spec = shown_picker(&mut rx);
+        assert_eq!(spec.items.len(), 1);
+        assert_eq!(spec.items[0].label, "Mock ACP");
+        let detail = spec.items[0].detail.clone().unwrap_or_default();
+        assert!(detail.contains("sign-in status unknown"), "{detail}");
     }
 
     #[test]
-    fn footer_segments_shared_picker_stays_open_after_a_toggle() {
+    fn footer_segments_picker_stays_open_after_a_toggle() {
         let (mut pane, mut rx) = test_bottom_pane_with_events();
         pane.show_selection_view(crate::nori::config_picker::footer_segments_picker_params(
             &nori_config::FooterSegmentConfig::default(),
             pane.app_event_tx.clone(),
         ));
 
-        let rendered = render_snapshot(&pane, Rect::new(0, 0, 100, 18));
-        assert_selected_row_has_symmetric_rails(&rendered, "Task Summary");
-
-        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
+        let spec = shown_picker(&mut rx);
+        let item = spec
+            .items
+            .iter()
+            .find(|item| item.label.starts_with("Task Summary"))
+            .expect("a Task Summary row");
         assert!(
-            pane.has_active_view(),
+            item.keep_open,
             "the footer toggle picker should remain open after changing one segment"
         );
+        let crate::choice_picker::ChoiceAction::Run(action) = &item.action else {
+            panic!("toggling a footer segment runs an action");
+        };
+        action(&pane.app_event_tx);
         assert!(
             matches!(rx.try_recv(), Ok(AppEvent::SetConfigFooterSegment(_, _))),
             "toggling a footer segment should still emit its config event"
@@ -1200,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn session_config_and_model_selections_use_the_shared_picker() {
+    fn session_config_and_model_selections_are_shown_as_choice_pickers() {
         let option = nori_protocol::acp::v1::SessionConfigOption::select(
             "model",
             "Model",
@@ -1211,7 +1201,7 @@ mod tests {
             ],
         )
         .category(nori_protocol::acp::v1::SessionConfigOptionCategory::Model);
-        let mut pane = test_bottom_pane();
+        let (mut pane, mut rx) = test_bottom_pane_with_events();
 
         pane.show_selection_view(
             crate::nori::session_config_picker::acp_session_config_picker_params(
@@ -1219,13 +1209,14 @@ mod tests {
                 None,
             ),
         );
-        let config_render = render_snapshot(&pane, Rect::new(0, 0, 100, 16))
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_selected_row_has_symmetric_rails(&config_render, "Model");
-        assert_snapshot!("shared_session_config_picker", config_render);
+        let config = shown_picker(&mut rx);
+        assert!(
+            config
+                .items
+                .iter()
+                .any(|item| item.label == "Model (Stable)"),
+            "the config picker lists the model option"
+        );
 
         pane.show_selection_view(
             crate::nori::session_config_picker::acp_session_config_value_picker_params(
@@ -1237,15 +1228,21 @@ mod tests {
                 crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
             ),
         );
-        let model_render = render_snapshot(&pane, Rect::new(0, 0, 100, 22))
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(model_render.contains("Recommended"), "{model_render}");
-        assert!(model_render.contains("Other"), "{model_render}");
-        assert_selected_row_has_symmetric_rails(&model_render, "Stable");
-        assert_snapshot!("shared_model_picker", model_render);
+        let models = shown_picker(&mut rx);
+        let rows: Vec<(&str, Option<&str>, bool)> = models
+            .items
+            .iter()
+            .map(|item| (item.label.as_str(), item.section.as_deref(), item.current))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("Stable", Some("Recommended"), true),
+                ("Preview", Some("Recommended"), false),
+                ("Experimental", Some("Other"), false),
+                ("Use custom model...", Some("Other"), false),
+            ]
+        );
     }
 
     #[test]
@@ -1344,10 +1341,7 @@ mod tests {
         let escape = KeyEvent::new(KeyCode::Esc, crossterm::event::KeyModifiers::NONE);
         pane.handle_key_event(escape);
 
-        assert_eq!(
-            pane.composer.vim_mode_state(),
-            textarea::VimModeState::Normal
-        );
+        assert_eq!(pane.composer.editor_mode(), nori_editor::EditorMode::Normal);
         assert!(
             matches!(events.try_recv(), Err(TryRecvError::Empty)),
             "Insert-mode Escape must not interrupt the active turn",
@@ -1401,10 +1395,7 @@ mod tests {
             KeyCode::Char('i'),
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(
-            pane.composer.vim_mode_state(),
-            textarea::VimModeState::Insert
-        );
+        assert_eq!(pane.composer.editor_mode(), nori_editor::EditorMode::Insert);
     }
 
     #[test]
@@ -1588,7 +1579,6 @@ mod tests {
             agent_slug: "elizacp".to_string(),
         });
 
-        pane.set_acp_wire_recording_enabled(false);
         for ch in ['/', 'p', 'r'] {
             let _ = pane.composer.handle_key_event(KeyEvent::new(
                 KeyCode::Char(ch),

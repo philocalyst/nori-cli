@@ -358,12 +358,6 @@ impl ListSelectionView {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_search_query(&mut self, query: String) {
-        self.model.set_query(query);
-        self.sync_scroll();
-    }
-
     pub(crate) fn take_last_selected_index(&mut self) -> Option<usize> {
         self.last_selected_actual_idx.take()
     }
@@ -627,7 +621,7 @@ mod tests {
             SelectionViewParams {
                 items: vec![item("ElizACP", true)],
                 on_shift_tab: Some(Box::new(|tx| {
-                    tx.send(AppEvent::SetConfigAcpWireRecording(true));
+                    tx.send(AppEvent::SetConfigPinnedPlanDrawer(true));
                 })),
                 ..Default::default()
             },
@@ -636,7 +630,7 @@ mod tests {
         view.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert!(matches!(
             rx.try_recv(),
-            Ok(AppEvent::SetConfigAcpWireRecording(true))
+            Ok(AppEvent::SetConfigPinnedPlanDrawer(true))
         ));
         assert!(!view.is_complete());
     }
@@ -693,7 +687,7 @@ mod tests {
             SelectionViewParams {
                 items: vec![item("a", true)],
                 on_dismiss: Some(Box::new(|tx| {
-                    tx.send(AppEvent::SetConfigAcpWireRecording(false));
+                    tx.send(AppEvent::SetConfigPinnedPlanDrawer(false));
                 })),
                 ..Default::default()
             },
@@ -702,7 +696,7 @@ mod tests {
         view.on_ctrl_c();
         assert!(matches!(
             rx.try_recv(),
-            Ok(AppEvent::SetConfigAcpWireRecording(false))
+            Ok(AppEvent::SetConfigPinnedPlanDrawer(false))
         ));
     }
 }
