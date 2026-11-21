@@ -3,30 +3,29 @@ use std::collections::HashMap;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 
-/// State machine that manages shell-style history navigation (Up/Down) inside
-/// the chat composer. This struct is intentionally decoupled from the
-/// rendering widget so the logic remains isolated and easier to test.
+/// What stepping through the history of earlier sessions found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Recall {
+    Ready(String),
+    /// The entry is being read; it arrives as a history-entry response.
+    Pending,
+    /// There is nothing further that way.
+    Exhausted,
+}
+
+/// The prompts of earlier sessions, for walking past the oldest prompt of this conversation
+/// (see the composer's `prompt_walk`). Entries are read from the persistent history log on
+/// demand, one at a time, and cached.
 pub(crate) struct ChatComposerHistory {
     /// Identifier of the history log as reported by `SessionConfiguredEvent`.
     history_log_id: Option<u64>,
-    /// Number of entries already present in the persistent cross-session
-    /// history file when the session started.
+    /// Number of entries in the persistent history file when the session started: everything
+    /// before this session.
     history_entry_count: usize,
-
-    /// Messages submitted by the user *during this UI session* (newest at END).
-    local_history: Vec<String>,
-
-    /// Cache of persistent history entries fetched on-demand.
+    /// Entries read so far, by offset.
     fetched_history: HashMap<usize, String>,
-
-    /// Current cursor within the combined (persistent + local) history. `None`
-    /// indicates the user is *not* currently browsing history.
-    history_cursor: Option<isize>,
-
-    /// The text that was last inserted into the composer as a result of
-    /// history navigation. Used to decide if further Up/Down presses should be
-    /// treated as navigation versus normal cursor movement.
-    last_history_text: Option<String>,
+    /// The entry being shown, while walking. `None` when not walking the history.
+    history_cursor: Option<usize>,
 }
 
 impl ChatComposerHistory {
@@ -34,10 +33,8 @@ impl ChatComposerHistory {
         Self {
             history_log_id: None,
             history_entry_count: 0,
-            local_history: Vec::new(),
             fetched_history: HashMap::new(),
             history_cursor: None,
-            last_history_text: None,
         }
     }
 
@@ -46,102 +43,42 @@ impl ChatComposerHistory {
         self.history_log_id = Some(log_id);
         self.history_entry_count = entry_count;
         self.fetched_history.clear();
-        self.local_history.clear();
         self.history_cursor = None;
-        self.last_history_text = None;
     }
 
-    /// Record a message submitted by the user in the current session so it can
-    /// be recalled later.
-    pub fn record_local_submission(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-
-        self.history_cursor = None;
-        self.last_history_text = None;
-
-        // Avoid inserting a duplicate if identical to the previous entry.
-        if self.local_history.last().is_some_and(|prev| prev == text) {
-            return;
-        }
-
-        self.local_history.push(text.to_string());
-    }
-
-    /// Reset navigation tracking so the next Up key resumes from the latest entry.
+    /// Reset navigation tracking so the next walk starts from the newest entry.
     pub fn reset_navigation(&mut self) {
         self.history_cursor = None;
-        self.last_history_text = None;
     }
 
-    /// Should Up/Down key presses be interpreted as history navigation given
-    /// the current content and cursor position of `textarea`?
-    pub fn should_handle_navigation(&self, text: &str, cursor: usize) -> bool {
-        if self.history_entry_count == 0 && self.local_history.is_empty() {
-            return false;
-        }
-
-        if text.is_empty() {
-            return true;
-        }
-
-        // Recalled entries keep the cursor at the end for shell-like history
-        // traversal. Preserve start-of-line compatibility while allowing both
-        // boundaries; interior multiline positions remain normal cursor moves.
-        if cursor != 0 && cursor != text.len() {
-            return false;
-        }
-
-        matches!(&self.last_history_text, Some(prev) if prev == text)
-    }
-
-    /// Handle <Up>. Returns true when the key was consumed and the caller
-    /// should request a redraw.
-    pub fn navigate_up(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
-        let total_entries = self.history_entry_count + self.local_history.len();
-        if total_entries == 0 {
-            return None;
-        }
-
-        let next_idx = match self.history_cursor {
-            None => (total_entries as isize) - 1,
-            Some(0) => return None, // already at oldest
+    /// `↑` past the oldest prompt of the conversation: the entries of earlier sessions, newest
+    /// first.
+    pub fn navigate_up_before_session(&mut self, app_event_tx: &AppEventSender) -> Recall {
+        let next = match self.history_cursor {
+            None if self.history_entry_count > 0 => self.history_entry_count - 1,
+            None | Some(0) => return Recall::Exhausted,
             Some(idx) => idx - 1,
         };
-
-        self.history_cursor = Some(next_idx);
-        self.populate_history_at_index(next_idx as usize, app_event_tx)
+        self.history_cursor = Some(next);
+        self.recall(next, app_event_tx)
     }
 
-    /// Handle <Down>.
-    pub fn navigate_down(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
-        let total_entries = self.history_entry_count + self.local_history.len();
-        if total_entries == 0 {
-            return None;
-        }
-
-        let next_idx_opt = match self.history_cursor {
-            None => return None, // not browsing
-            Some(idx) if (idx as usize) + 1 >= total_entries => None,
-            Some(idx) => Some(idx + 1),
+    /// `↓` while walking the entries of earlier sessions; [`Recall::Exhausted`] past the newest
+    /// of them.
+    pub fn navigate_down_before_session(&mut self, app_event_tx: &AppEventSender) -> Recall {
+        let next = match self.history_cursor {
+            Some(idx) if idx + 1 < self.history_entry_count => idx + 1,
+            None | Some(_) => {
+                self.reset_navigation();
+                return Recall::Exhausted;
+            }
         };
-
-        match next_idx_opt {
-            Some(idx) => {
-                self.history_cursor = Some(idx);
-                self.populate_history_at_index(idx as usize, app_event_tx)
-            }
-            None => {
-                // Past newest – clear and exit browsing mode.
-                self.history_cursor = None;
-                self.last_history_text = None;
-                Some(String::new())
-            }
-        }
+        self.history_cursor = Some(next);
+        self.recall(next, app_event_tx)
     }
 
-    /// Integrate a GetHistoryEntryResponse event.
+    /// Integrate a GetHistoryEntryResponse event: the entry's text when it is the one being
+    /// shown.
     pub fn on_entry_response(
         &mut self,
         log_id: u64,
@@ -153,160 +90,68 @@ impl ChatComposerHistory {
         }
         let text = entry?;
         self.fetched_history.insert(offset, text.clone());
-
-        if self.history_cursor == Some(offset as isize) {
-            self.last_history_text = Some(text.clone());
-            return Some(text);
-        }
-        None
+        (self.history_cursor == Some(offset)).then_some(text)
     }
 
-    // ---------------------------------------------------------------------
-    // Internal helpers
-    // ---------------------------------------------------------------------
-
-    fn populate_history_at_index(
-        &mut self,
-        global_idx: usize,
-        app_event_tx: &AppEventSender,
-    ) -> Option<String> {
-        if global_idx >= self.history_entry_count {
-            // Local entry.
-            if let Some(text) = self
-                .local_history
-                .get(global_idx - self.history_entry_count)
-            {
-                self.last_history_text = Some(text.clone());
-                return Some(text.clone());
-            }
-        } else if let Some(text) = self.fetched_history.get(&global_idx) {
-            self.last_history_text = Some(text.clone());
-            return Some(text.clone());
-        } else if let Some(log_id) = self.history_log_id {
-            let Ok(log_id) = i64::try_from(log_id) else {
-                return None;
-            };
-            let Ok(offset) = i64::try_from(global_idx) else {
-                return None;
-            };
+    /// The entry at `offset` if it has been read, else ask for it.
+    fn recall(&mut self, offset: usize, app_event_tx: &AppEventSender) -> Recall {
+        if let Some(text) = self.fetched_history.get(&offset) {
+            return Recall::Ready(text.clone());
+        }
+        if let Some(log_id) = self.history_log_id
+            && let (Ok(log_id), Ok(offset)) = (i64::try_from(log_id), i64::try_from(offset))
+        {
             app_event_tx.send(AppEvent::HarnessAction(
                 crate::app_event::HarnessAction::HistoryEntry { log_id, offset },
             ));
         }
-        None
+        Recall::Pending
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_event::AppEvent;
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
-    fn duplicate_submissions_are_not_recorded() {
-        let mut history = ChatComposerHistory::new();
-
-        // Empty submissions are ignored.
-        history.record_local_submission("");
-        assert_eq!(history.local_history.len(), 0);
-
-        // First entry is recorded.
-        history.record_local_submission("hello");
-        assert_eq!(history.local_history.len(), 1);
-        assert_eq!(history.local_history.last().unwrap(), "hello");
-
-        // Identical consecutive entry is skipped.
-        history.record_local_submission("hello");
-        assert_eq!(history.local_history.len(), 1);
-
-        // Different entry is recorded.
-        history.record_local_submission("world");
-        assert_eq!(history.local_history.len(), 2);
-        assert_eq!(history.local_history.last().unwrap(), "world");
-    }
-
-    #[test]
-    fn navigation_with_async_fetch() {
+    fn walks_earlier_sessions_newest_first_reading_entries_on_demand() {
         let (tx, mut rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
-
         let mut history = ChatComposerHistory::new();
-        // Pretend there are 3 persistent entries.
         history.set_metadata(1, 3);
 
-        // First Up should request offset 2 (latest) and await async data.
-        assert!(history.should_handle_navigation("", 0));
-        assert!(history.navigate_up(&tx).is_none()); // don't replace the text yet
-
-        // Verify that the typed history query was sent.
-        let event = rx.try_recv().expect("expected AppEvent to be sent");
-        let AppEvent::HarnessAction(crate::app_event::HarnessAction::HistoryEntry {
-            log_id,
-            offset,
-        }) = event
+        assert_eq!(history.navigate_up_before_session(&tx), Recall::Pending);
+        let Ok(AppEvent::HarnessAction(crate::app_event::HarnessAction::HistoryEntry {
+            log_id: 1,
+            offset: 2,
+        })) = rx.try_recv()
         else {
-            panic!("unexpected event variant");
+            panic!("expected a request for the newest entry");
         };
-        assert_eq!((log_id, offset), (1, 2));
-
-        // Inject the async response.
         assert_eq!(
-            Some("latest".into()),
-            history.on_entry_response(1, 2, Some("latest".into()))
+            history.on_entry_response(1, 2, Some("latest".into())),
+            Some("latest".to_owned())
         );
 
-        // Next Up should move to offset 1.
-        assert!(history.navigate_up(&tx).is_none()); // don't replace the text yet
-
-        // Verify the second typed query for offset 1.
-        let event2 = rx.try_recv().expect("expected second event");
-        let AppEvent::HarnessAction(crate::app_event::HarnessAction::HistoryEntry {
-            log_id,
-            offset,
-        }) = event2
-        else {
-            panic!("unexpected event variant");
-        };
-        assert_eq!((log_id, offset), (1, 1));
-
+        assert_eq!(history.navigate_up_before_session(&tx), Recall::Pending);
         assert_eq!(
-            Some("older".into()),
-            history.on_entry_response(1, 1, Some("older".into()))
+            history.on_entry_response(1, 1, Some("older".into())),
+            Some("older".to_owned())
         );
+        assert_eq!(
+            history.navigate_down_before_session(&tx),
+            Recall::Ready("latest".into())
+        );
+        assert_eq!(history.navigate_down_before_session(&tx), Recall::Exhausted);
     }
 
     #[test]
-    fn reset_navigation_resets_cursor() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let tx = AppEventSender::new(tx);
-
-        let mut history = ChatComposerHistory::new();
-        history.set_metadata(1, 3);
-        history.fetched_history.insert(1, "command2".into());
-        history.fetched_history.insert(2, "command3".into());
-
-        assert_eq!(Some("command3".into()), history.navigate_up(&tx));
-        assert_eq!(Some("command2".into()), history.navigate_up(&tx));
-
-        history.reset_navigation();
-        assert!(history.history_cursor.is_none());
-        assert!(history.last_history_text.is_none());
-
-        assert_eq!(Some("command3".into()), history.navigate_up(&tx));
-    }
-
-    #[test]
-    fn recalled_history_only_handles_navigation_at_text_boundaries() {
+    fn nothing_before_the_session_is_exhausted_at_once() {
         let (tx, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx);
         let mut history = ChatComposerHistory::new();
-        history.record_local_submission("first\nmessage");
-        let recalled = history.navigate_up(&tx).expect("history entry");
-
-        assert!(history.should_handle_navigation(&recalled, 0));
-        assert!(history.should_handle_navigation(&recalled, recalled.len()));
-        assert!(!history.should_handle_navigation(&recalled, "first".len()));
-        assert!(!history.should_handle_navigation("edited", "edited".len()));
+        assert_eq!(history.navigate_up_before_session(&tx), Recall::Exhausted);
     }
 }

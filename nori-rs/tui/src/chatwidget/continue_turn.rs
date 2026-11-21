@@ -3,6 +3,8 @@
 use nori_protocol::acp::v1::StopReason;
 
 use super::ChatWidget;
+use crate::history_cell::StopWhy;
+use crate::history_cell::StoppedTurnCell;
 
 /// What `/continue` asks of an agent that had started on the prompt.
 const CONTINUATION: &str = "Continue where you left off.";
@@ -30,6 +32,9 @@ impl ChatWidget {
     /// continued, and the user is told so.
     pub(super) fn note_turn_end(&mut self, stop_reason: StopReason, failed: bool) {
         let prompt = self.turn_prompt.take();
+        // A turn the person did not start (a compaction, delivered results) says its own failure;
+        // the bar is for what they asked, or stopped.
+        let theirs = prompt.is_some() || stop_reason == StopReason::Cancelled;
         let finished = !failed
             && !matches!(
                 stop_reason,
@@ -39,11 +44,23 @@ impl ChatWidget {
             prompt,
             reached_agent: self.turn_reached_agent,
         });
-        if self.unfinished.is_some() {
-            self.add_info_message(
-                "/continue picks the turn up where it stopped".to_owned(),
-                None,
-            );
+        if !finished && theirs {
+            let reason = if failed {
+                StopWhy::Other
+            } else {
+                match stop_reason {
+                    StopReason::Cancelled => StopWhy::Interrupted,
+                    StopReason::MaxTokens => StopWhy::TokenLimit,
+                    StopReason::MaxTurnRequests => StopWhy::TurnLimit,
+                    // EndTurn and Refusal end a turn on their own terms, and the enum is
+                    // non_exhaustive, so any later stop reason lands here too.
+                    _ => StopWhy::Other,
+                }
+            };
+            self.add_to_history(StoppedTurnCell {
+                reason,
+                can_continue: self.unfinished.is_some(),
+            });
         }
         if finished && self.config.git.auto_commit {
             self.app_event_tx

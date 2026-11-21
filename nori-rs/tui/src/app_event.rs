@@ -839,6 +839,29 @@ pub(crate) enum AppEvent {
     },
 }
 
+/// A prompt of the main conversation the composer walked back to, sent again from there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RewindSelection {
+    pub(crate) generation: SessionGeneration,
+    /// The prompt's index in the transcript when Enter was pressed.
+    pub(crate) cell_index: usize,
+    /// Which prompt of the conversation it is, from 1: a check on `cell_index`.
+    pub(crate) turn: usize,
+    /// The prompt as edited in the composer, trimmed.
+    pub(crate) text: String,
+    pub(crate) files: RewindFiles,
+}
+
+/// What a rewind does with the files the rewound turns changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RewindFiles {
+    /// Restore them from the edit journal (Enter).
+    Restore,
+    /// Leave them as they are (Alt+Enter).
+    Keep,
+}
+
+
 /// What becomes of the prompt a conversation was forked before.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ForkAfter {

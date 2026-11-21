@@ -54,7 +54,7 @@ fn continue_sends_again_a_prompt_the_agent_never_answered() {
         Some(crate::presentation::TurnFailure::Retryable),
     );
     assert!(
-        history_text(&mut rx).contains("/continue picks the turn up where it stopped"),
+        history_text(&mut rx).contains("▌ stopped · /continue"),
         "the user is told the turn can be continued"
     );
 

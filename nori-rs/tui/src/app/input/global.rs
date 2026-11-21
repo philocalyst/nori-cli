@@ -104,10 +104,10 @@ impl App {
                 }
             }
             Global::ToggleTool => {
-                let nearest = self
-                    .chat_widget
-                    .nearest_transcript_tool()
-                    .or_else(|| tui.last_card().map(|cell| format!("{CARD_PREFIX}{cell}")));
+                let nearest = self.chat_widget.nearest_transcript_tool().or_else(|| {
+                    tui.last_card(&self.transcript_cells[..self.stage_cell_count()])
+                        .map(|cell| format!("{CARD_PREFIX}{cell}"))
+                });
                 if let Some(call_id) = nearest {
                     self.toggle_tool(tui, call_id);
                 } else if self.session_view.focused() == Target::Main {

@@ -37,7 +37,12 @@ impl App {
             InputMode::Overlay
         } else if self.chat_widget.has_active_overlay_or_popup() {
             InputMode::Panel
-        } else if self.focus.is_some() {
+        } else if self
+            .focus
+            .as_ref()
+            .is_some_and(super::focus::Focus::walks_child)
+        {
+            // Walking back through the main conversation happens in the composer.
             InputMode::Focus
         } else {
             InputMode::Composer

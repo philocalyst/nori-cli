@@ -124,6 +124,8 @@ pub(crate) struct App {
     /// A child's journal was asked for so that its prompts can be focused; keys typed meanwhile
     /// wait here.
     pub(crate) pending_child_focus: Option<child_navigation::PendingChildFocus>,
+    /// A rewind chosen while a turn ran: it goes ahead once the turn has stopped.
+    pub(crate) pending_rewind: Option<crate::app_event::RewindSelection>,
     pub(crate) child_focus_sequence: i64,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
@@ -387,6 +389,7 @@ impl App {
             recoveries: Vec::new(),
             pending_handover: None,
             pending_child_focus: None,
+            pending_rewind: None,
             child_focus_sequence: 0,
             pending_update_action: None,
             skip_world_writable_scan_once: false,
