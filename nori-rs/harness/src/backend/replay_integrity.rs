@@ -34,11 +34,15 @@ impl ReplayIntegrity {
                 acp::AgentNotification::SessionNotification(notification),
             )) => match &notification.update {
                 acp::SessionUpdate::ToolCall(call) => {
+                    // The agent did something about the prompt: it was not left unanswered.
+                    self.unanswered = None;
                     self.track(call.tool_call_id.to_string(), Some(call.status));
                 }
                 acp::SessionUpdate::ToolCallUpdate(update) => {
                     self.track(update.tool_call_id.to_string(), update.fields.status);
                 }
+                acp::SessionUpdate::AgentMessageChunk(_)
+                | acp::SessionUpdate::AgentThoughtChunk(_) => self.unanswered = None,
                 _ => {}
             },
             // Any outcome of the prompt, including a failure the user saw, answers it.
@@ -105,5 +109,40 @@ impl ReplayIntegrity {
                 ))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn answer() -> SessionEvent {
+        SessionEvent::Acp(AcpEvent::Notification(
+            acp::AgentNotification::SessionNotification(acp::SessionNotification::new(
+                "session",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("answer")),
+                )),
+            )),
+        ))
+    }
+
+    #[test]
+    fn a_prompt_the_agent_began_answering_is_not_offered_back() {
+        let mut integrity = ReplayIntegrity::new("session".into());
+        integrity.user_prompt("question");
+        integrity.observe(&answer());
+        assert!(integrity.finish(true).is_empty());
+    }
+
+    #[test]
+    fn a_prompt_with_no_output_after_it_is_offered_back() {
+        let mut integrity = ReplayIntegrity::new("session".into());
+        integrity.user_prompt("question");
+        let offered = integrity.finish(true);
+        assert!(matches!(
+            offered.as_slice(),
+            [SessionEvent::Nori(NoriEvent::PromptUnanswered(unanswered))]
+                if unanswered.text == "question"
+        ));
     }
 }
