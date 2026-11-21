@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::session_reducer::QueueOp;
+use crate::backend::prompt_context::PromptContext;
+use crate::backend::prompt_context::StaticContext;
 use crate::normalized::session_runtime::QueuedPrompt;
 use crate::normalized::session_runtime::QueuedPromptKind;
 
@@ -28,6 +30,9 @@ pub(crate) struct QueuedPromptRecord {
     pub(crate) original_content: Vec<acp::ContentBlock>,
     #[serde(default)]
     pub(crate) content: Vec<acp::ContentBlock>,
+    /// Workflow rules belong to the prompt and must survive a queued prompt being resumed.
+    #[serde(default)]
+    pub(crate) workflow_rules: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +65,7 @@ pub(crate) fn record_of(op: &QueueOp) -> Option<QueueRecord> {
                     prompt_meta: prompt.prompt_meta.clone(),
                     original_content: prompt.original_content.clone(),
                     content: prompt.content.clone(),
+                    workflow_rules: prompt.context.fixed.workflow_rules.clone(),
                 },
                 front: *front,
             })
@@ -101,9 +107,58 @@ pub(crate) fn fold(records: impl IntoIterator<Item = QueueRecord>) -> Vec<Queued
             prompt_meta: record.prompt_meta,
             original_content: record.original_content,
             content: record.content,
+            context: Box::new(PromptContext {
+                fixed: StaticContext {
+                    workflow_rules: record.workflow_rules,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             display_text: record.display_text,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn a_queued_prompt_keeps_its_workflow_rules_across_resume() {
+        let prompt = QueuedPrompt {
+            event_id: "prompt-1".to_owned(),
+            kind: QueuedPromptKind::User,
+            text: "keep going".to_owned(),
+            prompt_meta: None,
+            original_content: Vec::new(),
+            content: Vec::new(),
+            context: Box::new(PromptContext {
+                fixed: StaticContext {
+                    workflow_rules: Some("follow the project workflow".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            display_text: Some("keep going".to_owned()),
+        };
+        let operation = QueueOp::Enqueued {
+            prompt,
+            front: false,
+        };
+        let record = record_of(&operation).expect("user prompts are journaled");
+        let payload = serde_json::to_string(&record).expect("serialize queue record");
+        let restored: QueueRecord =
+            serde_json::from_str(&payload).expect("deserialize queue record");
+        let restored_prompts = fold([restored]);
+        let [restored] = restored_prompts.as_slice() else {
+            panic!("expected one queued prompt");
+        };
+        assert_eq!(
+            restored.context.fixed.workflow_rules.as_deref(),
+            Some("follow the project workflow")
+        );
+    }
 }
 
 impl super::AcpBackend {

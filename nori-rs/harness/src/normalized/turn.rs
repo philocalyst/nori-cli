@@ -40,6 +40,8 @@ pub enum TurnOwner {
 pub struct TrackedTool {
     pub call_id: String,
     pub status: acp::ToolCallStatus,
+    /// It runs a subagent (Claude's `Agent`), which ends if the turn is cancelled.
+    pub subagent: bool,
 }
 
 impl TrackedTool {
@@ -57,6 +59,8 @@ pub struct TurnWork {
     pub messages: MessageAssembly,
     /// Tool calls in the order the turn first saw them.
     pub tools: Vec<TrackedTool>,
+    /// The latest tool calls, for loop detection.
+    pub loops: crate::backend::turn::loops::CallWindow,
     /// Permission and question requests the agent is waiting on, by wire request ID.
     pub pending_requests: BTreeSet<String>,
     /// Counts agent activity so the quiet window can tell whether anything happened during it.
@@ -77,19 +81,34 @@ pub struct TurnWork {
 }
 
 impl TurnWork {
-    /// Record the status the agent reported for a tool call, tracking it if it is new.
-    pub fn track_tool(&mut self, call_id: &str, status: Option<acp::ToolCallStatus>) {
+    /// Record the status the agent reported for a tool call, tracking it if it is new, and
+    /// whether it runs a subagent once the agent says so.
+    pub fn track_tool(
+        &mut self,
+        call_id: &str,
+        status: Option<acp::ToolCallStatus>,
+        subagent: bool,
+    ) {
         match self.tools.iter_mut().find(|tool| tool.call_id == call_id) {
             Some(tool) => {
                 if let Some(status) = status {
                     tool.status = status;
                 }
+                tool.subagent |= subagent;
             }
             None => self.tools.push(TrackedTool {
                 call_id: call_id.to_owned(),
                 status: status.unwrap_or(acp::ToolCallStatus::Pending),
+                subagent,
             }),
         }
+    }
+
+    /// A subagent runs inside the turn: cancelling it would end the subagent's work.
+    pub fn runs_subagent(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.subagent && !tool.is_terminal())
     }
 
     /// Nothing the agent is waiting on or running is left open.

@@ -16,19 +16,23 @@ impl AcpBackend {
     ) -> crate::normalized::TurnFailure {
         let (message, retryable) = match prompt_kind {
             QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {
-                (format!("Compact failed: {err}"), false)
+                (format!("Compact failed: {err:#}"), false)
             }
             QueuedPromptKind::GoalContinuation => {
-                (format!("Goal continuation failed: {err}"), false)
+                (format!("Goal continuation failed: {err:#}"), false)
             }
             QueuedPromptKind::TaskResults => (
-                format!("Delivering delegated task results failed: {err}"),
+                format!("Delivering delegated task results failed: {err:#}"),
                 false,
             ),
             QueuedPromptKind::MonitorEvents => {
-                (format!("Delivering monitor events failed: {err}"), false)
+                (format!("Delivering monitor events failed: {err:#}"), false)
             }
-            QueuedPromptKind::WorkflowHook => (format!("Workflow hook failed: {err}"), false),
+            QueuedPromptKind::WorkflowHook => (format!("Workflow hook failed: {err:#}"), false),
+            QueuedPromptKind::LoopNudge => (format!("Steering the agent failed: {err:#}"), false),
+            QueuedPromptKind::GateContinue => {
+                (format!("Continuing the turn failed: {err:#}"), false)
+            }
             QueuedPromptKind::User => {
                 let error_string = format!("{err:?}");
                 let FailureDetails {
@@ -36,11 +40,21 @@ impl AcpBackend {
                     message: agent_message,
                     detail,
                 } = classify_failure(err);
-                // Prefer the concise structured ACP message. Falling back to
-                // top-level Display avoids dumping structured `data` as JSON.
-                // Preserve clean agent-supplied `data.detail` parenthetically,
-                // mirroring `enhance_agent_error`.
-                let display_error = agent_message.unwrap_or_else(|| format!("{err}"));
+                // The agent's reason in words. JSON-RPC's generic "Internal error" says nothing,
+                // so the agent's `data.detail` (already the provider's sentence, never its JSON
+                // body: see `classify_failure`) takes its place; any other message keeps the
+                // detail after it, mirroring `enhance_agent_error`. Top-level Display is the last
+                // resort, which avoids dumping structured `data` as JSON.
+                let (display_error, detail) = match (agent_message, detail) {
+                    (Some(message), Some(detail))
+                        if message.eq_ignore_ascii_case("internal error") =>
+                    {
+                        (detail, None)
+                    }
+                    (Some(message), detail) => (message, detail),
+                    (None, Some(detail)) => (detail, None),
+                    (None, None) => (format!("{err}"), None),
+                };
                 let retryable = class.is_transient();
                 let not_running = nori_acp_host::agent_not_running(err);
                 warn!(?class, retryable, "ACP user prompt failed: {error_string}");

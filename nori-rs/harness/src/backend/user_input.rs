@@ -140,10 +140,9 @@ impl AcpBackend {
         // Save prompt text for post_user_prompt hooks (before it gets moved)
         let prompt_text_for_hooks = display_text;
 
-        let hook_context = self.pending_hook_context.lock().await.take();
-
-        // Internal context is an additional leading block. The caller's ACP
-        // content remains an ordered subsequence of the wire prompt.
+        // The caller's ACP content stays as given; what Nori says along with it is put around it
+        // when the prompt is sent (`prompt_context`). Only what is this prompt's own is recorded
+        // now, so a prompt that is refused, dropped or never sent takes nothing from the session.
         let echo_id = prompt_meta
             .as_ref()
             .and_then(|meta| meta.get(nori_protocol::PROMPT_ECHO_ID_META_KEY))
@@ -155,14 +154,6 @@ impl AcpBackend {
             serde_json::Value::String(echo_id),
         );
         let original_content = content.clone();
-        // The checkpoint a compaction, fork, or resume leaves is not applied here: this prompt
-        // may wait in the queue past a session swap, and the first prompt to reach the new
-        // session must carry it whichever prompt that is. `send_prompt` applies it.
-        let final_content = super::prompt_context::with_context(
-            content,
-            Vec::new(),
-            [workflow_rules, hook_context].into_iter().flatten(),
-        );
 
         let (phase_before_submit, active_request_id_before_submit, queue_len_before_submit) = {
             let driver = self.session_driver.lock().await;
@@ -181,7 +172,7 @@ impl AcpBackend {
                 .unwrap_or("<none>"),
             queue_len_before_submit,
             prompt_text_len = prompt_text.len(),
-            content_blocks = final_content.len(),
+            content_blocks = content.len(),
             "Accepted user prompt into ACP backend"
         );
 
@@ -191,7 +182,14 @@ impl AcpBackend {
             text: prompt_text,
             prompt_meta,
             original_content,
-            content: final_content,
+            content,
+            context: Box::new(super::prompt_context::PromptContext {
+                fixed: super::prompt_context::StaticContext {
+                    workflow_rules,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
             display_text: Some(prompt_text_for_hooks),
         };
         let event = match admission {

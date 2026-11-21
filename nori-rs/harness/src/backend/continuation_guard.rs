@@ -119,6 +119,7 @@ mod tests {
             prompt_meta: None,
             original_content: Vec::new(),
             content: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+            context: Default::default(),
             display_text: None,
         };
         for (kind, text) in [

@@ -8,6 +8,8 @@
 //! - [`cancel`]: what cancelling does to each kind of turn.
 //! - [`lifecycle`]: the requests that own a turn: prompt, load, connection.
 //! - [`updates`] and [`metadata`]: agent activity and the session facts it carries.
+//! - [`loops`]: an agent repeating one tool call, and what the policy does about it.
+//! - [`pressure`]: a context near its end, and the compaction that comes first.
 //! - [`permissions`]: requests the agent waits on, valid in every turn.
 //! - [`quiescence`]: when an agent turn is over.
 //!
@@ -21,8 +23,10 @@ pub(super) mod dispatch;
 pub(super) mod failure;
 pub(super) mod ledger;
 pub(super) mod lifecycle;
+pub(crate) mod loops;
 pub(super) mod metadata;
 pub(super) mod permissions;
+pub(crate) mod pressure;
 pub(super) mod queue;
 pub(super) mod quiescence;
 pub(super) mod send_prompt;

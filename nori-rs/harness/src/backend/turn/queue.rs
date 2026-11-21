@@ -10,6 +10,7 @@ use super::cancel;
 use super::ledger;
 use crate::normalized::ClientEvent;
 use crate::normalized::QueueChanged;
+use crate::normalized::WarningInfo;
 use crate::normalized::session_runtime::QueuedPrompt;
 use crate::normalized::session_runtime::QueuedPromptKind;
 use crate::normalized::session_runtime::SessionRuntime;
@@ -75,13 +76,32 @@ pub(in crate::backend) fn steer(
         return;
     };
     turn.work.start_next_on_end = true;
+    let keep_turn = turn.work.runs_subagent();
     out.queue_ops.push(QueueOp::Enqueued {
         prompt: prompt.clone(),
         front: true,
     });
     runtime.queue.push_front(prompt);
     out.events.push(queue_changed(runtime));
-    cancel::cancel(runtime, None, out);
+    interrupt_unless_subagents(runtime, keep_turn, out);
+}
+
+/// Interrupt the open turn so the prompt at the front starts now; but a turn with a subagent
+/// running is let finish, since cancelling it would end the subagent's work too. The prompt
+/// starts as the turn ends, and Esc still interrupts everything.
+fn interrupt_unless_subagents(
+    runtime: &mut SessionRuntime,
+    keep_turn: bool,
+    out: &mut ReduceOutput,
+) {
+    if keep_turn {
+        out.events.push(ClientEvent::Warning(WarningInfo {
+            message: "Subagents are running: your message goes in as soon as they finish. Esc interrupts them."
+                .to_owned(),
+        }));
+    } else {
+        cancel::cancel(runtime, None, out);
+    }
 }
 
 /// Start the oldest queued prompt, interrupting the open turn if there is one.
@@ -102,7 +122,8 @@ pub(in crate::backend) fn promote(runtime: &mut SessionRuntime, out: &mut Reduce
         None => start_next_queued(runtime, out),
         Some(turn) => {
             turn.work.start_next_on_end = true;
-            cancel::cancel(runtime, None, out);
+            let keep_turn = turn.work.runs_subagent();
+            interrupt_unless_subagents(runtime, keep_turn, out);
         }
     }
 }
@@ -136,7 +157,21 @@ pub(in crate::backend) fn start_next_queued(runtime: &mut SessionRuntime, out: &
 }
 
 fn start_prompt(runtime: &mut SessionRuntime, prompt: QueuedPrompt, out: &mut ReduceOutput) {
+    if super::pressure::compact_first(runtime, prompt.kind, out) {
+        // The prompt waits first in line while the session compacts, and starts on the result.
+        out.queue_ops.push(QueueOp::Enqueued {
+            prompt: prompt.clone(),
+            front: true,
+        });
+        runtime.queue.push_front(prompt);
+        out.events.push(queue_changed(runtime));
+        return;
+    }
     let request_id = acp::RequestId::Str(uuid::Uuid::new_v4().to_string());
+    if prompt.kind == QueuedPromptKind::User {
+        // What the user asks starts a new task, in which the agent may be steered again.
+        runtime.loops.new_task();
+    }
     ledger::open_request_turn(
         runtime,
         TurnOwner::Local {
@@ -209,5 +244,85 @@ pub(in crate::backend) fn drop_queued(
         out.queue_ops.push(QueueOp::Removed {
             event_id: event_id.to_owned(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::backend::session_reducer::InboundEvent;
+    use crate::backend::session_reducer::reduce;
+    use crate::normalized::ClientEventNormalizer;
+
+    fn prompt(id: &str) -> QueuedPrompt {
+        QueuedPrompt {
+            event_id: id.to_owned(),
+            kind: QueuedPromptKind::User,
+            text: id.to_owned(),
+            prompt_meta: None,
+            original_content: Vec::new(),
+            content: Vec::new(),
+            context: Default::default(),
+            display_text: None,
+        }
+    }
+
+    fn cancels(out: &ReduceOutput) -> bool {
+        out.side_effects
+            .iter()
+            .any(|effect| matches!(effect, SideEffect::SendCancel { .. }))
+    }
+
+    /// Sending the next message now interrupts a turn, unless a subagent runs in it: then the
+    /// message waits for the turn, and the subagent's work is not thrown away.
+    #[test]
+    fn sending_now_waits_for_a_running_subagent_instead_of_cancelling_it() {
+        let mut runtime = SessionRuntime::new();
+        let mut normalizer = ClientEventNormalizer::default();
+        reduce(
+            &mut runtime,
+            InboundEvent::PromptSubmit(prompt("first")),
+            &mut normalizer,
+        );
+        let subagent = acp::ToolCall::new(acp::ToolCallId::new("agent-1"), "Explore the repo")
+            .status(acp::ToolCallStatus::InProgress)
+            .meta(nori_host_tools::subagent_meta());
+        reduce(
+            &mut runtime,
+            InboundEvent::Notification(Box::new(acp::SessionUpdate::ToolCall(subagent))),
+            &mut normalizer,
+        );
+        let steered = reduce(
+            &mut runtime,
+            InboundEvent::PromptSteer(prompt("second")),
+            &mut normalizer,
+        );
+        assert_eq!(
+            (
+                cancels(&steered),
+                runtime.queue.front().map(|queued| queued.event_id.clone()),
+                runtime
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.work.start_next_on_end),
+            ),
+            (false, Some("second".to_owned()), true)
+        );
+
+        // Once the subagent is done, sending now interrupts as always.
+        reduce(
+            &mut runtime,
+            InboundEvent::Notification(Box::new(acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new("agent-1"),
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                ),
+            ))),
+            &mut normalizer,
+        );
+        let promoted = reduce(&mut runtime, InboundEvent::PromoteQueued, &mut normalizer);
+        assert!(cancels(&promoted));
     }
 }

@@ -17,6 +17,13 @@ pub struct SessionUsageState {
     pub cost_display: Option<String>,
 }
 
+/// How much of the model's context window the session uses, as the agent last reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used_tokens: i64,
+    pub window_tokens: i64,
+}
+
 /// A user prompt waiting to be sent to ACP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedPromptKind {
@@ -33,6 +40,10 @@ pub enum QueuedPromptKind {
     MonitorEvents,
     /// A prompt the session's workflow hooks to what the last turn did.
     WorkflowHook,
+    /// The steer that follows an agent repeating one tool call.
+    LoopNudge,
+    /// The hidden prompt a `stop` gate hands the agent so that a turn it ended goes on.
+    GateContinue,
 }
 
 /// A user prompt waiting to be sent to ACP.
@@ -45,8 +56,13 @@ pub struct QueuedPrompt {
     pub prompt_meta: Option<acp::Meta>,
     /// Exact caller-supplied ACP content, before Nori prepends private context.
     pub original_content: Vec<acp::ContentBlock>,
-    /// Content sent to the downstream agent, including any Nori context.
+    /// Content sent to the downstream agent, as the caller gave it: what Nori says along with
+    /// it is `context`, put around it when the prompt is sent.
     pub content: Vec<acp::ContentBlock>,
+    /// What belongs to this prompt alone, recorded when it was admitted (its workflow rules).
+    /// What the session owes whichever prompt goes out next is not here: it is taken at the
+    /// send, so a prompt that is refused, dropped or never sent takes none of it.
+    pub context: Box<crate::backend::prompt_context::PromptContext>,
     pub display_text: Option<String>,
 }
 
@@ -69,6 +85,13 @@ pub struct SessionRuntime {
     pub declines: BTreeMap<String, i64>,
     /// Slash commands the agent currently advertises.
     pub available_commands: Vec<AgentCommandInfo>,
+    /// The loop policy in force and what it has done in the current task.
+    pub loops: crate::backend::turn::loops::LoopGuard,
+    /// The compaction policy in force and what automatic compaction has done in this session.
+    pub compaction: crate::backend::turn::pressure::PressureGuard,
+    /// The context the agent last reported, `None` until it reports one and after a compaction
+    /// (the old figure no longer describes the session).
+    pub context_usage: Option<ContextUsage>,
 }
 
 impl SessionRuntime {

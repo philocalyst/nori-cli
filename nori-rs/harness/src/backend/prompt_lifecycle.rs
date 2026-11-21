@@ -124,6 +124,7 @@ mod tests {
             prompt_meta: None,
             original_content: vec![],
             content: vec![],
+            context: Default::default(),
             display_text: Some(id.into()),
         }));
         driver.apply(InboundEvent::PromptStarted {

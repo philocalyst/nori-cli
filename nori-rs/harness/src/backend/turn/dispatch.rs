@@ -326,6 +326,13 @@ impl AcpBackend {
     async fn execute_side_effect(&self, side_effect: SideEffect) {
         match side_effect {
             SideEffect::SendPrompt { request_id, prompt } => {
+                // The ledger looks for loops, and measures the context, by the policy of the turn
+                // that is starting.
+                let policy = self.session_policy_now().await;
+                self.session_driver
+                    .lock()
+                    .await
+                    .set_policy(policy.loops, policy.compaction);
                 self.send_prompt(request_id, prompt).await;
             }
             SideEffect::SendCancel {
@@ -419,6 +426,8 @@ impl AcpBackend {
                     )))
                     .await;
             }
+            SideEffect::CompactFirst { usage, how } => self.compact_first(usage, how),
+            SideEffect::PrepareSummary { usage } => self.prepare_summary(usage),
             SideEffect::Schedule { wake, after } => {
                 let inputs = self.session_event_tx.clone();
                 tokio::spawn(async move {

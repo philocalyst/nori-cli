@@ -126,11 +126,15 @@ impl AcpBackend {
                 // finished; a divider after a failed or cancelled compaction would claim the
                 // context shrank.
                 if completed_turn.stop_reason == acp::StopReason::EndTurn {
+                    self.compaction_finished(super::super::compaction::CompactionOutcome::Swapped)
+                        .await;
                     self.forward_client_event(ClientEvent::ContextCompacted(
                         crate::normalized::ContextCompacted { summary: None },
                     ))
                     .await;
                 } else {
+                    self.compaction_finished(super::super::compaction::CompactionOutcome::Failed)
+                        .await;
                     let _ = self
                         .backend_event_tx
                         .send(BackendEvent::Public(SessionEvent::Nori(
@@ -157,6 +161,15 @@ impl AcpBackend {
         self.monitor_turn_boundary();
         self.edit_journal.capture_turn_end();
         self.maybe_watch_ci(generation).await;
+        // Last, after the turn's follow-ups had their chance to start: if the session is at
+        // rest, its context is measured now, while the provider's cache is warm. This runs on
+        // the runtime actor, which must never wait on its own queue: when that is full the
+        // check is skipped, and the next prompt to start makes it instead.
+        let _ =
+            self.session_event_tx
+                .try_send(session_runtime_driver::SessionRuntimeInput::Reducer(
+                    session_reducer::InboundEvent::CompactIfDue,
+                ));
     }
 
     async fn maybe_submit_goal_continuation(
@@ -188,7 +201,9 @@ impl AcpBackend {
             QueuedPromptKind::User
             | QueuedPromptKind::TaskResults
             | QueuedPromptKind::MonitorEvents
-            | QueuedPromptKind::WorkflowHook => {}
+            | QueuedPromptKind::WorkflowHook
+            | QueuedPromptKind::LoopNudge
+            | QueuedPromptKind::GateContinue => {}
             QueuedPromptKind::GoalContinuation if can_chain_continuation => {}
             QueuedPromptKind::GoalContinuation
             | QueuedPromptKind::Compact

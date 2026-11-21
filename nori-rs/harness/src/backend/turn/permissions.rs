@@ -47,7 +47,7 @@ pub(in crate::backend) fn opened(
                 after_cancel: cancel_ignored,
             });
         }
-        turn.work.track_tool(call_id, None);
+        turn.work.track_tool(call_id, None, false);
     }
     turn.work.pending_requests.insert(request_id);
     quiescence::touch(turn, out);

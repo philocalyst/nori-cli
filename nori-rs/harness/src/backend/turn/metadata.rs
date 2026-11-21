@@ -13,6 +13,7 @@ use super::lifecycle;
 use super::quiescence;
 use crate::normalized::ClientEvent;
 use crate::normalized::ClientEventNormalizer;
+use crate::normalized::session_runtime::ContextUsage;
 use crate::normalized::session_runtime::SessionRuntime;
 use crate::normalized::turn::TurnOwner;
 
@@ -58,6 +59,22 @@ pub(in crate::backend) fn reduce(
             }
             _ => {}
         }
+    }
+
+    // A replayed history reports the context as it was when it was recorded, on whatever model
+    // ran it then; only what the agent reports of the live session measures it (an old chat
+    // resumed must not compact on what it once held).
+    let replaying = runtime
+        .turn
+        .as_ref()
+        .is_some_and(|turn| matches!(turn.owner, TurnOwner::Replay { .. }));
+    if let acp::SessionUpdate::UsageUpdate(usage) = update
+        && !replaying
+    {
+        runtime.context_usage = Some(ContextUsage {
+            used_tokens: i64::try_from(usage.used).unwrap_or(i64::MAX),
+            window_tokens: i64::try_from(usage.size).unwrap_or(i64::MAX),
+        });
     }
 
     // Metadata during agent work is still a sign of life.

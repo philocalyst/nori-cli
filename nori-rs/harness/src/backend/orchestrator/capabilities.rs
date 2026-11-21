@@ -129,32 +129,34 @@ fn listed_models(home: &std::path::Path, agent: &str) -> Vec<ModelEntry> {
 }
 
 impl super::Orchestrator {
-    /// Put the cached provider catalog in the first prompt without probing agents or
-    /// changing the static host-tool instructions used by prewarmed processes.
+    /// What the first prompt opens with: the session preamble and the cached provider catalog,
+    /// without probing agents or changing the static host-tool instructions used by prewarmed
+    /// processes.
     pub(crate) async fn initial_catalog_context(
         &self,
         context: Option<String>,
         workflow: &tokio::sync::Mutex<crate::backend::workflow::WorkflowState>,
         tools_available: bool,
-    ) -> Option<String> {
+    ) -> crate::backend::prompt_context::StaticContext {
         let workflow = workflow.lock().await;
         let policy = workflow
             .active
             .as_ref()
             .and_then(|workflow| workflow.tools.as_ref());
+        let mut fixed = crate::backend::prompt_context::StaticContext {
+            preamble: context,
+            ..Default::default()
+        };
         if !tools_available || !catalog_tools_enabled(policy) {
-            return context;
+            return fixed;
         }
         let Ok(catalog) = serde_json::to_string(&self.inner.capabilities()) else {
-            return context;
+            return fixed;
         };
-        let catalog = format!(
+        fixed.catalog = Some(format!(
             "<nori_agent_catalog>\nCached configured delegation capabilities: {catalog}\nModels and settings may be stale; an empty model list means unprobed, not unavailable. Use agent_capabilities to refresh before choosing a provider or model.\n</nori_agent_catalog>"
-        );
-        Some(match context {
-            Some(context) => format!("{context}\n\n{catalog}"),
-            None => catalog,
-        })
+        ));
+        fixed
     }
 }
 
@@ -192,13 +194,17 @@ mod context_tests {
             orchestrator
                 .initial_catalog_context(initial.clone(), &workflow, false)
                 .await,
-            initial
+            crate::backend::prompt_context::StaticContext {
+                preamble: initial.clone(),
+                ..Default::default()
+            }
         );
-        let context = orchestrator
-            .initial_catalog_context(initial, &workflow, true)
-            .await
-            .unwrap();
-        assert!(context.starts_with("existing context\n\n<nori_agent_catalog>"));
+        let fixed = orchestrator
+            .initial_catalog_context(initial.clone(), &workflow, true)
+            .await;
+        assert_eq!(fixed.preamble, initial);
+        let context = fixed.catalog.unwrap();
+        assert!(context.starts_with("<nori_agent_catalog>"));
         let catalog = context
             .lines()
             .find_map(|line| line.strip_prefix("Cached configured delegation capabilities: "))

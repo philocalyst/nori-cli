@@ -98,6 +98,9 @@ pub enum InboundEvent {
     AttemptEnded { turn_seq: i64 },
     /// A session swap finished: prompts may start again.
     ReleaseFence,
+    /// The session may have come to rest after a turn: compact now if its context is past the
+    /// trigger, or prepare the summary if it is close (see [`super::turn::pressure`]).
+    CompactIfDue,
     /// Prompts typed ahead before the previous session ended: held for the user, not queued.
     RestoreQueued(Vec<QueuedPrompt>),
     /// The user dropped a queued or restored prompt.
@@ -125,6 +128,7 @@ pub(super) fn inbound_event_kind(event: &InboundEvent) -> &'static str {
         InboundEvent::ConnectionLost => "connection_lost",
         InboundEvent::AttemptEnded { .. } => "attempt_ended",
         InboundEvent::ReleaseFence => "release_fence",
+        InboundEvent::CompactIfDue => "compact_if_due",
         InboundEvent::RestoreQueued(_) => "restore_queued",
         InboundEvent::DropQueued { .. } => "drop_queued",
     }
@@ -168,6 +172,16 @@ pub enum SideEffect {
     AnnounceSilent { silent_for_secs: i64 },
     /// The agent that was silent did something.
     AnnounceHeard,
+    /// Compact the session before anything starts; the ledger holds the fence until whoever
+    /// performs it releases it.
+    CompactFirst {
+        usage: crate::normalized::session_runtime::ContextUsage,
+        how: super::turn::pressure::CompactHow,
+    },
+    /// Write the summary now and keep it for when the context reaches the trigger.
+    PrepareSummary {
+        usage: crate::normalized::session_runtime::ContextUsage,
+    },
 }
 
 /// A change to the queue of typed-ahead prompts, for the journal: replaying them rebuilds what
@@ -267,6 +281,7 @@ pub fn reduce(
             runtime.fenced = false;
             queue::start_next_queued(runtime, &mut out);
         }
+        InboundEvent::CompactIfDue => super::turn::pressure::at_rest(runtime, &mut out),
         InboundEvent::RestoreQueued(prompts) => queue::restore(runtime, prompts, &mut out),
         InboundEvent::DropQueued { event_id } => queue::drop_queued(runtime, &event_id, &mut out),
     }

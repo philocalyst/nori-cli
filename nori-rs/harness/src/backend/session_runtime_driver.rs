@@ -65,6 +65,21 @@ impl SessionDriver {
         }
     }
 
+    /// Take in what the agent announced about the session while it was being set up (its
+    /// commands, mode, settings, context usage), before the ledger ran: the ledger starts knowing
+    /// it. Turn activity of setup is not the ledger's, and what the reduction says was already
+    /// published as the setup's own events.
+    pub(crate) fn absorb_setup<'a>(
+        &mut self,
+        updates: impl IntoIterator<Item = &'a acp::SessionUpdate>,
+    ) {
+        for update in updates {
+            if super::turn::metadata::is_session_metadata(update) {
+                self.apply(InboundEvent::Notification(Box::new(update.clone())));
+            }
+        }
+    }
+
     pub(crate) fn apply(&mut self, event: InboundEvent) -> ReducerActions {
         let out = reduce(&mut self.runtime, event, &mut self.normalizer);
         ReducerActions {
@@ -114,6 +129,32 @@ impl SessionDriver {
             .map(|turn| turn.seq)
     }
 
+    /// The loop and compaction policies in force, from the next tool call and turn end on.
+    pub(crate) fn set_policy(
+        &mut self,
+        loops: nori_workflow::LoopPolicy,
+        compaction: nori_workflow::CompactionPolicy,
+    ) {
+        self.runtime.loops.policy = loops;
+        self.runtime.compaction.policy = compaction;
+    }
+
+    /// A compaction ended. A compacted session is measured again from the agent's next report.
+    /// Returns whether automatic compaction stopped for this session because of it.
+    pub(crate) fn compaction_ended(
+        &mut self,
+        end: crate::backend::turn::pressure::CompactionEnd,
+    ) -> bool {
+        let used_tokens = self
+            .runtime
+            .context_usage
+            .map_or(0, |usage| usage.used_tokens);
+        if end == crate::backend::turn::pressure::CompactionEnd::Compacted {
+            self.runtime.context_usage = None;
+        }
+        self.runtime.compaction.ended(end, used_tokens)
+    }
+
     /// A turn of any owner is open.
     pub(crate) fn has_open_turn(&self) -> bool {
         self.runtime.turn.is_some()
@@ -159,7 +200,10 @@ impl SessionDriver {
                 .and_then(|meta| meta.get(nori_protocol::PROMPT_ECHO_ID_META_KEY))
                 .and_then(serde_json::Value::as_str)
                 == Some(owner_event_id)
-                && prompt.content.contains(&chunk.content)
+                && (prompt.content.contains(&chunk.content)
+                    // The prompt waits here as the person wrote it; what Nori puts around it
+                    // is added as it is sent, and an agent echoes that too.
+                    || super::prompt_context::is_injected(&chunk.content))
         })
     }
 

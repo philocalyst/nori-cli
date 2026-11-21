@@ -4,6 +4,8 @@ use super::super::*;
 
 use crate::normalized::session_runtime::QueuedPromptKind;
 
+use super::super::prompt_context::PromptContext;
+use super::super::prompt_context::session::SessionStores;
 use super::super::prompt_lifecycle::PromptResult;
 use super::super::session_reducer::InboundEvent;
 
@@ -19,7 +21,15 @@ impl AcpBackend {
             abort_handle.abort();
         }
 
-        let (prompt_kind, prompt_event_id, prompt_meta, original_content, display_text, turn_seq) = {
+        let (
+            prompt_kind,
+            prompt_event_id,
+            prompt_meta,
+            original_content,
+            admitted_context,
+            display_text,
+            turn_seq,
+        ) = {
             let driver = self.session_driver.lock().await;
             let turn_seq = driver.local_turn_seq();
             driver
@@ -30,6 +40,7 @@ impl AcpBackend {
                         prompt.event_id.clone(),
                         prompt.prompt_meta.clone(),
                         prompt.original_content.clone(),
+                        (*prompt.context).clone(),
                         prompt.display_text.clone(),
                         turn_seq,
                     )
@@ -39,6 +50,7 @@ impl AcpBackend {
                     request_id.to_string(),
                     None,
                     Vec::new(),
+                    PromptContext::default(),
                     None,
                     turn_seq,
                 ))
@@ -56,22 +68,44 @@ impl AcpBackend {
                 self.edit_journal
                     .begin_turn("goal continuation".to_string());
             }
+            QueuedPromptKind::LoopNudge => {
+                self.edit_journal.begin_turn("loop nudge".to_string());
+            }
+            QueuedPromptKind::GateContinue => {
+                self.edit_journal.begin_turn("gate continue".to_string());
+            }
             QueuedPromptKind::TaskResults => {
                 self.edit_journal
                     .begin_turn("delegated task results".to_string());
+                if let Some(delivered) = self
+                    .pending_task_results
+                    .lock()
+                    .await
+                    .remove(&prompt_event_id)
+                {
+                    let _ = self
+                        .backend_event_tx
+                        .send(BackendEvent::Public(SessionEvent::Nori(
+                            nori_protocol::NoriEvent::TaskResultsDelivered(delivered),
+                        )))
+                        .await;
+                }
             }
             QueuedPromptKind::MonitorEvents => {
                 self.edit_journal.begin_turn("monitor events".to_string());
             }
             QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {}
         }
-        let snapshot_turn = if matches!(
-            prompt_kind,
-            QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
-        ) {
-            None
-        } else {
-            self.edit_journal.latest_turn_id()
+        // The turn just opened, to snapshot the tree for before its prompt is sent.
+        let snapshot_turn = match prompt_kind {
+            QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => None,
+            QueuedPromptKind::User
+            | QueuedPromptKind::WorkflowHook
+            | QueuedPromptKind::GoalContinuation
+            | QueuedPromptKind::LoopNudge
+            | QueuedPromptKind::GateContinue
+            | QueuedPromptKind::TaskResults
+            | QueuedPromptKind::MonitorEvents => self.edit_journal.latest_turn_id(),
         };
         let client_request_started = self
             .pending_prompt_submissions
@@ -92,33 +126,26 @@ impl AcpBackend {
             if let Some(turn) = snapshot_turn {
                 backend.edit_journal.capture_turn_start(turn).await;
             }
-            let mut prompt = prompt;
-            // The first prompt to reach a session a compaction, fork, or resume prepared opens
-            // with its checkpoint, whichever prompt that is.
-            let mut checkpoint = if matches!(
-                prompt_kind,
-                QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
-            ) {
-                None
-            } else {
-                backend.pending_compact_summary.lock().await.take()
+            // What the session owes the prompt that goes out (a compaction, fork or resume's
+            // checkpoint, the preamble, hook output, goal context) is taken now, whichever
+            // prompt that is, and given back below if the agent never receives it.
+            let goals_enabled = backend.goal_mcp_http_server.lock().await.is_some();
+            let stores = SessionStores {
+                fixed: &backend.pending_static_context,
+                hook_output: &backend.pending_hook_context,
+                checkpoint: &backend.pending_compact_summary,
+                workflow: &backend.workflow,
+                goals: &backend.thread_goal_state,
+                goals_enabled,
             };
-            let unsent_checkpoint = checkpoint.clone();
-            if let Some(checkpoint) = checkpoint.as_mut() {
-                let historical = crate::transcript::fork_context::take_typed_history(checkpoint);
-                prompt = super::super::prompt_context::with_context(
-                    prompt,
-                    historical,
-                    [std::mem::take(checkpoint)],
-                );
-            }
-            if !matches!(
-                prompt_kind,
-                QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
-            ) && let Some(context) = backend.take_goal_context_for_prompt().await
-            {
-                prompt.push(acp::ContentBlock::Text(acp::TextContent::new(context)));
-            }
+            let context = stores
+                .take(
+                    prompt_kind,
+                    admitted_context,
+                    super::super::thread_goal::now_seconds(),
+                )
+                .await;
+            let prompt = context.assemble(prompt);
             debug!(
                 target: "acp_event_flow",
                 request_id = %request_id_for_task,
@@ -163,19 +190,27 @@ impl AcpBackend {
                         .await;
                 }
                 Err(err) => {
-                    // The agent never took the prompt: the next one still owes it the checkpoint.
-                    if let Some(checkpoint) = unsent_checkpoint {
-                        backend
-                            .pending_compact_summary
-                            .lock()
-                            .await
-                            .get_or_insert(checkpoint);
+                    // The agent never took the prompt: the next one still owes it the context.
+                    let mut context = context;
+                    // Sent again as it was, a checkpoint the provider called too long would
+                    // only be refused again.
+                    if matches!(
+                        nori_acp_host::classify_failure(&err).class,
+                        nori_acp_host::FailureClass::PromptTooLong
+                    ) && let Some(checkpoint) = context.dynamic.checkpoint.as_mut()
+                        && let Some(smaller) = crate::context_budget::shrink_checkpoint(
+                            checkpoint,
+                            checkpoint.len() / 4,
+                        )
+                    {
+                        *checkpoint = smaller;
                     }
+                    stores.restore(context).await;
                     warn!(
                         target: "acp_event_flow",
                         request_id = %wire_request_id,
                         error = %err,
-                        "Prompt task failed before reducer observed a prompt response"
+                        "The agent failed the prompt"
                     );
                     if let Some(mut handoff) = handoff {
                         // The conversation continues on another agent: this turn ends here
