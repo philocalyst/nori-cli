@@ -132,5 +132,9 @@ not on the login `PATH` names it: `[machines.NAME] nori = "~/bin/nori"`, `nori_h
 `auth.json`), environment values, and the agent's own session store. The target uses its own
 sign-ins; the user is told if an account is not available there.
 
+After an import from another known machine, Nori restores delegated children from their
+conversation journals once and records that recovery. Ordinary resumes on the same machine
+do not replay those child journals.
+
 The **conversation ID** survives a move. The ACP session ID does not; see
 [transcripts.md](transcripts.md).
