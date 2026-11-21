@@ -35,7 +35,7 @@ pub(crate) struct WorkflowState {
     pub(super) loops: nori_workflow::LoopPolicy,
     /// Whether an independent reviewer checks a goal the agent calls complete.
     pub(super) goals: nori_workflow::GoalsPolicy,
-    /// The agent has been told the active workflow's rules.
+    /// The agent has been told the active workflow's rules: a prompt that carried them was sent.
     told: bool,
     /// Hook turns sent since the user's last turn.
     pub(super) hook_turns: i64,
@@ -208,6 +208,21 @@ impl WorkflowState {
         if self.active.is_none() {
             self.active = workflow;
         }
+    }
+
+    /// Hand `rules` to the prompt that is being sent, once: the agent is told them by the first
+    /// prompt that goes out, not by one that was only admitted.
+    pub(super) fn claim_rules(&mut self, rules: String) -> Option<String> {
+        if self.told {
+            return None;
+        }
+        self.told = true;
+        Some(rules)
+    }
+
+    /// The prompt that claimed the rules never reached the agent: tell them again.
+    pub(super) fn release_rules(&mut self) {
+        self.told = false;
     }
 
     /// The pull request rules and `on-pr` hook of the workflow in force.
@@ -532,6 +547,9 @@ async fn apply_policy_for_prompt(
     let mut state = workflow.lock().await;
     state.hook_turns = 0;
     state.stop_hooked = false;
+    // The rules are this prompt's own; whether the agent still has to be told them is decided
+    // when a prompt is sent (`WorkflowState::claim_rules`), so a prompt that never goes out does
+    // not use them up.
     let rules = state
         .active
         .as_ref()
@@ -539,7 +557,6 @@ async fn apply_policy_for_prompt(
         .map(Workflow::instructions)
         .filter(|rules| !rules.is_empty())
         .map(|rules| format!("<workflow>\n{rules}</workflow>"));
-    state.told |= rules.is_some();
     (prompt_text.to_owned(), rules)
 }
 
@@ -614,6 +631,32 @@ mod tests {
         let (ready, _) = watch::channel(true);
         let (_, rules) = apply_policy_for_prompt(&state, &ready, "hello").await;
         assert!(rules.unwrap().contains("Policy prompt"));
+    }
+
+    #[tokio::test]
+    async fn admitting_a_prompt_does_not_use_up_the_rules_only_sending_it_does() {
+        let mut policy = Workflow::named("project");
+        policy.instructions.push("Check the tests".into());
+        let state = tokio::sync::Mutex::new(WorkflowState {
+            active: Some(policy),
+            ..Default::default()
+        });
+        let (ready, _) = watch::channel(true);
+        let (_, admitted) = apply_policy_for_prompt(&state, &ready, "one").await;
+        let (_, admitted_again) = apply_policy_for_prompt(&state, &ready, "two").await;
+        assert_eq!(admitted, admitted_again);
+        let rules = admitted.expect("rules");
+        assert_eq!(
+            state.lock().await.claim_rules(rules.clone()),
+            Some(rules.clone())
+        );
+        assert_eq!(state.lock().await.claim_rules(rules.clone()), None);
+        assert_eq!(
+            apply_policy_for_prompt(&state, &ready, "three").await.1,
+            None
+        );
+        state.lock().await.release_rules();
+        assert_eq!(state.lock().await.claim_rules(rules.clone()), Some(rules));
     }
 
     #[tokio::test]
