@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 
 use super::AgentDef;
+use super::ConfigEffect;
 use super::ErrorClass;
 use super::Step;
 use super::Text;
@@ -153,7 +154,56 @@ impl Problems<'_> {
                 }
                 self.steps(&format!("{at} > subagent"), &subagent.steps);
             }
+            Step::ConfigUpdate(update) => {
+                let mut ids = HashSet::new();
+                for model in &update.models {
+                    if !ids.insert(model.id.as_str()) {
+                        self.add(at, format_args!("model {:?} is listed twice", model.id));
+                    }
+                }
+                if update.models.is_empty() && update.set.is_empty() {
+                    self.add(
+                        at,
+                        "config_update needs the models the agent announces, or options it `set`s",
+                    );
+                }
+            }
             Step::PeerMessage(message) => self.text(at, &message.text),
+            Step::When(when) => {
+                let conditions = [
+                    when.matches.is_some(),
+                    when.equals.is_some(),
+                    when.bound.is_some(),
+                ];
+                if conditions.into_iter().filter(|set| *set).count() != 1 {
+                    self.add(at, "when needs exactly one of matches, equals and bound");
+                }
+                if let Some(pattern) = &when.matches
+                    && let Err(error) = regex::Regex::new(pattern)
+                {
+                    self.add(
+                        at,
+                        format_args!("matches {pattern:?} is not a regular expression: {error}"),
+                    );
+                }
+                self.steps(&format!("{at} > then"), &when.then);
+                self.steps(&format!("{at} > otherwise"), &when.otherwise);
+            }
+            Step::Set(set) => {
+                if set.name.is_empty() {
+                    self.add(at, "set needs the name of the variable to bind");
+                }
+                self.text(at, &set.value);
+            }
+            Step::Commands(commands) => {
+                if commands
+                    .commands
+                    .iter()
+                    .any(|command| command.name.is_empty())
+                {
+                    self.add(at, "a command needs a name");
+                }
+            }
             Step::Repeat(repeat) => {
                 if repeat.times < 0 {
                     self.add(at, "repeat.times must not be negative");
@@ -212,6 +262,38 @@ impl Problems<'_> {
                 format_args!("default_mode {default:?} is not among its modes"),
             );
         }
+        for (name, limit) in [
+            (
+                "limits.max_text_block_bytes",
+                agent.limits.max_text_block_bytes,
+            ),
+            ("limits.max_prompt_bytes", agent.limits.max_prompt_bytes),
+        ] {
+            if limit.is_some_and(|bytes| bytes <= 0) {
+                self.add(&at, format_args!("{name} must be positive"));
+            }
+        }
+        for (index, fault) in agent.config_faults.iter().enumerate() {
+            let at = format!("{at} config_fault {}", index + 1);
+            if fault.option.is_empty() {
+                self.add(
+                    &at,
+                    "needs the option id it misbehaves for (`model`, `thought_level`, ...)",
+                );
+            }
+            match fault.effect {
+                ConfigEffect::Substitute if fault.actual.is_none() => {
+                    self.add(&at, "substitute needs `actual`, the value the option takes");
+                }
+                ConfigEffect::Reject | ConfigEffect::Ignore | ConfigEffect::Substitute => {}
+            }
+        }
+        if agent.startup.models_announced_after.is_some() && agent.models.is_empty() {
+            self.add(
+                &at,
+                "startup.models_announced_after announces the agent's `models`, and it has none",
+            );
+        }
         if agent.startup.requires_auth && agent.startup.new_session_error.is_some() {
             self.add(&at, "startup.requires_auth and startup.new_session_error both fail session/new; pick one");
         }
@@ -221,8 +303,14 @@ impl Problems<'_> {
                 .as_deref()
                 .map_or_else(String::new, |name| format!(" {name:?}"));
             let at = format!("{at} scene {}{label}", index + 1);
-            if let Some(message) = scene.on.pattern_error() {
+            for message in scene.on.problems() {
                 self.add(&at, message);
+            }
+            if scene.times.is_some_and(|times| times <= 0) {
+                self.add(
+                    &at,
+                    "times must be positive; a scene that answers nothing is a scene to remove",
+                );
             }
             if let Some(model) = &scene.model
                 && !agent.models.is_empty()
@@ -288,6 +376,11 @@ impl World {
         }
         for agent in &self.agents {
             problems.agent(agent);
+        }
+        for (index, process) in self.processes.iter().enumerate() {
+            if let Some(message) = process.pattern_error() {
+                problems.add(&format!("process {}", index + 1), message);
+            }
         }
         if problems.found.is_empty() {
             Ok(())

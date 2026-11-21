@@ -34,7 +34,8 @@ pub fn registration() -> Registration {
         launch: Arc::new(|spec, pipe, host| Box::pin(serve_spec(spec, pipe, host))),
         prewarm: None,
         resolve: None,
-        availability: None,
+        // A fake agent is signed in by its world (`startup.requires_auth`), not probed.
+        auth_probe: None,
     }
 }
 
@@ -81,6 +82,7 @@ async fn serve_spec(
             clock: runtime.clock.clone(),
             initialize_delay: agent_def.startup.initialize_delay.0,
             initialize_error: agent_def.startup.initialize_error.clone(),
+            initialize_never: agent_def.startup.hang_initialize,
             external: host == Host::External,
         },
     );

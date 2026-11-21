@@ -35,14 +35,19 @@ typealias Answer = "allow"|"deny"|"cancelled"|"timeout"
 typealias StopReason = "end_turn"|"max_tokens"|"max_turn_requests"|"refusal"|"cancelled"
 typealias Priority = "high"|"medium"|"low"
 typealias PlanStatus = "pending"|"in_progress"|"completed"
-typealias ErrorClass = "quota"|"model_unavailable"|"model_placeholder"|"capacity"|"rate_limited"|"server_error"|"network"|"auth"|"prompt_too_long"|"session_not_found"|"internal"|"raw"
+typealias ErrorClass = "quota"|"model_unavailable"|"model_placeholder"|"capacity"|"rate_limited"|"server_error"|"network"|"auth"|"prompt_too_long"|"session_not_found"|"not_resumable"|"executable_not_found"|"not_running"|"internal"|"raw"
 typealias Disorder = "none"|"end_before_start"|"duplicate_start"|"update_after_end"|"contradictory_end"|"never_ends"
 typealias TurnPolicy = "exclusive"|"steerable"|"replace"
 typealias Unscripted = "echo"|"fail"|"hang"
 typealias CancelMode = "honor"|"ignore"|"hang"
 typealias ChunkUnit = "chars"|"words"|"lines"
 typealias SubagentEnd = "running"|"idle"|"completed"|"failed"|"cancelled"|"closed"
+typealias SubagentWire = "claude"|"codex"
 typealias StaleId = "previous"|"unknown"
+typealias Provider = "openai"|"anthropic"
+typealias ConfigEffect = "reject"|"ignore"|"substitute"
+typealias WakeKind = "any"|"task_results"|"monitor_events"
+typealias TurnFilter = "any"|"started"|"steered"|"replaced"
 
 /// A huge text without writing it down: `unit` repeated `times` times (`{{n}}` is the count).
 class Generated {
@@ -138,6 +143,9 @@ class Option {
 
 abstract class Step { abstract kind: String }
 
+/// Anything a script lists as a step: every `Step`, a `Tool`, and a `Fail`.
+typealias AnyStep = Step|Tool|Fail
+
 /// Stream a chunk of the answer.
 class Say extends Step {
   kind = "say"
@@ -197,10 +205,10 @@ class Permission extends Step {
   expect: Answer?
   timeout: Duration?
   run_when_allowed: Boolean = true
-  on_allow: Listing<Any> = new Listing {}
-  on_deny: Listing<Any> = new Listing {}
-  on_cancelled: Listing<Any> = new Listing {}
-  on_timeout: Listing<Any> = new Listing {}
+  on_allow: Listing<AnyStep> = new Listing {}
+  on_deny: Listing<AnyStep> = new Listing {}
+  on_cancelled: Listing<AnyStep> = new Listing {}
+  on_timeout: Listing<AnyStep> = new Listing {}
 }
 
 class PlanEntry {
@@ -262,6 +270,16 @@ class Status extends Step {
 class Mode extends Step {
   kind = "mode"
   id: String
+}
+
+/// The agent announces new settings (`config_option_update`): the models it can run from now on
+/// (unchanged when empty; the session keeps its model when it is still offered, and otherwise
+/// takes the first), and options it switches by itself (`set`, by option id: `model`,
+/// `thought_level`, `mode`, `service_tier`), as Claude does when it falls back to another model.
+class ConfigUpdate extends Step {
+  kind = "config_update"
+  models: Listing<Model> = new Listing {}
+  set: Mapping<String, String> = new Mapping {}
 }
 
 /// Call any host tool as a tool card. `bind` names the result for later steps.
@@ -349,7 +367,7 @@ class StaleResponse extends Step {
 class Detach extends Step {
   kind = "detach"
   after: Duration = 0.s
-  steps: Listing<Any>
+  steps: Listing<AnyStep>
 }
 
 /// Close the connection abruptly. A served process exits with `exit_code`.
@@ -399,26 +417,46 @@ class RawUpdate extends Step {
 /// Lanes at once; their updates interleave in the order of the clock.
 class Par extends Step {
   kind = "par"
-  lanes: Listing<Listing<Any>>
+  lanes: Listing<Listing<AnyStep>>
 }
 
 /// Steps on another session: `self`, `previous`, `first`, `newest`, or a session id.
 class Lane extends Step {
   kind = "lane"
   session: String
-  steps: Listing<Any>
+  steps: Listing<AnyStep>
 }
 
-/// A child session the agent reports itself (as Claude does), with its own activity.
+/// The parent's tool call that starts a provider subagent (Claude's `Task`, Codex's
+/// `spawn_agent`), shown before the child is announced.
+class Launcher {
+  /// The tool as the provider names it: `Task`, `Agent`, `spawn_agent`.
+  tool: String = "Task"
+  /// Generated when absent.
+  id: String?
+  /// The card's title; the child's description when absent.
+  title: String?
+  /// The call returns at once and the child works on; otherwise it ends when the child does.
+  background: Boolean = false
+}
+
+/// A child session the agent reports itself (as Claude or Codex does), with its own activity.
 class Subagent extends Step {
   kind = "subagent"
   id: String?
+  /// The kind of child (`general-purpose`, `Explore`, a Codex role).
   title: String
+  /// What the provider calls this child (Codex's nickname).
+  name: String?
   description: String?
   model: String?
   /// What the parent told the child.
   prompt: Text?
-  steps: Listing<Any> = new Listing {}
+  /// How the provider spells the announcements.
+  wire: SubagentWire = "claude"
+  /// The parent's tool call that starts the child.
+  launcher: Launcher?
+  steps: Listing<AnyStep> = new Listing {}
   ends: SubagentEnd = "idle"
   reason: String?
 }
@@ -436,7 +474,36 @@ class Repeat extends Step {
   kind = "repeat"
   times: Int
   every: Duration = 0.s
-  steps: Listing<Any>
+  steps: Listing<AnyStep>
+}
+
+/// Run `then` when the condition holds of `value`, `otherwise` when it does not. Exactly one of
+/// `matches`, `equals` and `bound` is the condition.
+class When extends Step {
+  kind = "when"
+  /// Rendered when the step runs: `{{model}}`, `{{prompt}}`.
+  value: String = ""
+  /// `value` matches this regular expression.
+  matches: String?
+  /// `value` is exactly this.
+  equals: String?
+  /// The variable of this name is bound; `value` is unused.
+  bound: String?
+  then: Listing<AnyStep> = new Listing {}
+  otherwise: Listing<AnyStep> = new Listing {}
+}
+
+/// Bind `name` to `value` (rendered) for the session's later steps and turns.
+class Set extends Step {
+  kind = "set"
+  name: String
+  value: Text
+}
+
+/// The slash commands the agent offers from now on (`available_commands_update`).
+class Commands extends Step {
+  kind = "commands"
+  commands: Listing<Command>
 }
 
 // ------------------------------------------------------------- scenes, agents
@@ -459,12 +526,43 @@ class Matching extends Match {
   pattern: String
 }
 
+/// The prompts Nori sends by itself to wake the agent: a child's results (`task_results`), a
+/// monitor's events (`monitor_events`), or either.
+class Wake extends Match {
+  kind = "wake"
+  of: WakeKind = "any"
+}
+
+/// The slash command `/name`, with or without arguments. `name` has no slash.
+class SlashCommand extends Match {
+  kind = "command"
+  name: String
+}
+
+/// Every matcher matches.
+class AllOf extends Match {
+  kind = "all_of"
+  matchers: Listing<Match>
+}
+
+/// At least one matcher matches.
+class AnyOf extends Match {
+  kind = "any_of"
+  matchers: Listing<Match>
+}
+
+/// The matcher does not match.
+class Not extends Match {
+  kind = "not"
+  matcher: Match
+}
+
 class CancelPolicy {
   mode: CancelMode = "honor"
   /// How long the agent takes to notice.
   after: Duration = 0.s
   /// Steps the agent runs once it has noticed.
-  then: Listing<Any> = new Listing {}
+  then: Listing<AnyStep> = new Listing {}
   /// Run `then` after answering, so the agent keeps talking to a client that thinks it stopped.
   detach_then: Boolean = false
 }
@@ -474,8 +572,14 @@ class Scene {
   on: Match = new Always {}
   /// Only while the session's model is this one.
   model: String?
+  /// Only turns that began this way: `started` (the session was idle), `steered` (the prompt
+  /// joined a running turn of a `steerable` agent), `replaced` (it superseded one).
+  turn: TurnFilter = "any"
+  /// Answer at most this many prompts of the agent, then leave them to the next scene that
+  /// matches: a first prompt that fails and a second that succeeds are two scenes.
+  times: Int?
   cancel: CancelPolicy = new CancelPolicy {}
-  steps: Listing<Any> = new Listing {}
+  steps: Listing<AnyStep> = new Listing {}
 }
 
 class Model {
@@ -518,6 +622,50 @@ class Startup {
   initialize_error: ErrorSpec?
   new_session_error: ErrorSpec?
   requires_auth: Boolean = false
+  /// `initialize` is never answered, as when the agent's process starts and then stalls.
+  hang_initialize: Boolean = false
+  /// `session/new` is never answered.
+  hang_new_session: Boolean = false
+  /// Fail every `session/load`.
+  load_error: ErrorSpec?
+  /// Fail every `session/resume`.
+  resume_error: ErrorSpec?
+  /// Fail every `session/list`, as an agent whose backing service is down does.
+  list_error: ErrorSpec?
+  /// `session/new` offers no models; this long after it answers, the agent announces its `models`
+  /// in a `config_option_update`, as Claude does once its CLI has reported them.
+  models_announced_after: Duration?
+}
+
+/// A provider's request limits. A prompt over a limit is refused before any scene runs, with a
+/// JSON-RPC internal error whose `data.detail` is the provider's own error body.
+class Limits {
+  /// Whose error bodies: OpenAI's (`string_above_max_length`, `context_length_exceeded`) or
+  /// Anthropic's (`request_too_large`, `prompt is too long`).
+  provider: Provider = "openai"
+  /// The longest a single text block of the prompt may be, in bytes.
+  max_text_block_bytes: Int?
+  /// The most all the text blocks of one prompt may add up to, in bytes (about four to a token).
+  max_prompt_bytes: Int?
+  /// Said in front of the provider's body, as Codex words a failed compaction
+  /// (`Error running remote compact task: `).
+  prefix: String?
+}
+
+/// A setting that misbehaves on `session/set_config_option`. The first fault whose `option` (and
+/// `value`) matches the request applies.
+class ConfigFault {
+  /// The option id: `model`, `thought_level`, `mode`, ...
+  option: String
+  /// Only when this value is asked for; every value when absent.
+  value: String?
+  /// `reject` fails with `error`; `ignore` says yes and keeps the old value (the agent goes on
+  /// running the old model); `substitute` says yes and sets `actual` instead.
+  effect: ConfigEffect = "reject"
+  error: ErrorSpec?
+  actual: String?
+  /// How long the agent takes to answer.
+  delay: Duration = 0.s
 }
 
 class Agent {
@@ -532,6 +680,9 @@ class Agent {
   default_mode: String?
   /// Reasoning-effort values; the first is the default.
   efforts: Listing<String> = new Listing {}
+  /// Model-mode values (the agent's service tier: `standard`, `fast`, `flex`, `priority`); the
+  /// first is the default. Offered as the `service_tier` option.
+  model_modes: Listing<String> = new Listing {}
   commands: Listing<Command> = new Listing {}
   capabilities: Capabilities = new Capabilities {}
   turn_policy: TurnPolicy = "exclusive"
@@ -539,8 +690,33 @@ class Agent {
   account: String?
   startup: Startup = new Startup {}
   unscripted: Unscripted = "echo"
+  /// What the provider behind the agent refuses.
+  limits: Limits = new Limits {}
+  /// Settings that misbehave.
+  config_faults: Listing<ConfigFault> = new Listing {}
   /// The first scene whose `on` and `model` match answers the prompt.
   scenes: Listing<Scene> = new Listing {}
+}
+
+// ------------------------------------------------------------------------------- processes
+
+/// A line a scripted process prints.
+class Line {
+  /// How long after the previous line (or the start).
+  after: Duration = 0.s
+  text: String
+  stream: "stdout"|"stderr" = "stdout"
+}
+
+/// A command the world's machine runs for jobs (`job_start`, a background `bash`): instead of a real
+/// process, its output and its end play on the world's clock.
+class Process {
+  /// The job's command matches this regular expression; the first process that matches runs.
+  command: String
+  output: Listing<Line> = new Listing {}
+  /// How it ends: an exit code this long after its last line, or `null` to run until stopped.
+  exit: Int? = 0
+  linger: Duration = 0.s
 }
 
 name: String
@@ -554,3 +730,5 @@ default_agent: String?
 /// Pkl source for the session's `$NORI_HOME/init.pkl` (the recovery policy this world is about).
 policy: String?
 agents: Mapping<String, Agent>
+/// What jobs run in this world. A job whose command no process matches fails to start, saying so.
+processes: Listing<Process> = new Listing {}

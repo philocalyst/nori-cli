@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use nori_acp_kit::Sink;
 use nori_acp_kit::schema::SessionId;
-use serde_json::Value;
 use serde_json::json;
 
 use super::Break;
@@ -25,8 +24,6 @@ use crate::world::RespondTwice;
 use crate::world::StaleId;
 use crate::world::StaleResponse;
 use crate::world::StderrFlood;
-use crate::world::Subagent;
-use crate::world::SubagentEnd;
 use crate::world::Throttle;
 use crate::world::WireNoise;
 
@@ -215,69 +212,6 @@ impl Ctx {
             .into_iter()
             .collect::<Result<Vec<()>, Break>>()
             .map(|_| ())
-    }
-
-    /// A child session the agent reports itself, as Claude does: announced on the parent, its
-    /// own activity on its own session id, its state at the end.
-    pub(super) async fn subagent(&self, subagent: &Subagent) -> Run {
-        let child = match &subagent.id {
-            Some(id) => self.render(id),
-            None => {
-                let mut state = self.live.record.state();
-                state.subagents += 1;
-                format!("{}/sub-{}", self.session_id(), state.subagents)
-            }
-        };
-        let child_id = SessionId::new(child.clone());
-        let parent = self.lane.id.clone();
-        let mut announcement = json!({
-            "sessionUpdate": "subagent_update",
-            "sessionId": child,
-            "title": self.render(&subagent.title),
-            "state": {"state": "running"},
-        });
-        if let Some(description) = &subagent.description {
-            announcement["description"] = json!(self.render(description));
-        }
-        if let Some(model) = &subagent.model {
-            announcement["model"] = json!(self.render(model));
-        }
-        self.emit_raw(&parent, announcement)?;
-        if let Some(prompt) = &subagent.prompt {
-            self.emit_raw(
-                &child_id,
-                json!({
-                    "sessionUpdate": "session_message",
-                    "senderSessionId": parent,
-                    "recipientSessionId": child_id,
-                    "content": {"type": "text", "text": self.text(prompt)},
-                }),
-            )?;
-        }
-        let lane = Self {
-            lane: Lane {
-                sink: Sink::new(self.lane.sink.cx(), child_id.clone()),
-                id: child_id.clone(),
-                recorded: false,
-            },
-            ..self.clone()
-        };
-        lane.run(&subagent.steps).await?;
-        let state: Option<Value> = match subagent.ends {
-            SubagentEnd::Running => None,
-            SubagentEnd::Idle => Some(json!({"state": "turn_idle", "stopReason": "end_turn"})),
-            SubagentEnd::Completed => Some(json!({"state": "completed", "stopReason": "end_turn"})),
-            SubagentEnd::Failed => Some(json!({"state": "failed", "stopReason": subagent.reason})),
-            SubagentEnd::Cancelled => Some(json!({"state": "cancelled"})),
-            SubagentEnd::Closed => Some(json!({"state": "closed"})),
-        };
-        match state {
-            Some(state) => self.emit_raw(
-                &parent,
-                json!({"sessionUpdate": "subagent_update", "sessionId": child, "state": state}),
-            ),
-            None => Ok(()),
-        }
     }
 
     /// A `session_message` between two sessions, delivered on the recipient's.

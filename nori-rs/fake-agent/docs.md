@@ -28,7 +28,11 @@ plays; the crate interprets them on top of `nori-acp-kit`. The full guide is
 - `exec/`: the interpreter. `Ctx` is one task's view (its session lane, its share of the clock,
   whether a cancel interrupts it); a step that ends the turn breaks out with `Break`.
   `turn.rs` selects the scene and applies the cancel policy, `tools.rs` runs tool lifecycles and
-  permissions, `host.rs` calls Nori's host tools, `faults.rs` holds faults and composition.
+  permissions, `host.rs` calls Nori's host tools, `faults.rs` holds faults and composition,
+  `provider.rs` is the provider behind the agent (the `limits` a prompt is refused over, in the
+  provider's own error body).
+- `world/provider.rs`: `Limits`, `ConfigFault` (a setting that is acknowledged and ignored,
+  substituted or refused) and the `ConfigUpdate` step.
 - `wire.rs`: the wire tap. It forwards JSON-RPC lines between the host's pipe and the kit and applies
   faults the kit cannot express (dropped, repeated and stale responses, noise, crash, slow
   `initialize`).
@@ -46,6 +50,11 @@ plays; the crate interprets them on top of `nori-acp-kit`. The full guide is
   stripped from the prompt first.
 - A `Permission` that times out fails its tool call; `ToolStart` leaves one open on purpose.
 - Faults that need the tap report a divergence when the agent is served without one.
+- A refused prompt (`limits`) never reaches a scene, and is recorded as `PromptRefused`, not as a
+  divergence: the provider refusing is the world working. An agent whose models are announced later
+  (`startup.models_announced_after`) offers no model option at `session/new`.
+- The suite that plays these faults against the harness is `nori-rs/world/tests/`; see
+  [fault-catalog.md](../../docs/fault-catalog.md).
 - Agent-facing strings in scripts are authored text; the crate adds none of its own beyond the
   echo for an unmatched prompt.
 

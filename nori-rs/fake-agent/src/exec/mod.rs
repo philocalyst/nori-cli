@@ -6,10 +6,13 @@
 //! at the next await. Parallel lanes, detached tails and child sessions are each a `Ctx` of their
 //! own with their own share of the clock.
 
+mod control;
 pub mod errors;
 mod faults;
 mod host;
 mod output;
+mod provider;
+mod subagent;
 mod tools;
 mod turn;
 
@@ -262,7 +265,7 @@ impl Ctx {
         out
     }
 
-    fn variable(&self, name: &str) -> Option<String> {
+    pub(super) fn variable(&self, name: &str) -> Option<String> {
         let (root, path) = name
             .split_once('.')
             .map_or((name, None), |(root, path)| (root, Some(path)));
@@ -323,6 +326,7 @@ impl Ctx {
             Step::SessionInfo(info) => self.session_info(info),
             Step::Status(status) => self.status(status),
             Step::Mode(mode) => self.mode(mode),
+            Step::ConfigUpdate(update) => self.config_update(update),
             Step::HostTool(call) => self.host_tool(call).await,
             Step::Delegate(delegate) => self.delegate(delegate).await,
             Step::Send(send) => self.send(send).await,
@@ -344,6 +348,9 @@ impl Ctx {
             Step::Subagent(subagent) => self.subagent(subagent).await,
             Step::PeerMessage(message) => self.peer_message(message),
             Step::Repeat(repeat) => self.repeat(repeat).await,
+            Step::When(when) => self.when(when).await,
+            Step::Set(set) => self.set(set),
+            Step::Commands(commands) => self.commands(commands),
         }
     }
 }

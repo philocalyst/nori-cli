@@ -21,6 +21,8 @@ use super::Env;
 use super::Lane;
 use super::Live;
 use super::TurnInfo;
+use super::provider::refusal;
+use super::provider::weigh;
 use crate::record::Record;
 use crate::session::TurnRecord;
 use crate::world::CancelMode;
@@ -85,6 +87,20 @@ pub(crate) async fn run_prompt(
     request: PromptRequest,
 ) -> acp::Result<PromptResponse> {
     let turn = live.gate.begin().await?;
+    let (bytes, largest_block_bytes) = weigh(&request.prompt);
+    if let Some(detail) = refusal(&env.def.limits, &request.prompt, bytes, largest_block_bytes) {
+        env.rt.recorder.push(
+            env.rt.clock.elapsed(),
+            Record::PromptRefused {
+                agent: env.def.slug.clone(),
+                session: live.record.id.clone(),
+                bytes,
+                largest_block_bytes,
+                detail: detail.clone(),
+            },
+        );
+        return Err(acp::Error::internal_error().data(serde_json::json!({"detail": detail})));
+    }
     let _open = TurnOpen::begin(live);
     let text = prompt_text(&request.prompt);
     let (index, model) = {
@@ -104,13 +120,24 @@ pub(crate) async fn run_prompt(
         )
     };
     let agent_index = env.rt.next(&format!("prompts:{}", env.def.slug));
-    let scene = env.def.scenes.iter().find(|scene| {
+    // The first scene that matches and has uses left answers; a scene with `times` counts its
+    // uses across the agent's sessions.
+    let uses = |position: usize| format!("scene-uses:{}:{position}", env.def.slug);
+    let chosen = env.def.scenes.iter().enumerate().find(|(position, scene)| {
         scene.on.matches(index, agent_index, &text)
+            && scene.turn.admits(turn.kind())
             && scene
                 .model
                 .as_deref()
                 .is_none_or(|wanted| model.as_deref() == Some(wanted))
+            && scene
+                .times
+                .is_none_or(|times| env.rt.count(&uses(*position)) < times)
     });
+    if let Some((position, _)) = chosen {
+        env.rt.next(&uses(position));
+    }
+    let scene = chosen.map(|(_, scene)| scene);
     env.rt.recorder.push(
         env.rt.clock.elapsed(),
         Record::PromptReceived {
@@ -119,6 +146,8 @@ pub(crate) async fn run_prompt(
             index,
             text: text.clone(),
             scene: scene.map(|scene| scene.name.clone().unwrap_or_else(|| "(unnamed)".to_owned())),
+            bytes,
+            largest_block_bytes,
         },
     );
 

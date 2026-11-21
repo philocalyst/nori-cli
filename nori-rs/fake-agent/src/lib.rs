@@ -47,5 +47,8 @@ pub use registration::OPTIONS;
 pub use registration::registration;
 pub use runtime::WorldRuntime;
 pub use world::Answer;
+pub use world::LineDef;
+pub use world::ProcessDef;
+pub use world::StreamDef;
 pub use world::World;
 pub use world::WorldError;

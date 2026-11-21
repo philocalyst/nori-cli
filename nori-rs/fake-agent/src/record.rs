@@ -47,6 +47,21 @@ pub enum Record {
         index: i64,
         text: String,
         scene: Option<String>,
+        /// What the prompt weighed on the wire: all its text blocks, and the longest of them.
+        /// Nori's own context counts here, though `text` leaves it out.
+        #[serde(default)]
+        bytes: i64,
+        #[serde(default)]
+        largest_block_bytes: i64,
+    },
+    /// The agent's provider refused a prompt for its size (see `Limits`), before any scene ran.
+    PromptRefused {
+        agent: String,
+        session: String,
+        bytes: i64,
+        largest_block_bytes: i64,
+        /// The provider's body, as the client received it.
+        detail: String,
     },
     CancelReceived {
         agent: String,
@@ -92,6 +107,16 @@ pub enum Record {
         session: String,
         option: String,
         value: String,
+    },
+    /// A `session/set_config_option` went wrong on purpose (see `ConfigFault`): `effect` is
+    /// `reject`, `ignore` or `substitute`; `actual` is the value the option has afterwards.
+    ConfigFaulted {
+        agent: String,
+        session: String,
+        option: String,
+        requested: String,
+        effect: String,
+        actual: Option<String>,
     },
     /// The script and the world disagreed: an answer other than the one expected, an unbound
     /// variable, a prompt no scene covers, a host tool that could not run.
@@ -242,6 +267,7 @@ impl FlightRecorder {
                 Record::Serving { .. }
                 | Record::SessionOpened { .. }
                 | Record::PromptReceived { .. }
+                | Record::PromptRefused { .. }
                 | Record::CancelReceived { .. }
                 | Record::PermissionAsked { .. }
                 | Record::PermissionAnswered { .. }
@@ -249,6 +275,7 @@ impl FlightRecorder {
                 | Record::Response { .. }
                 | Record::TurnEnded { .. }
                 | Record::ConfigChanged { .. }
+                | Record::ConfigFaulted { .. }
                 | Record::Crashed { .. }
                 | Record::User { .. } => None,
             })

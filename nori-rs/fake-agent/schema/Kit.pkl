@@ -1,0 +1,200 @@
+/// Ready-made pieces for worlds: agents shaped like the real ones on the wire, and short helpers
+/// for the steps every world writes.
+///
+///     amends "nori:World"
+///     import "nori:Kit"
+///
+///     name = "kit-demo"
+///     default_agent = "claude"
+///     agents {
+///       ["claude"] = (Kit.claudeLike) {
+///         scenes {
+///           new Scene {
+///             steps {
+///               Kit.think("The parser is the likely culprit.")
+///               Kit.readFile("src/parser.rs")
+///               Kit.edit("src/parser.rs", "let x = 1;", "let x = 2;")
+///               Kit.shell("cargo test", "test result: ok. 12 passed\n", 0)
+///               Kit.stream("Fixed: the parser read one token too far.", 4, 30.ms)
+///             }
+///           }
+///         }
+///       }
+///     }
+///
+/// An agent preset is an `Agent` to amend: `(Kit.codexLike) { scenes { ... } }` keeps its shape and
+/// adds the script.
+module nori.Kit
+
+import "nori:World" as W
+
+// ------------------------------------------------------------------------------- agents
+
+/// Shaped like Claude Code's adapter: a newer prompt replaces the running turn, the models arrive
+/// in a `config_option_update` shortly after `session/new`, permission modes, and the slash commands
+/// it offers. Its subagents (`claudeTask`) are spelled `subagent_update`.
+claudeLike: W.Agent = new W.Agent {
+  title = "Claude-like"
+  models {
+    new W.Model { id = "fake-opus"; name = "Fake Opus"; context_window = 200000 }
+    new W.Model { id = "fake-sonnet"; name = "Fake Sonnet"; context_window = 200000 }
+    new W.Model { id = "fake-haiku"; name = "Fake Haiku"; context_window = 200000 }
+  }
+  modes {
+    new W.ModeDef { id = "default"; name = "Default" }
+    new W.ModeDef { id = "acceptEdits"; name = "Accept edits" }
+    new W.ModeDef { id = "plan"; name = "Plan" }
+    new W.ModeDef { id = "bypassPermissions"; name = "Bypass permissions" }
+  }
+  efforts { "low"; "medium"; "high" }
+  commands {
+    new W.Command { name = "compact"; description = "Summarize the conversation to free context" }
+    new W.Command { name = "review"; description = "Review the current changes" }
+  }
+  turn_policy = "replace"
+  startup = new W.Startup { models_announced_after = 300.ms }
+}
+
+/// Shaped like Codex: prompts sent while a turn runs steer it, reasoning efforts and service
+/// tiers. Its native children (`codexChild`) are spelled `subagent_spawned`.
+codexLike: W.Agent = new W.Agent {
+  title = "Codex-like"
+  models {
+    new W.Model { id = "fake-gpt"; name = "Fake GPT"; context_window = 400000 }
+    new W.Model { id = "fake-gpt-mini"; name = "Fake GPT mini"; context_window = 400000 }
+  }
+  efforts { "medium"; "low"; "high"; "xhigh" }
+  model_modes { "standard"; "flex"; "priority" }
+  turn_policy = "steerable"
+}
+
+/// Shaped like OpenCode: a gateway to models of several providers, one turn at a time.
+opencodeLike: W.Agent = new W.Agent {
+  title = "OpenCode-like"
+  models {
+    new W.Model { id = "openai/fake-gpt"; name = "Fake GPT (OpenAI)"; context_window = 400000 }
+    new W.Model { id = "anthropic/fake-sonnet"; name = "Fake Sonnet (Anthropic)"; context_window = 200000 }
+  }
+  turn_policy = "exclusive"
+}
+
+// -------------------------------------------------------------------------------- output
+//
+// Parameters are never named like a property of the object they build: inside an object body a
+// name means the object's own property first.
+
+/// The answer, in one chunk.
+function say(content: String): W.Say = new W.Say { text = content; chunk = new W.Chunking { size = 0 } }
+
+/// The answer streamed `perChunk` words at a time, `pause` apart.
+function stream(content: String, perChunk: Int, pause: Duration): W.Say = new W.Say {
+  text = content
+  chunk = new W.Chunking { size = perChunk; unit = "words"; every = pause }
+}
+
+/// Reasoning, in one chunk.
+function think(content: String): W.Think = new W.Think { text = content; chunk = new W.Chunking { size = 0 } }
+
+// --------------------------------------------------------------------------------- tools
+
+/// A file read.
+function readFile(file: String): W.Tool = new W.Tool {
+  title = "Read \(file)"
+  tool_kind = "read"
+  locations { new W.Location { path = file } }
+}
+
+/// An edit with the real old and new text, so the diff, the edit journal and undo work.
+function edit(file: String, before: String, after: String): W.Tool = new W.Tool {
+  title = "Edit \(file)"
+  tool_kind = "edit"
+  locations { new W.Location { path = file } }
+  content { new W.DiffContent { path = file; old_text = before; new_text = after } }
+}
+
+/// A new file.
+function create(file: String, body: String): W.Tool = new W.Tool {
+  title = "Write \(file)"
+  tool_kind = "edit"
+  locations { new W.Location { path = file } }
+  content { new W.DiffContent { path = file; new_text = body } }
+}
+
+/// A shell command with what it printed and its exit code; non-zero fails the call.
+function shell(cmd: String, printed: String, code: Int): W.Tool = new W.Tool {
+  title = cmd
+  tool_kind = "execute"
+  input = new Dynamic { command = cmd }
+  stdout = printed
+  exit_code = code
+  outcome = if (code == 0) "completed" else "failed"
+}
+
+/// A search and what it found.
+function search(regex: String, found: String): W.Tool = new W.Tool {
+  title = "Search \(regex)"
+  tool_kind = "search"
+  input = new Dynamic { pattern = regex }
+  stdout = found
+}
+
+/// An edit that asks permission first, and is made only when allowed.
+function askToEdit(file: String, before: String, after: String): W.Permission = new W.Permission {
+  tool = edit(file, before, after)
+}
+
+// ------------------------------------------------------------------------------ failures
+
+/// Fail the turn with a failure Nori's recovery policy knows (`quota`, `capacity`, ...).
+function fail(why: W.ErrorClass, reason: String): W.Fail = new W.Fail { failure = why; detail = reason }
+
+// ------------------------------------------------------------------------------- children
+
+/// A Claude-style subagent: the parent's `Task` call, the child announced with `subagent_update`,
+/// its own steps, and its end.
+function claudeTask(agentType: String, summary: String, brief: String, work: Listing<W.AnyStep>): W.Subagent =
+  new W.Subagent {
+    title = agentType
+    description = summary
+    prompt = brief
+    wire = "claude"
+    launcher = new W.Launcher { tool = "Task" }
+    steps = work
+    ends = "completed"
+  }
+
+/// A Codex native child: `spawn_agent`, `subagent_spawned` with its nickname, and its end.
+function codexChild(nickname: String, role: String, assignment: String, work: Listing<W.AnyStep>): W.Subagent =
+  new W.Subagent {
+    title = role
+    name = nickname
+    description = assignment
+    prompt = assignment
+    wire = "codex"
+    launcher = new W.Launcher { tool = "spawn_agent" }
+    steps = work
+    ends = "completed"
+  }
+
+// -------------------------------------------------------------------------------- scenes
+
+/// A scene for the prompts Nori sends by itself: a child's results, a monitor's events.
+function onWake(work: Listing<W.AnyStep>): W.Scene = new W.Scene {
+  name = "wake"
+  on = new W.Wake {}
+  steps = work
+}
+
+/// A scene for `/command`.
+function onCommand(command: String, work: Listing<W.AnyStep>): W.Scene = new W.Scene {
+  name = "/\(command)"
+  on = new W.SlashCommand { name = command }
+  steps = work
+}
+
+/// A scene for prompts that match `regex`.
+function matching(regex: String, work: Listing<W.AnyStep>): W.Scene = new W.Scene {
+  name = regex
+  on = new W.Matching { pattern = regex }
+  steps = work
+}

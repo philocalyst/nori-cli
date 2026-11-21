@@ -6,6 +6,8 @@ use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::provider::ConfigFault;
+use super::provider::Limits;
 use super::step::ErrorSpec;
 use super::step::Step;
 use super::value::Span;
@@ -107,6 +109,19 @@ pub struct Startup {
     pub new_session_error: Option<ErrorSpec>,
     /// Require authentication: `session/new` fails with auth required until `authenticate`.
     pub requires_auth: bool,
+    /// `initialize` is never answered, as when the agent's process starts and then stalls.
+    pub hang_initialize: bool,
+    /// `session/new` is never answered.
+    pub hang_new_session: bool,
+    /// Fail every `session/load`.
+    pub load_error: Option<ErrorSpec>,
+    /// Fail every `session/resume`.
+    pub resume_error: Option<ErrorSpec>,
+    /// Fail every `session/list`, as an agent whose backing service is down does.
+    pub list_error: Option<ErrorSpec>,
+    /// `session/new` offers no models; this long after it answers, the agent announces its
+    /// `models` in a `config_option_update`, as Claude does once its CLI has reported them.
+    pub models_announced_after: Option<Span>,
 }
 
 impl Default for Startup {
@@ -117,6 +132,12 @@ impl Default for Startup {
             initialize_error: None,
             new_session_error: None,
             requires_auth: false,
+            hang_initialize: false,
+            hang_new_session: false,
+            load_error: None,
+            resume_error: None,
+            list_error: None,
+            models_announced_after: None,
         }
     }
 }
@@ -131,6 +152,30 @@ pub enum Unscripted {
     /// Fail the prompt with an internal error naming the missing scene.
     Fail,
     Hang,
+}
+
+/// Which of Nori's own prompts wake an agent: delegated task results, monitor events, or either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeKind {
+    #[default]
+    Any,
+    /// `<delegated_task_results>`: children finished.
+    TaskResults,
+    /// `<monitor_events>`: a monitor saw something.
+    MonitorEvents,
+}
+
+impl WakeKind {
+    fn matches(self, text: &str) -> bool {
+        let results = text.contains("<delegated_task_results");
+        let monitors = text.contains("<monitor_events");
+        match self {
+            Self::Any => results || monitors,
+            Self::TaskResults => results,
+            Self::MonitorEvents => monitors,
+        }
+    }
 }
 
 /// Which prompts a scene answers.
@@ -152,6 +197,19 @@ pub enum Match {
         #[serde(skip)]
         compiled: OnceLock<Option<Regex>>,
     },
+    /// The prompts Nori sends on its own to wake the agent: a child's results, a monitor's events.
+    Wake {
+        #[serde(default)]
+        of: WakeKind,
+    },
+    /// The slash command `/name`, with or without arguments.
+    Command { name: String },
+    /// Every matcher matches.
+    AllOf { matchers: Vec<Match> },
+    /// At least one matcher matches.
+    AnyOf { matchers: Vec<Match> },
+    /// The matcher does not match.
+    Not { matcher: Box<Match> },
 }
 
 impl PartialEq for Match {
@@ -172,7 +230,22 @@ impl PartialEq for Match {
                     ..
                 },
             ) => pattern == other_pattern,
-            _ => false,
+            (Self::Wake { of }, Self::Wake { of: other }) => of == other,
+            (Self::Command { name }, Self::Command { name: other }) => name == other,
+            (Self::AllOf { matchers }, Self::AllOf { matchers: other })
+            | (Self::AnyOf { matchers }, Self::AnyOf { matchers: other }) => matchers == other,
+            (Self::Not { matcher }, Self::Not { matcher: other }) => matcher == other,
+            (
+                Self::Always
+                | Self::Nth { .. }
+                | Self::Matching { .. }
+                | Self::Wake { .. }
+                | Self::Command { .. }
+                | Self::AllOf { .. }
+                | Self::AnyOf { .. }
+                | Self::Not { .. },
+                _,
+            ) => false,
         }
     }
 }
@@ -188,6 +261,17 @@ impl Clone for Match {
             Self::Matching { pattern, .. } => Self::Matching {
                 pattern: pattern.clone(),
                 compiled: OnceLock::new(),
+            },
+            Self::Wake { of } => Self::Wake { of: *of },
+            Self::Command { name } => Self::Command { name: name.clone() },
+            Self::AllOf { matchers } => Self::AllOf {
+                matchers: matchers.clone(),
+            },
+            Self::AnyOf { matchers } => Self::AnyOf {
+                matchers: matchers.clone(),
+            },
+            Self::Not { matcher } => Self::Not {
+                matcher: matcher.clone(),
             },
         }
     }
@@ -211,15 +295,69 @@ impl Match {
                 .get_or_init(|| Regex::new(pattern).ok())
                 .as_ref()
                 .is_some_and(|regex| regex.is_match(text)),
+            Self::Wake { of } => of.matches(text),
+            Self::Command { name } => text
+                .trim_start()
+                .strip_prefix('/')
+                .and_then(|rest| rest.strip_prefix(name.as_str()))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)),
+            Self::AllOf { matchers } => matchers
+                .iter()
+                .all(|matcher| matcher.matches(session_index, agent_index, text)),
+            Self::AnyOf { matchers } => matchers
+                .iter()
+                .any(|matcher| matcher.matches(session_index, agent_index, text)),
+            Self::Not { matcher } => !matcher.matches(session_index, agent_index, text),
         }
     }
 
-    pub fn pattern_error(&self) -> Option<String> {
+    /// What is wrong with this matcher (or one inside it), if anything.
+    pub fn problems(&self) -> Vec<String> {
         match self {
             Self::Matching { pattern, .. } => Regex::new(pattern)
                 .err()
-                .map(|error| format!("pattern {pattern:?} is not a regular expression: {error}")),
-            Self::Always | Self::Nth { .. } => None,
+                .map(|error| format!("pattern {pattern:?} is not a regular expression: {error}"))
+                .into_iter()
+                .collect(),
+            Self::Command { name } if name.is_empty() || name.starts_with('/') => vec![format!(
+                "command matcher name {name:?} must be the command without its slash, such as \"review\""
+            )],
+            Self::AllOf { matchers } | Self::AnyOf { matchers } if matchers.is_empty() => {
+                vec!["all_of / any_of need at least one matcher".to_owned()]
+            }
+            Self::AllOf { matchers } | Self::AnyOf { matchers } => {
+                matchers.iter().flat_map(Self::problems).collect()
+            }
+            Self::Not { matcher } => matcher.problems(),
+            Self::Always | Self::Nth { .. } | Self::Wake { .. } | Self::Command { .. } => {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Which turns a scene answers, by how they began.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFilter {
+    #[default]
+    Any,
+    /// The session was idle.
+    Started,
+    /// The prompt joined a running turn (a `steerable` agent).
+    Steered,
+    /// The prompt superseded a running turn (a `replace` agent).
+    Replaced,
+}
+
+impl TurnFilter {
+    pub fn admits(self, kind: nori_acp_kit::TurnKind) -> bool {
+        match (self, kind) {
+            (Self::Any, _)
+            | (Self::Started, nori_acp_kit::TurnKind::Started)
+            | (Self::Steered, nori_acp_kit::TurnKind::Steered)
+            | (Self::Replaced, nori_acp_kit::TurnKind::Replaced) => true,
+            (Self::Started | Self::Steered | Self::Replaced, _) => false,
         }
     }
 }
@@ -269,6 +407,11 @@ pub struct Scene {
     pub on: Match,
     /// Only while the session's model is this one.
     pub model: Option<String>,
+    /// Only turns that began this way.
+    pub turn: TurnFilter,
+    /// The scene answers at most this many prompts of its agent, then the next scene that
+    /// matches does: a first prompt that fails and a second that succeeds are two scenes.
+    pub times: Option<i64>,
     pub cancel: CancelPolicy,
     pub steps: Vec<Step>,
 }
@@ -279,6 +422,8 @@ impl Default for Scene {
             name: None,
             on: Match::Always,
             model: None,
+            turn: TurnFilter::Any,
+            times: None,
             cancel: CancelPolicy::default(),
             steps: Vec::new(),
         }
@@ -298,6 +443,9 @@ pub struct AgentDef {
     pub default_mode: Option<String>,
     /// Reasoning-effort values; the first is the default.
     pub efforts: Vec<String>,
+    /// Model-mode (service tier) values such as `standard`, `fast`, `flex`, `priority`; the
+    /// first is the default.
+    pub model_modes: Vec<String>,
     pub commands: Vec<CommandDef>,
     pub capabilities: CapabilityDef,
     pub turn_policy: TurnPolicyDef,
@@ -305,6 +453,10 @@ pub struct AgentDef {
     pub account: Option<String>,
     pub startup: Startup,
     pub unscripted: Unscripted,
+    /// What the provider behind the agent refuses.
+    pub limits: Limits,
+    /// Settings that misbehave.
+    pub config_faults: Vec<ConfigFault>,
     /// Scenes in order: the first whose `on` and `model` match answers the prompt.
     pub scenes: Vec<Scene>,
 }
@@ -320,12 +472,15 @@ impl Default for AgentDef {
             modes: Vec::new(),
             default_mode: None,
             efforts: Vec::new(),
+            model_modes: Vec::new(),
             commands: Vec::new(),
             capabilities: CapabilityDef::default(),
             turn_policy: TurnPolicyDef::Exclusive,
             account: None,
             startup: Startup::default(),
             unscripted: Unscripted::Echo,
+            limits: Limits::default(),
+            config_faults: Vec::new(),
             scenes: Vec::new(),
         }
     }

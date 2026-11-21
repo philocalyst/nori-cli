@@ -9,6 +9,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::agent::CommandDef;
+use super::provider::ConfigUpdateStep;
 use super::tool::PermissionStep;
 use super::tool::ToolSpec;
 use super::tool::ToolStart;
@@ -44,6 +46,8 @@ pub enum Step {
     /// Nori's status hint: `working` or `idle`.
     Status(StatusStep),
     Mode(ModeStep),
+    /// The agent announces new settings (`config_option_update`): the models it can run.
+    ConfigUpdate(ConfigUpdateStep),
     // Delegation through Nori's host tools
     HostTool(HostToolStep),
     Delegate(DelegateStep),
@@ -84,6 +88,13 @@ pub enum Step {
     /// A message between sessions, as the agent reports it.
     PeerMessage(PeerMessage),
     Repeat(Repeat),
+    // Control
+    /// Branch on a value as it stands when the step runs.
+    When(Box<WhenStep>),
+    /// Bind a variable for the session's later steps.
+    Set(SetStep),
+    /// Announce the slash commands the agent offers from now on.
+    Commands(CommandsStep),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,6 +317,12 @@ pub enum ErrorClass {
     Auth,
     PromptTooLong,
     SessionNotFound,
+    /// A session that exists in storage but cannot be attached again (`-32012`).
+    NotResumable,
+    /// The program the agent runs is not installed (`executable_not_found`).
+    ExecutableNotFound,
+    /// The service behind the agent is not running (`-32016`).
+    NotRunning,
     #[default]
     Internal,
     /// Exactly `code`, `message` and `data`, for shapes the other classes do not make.
@@ -511,6 +528,44 @@ pub struct Lane {
     pub steps: Vec<Step>,
 }
 
+/// How a provider spells its subagents on the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentSpelling {
+    /// `subagent_update` with patch semantics (Claude Code's adapter).
+    #[default]
+    Claude,
+    /// `subagent_spawned` then `subagent_state_update` (Codex's native children).
+    Codex,
+}
+
+/// The parent's tool call that starts a provider subagent (Claude's `Task`, Codex's
+/// `spawn_agent`), shown before the child is announced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Launcher {
+    /// The tool as the provider names it: `Task`, `Agent`, `spawn_agent`.
+    pub tool: String,
+    /// Generated when absent.
+    pub id: Option<String>,
+    /// The card's title; the child's description when absent.
+    pub title: Option<String>,
+    /// The call returns at once and the child works on (Claude's `async_launched`); otherwise the
+    /// call ends when the child does.
+    pub background: bool,
+}
+
+impl Default for Launcher {
+    fn default() -> Self {
+        Self {
+            tool: "Task".to_owned(),
+            id: None,
+            title: None,
+            background: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentEnd {
@@ -529,11 +584,19 @@ pub enum SubagentEnd {
 pub struct Subagent {
     /// The child's session id; generated when absent. Reusing an id addresses the same child.
     pub id: Option<String>,
+    /// The kind of child (`general-purpose`, `Explore`, a Codex role).
     pub title: String,
+    /// What the provider calls this child (Codex's nickname); the views fall back to the
+    /// description's first line when absent.
+    pub name: Option<String>,
     pub description: Option<String>,
     pub model: Option<String>,
     /// What the parent told the child, shown as a message.
     pub prompt: Option<Text>,
+    /// How the provider spells the announcements.
+    pub wire: SubagentSpelling,
+    /// The parent's tool call that starts the child.
+    pub launcher: Option<Launcher>,
     /// The child's own activity, on its own session id.
     pub steps: Vec<Step>,
     pub ends: SubagentEnd,
@@ -545,9 +608,12 @@ impl Default for Subagent {
         Self {
             id: None,
             title: String::new(),
+            name: None,
             description: None,
             model: None,
             prompt: None,
+            wire: SubagentSpelling::Claude,
+            launcher: None,
             steps: Vec::new(),
             ends: SubagentEnd::Idle,
             reason: None,
@@ -585,4 +651,36 @@ pub struct Repeat {
     #[serde(default)]
     pub every: Span,
     pub steps: Vec<Step>,
+}
+
+/// Run `then` when the condition holds of `value`, `otherwise` when it does not. Exactly one of
+/// `matches`, `equals` and `bound` is the condition.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WhenStep {
+    /// Rendered when the step runs: `{{model}}`, `{{prompt}}`, `{{task.status}}`.
+    pub value: String,
+    /// `value` matches this regular expression.
+    pub matches: Option<String>,
+    /// `value` is exactly this.
+    pub equals: Option<String>,
+    /// The variable of this name is bound (a step's `bind`, a `set`); `value` is unused.
+    pub bound: Option<String>,
+    pub then: Vec<Step>,
+    pub otherwise: Vec<Step>,
+}
+
+/// Bind `name` to `value` (rendered) for the session's later steps and turns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetStep {
+    pub name: String,
+    pub value: Text,
+}
+
+/// The slash commands the agent offers from now on (`available_commands_update`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandsStep {
+    pub commands: Vec<CommandDef>,
 }

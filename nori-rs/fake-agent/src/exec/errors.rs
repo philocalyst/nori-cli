@@ -84,6 +84,30 @@ pub fn acp_error(spec: &ErrorSpec, clock: &Clock) -> acp::Error {
             ),
             None,
         ),
+        ErrorClass::NotResumable => (
+            AgentError::NotResumable(
+                spec.detail
+                    .clone()
+                    .unwrap_or_else(|| "the session is held by another process".to_owned()),
+            ),
+            None,
+        ),
+        ErrorClass::ExecutableNotFound => (
+            AgentError::ExecutableNotFound(
+                spec.detail
+                    .clone()
+                    .unwrap_or_else(|| "the agent's program is not installed".to_owned()),
+            ),
+            None,
+        ),
+        ErrorClass::NotRunning => (
+            AgentError::NotRunning(
+                spec.detail
+                    .clone()
+                    .unwrap_or_else(|| "the service behind the agent is not running".to_owned()),
+            ),
+            None,
+        ),
         ErrorClass::Internal => (
             AgentError::Internal(
                 spec.detail

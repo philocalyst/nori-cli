@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use nori_acp_kit::AgentError;
 use nori_acp_kit::Capabilities;
@@ -69,6 +70,9 @@ use crate::runtime::WorldRuntime;
 use crate::session::SessionRecord;
 use crate::wire::Wire;
 use crate::world::AgentDef;
+use crate::world::CommandDef;
+use crate::world::ConfigEffect;
+use crate::world::ModelDef;
 use crate::world::TurnPolicyDef;
 use crate::world::WorldError;
 
@@ -85,11 +89,76 @@ fn interned(text: &str) -> &'static str {
     leaked
 }
 
+/// Slash commands as ACP announces them.
+pub(crate) fn available_commands(commands: &[CommandDef]) -> Vec<AvailableCommand> {
+    commands
+        .iter()
+        .map(|command| {
+            AvailableCommand::new(command.name.clone(), command.description.clone()).input(
+                command.hint.clone().map(|hint| {
+                    AvailableCommandInput::Unstructured(
+                        nori_acp_kit::schema::UnstructuredCommandInput::new(hint),
+                    )
+                }),
+            )
+        })
+        .collect()
+}
+
+/// `flex` as `Flex`, `fast_mode` as `Fast mode`.
+fn title_case(value: &str) -> String {
+    let spaced = value.replace(['_', '-'], " ");
+    let mut chars = spaced.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 fn options_of(def: &AgentDef) -> Options {
+    // An agent that announces its models later offers none at `session/new`.
+    let models = if def.startup.models_announced_after.is_some() {
+        &[]
+    } else {
+        def.models.as_slice()
+    };
+    options_with_models(def, models, None)
+}
+
+/// `old` with its model list replaced by `models`: the other options keep their values, and the
+/// model its own when it is still offered.
+pub(crate) fn with_models(def: &AgentDef, models: &[ModelDef], old: &Options) -> Options {
+    let mut fresh = options_with_models(def, models, old.current(nori_acp_kit::MODEL));
+    for id in [
+        nori_acp_kit::THOUGHT_LEVEL,
+        "service_tier",
+        nori_acp_kit::MODE,
+    ] {
+        if let Some(value) = old.current(id) {
+            let _ = fresh.set(id, value);
+        }
+    }
+    fresh
+}
+
+/// The agent's options with `models` on offer, the model `current` when it is among them.
+pub(crate) fn options_with_models(
+    def: &AgentDef,
+    models: &[ModelDef],
+    current: Option<&str>,
+) -> Options {
     let mut selects = Vec::new();
-    if let Some(initial) = def.initial_model() {
+    let initial = current
+        .and_then(|id| models.iter().find(|model| model.id == id))
+        .or_else(|| {
+            def.default_model
+                .as_deref()
+                .and_then(|id| models.iter().find(|model| model.id == id))
+        })
+        .or_else(|| models.first());
+    if let Some(initial) = initial {
         selects.push(Select::model(
-            def.models
+            models
                 .iter()
                 .map(|model| {
                     let choice = Choice::new(
@@ -110,6 +179,18 @@ fn options_of(def: &AgentDef) -> Options {
             def.efforts
                 .iter()
                 .map(|effort| Choice::new(effort.clone(), effort.clone()))
+                .collect(),
+            first.clone(),
+        ));
+    }
+    if let Some(first) = def.model_modes.first() {
+        selects.push(Select::new(
+            "service_tier",
+            "Service tier",
+            SessionConfigOptionCategory::ModelConfig,
+            def.model_modes
+                .iter()
+                .map(|mode| Choice::new(mode.clone(), title_case(mode)))
                 .collect(),
             first.clone(),
         ));
@@ -192,6 +273,30 @@ impl FakeAgent {
             sessions: Sessions::default(),
             authenticated: AtomicBool::new(false),
         })
+    }
+
+    /// Take `delay` of the world's time to answer; the end of the connection ends the wait.
+    async fn linger(&self, delay: Duration) -> acp::Result<()> {
+        if delay.is_zero() {
+            return Ok(());
+        }
+        let participant = self.env.rt.clock.join();
+        tokio::select! {
+            () = participant.sleep(delay) => Ok(()),
+            () = self.env.shutdown.cancelled() => {
+                Err(AgentError::Unreachable("the connection ended".to_owned()).into())
+            }
+        }
+    }
+
+    /// Never answer, until the connection ends.
+    async fn never(&self) -> acp::Error {
+        let participant = self.env.rt.clock.join();
+        tokio::select! {
+            () = participant.park(std::future::pending::<()>()) => {}
+            () = self.env.shutdown.cancelled() => {}
+        }
+        AgentError::Unreachable("the connection ended".to_owned()).into()
     }
 
     fn live(&self, id: &SessionId) -> Result<Arc<Live>, AgentError> {
@@ -279,21 +384,15 @@ impl NativeAgent for FakeAgent {
 
     async fn new_session(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         request: NewSessionRequest,
     ) -> acp::Result<NewSessionResponse> {
         let def = &self.env.def;
         let clock = &self.env.rt.clock;
-        let delay = def.startup.new_session_delay.0;
-        if !delay.is_zero() {
-            let participant = clock.join();
-            tokio::select! {
-                () = participant.sleep(delay) => {}
-                () = self.env.shutdown.cancelled() => {
-                    return Err(AgentError::Unreachable("the connection ended".to_owned()).into());
-                }
-            }
+        if def.startup.hang_new_session {
+            return Err(self.never().await);
         }
+        self.linger(def.startup.new_session_delay.0).await?;
         if def.startup.requires_auth && !self.authenticated.load(Ordering::SeqCst) {
             return Err(AgentError::AuthRequired(
                 "this fake agent needs `authenticate` before `session/new`".to_owned(),
@@ -314,6 +413,13 @@ impl NativeAgent for FakeAgent {
                 model: record.model(),
             },
         );
+        if let Some(after) = def.startup.models_announced_after {
+            self.announce_models(
+                Sink::new(cx, SessionId::new(record.id.clone())),
+                &live,
+                after.0,
+            );
+        }
         Ok(NewSessionResponse::new(record.id.clone())
             .modes(mode_state(def, &options))
             .config_options(options.to_acp()))
@@ -324,6 +430,9 @@ impl NativeAgent for FakeAgent {
         cx: &Cx,
         request: LoadSessionRequest,
     ) -> acp::Result<LoadSessionResponse> {
+        if let Some(error) = &self.env.def.startup.load_error {
+            return Err(errors::acp_error(error, &self.env.rt.clock));
+        }
         let record = self.known(&request.session_id)?;
         let live = self.attach(Arc::clone(&record), request.meta.as_ref());
         let history = live.record.state().history.clone();
@@ -348,6 +457,9 @@ impl NativeAgent for FakeAgent {
         _cx: &Cx,
         request: ResumeSessionRequest,
     ) -> acp::Result<ResumeSessionResponse> {
+        if let Some(error) = &self.env.def.startup.resume_error {
+            return Err(errors::acp_error(error, &self.env.rt.clock));
+        }
         let record = self.known(&request.session_id)?;
         let live = self.attach(record, request.meta.as_ref());
         let options = live.record.state().options.clone();
@@ -378,6 +490,9 @@ impl NativeAgent for FakeAgent {
         _cx: &Cx,
         request: ListSessionsRequest,
     ) -> acp::Result<ListSessionsResponse> {
+        if let Some(error) = &self.env.def.startup.list_error {
+            return Err(errors::acp_error(error, &self.env.rt.clock));
+        }
         let sessions = self
             .env
             .rt
@@ -442,7 +557,53 @@ impl NativeAgent for FakeAgent {
             .ok_or_else(|| AgentError::invalid("option values are selections"))?
             .to_string();
         let option = request.config_id.to_string();
-        let options = live.record.state().options.set(&option, &value)?;
+        let fault = self.env.def.config_faults.iter().find(|fault| {
+            fault.option == option && fault.value.as_ref().is_none_or(|v| *v == value)
+        });
+        let options = match fault {
+            None => live.record.state().options.set(&option, &value)?,
+            Some(fault) => {
+                self.linger(fault.delay.0).await?;
+                let (applied, outcome) = {
+                    let mut state = live.record.state();
+                    match fault.effect {
+                        ConfigEffect::Reject => (None, None),
+                        ConfigEffect::Ignore => (
+                            state.options.current(&option).map(str::to_owned),
+                            Some(state.options.to_acp()),
+                        ),
+                        ConfigEffect::Substitute => {
+                            let actual = fault.actual.clone().unwrap_or_else(|| value.clone());
+                            let options = state.options.set(&option, &actual)?;
+                            (Some(actual), Some(options))
+                        }
+                    }
+                };
+                self.env.rt.recorder.push(
+                    self.env.rt.clock.elapsed(),
+                    Record::ConfigFaulted {
+                        agent: self.env.def.slug.clone(),
+                        session: live.record.id.clone(),
+                        option: option.clone(),
+                        requested: value.clone(),
+                        effect: format!("{:?}", fault.effect).to_lowercase(),
+                        actual: applied,
+                    },
+                );
+                match outcome {
+                    Some(options) => options,
+                    None => {
+                        return Err(match &fault.error {
+                            Some(error) => errors::acp_error(error, &self.env.rt.clock),
+                            None => AgentError::internal(format!(
+                                "the agent could not set {option} to {value}"
+                            ))
+                            .into(),
+                        });
+                    }
+                }
+            }
+        };
         self.env.rt.recorder.push(
             self.env.rt.clock.elapsed(),
             Record::ConfigChanged {
@@ -477,22 +638,7 @@ impl NativeAgent for FakeAgent {
         if self.env.def.commands.is_empty() {
             return;
         }
-        let commands = self
-            .env
-            .def
-            .commands
-            .iter()
-            .map(|command| {
-                AvailableCommand::new(command.name.clone(), command.description.clone()).input(
-                    command.hint.clone().map(|hint| {
-                        AvailableCommandInput::Unstructured(
-                            nori_acp_kit::schema::UnstructuredCommandInput::new(hint),
-                        )
-                    }),
-                )
-            })
-            .collect();
-        let _ = Sink::new(cx, session.clone()).commands(commands);
+        let _ = Sink::new(cx, session.clone()).commands(available_commands(&self.env.def.commands));
     }
 
     async fn shutdown(&self) {
@@ -504,6 +650,27 @@ impl NativeAgent for FakeAgent {
 }
 
 impl FakeAgent {
+    /// `after` of the world's time from now, the session's model list becomes the agent's
+    /// `models`, and the agent says so.
+    fn announce_models(&self, sink: Sink, live: &Arc<Live>, after: Duration) {
+        let env = Arc::clone(&self.env);
+        let live = Arc::clone(live);
+        let participant = env.rt.clock.join();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = participant.sleep(after) => {}
+                () = env.shutdown.cancelled() => return,
+            }
+            let options = {
+                let mut state = live.record.state();
+                let fresh = with_models(&env.def, &env.def.models, &state.options);
+                state.options = fresh.clone();
+                fresh
+            };
+            let _ = sink.config_options(options.to_acp());
+        });
+    }
+
     fn known(&self, id: &SessionId) -> Result<Arc<SessionRecord>, AgentError> {
         self.env
             .rt

@@ -86,6 +86,8 @@ pub struct TapContext {
     pub clock: Clock,
     pub initialize_delay: Duration,
     pub initialize_error: Option<ErrorSpec>,
+    /// `initialize` is never answered.
+    pub initialize_never: bool,
     /// The agent is a served process: it has a standard error and a pid of its own.
     pub external: bool,
 }
@@ -303,6 +305,9 @@ impl State {
     }
 
     fn initialize_response(self: &Arc<Self>, id: &Value, line: String) {
+        if self.context.initialize_never {
+            return;
+        }
         let line = match &self.context.initialize_error {
             Some(error) => {
                 let error = crate::exec::errors::acp_error(error, &self.context.clock);

@@ -8,6 +8,8 @@ use super::World;
 
 /// The Pkl schema of a world, as the module `nori:World`.
 pub const WORLD_SCHEMA_PKL: &str = include_str!("../../schema/World.pkl");
+/// Ready-made agents and step helpers for worlds, as the module `nori:Kit`.
+pub const KIT_PKL: &str = include_str!("../../schema/Kit.pkl");
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
@@ -28,6 +30,9 @@ fn options() -> EvaluatorOptions {
     let mut modules = std::collections::BTreeMap::new();
     for name in ["nori:World", "nori:World.pkl", "nori:schemas/World.pkl"] {
         modules.insert(name.to_owned(), WORLD_SCHEMA_PKL.to_owned());
+    }
+    for name in ["nori:Kit", "nori:Kit.pkl"] {
+        modules.insert(name.to_owned(), KIT_PKL.to_owned());
     }
     EvaluatorOptions::preconfigured().virtual_modules(modules)
 }

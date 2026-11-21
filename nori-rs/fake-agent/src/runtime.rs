@@ -119,6 +119,16 @@ impl WorldRuntime {
         Ok(runtime)
     }
 
+    /// The counter `key` as it stands, without advancing it.
+    pub fn count(&self, key: &str) -> i64 {
+        self.counters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// The next value of counter `key`, starting at 0.
     pub fn next(&self, key: &str) -> i64 {
         let mut counters = self.counters.lock().unwrap_or_else(PoisonError::into_inner);

@@ -7,6 +7,8 @@
 
 mod agent;
 mod load;
+mod process;
+mod provider;
 mod step;
 mod tool;
 mod validate;
@@ -22,10 +24,20 @@ pub use agent::ModeDef;
 pub use agent::ModelDef;
 pub use agent::Scene;
 pub use agent::Startup;
+pub use agent::TurnFilter;
 pub use agent::TurnPolicyDef;
 pub use agent::Unscripted;
+pub use agent::WakeKind;
 pub use load::WORLD_SCHEMA_PKL;
 pub use load::WorldError;
+pub use process::LineDef;
+pub use process::ProcessDef;
+pub use process::StreamDef;
+pub use provider::ConfigEffect;
+pub use provider::ConfigFault;
+pub use provider::ConfigUpdateStep;
+pub use provider::Limits;
+pub use provider::Provider;
 pub use step::*;
 pub use tool::*;
 pub use value::ChunkUnit;
@@ -63,6 +75,8 @@ pub struct World {
     /// agents that name their own `slug`.
     #[serde(deserialize_with = "agents_from_map_or_list")]
     pub agents: Vec<AgentDef>,
+    /// What jobs run in this world; a job no process matches fails to start.
+    pub processes: Vec<ProcessDef>,
 }
 
 impl Default for World {
@@ -75,6 +89,7 @@ impl Default for World {
             default_agent: None,
             policy: None,
             agents: Vec::new(),
+            processes: Vec::new(),
         }
     }
 }
@@ -109,6 +124,11 @@ impl World {
             .as_deref()
             .and_then(|slug| self.agent(slug))
             .or_else(|| self.agents.first())
+    }
+
+    /// The scripted process `command` runs, if any.
+    pub fn process(&self, command: &str) -> Option<&ProcessDef> {
+        self.processes.iter().find(|process| process.runs(command))
     }
 
     pub fn slugs(&self) -> Vec<&str> {

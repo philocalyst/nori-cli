@@ -262,6 +262,9 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PermissionStep {
+    /// The tool asked about. A `Tool` step (with its `kind = "tool"`) is accepted as it is, so a
+    /// helper that builds a tool call serves both.
+    #[serde(deserialize_with = "tool_or_step")]
     pub tool: ToolSpec,
     /// Options offered. Defaults to Allow, Always allow, Deny.
     pub options: Vec<OptionDef>,
@@ -292,4 +295,21 @@ impl Default for PermissionStep {
             on_timeout: Vec::new(),
         }
     }
+}
+
+/// A [`ToolSpec`], or a `Tool` step: the same fields with `kind = "tool"`.
+fn tool_or_step<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<ToolSpec, D::Error> {
+    let mut value = Value::deserialize(deserializer)?;
+    if let Value::Object(fields) = &mut value {
+        match fields.remove("kind") {
+            None => {}
+            Some(Value::String(kind)) if kind == "tool" => {}
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "a permission's tool is a tool, not a {other} step"
+                )));
+            }
+        }
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }

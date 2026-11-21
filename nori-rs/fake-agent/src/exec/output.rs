@@ -19,6 +19,7 @@ use serde_json::json;
 
 use super::Ctx;
 use super::Run;
+use crate::world::ConfigUpdateStep;
 use crate::world::ModeStep;
 use crate::world::PlanStatusDef;
 use crate::world::PlanStep;
@@ -176,5 +177,41 @@ impl Ctx {
         self.emit(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
             mode.id.clone(),
         )))
+    }
+}
+
+impl Ctx {
+    pub(super) fn config_update(&self, update: &ConfigUpdateStep) -> Run {
+        // Rendered first: rendering reads bound variables from the session state.
+        let set: Vec<(&String, String)> = update
+            .set
+            .iter()
+            .map(|(id, value)| (id, self.render(value)))
+            .collect();
+        let mut refused = Vec::new();
+        let options = {
+            let mut state = self.live.record.state();
+            let mut fresh = if update.models.is_empty() {
+                state.options.clone()
+            } else {
+                crate::agent::with_models(&self.env.def, &update.models, &state.options)
+            };
+            for (id, value) in &set {
+                if let Err(error) = fresh.set(id, value) {
+                    refused.push(format!(
+                        "config_update cannot set {id} to {value:?}: {error}"
+                    ));
+                }
+            }
+            state.options = fresh.clone();
+            fresh
+        };
+        for message in refused {
+            self.diverge(message);
+        }
+        self.lane
+            .sink
+            .config_options(options.to_acp())
+            .map_err(|_| super::Break::Gone)
     }
 }
