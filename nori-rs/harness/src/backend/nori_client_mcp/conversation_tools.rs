@@ -15,9 +15,9 @@ pub(crate) struct ConversationProgramRequest {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConversationContextRequest {
-    /// Inclusive visible event ID. Omit for the most recent records.
+    /// First visible event ID, inclusive. Omit for the most recent records.
     start: Option<i64>,
-    /// Inclusive visible event ID. Omit for the current head.
+    /// Last visible event ID, inclusive. Omit for the current head.
     end: Option<i64>,
     /// Maximum records to return, 1 to 200; default 50.
     limit: Option<i64>,

@@ -40,6 +40,9 @@ of canonical context with event IDs, visible bounds and the current head so an
 agent can select history for Pkl context, forks and rewinds. A page is bounded to a
 quarter of the agent's context-window budget (at most 256 KiB): long strings are cut where
 marked, and a page cut short by size says `truncated` and where to continue (`next_start`).
+For a read from the head, `next_start` points to older history; pass it as `start` and the
+returned `selected_start` as `end` to read backward. For a read with `start`, pass `next_start`
+as the next `start` to continue forward.
 The same tool is how a forked, restored or revived child reads the history its checkpoint
 left out. A child started by `delegate_task` always has fresh context and no way to inherit
 the caller's conversation.

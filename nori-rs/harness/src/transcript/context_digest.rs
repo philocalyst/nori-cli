@@ -50,7 +50,7 @@ pub(crate) struct Digest {
     pub(crate) included: Option<(i64, i64)>,
     /// How many records of the slice are not in `json`.
     pub(crate) omitted: usize,
-    /// For [`Keep::Oldest`], the first record that did not fit, where the next page starts.
+    /// The first record that did not fit while walking from the kept end of the slice.
     pub(crate) next_id: Option<i64>,
 }
 
@@ -298,10 +298,7 @@ pub(crate) fn digest(records: &[&Record], max_bytes: usize, keep: Keep) -> Diges
         json: format!("[{}]", items.join(",")),
         included: ids(&indices),
         omitted,
-        next_id: match keep {
-            Keep::Newest => None,
-            Keep::Oldest => next_id,
-        },
+        next_id,
     }
 }
 
@@ -373,6 +370,7 @@ mod tests {
         assert!(digest.json.contains("question 299"));
         assert!(digest.json.contains("bytes omitted]"));
         assert!(digest.omitted > 0);
+        assert!(digest.next_id.is_some());
         assert_eq!(digest.included.map(|(_, last)| last), Some(900));
     }
 
