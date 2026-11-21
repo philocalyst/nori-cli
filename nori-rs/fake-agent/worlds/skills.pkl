@@ -1,0 +1,47 @@
+/// Skills: the lead runs a `nori:Skill` (a program with parameters) through the `skill` tool. The
+/// skill's actors are this world's agents: two members answer in parallel and a chair reconciles.
+/// The skill module itself lives in `$NORI_HOME/skills/` (the test writes `duo.pkl` there).
+///
+///     scene "list": the lead lists the skills there are.
+///     scene default: the lead runs `duo` with the prompt as its question.
+amends "nori:World"
+
+name = "skills"
+description = "A skill run through the skill tool, with world agents as its actors."
+default_agent = "lead"
+
+local model = new Model { id = "fake-sonnet"; context_window = 200000 }
+
+agents {
+  ["lead"] {
+    models { model }
+    scenes {
+      new Scene {
+        name = "list"
+        on = new Matching { pattern = "(?i)^list" }
+        steps {
+          new HostTool { name = "skill"; title = "List skills"; bind = "skills" }
+          new Say { text = "Skills: {{skills.skills}}" }
+        }
+      }
+      new Scene {
+        name = "ask the council"
+        steps {
+          new HostTool {
+            name = "skill"
+            title = "Ask the duo"
+            arguments = new Dynamic {
+              ["name"] = "duo"
+              ["arguments"] = new Dynamic { ["question"] = "{{prompt}}" }
+            }
+            bind = "verdict"
+          }
+          new Say { text = "The council decided: {{verdict.value}}" }
+        }
+      }
+    }
+  }
+  ["member-a"] { models { model }; scenes { new Scene { steps { new Say { text = "A thinks yes" } } } } }
+  ["member-b"] { models { model }; scenes { new Scene { steps { new Say { text = "B thinks no" } } } } }
+  ["chair"] { models { model }; scenes { new Scene { steps { new Say { text = "Decision from: {{prompt}}" } } } } }
+}
