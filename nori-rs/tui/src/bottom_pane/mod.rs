@@ -1817,7 +1817,7 @@ mod tests {
         let height = pane.desired_height(width);
         let area = Rect::new(0, 0, width, height);
         assert_snapshot!(
-            "status_and_queued_messages_snapshot",
+            "activity_and_queued_messages_snapshot",
             render_snapshot(&pane, area)
         );
     }
