@@ -127,16 +127,15 @@ pub(super) async fn prepare_workflow(
                         let log =
                             nori_conversation::ConversationLog::open(path.with_extension("pkl"))
                                 .ok()?;
-                        log.projection().visible().iter().rev().find_map(|record| {
-                            match &record.event {
-                                nori_conversation::Event::Command { name, payload }
-                                    if name == "pkl-machine-snapshot" =>
-                                {
-                                    serde_json::from_str(payload).ok()
-                                }
-                                _ => None,
+                        let newest = *log
+                            .visible_named(nori_conversation::Kind::Command, "pkl-machine-snapshot")
+                            .last()?;
+                        match &log.record(newest).ok()?.event {
+                            nori_conversation::Event::Command { payload, .. } => {
+                                serde_json::from_str(payload).ok()
                             }
-                        })
+                            _ => None,
+                        }
                     })
                     .unwrap_or_else(MachineSnapshot::capture);
                 let result = nori_pkl::load_policy_with_machine(

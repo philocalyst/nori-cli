@@ -332,10 +332,10 @@ impl Inner {
                 let loader =
                     crate::transcript::TranscriptLoader::new(self.seed.config.nori_home.clone());
                 async {
-                    let transcript = loader.load_transcript(&project, &session).await.ok()?;
+                    let meta = loader.load_session_meta(&project, &session).await.ok()?;
                     crate::transcript::TranscriptRecorder::continue_session(
                         loader.session_path(&project, &session),
-                        &transcript.meta,
+                        &meta,
                     )
                     .await
                     .ok()
