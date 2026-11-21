@@ -54,26 +54,21 @@ output, captures, development environments, and root Node dependencies.
   (`adapter.package`, default `programs.nori.package`) as a separate ACP process; `executable` picks
   the account's `claude` launcher. `nori agent serve <slug> [KEY=VALUE...] [--home DIR] [--env K=V]`
   serves any agent built into Nori over stdio ACP for any client.
-- Nori selects its in-process Rust ACP adapter for OpenCode v2 when built with
-  the default `native-opencode` feature. It connects to the running OpenCode
-  HTTP server and never spawns an `opencode` process. It discovers the local
-  managed service from OpenCode's state registration, including its credential,
-  and verifies the service identity. Set `NORI_OPENCODE_URL` (or
-  `OPENCODE_SERVER_URL`) and, if needed, `OPENCODE_PASSWORD` for an explicit
-  server. Without a registration or explicit address it tries
-  `http://127.0.0.1:4096`. A local distribution with `command = "opencode"; args = [ "acp" ];`
-  uses the upstream ACP adapter. During startup, the native adapter retries
-  temporary HTTP 503 responses while OpenCode activates its location plugins,
-  for up to 30 seconds.
+- Nori runs OpenCode in its own process when built with the default
+  `native-opencode` feature: Nori's engine calls OpenCode Zen directly using
+  a key stored by Nori and a model catalog from models.dev. It does not read
+  OpenCode's configuration or sign-ins, run `opencode`, or connect to an
+  OpenCode server. A local distribution with
+  `command = "opencode"; args = [ "acp" ];` uses the upstream ACP adapter
+  instead. See [native-agents.md](native-agents.md).
 - The experimental Gemini Core adapter can be included with `nativeGemini = true`
   when calling `nori-rs/default.nix`, supplying `nodejs` and `geminiCoreEntry`
   for the official Core 0.68.0 entry point. The wrapper sets its Core path;
   select it explicitly with a native `gemini` distribution and API-key or
   Vertex authentication. The built-in Gemini distribution remains the
   official CLI for Google-account sign-in. See `nori-rs/config.md`.
-- `native = { agent = "codex"; home = "..."; }` loads the Codex ACP adapter inside Nori,
-  without an adapter subprocess or Node. Code Mode uses a hidden entry point of the
-  same Nori executable; no separate `codex-code-mode-host` installation is needed.
+- `native = { agent = "codex"; home = "..."; }` runs Codex inside Nori, on Nori's engine with
+  Codex's sign-in, config and catalog: no Codex program, no adapter subprocess and no Node.
   `native = { agent = "claude"; config = [ "cli_path=/path/to/claude2" ]; }`
   does the same for Claude Code through the Rust driver, which starts only Claude Code's own CLI;
   `cli_path` is how an account is chosen. `home` is that account's `CODEX_HOME`, set per agent so several accounts
@@ -102,6 +97,6 @@ adds `pkgs.nori`, and `nix develop` gives a build shell. `nix flake check` build
 evaluates the module. The `nori` package includes OpenCode on its runtime
 `PATH` for upstream ACP configurations. Pkl policy and conversation programs run
 in Nori's native Rust runtime and do not require a Pkl or Java executable. The native OpenCode adapter
-requires a running OpenCode service; installing the executable alone does not start it.
+does not require an OpenCode executable or service.
 
 The Claude adapter runs Claude Code, which is unfree: allow `claude-code` in your nixpkgs config.
