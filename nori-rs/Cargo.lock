@@ -10416,6 +10416,7 @@ dependencies = [
  "nori-conversation",
  "nori-forge",
  "nori-host-tools",
+ "nori-machines",
  "nori-pkl",
  "nori-protocol",
  "nori-workflow",

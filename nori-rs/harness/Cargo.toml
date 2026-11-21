@@ -44,6 +44,7 @@ nori-config = { workspace = true }
 nori-conversation = { workspace = true }
 nori-forge = { workspace = true }
 nori-host-tools = { workspace = true }
+nori-machines = { workspace = true }
 nori-workflow = { workspace = true }
 nori-pkl = { workspace = true }
 nori-conduit = { workspace = true }
