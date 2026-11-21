@@ -188,12 +188,30 @@ mod tests {
     fn test_default_log_level_returns_expected_value() {
         let level = default_log_level();
 
+        // Debug builds log Nori at debug and keep the noisy wire and parser targets at warning:
+        // the list of quiet targets grows, so the test checks the rule, not the whole string.
         #[cfg(debug_assertions)]
         {
-            assert_eq!(
-                level,
-                "debug,agent_client_protocol=warn,claude=warn,claude_acp=warn,rmcp=warn,rmcp_client=warn,codex_rmcp_client=warn",
-                "Debug builds should keep third-party ACP wire logging at warning level"
+            let (default, quiet) = level.split_once(',').unwrap_or((level, ""));
+            assert_eq!(default, "debug", "{level}");
+            for target in [
+                "agent_client_protocol",
+                "claude",
+                "claude_acp",
+                "rmcp",
+                "rmcp_client",
+                "codex_rmcp_client",
+            ] {
+                assert!(
+                    quiet
+                        .split(',')
+                        .any(|entry| entry == format!("{target}=warn")),
+                    "Debug builds should keep {target} at warning level: {level}"
+                );
+            }
+            assert!(
+                quiet.split(',').all(|entry| entry.ends_with("=warn")),
+                "only quieter targets follow the default: {level}"
             );
         }
 
