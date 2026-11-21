@@ -18,6 +18,7 @@
 //! An agent built into Nori's own process gets the same tools with no server at all: they are
 //! handed to it as host tools (see [`super::host_tools`]), and this server is not started.
 
+mod bash_job;
 mod bash_report;
 mod bash_tool;
 mod caller;
@@ -381,16 +382,26 @@ impl ServerHandler for NoriClientService {
     }
 }
 
+/// A policy gate (`nori:Gate`) may refuse or rewrite a Nori tool call.
+const GATE_INSTRUCTIONS: &str = "A Nori tool call can come back refused by a policy gate, with the reason, or rewritten (the result says how). Do not retry a refused call unchanged: change it to meet the reason, or tell the user.";
+
 /// What every agent is told about the tools, however it reaches them.
 pub(super) fn tool_instructions() -> String {
-    format!(
-        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
+    let mut out = format!(
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        GATE_INSTRUCTIONS,
         thread_goal::NORI_GOAL_CONTROL_INSTRUCTIONS,
         super::orchestrator::TASK_INSTRUCTIONS,
         nori_host_tools::MONITOR_INSTRUCTIONS,
+        nori_host_tools::JOB_INSTRUCTIONS,
         bash_tool::BASH_INSTRUCTIONS,
         super::nudox::INSTRUCTIONS,
-    )
+    );
+    if let Some(guide) = bash_tool::machines_guide(&nori_machines::global()) {
+        out.push_str("\n\n");
+        out.push_str(&guide);
+    }
+    out
 }
 
 pub(super) fn tool_success(body: serde_json::Value) -> CallToolResult {
