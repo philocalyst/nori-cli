@@ -1,6 +1,7 @@
 //! A session's select-style configuration options: the model, the thought level, the mode.
 
 use crate::error::AgentError;
+use crate::schema::Meta;
 use crate::schema::SessionConfigOption;
 use crate::schema::SessionConfigOptionCategory;
 use crate::schema::SessionConfigSelectOption;
@@ -18,6 +19,8 @@ pub struct Choice {
     pub value: String,
     pub label: String,
     pub description: Option<String>,
+    /// Extra `_meta` on the choice, such as the effect of choosing it that Nori's clients show.
+    pub meta: Option<Meta>,
 }
 
 impl Choice {
@@ -26,12 +29,19 @@ impl Choice {
             value: value.into(),
             label: label.into(),
             description: None,
+            meta: None,
         }
     }
 
     /// A line of help shown beside the choice.
     pub fn describe(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
+        self
+    }
+
+    /// The choice's `_meta`.
+    pub fn with_meta(mut self, meta: Meta) -> Self {
+        self.meta = Some(meta);
         self
     }
 }
@@ -124,6 +134,7 @@ impl Select {
             .map(|choice| {
                 SessionConfigSelectOption::new(choice.value.clone(), choice.label.clone())
                     .description(choice.description.clone())
+                    .meta(choice.meta.clone())
             })
             .collect();
         SessionConfigOption::select(
