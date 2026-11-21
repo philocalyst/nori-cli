@@ -26,6 +26,8 @@ pub struct RetryScheduled {
     pub class: FailureKind,
     /// The retry about to happen, counting from 1.
     pub attempt: i64,
+    /// 0: no limit; Nori keeps trying until it works (a network outage, a usage limit waiting
+    /// for its reset).
     pub max_attempts: i64,
     pub wait_ms: i64,
     /// What the failing route said, as the agent put it.
