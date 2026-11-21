@@ -1,0 +1,177 @@
+/// Context that fills up, and an agent that goes in circles: Nori compacts before the window runs
+/// out, and notices a loop.
+///
+///   squeezed  reports its context filling (a 200000-token window) and writes its summaries in
+///             the template. `use 60k` and so on are the prompts after which it reports that much
+///             used: 60k and 120k are comfortable, 165k is close to the trigger (the summary is
+///             prepared in the background), 175k and 180k are past it (compaction is due). Two models and two modes, so a
+///             setting that is lost across the swap shows. `who` answers with its model.
+///   stubborn  the same, but never writes the template: it answers the summary prompt, and the
+///             reminder that follows, in prose, so compaction fails and automatic compaction stops.
+///   native    offers its own `/compact`: it answers that and reports a small context after it, and
+///             would say so if it were ever asked for a summary.
+///   looper    calls the same tool with the same input eight times in one turn, and again after
+///             it is steered.
+///
+/// A 200000-token window triggers below 30000 free tokens (15%), and prepares the summary below
+/// 42000 free (the 12000-token background margin). The policy is the built-in one.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/context-pressure.pkl "use 60k" "use 180k" hello
+amends "nori:World"
+
+name = "context-pressure"
+description = "A filling context window and a looping agent, against automatic compaction and loop detection."
+default_agent = "squeezed"
+
+local template = """
+  ## Objective
+  - Exercise automatic compaction.
+
+  ## Requirements
+  - (none)
+
+  ## Decisions
+  - (none)
+
+  ## Work State
+  ### Completed
+  - Filled the context.
+
+  ## Next Move
+  - Carry on from the checkpoint.
+
+  ## Relevant Files
+  - (none)
+
+  ## Important Context
+  - (none)
+  """
+
+local fakeModels = new Listing<Model> {
+  new Model { id = "fake-opus"; name = "Fake Opus"; context_window = 200000 }
+  new Model { id = "fake-sonnet"; name = "Fake Sonnet"; context_window = 200000 }
+}
+
+local fakeModes = new Listing<ModeDef> {
+  new ModeDef { id = "default"; name = "Default" }
+  new ModeDef { id = "plan"; name = "Plan" }
+}
+
+/// What every prompt is told when it is not a summary: `use Nk` reports N thousand tokens used,
+/// after `first` (steps the agent runs before it answers).
+local function fills(first: Listing<AnyStep>): Listing<Scene> = new Listing<Scene> {
+  for (thousands in List(12, 60, 120, 165, 175, 180)) {
+    new Scene {
+      name = "use \(thousands)k"
+      on = new Matching { pattern = "^use \(thousands)k$" }
+      steps {
+        ...first
+        new Say { text = "Used \(thousands)k." }
+        new Usage { context_used = thousands * 1000; context_size = 200000 }
+      }
+    }
+  }
+  new Scene {
+    name = "who"
+    on = new Matching { pattern = "^who" }
+    steps { new Say { text = "model={{model}}" } }
+  }
+  new Scene {
+    name = "answer"
+    steps { new Say { text = "answered: {{prompt}}" } }
+  }
+}
+
+agents {
+  ["squeezed"] {
+    title = "Squeezed"
+    models = fakeModels
+    modes = fakeModes
+    scenes {
+      new Scene {
+        name = "summary"
+        on = new Matching { pattern = "^You MUST summarize the conversation above" }
+        steps { new Say { text = template } }
+      }
+      ...fills(new Listing<AnyStep> {})
+    }
+  }
+
+  ["stubborn"] {
+    title = "Stubborn"
+    models = fakeModels
+    modes = fakeModes
+    scenes {
+      new Scene {
+        name = "summary-in-prose"
+        on = new AnyOf {
+          matchers {
+            new Matching { pattern = "^You MUST summarize the conversation above" }
+            new Matching { pattern = "^The previous response did not fill in the required summary template" }
+          }
+        }
+        steps { new Say { text = "We talked about a few things, and then some more." } }
+      }
+      ...fills(new Listing<AnyStep> {})
+    }
+  }
+
+  ["native"] {
+    title = "Native"
+    models = fakeModels
+    modes = fakeModes
+    commands { new Command { name = "compact"; description = "Compact the conversation" } }
+    scenes {
+      new Scene {
+        name = "native-compact"
+        on = new SlashCommand { name = "compact" }
+        steps {
+          new Say { text = "Compacted by the agent itself." }
+          new Usage { context_used = 12000; context_size = 200000 }
+        }
+      }
+      new Scene {
+        name = "summary-asked-for"
+        on = new Matching { pattern = "^You MUST summarize the conversation above" }
+        steps { new Say { text = "SUMMARY WAS ASKED FOR: {{prompt}}" } }
+      }
+      // Commands the agent announces while it works, as Claude does: the ones announced the
+      // moment a session opens are not yet seen by the turn ledger (see the report).
+      ...fills(new Listing<AnyStep> {
+        new Commands { commands { new Command { name = "compact"; description = "Compact the conversation" } } }
+      })
+    }
+  }
+
+  ["looper"] {
+    title = "Looper"
+    models = fakeModels
+    scenes {
+      new Scene {
+        name = "loop"
+        on = new Matching { pattern = "^(loop|You have called)" }
+        steps {
+          new Say { text = "Let me look at that file." }
+          new Repeat {
+            times = 8
+            every = 200.ms
+            steps {
+              new Tool {
+                title = "Read src/lib.rs"
+                tool_kind = "read"
+                input = new Dynamic { path = "src/lib.rs" }
+                locations { new Location { path = "src/lib.rs" } }
+                duration = 50.ms
+              }
+            }
+          }
+          new Say { text = "Done looking." }
+        }
+      }
+      new Scene {
+        name = "answer"
+        steps { new Say { text = "answered: {{prompt}}" } }
+      }
+    }
+  }
+}
