@@ -47,12 +47,39 @@ impl SessionEventFanout {
         self.primary.send(event).map_err(Box::new)
     }
 
+    /// A handle that does not keep the primary receiver's stream open: for what lives as long
+    /// as the session's backend and must not stop the stream from ending with the session.
+    pub(crate) fn downgrade(&self) -> WeakSessionEventFanout {
+        WeakSessionEventFanout {
+            primary: self.primary.downgrade(),
+            subscribers: Arc::downgrade(&self.subscribers),
+        }
+    }
+
     pub(crate) fn subscribe(&self) -> mpsc::Receiver<SessionEvent> {
         let (subscriber_tx, subscriber_rx) = mpsc::channel(SUBSCRIBER_QUEUE_EVENTS);
         if let Ok(mut subscribers) = self.subscribers.lock() {
             subscribers.push(subscriber_tx);
         }
         subscriber_rx
+    }
+}
+
+/// A [`SessionEventFanout`] that does not keep the session's event stream open; see
+/// [`SessionEventFanout::downgrade`].
+#[derive(Clone)]
+pub(crate) struct WeakSessionEventFanout {
+    primary: tokio::sync::mpsc::WeakUnboundedSender<SessionEvent>,
+    subscribers: std::sync::Weak<std::sync::Mutex<Vec<mpsc::Sender<SessionEvent>>>>,
+}
+
+impl WeakSessionEventFanout {
+    /// The fan-out, unless the session's event stream has already ended.
+    pub(crate) fn upgrade(&self) -> Option<SessionEventFanout> {
+        Some(SessionEventFanout {
+            primary: self.primary.upgrade()?,
+            subscribers: self.subscribers.upgrade()?,
+        })
     }
 }
 
@@ -96,6 +123,17 @@ mod tests {
                 format!("event {index}")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_weak_handle_does_not_keep_the_primary_stream_open() {
+        let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
+        let fanout = SessionEventFanout::new(primary_tx);
+        let weak = fanout.downgrade();
+        assert!(weak.upgrade().is_some());
+        drop(fanout);
+        assert!(primary_rx.recv().await.is_none());
+        assert!(weak.upgrade().is_none());
     }
 
     #[tokio::test]
