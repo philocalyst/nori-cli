@@ -23,8 +23,7 @@ const MAX_BASELINE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const BASELINE_VERSION_FILE: &str = "codex-baseline-version";
 const BASELINE_VERSION: &[u8] = b"1\n";
 
-const BASELINE_COMMIT_MESSAGE: &str =
-    "Initialize Codex git baseline\n\nCo-authored-by: Codex <noreply@openai.com>";
+const BASELINE_COMMIT_MESSAGE: &str = "Initialize Codex git baseline";
 
 /// File-level change status between a git baseline and the current directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
