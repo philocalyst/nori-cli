@@ -1337,6 +1337,16 @@ pub(super) fn mapping_amendment_scopes(
     for (key, ty) in current.flatten_type_aliases() {
         amendment.set_type_alias(key, ty);
     }
+    // A name whose value failed to evaluate has no value to flatten. Without
+    // its failure the amendment would report the name as missing, instead of
+    // the error the name stands for.
+    for (key, message) in current.flatten_poisoned() {
+        for scope in [&mut inherited, &mut amendment] {
+            if scope.get(&key).is_none() {
+                scope.poison(key.clone(), message.clone());
+            }
+        }
+    }
     (inherited, amendment)
 }
 

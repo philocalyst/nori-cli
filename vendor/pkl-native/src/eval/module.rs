@@ -102,8 +102,7 @@ impl Evaluator {
         source: &str,
         name: &str,
     ) -> Result<Module> {
-        let (module, declarations, spans) =
-            parser::parse_named_declarations(tokens, source, name)?;
+        let (module, declarations, spans) = parser::parse_named_declarations(tokens, source, name)?;
         self.spans.register(name, source, spans);
         if !declarations.is_empty() {
             if self.parsed_declarations.len() >= 64 {
@@ -574,7 +573,11 @@ impl Evaluator {
             }
         }
         let mut inherited_type_names = HashSet::default();
-        let relation = if module.amends.is_some() { "amends" } else { "extends" };
+        let relation = if module.amends.is_some() {
+            "amends"
+        } else {
+            "extends"
+        };
         let inherited_references = self
             .inherited_reference_roots(module, path, depth + 1, &mut inherited_type_names)
             .inspect_err(|error| self.note_module_step(error, relation, module, path))?;
@@ -2011,6 +2014,7 @@ impl Evaluator {
                         match evaluated {
                             Ok(val) => scope.declare(&prop.name, val),
                             Err(Error::Eval(message)) => {
+                                self.spans.local_failed(&message, prop);
                                 scope.declare_poisoned(prop.name.clone(), message.clone());
                                 failed.insert(&prop.name, message);
                                 failed_indices.insert(index);

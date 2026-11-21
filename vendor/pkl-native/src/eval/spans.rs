@@ -39,6 +39,9 @@ pub(super) struct SourceMap {
     failure: Option<Failure>,
     /// The object bodies being built now, innermost last.
     bodies: Vec<Vec<Arc<Property>>>,
+    /// The `local`s whose evaluation raised each message, so an error that reaches a use of the
+    /// local is still placed in the local.
+    local_failures: HashMap<String, Vec<usize>>,
 }
 
 struct Failure {
@@ -104,6 +107,31 @@ impl SourceMap {
         });
     }
 
+    /// Note that evaluating the `local` `property` raised `message`. The first local to raise a
+    /// message keeps it: later reads of the failed local carry the same message. The evaluator
+    /// works on copies of the parsed properties, so the local is matched to the parsed
+    /// properties of the same name and content; when the same text occurs more than once, all
+    /// of them are kept.
+    pub(super) fn local_failed(&mut self, message: &str, property: &Property) {
+        if self.local_failures.contains_key(message) {
+            return;
+        }
+        let mut found: Vec<usize> = self
+            .properties
+            .iter()
+            .filter(|(_, loc)| {
+                loc.property.name == property.name
+                    && loc.property.value == property.value
+                    && loc.property.body == property.body
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        found.sort_by_key(|key| self.properties[key].declaration.start);
+        if !found.is_empty() {
+            self.local_failures.insert(message.to_owned(), found);
+        }
+    }
+
     pub(super) fn enter_body(&mut self, entries: &[crate::parser::Entry]) {
         self.bodies.push(
             entries
@@ -151,10 +179,10 @@ impl SourceMap {
 
 impl SourceMap {
     /// Where the properties of an object body were written. The evaluator works on copies of
-    /// the parsed properties (it adds inherited types, for one), so each is matched to the
-    /// parsed property of the same name and content; when the same text occurs more than once,
-    /// the copies nearest the first property's match are taken, so the properties of one object
-    /// literal resolve together.
+    /// the parsed properties (it adds inherited types, for one), so each is matched to the parsed
+    /// property of the same name and content; when the same text occurs more than once, the copies
+    /// nearest the first property's match are taken, so the properties of one object literal
+    /// resolve together.
     fn locate_body(&self, body: &[Arc<Property>]) -> Vec<ErrorFrame> {
         let candidates = |wanted: &Property| -> Vec<&PropertyLoc> {
             self.properties
@@ -229,6 +257,20 @@ impl Evaluator {
                 let properties = self.spans.locate_body(body);
                 (!properties.is_empty()).then_some(ObjectFrame { properties })
             })
+            .collect()
+    }
+
+    /// The `local`s whose evaluation raised `message`, when the error is one a local raised: it
+    /// may reach the person from where the local was used, which is not where it failed. More
+    /// than one when the same local text is written in several places.
+    pub fn error_locals(&self, message: &str) -> Vec<ErrorFrame> {
+        self.spans
+            .local_failures
+            .get(message)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| self.spans.properties.get(key))
+            .map(SourceMap::frame)
             .collect()
     }
 

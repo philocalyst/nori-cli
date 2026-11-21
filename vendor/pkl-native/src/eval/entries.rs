@@ -1010,6 +1010,7 @@ impl Evaluator {
                             }
                         }
                         Err(Error::Eval(message)) => {
+                            self.spans.local_failed(&message, prop);
                             if prop.type_ann.is_none()
                                 && const_local_reads_non_const(prop, &st.non_const_members)
                                     .is_none()
@@ -1073,6 +1074,15 @@ impl Evaluator {
     /// Evaluate the body's `default` property, the template its other entries
     /// amend.
     fn eval_default_template(&mut self, cx: &BodyContext, st: &BodyState) -> Result<Option<Value>> {
+        // `default` is a template only for a Dynamic, Listing or Mapping. An
+        // instance of a class has no template: a `default` it sets is one of
+        // its properties (`class Parameter { default: String? }`).
+        if cx
+            .inherited_source
+            .is_some_and(|source| source.type_identity.is_some())
+        {
+            return Ok(None);
+        }
         let mut default_template: Option<Value> = None;
         for (entry_index, entry) in cx.entries.iter().enumerate() {
             let Entry::Property(prop) = entry else {
@@ -1152,6 +1162,7 @@ impl Evaluator {
                         recovered = true;
                     }
                     Err(Error::Eval(message)) => {
+                        self.spans.local_failed(&message, prop);
                         if cx.binds_declared(&prop.name) {
                             st.child_scope.declare_poisoned(prop.name.clone(), message);
                         } else {

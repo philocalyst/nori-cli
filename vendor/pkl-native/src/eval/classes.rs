@@ -619,6 +619,11 @@ impl Evaluator {
             let value_checkable = type_is_runtime_checkable(value_ty, scope);
             let mut alternative_matches = true;
             for (stored_key, entry) in entries.iter() {
+                // An entry that failed reports its own failure, not a type
+                // mismatch against the `Null` it stands for.
+                if let Value::Failed(message) = entry {
+                    return Err(Error::Eval(message.to_string()));
+                }
                 let key = self
                     .mapping_key_values
                     .get(stored_key)
