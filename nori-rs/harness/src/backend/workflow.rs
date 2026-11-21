@@ -28,6 +28,11 @@ pub(crate) struct WorkflowState {
     /// How failed requests are retried and where the session falls back to. Children carry the
     /// user's policy too, even though they run no workflow of their own.
     pub(super) recovery: nori_workflow::RecoveryPolicy,
+    /// When the session compacts itself and how a refused checkpoint is cut down. Kept apart
+    /// from `active`, which a child does not run.
+    pub(super) compaction: nori_workflow::CompactionPolicy,
+    /// What happens when the agent repeats one tool call.
+    pub(super) loops: nori_workflow::LoopPolicy,
     /// Whether an independent reviewer checks a goal the agent calls complete.
     pub(super) goals: nori_workflow::GoalsPolicy,
     /// The agent has been told the active workflow's rules.
@@ -145,18 +150,22 @@ pub(super) async fn prepare_workflow(
     let (loaded, snapshot) = receiver
         .await
         .map_err(|error| anyhow::anyhow!("Workflow policy loader stopped: {error}"))?;
-    let (active, recovery, goals) = match loaded {
+    let (active, recovery, compaction, loops, goals) = match loaded {
         Ok(policy) if child => (
             policy.tools.map(|tools| Workflow {
                 tools: Some(tools),
                 ..Default::default()
             }),
             policy.recovery,
+            policy.compaction,
+            policy.loops,
             policy.goals,
         ),
         Ok(policy) => (
             Some(policy.clone()),
             policy.recovery,
+            policy.compaction,
+            policy.loops,
             policy.goals,
         ),
         Err(error) => return Err(anyhow::anyhow!("Workflow policy failed to load: {error}")),
@@ -164,6 +173,8 @@ pub(super) async fn prepare_workflow(
     let workflow = Arc::new(Mutex::new(WorkflowState {
         active,
         recovery,
+        compaction,
+        loops,
         goals,
         ..Default::default()
     }));
