@@ -21,6 +21,8 @@ mod approvals;
 mod boot;
 mod events;
 mod invariants;
+mod log;
+mod processes;
 mod session;
 
 pub use approvals::Approvals;
@@ -40,6 +42,7 @@ pub use invariants::Violation;
 pub use nori_fake_agent::Entry;
 pub use nori_fake_agent::Record;
 pub use nori_fake_agent::World;
+pub use processes::WorldSupervisor;
 pub use session::Report;
 pub use session::Stuck;
 pub use session::WorldSession;

@@ -142,6 +142,7 @@ struct Snapshot {
 impl WorldSession {
     /// Boot `world` and start a session on its default agent (or `options.agent`).
     pub async fn boot(world: World, options: WorldOptions) -> anyhow::Result<Self> {
+        crate::log::init();
         let WorldOptions {
             transport,
             approvals,
@@ -150,6 +151,7 @@ impl WorldSession {
             quiet,
             timeout,
             configure,
+            allow_failed_start,
         } = options;
         let agent = agent
             .or_else(|| world.default_agent().map(|agent| agent.slug.clone()))
@@ -195,6 +197,15 @@ impl WorldSession {
         std::fs::create_dir_all(&nori_home).context("nori home")?;
         if let Some(policy) = &installed.world().policy {
             std::fs::write(nori_home.join("init.pkl"), policy).context("the world's policy")?;
+        }
+        // A world that scripts processes runs every job on them, on its clock; one that does not
+        // runs jobs for real.
+        let processes = installed.world().processes.clone();
+        if !processes.is_empty() {
+            nori_harness::backend::jobs::install_supervisor_for_home(
+                nori_home.clone(),
+                Arc::new(crate::WorldSupervisor::new(processes, clock)),
+            );
         }
         let mut config = NoriConfig {
             active_agent: agent.clone(),
@@ -244,11 +255,16 @@ impl WorldSession {
             _claim: claim,
         };
         session.attach(launched);
-        session
+        match session
             .wait_for("the session to start", |events| {
                 events.root_session().is_some()
             })
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(Stuck::Ended) if allow_failed_start => {}
+            Err(stuck) => return Err(stuck.into()),
+        }
         Ok(session)
     }
 
@@ -259,6 +275,11 @@ impl WorldSession {
         self.shared.ended.store(false, Ordering::SeqCst);
         let pump = tokio::spawn(pump(events, handle, Arc::clone(&self.shared)));
         *Shared::lock(&self.pump) = Some(pump);
+    }
+
+    /// The session's event stream has ended: it failed to start, or was shut down.
+    pub fn has_ended(&self) -> bool {
+        self.shared.ended.load(Ordering::SeqCst)
     }
 
     /// The harness handle, for anything the driver has no verb for.
@@ -482,6 +503,25 @@ impl WorldSession {
         self.handle().rewind_and_rebind(transcript, head).await
     }
 
+    /// Fork the whole visible conversation into a child session of the same agent, as `/fork`
+    /// does for the range a person selects. A range is named by the journal's record ids, which
+    /// count up from 1, so the end is found by looking down from a number no journal reaches.
+    pub async fn fork_history(&self) -> anyhow::Result<()> {
+        const MOST_RECORDS: i64 = 10_000;
+        let transcript = Shared::lock(&self.shared.transcript_id)
+            .clone()
+            .context("the session has no transcript yet")?;
+        self.note("fork", "the whole conversation");
+        let handle = self.handle();
+        for end in (1..=MOST_RECORDS).rev() {
+            let source = Some((transcript.clone(), 1, end));
+            if handle.fork_history(String::new(), source).await.is_ok() {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("no range of the conversation could be forked")
+    }
+
     /// End this harness session and resume the same agent session in a new one, as quitting and
     /// running `nori resume` does. Events keep accumulating in the same record.
     pub async fn resume(&self) -> anyhow::Result<()> {
@@ -550,6 +590,7 @@ impl WorldSession {
 
 impl Drop for WorldSession {
     fn drop(&mut self) {
+        nori_harness::backend::jobs::remove_supervisor_for_home(&self.config.nori_home);
         let handle = Shared::lock(&self.handle).clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {

@@ -13,10 +13,12 @@ workspace = true
 # harness, and tests of any crate can depend on it.
 [dependencies]
 anyhow = { workspace = true }
+chrono = { workspace = true }
 nori-acp-host = { workspace = true }
 nori-config = { workspace = true }
 nori-fake-agent = { workspace = true }
 nori-harness = { workspace = true }
+nori-machines = { workspace = true }
 nori-protocol = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
@@ -24,6 +26,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 toml = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+nori-actions = { workspace = true }
+pretty_assertions = { workspace = true }
 tui-pty-e2e = { path = "../tui-pty-e2e" }

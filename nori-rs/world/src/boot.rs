@@ -62,6 +62,9 @@ pub struct WorldOptions {
     pub timeout: Duration,
     /// Last say over the Nori configuration the session starts with.
     pub configure: Option<Configure>,
+    /// A session that fails to start is a result to read in the events, not an error of
+    /// [`WorldSession::boot`](crate::WorldSession::boot): for worlds about agents that do not start.
+    pub allow_failed_start: bool,
 }
 
 impl Default for WorldOptions {
@@ -74,6 +77,7 @@ impl Default for WorldOptions {
             quiet: Duration::from_millis(1000),
             timeout: Duration::from_secs(60),
             configure: None,
+            allow_failed_start: false,
         }
     }
 }
@@ -180,14 +184,22 @@ impl Claim {
                 released.await;
             }
         };
-        tokio::time::timeout(limit, waiting).await.map_err(|_| {
-            anyhow::anyhow!(
+        // The limit is real time. A test on a paused tokio clock auto-advances its timers the
+        // moment it is idle, which would expire a tokio timeout before the other world (on
+        // another test's runtime) could finish.
+        let (expired_tx, expired) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(limit);
+            let _ = expired_tx.send(());
+        });
+        tokio::select! {
+            () = waiting => Ok(Self { slugs: wanted }),
+            _ = expired => Err(anyhow::anyhow!(
                 "another world in this process holds the agents {}; worlds that share an agent \
                  slug run one at a time, and it did not finish within {limit:?}",
                 wanted.join(", ")
-            )
-        })?;
-        Ok(Self { slugs: wanted })
+            )),
+        }
     }
 }
 

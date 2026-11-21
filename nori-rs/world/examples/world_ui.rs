@@ -11,7 +11,7 @@
 //!
 //! `--ask` makes the TUI ask for permission instead of approving everything (a debug `nori`
 //! approves unless `NORI_TEST_REQUIRE_APPROVAL` is set). Arguments after the options are a script. A plain argument is typed as a prompt and sent with
-//! Enter. `/wait MS`, `/waitfor TEXT` (up to 60 s), `/key enter|esc|up|down|tab|ctrl-c|CHAR`,
+//! Enter. `/wait MS`, `/waitfor TEXT` (up to 60 s), `/key enter|esc|up|down|tab|ctrl-c|ctrl-space|CHAR`,
 //! `/type TEXT`, `/frame NAME` (writes `NN-NAME.screen.txt` and `NN-NAME.scrollback.txt`),
 //! `/resize COLSxROWS`. A final frame is always written. `NORI_WORLD_CLOCK` (default `virtual`
 //! skips the world's cadence; use `real` for streaming) sets the world's time.
@@ -146,6 +146,7 @@ fn main() -> anyhow::Result<()> {
                     "down" => Key::Down,
                     "tab" => Key::Tab,
                     "ctrl-c" => Key::Ctrl('c'),
+                    "ctrl-space" => Key::Ctrl(' '),
                     key if key.chars().count() == 1 => Key::Char(key.chars().next().unwrap_or(' ')),
                     key => anyhow::bail!("unknown key {key:?}"),
                 };

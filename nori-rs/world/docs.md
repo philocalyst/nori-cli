@@ -24,6 +24,9 @@ The guide is [fake-worlds.md](../../docs/fake-worlds.md).
 - `events.rs`: `Events`, a snapshot with a query API over lanes (the root's and each child's).
 - `invariants.rs`: properties checked over the event stream and the flight recorder.
 - `approvals.rs`, `boot.rs`: who answers permission requests; the claim on agent slugs.
+- `tests/`: the fault suite (`just faults`): `claude_faults`, `oversize_context`, `startup_faults`, and
+  `worlds_load`. Each test names the fault of [fault-catalog.md](../../docs/fault-catalog.md) it
+  reproduces. `tests/support` loads the showcase worlds and reads the recorder.
 
 ### Things to Know
 
@@ -31,6 +34,11 @@ The guide is [fake-worlds.md](../../docs/fake-worlds.md).
   one at a time, and `boot` waits.
 - `settle` needs a quiet moment (`WorldOptions::quiet`) longer than the harness's completion-wake
   batching (600 ms), or it can return before a child's result has woken its parent.
+- `WorldOptions::allow_failed_start` makes a session that fails to start a result to read in the
+  events instead of an error of `boot`. Worlds about agents that never answer run on a paused tokio
+  clock (`#[tokio::test(start_paused = true)]`), so the harness's own timeouts pass at once.
+- `fork_history` forks the whole visible conversation; the journal's record ids count up from 1, so it
+  looks for the last one down from a number no journal reaches.
 - User actions are written to the world's flight recorder before they are sent, so an invariant can
   tell a cancel the user made from one the harness made up.
 
