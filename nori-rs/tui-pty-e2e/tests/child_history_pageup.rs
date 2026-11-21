@@ -22,13 +22,11 @@ fn pageup_reaches_inherited_long_child_history() {
         .wait_for_text("long-history-line-44", timeout)
         .expect("parent response");
     session.type_input("ROOT-DRAFT-MARKER").expect("root draft");
-    session.send_str("\x1b[27u").expect("normal mode");
-    session.wait_for_text("NORMAL", timeout).expect("normal");
-    session.send_str("[").expect("focus answer");
+    session.send_key(Key::Up).expect("walk to parent prompt");
     session
-        .wait_for_text("Turn 1 of 1", timeout)
+        .wait_for_text("turn 1 of 1", timeout)
         .expect("focused");
-    session.send_str(" ").expect("fork answer");
+    session.send_key(Key::Ctrl('f')).expect("fork answer");
     session
         .wait_for_text("History fork", timeout)
         .expect("fork card");
@@ -45,12 +43,14 @@ fn pageup_reaches_inherited_long_child_history() {
             timeout,
         )
         .expect("child reply completed");
-    session
-        .send_str("\x1b[5~\x1b[5~\x1b[5~")
-        .expect("three PageUp keys");
-    session
-        .wait_for_text("Continue from the conversation above", timeout)
-        .expect("inherited history after three PageUps");
+    // PageUp is handled by the terminal, so inspect its native scrollback directly.
+    let pages: Vec<_> = (1..=8)
+        .map(|page| session.scrollback_contents(page * 20))
+        .collect();
+    assert!(
+        pages.iter().any(|page| page.contains("long history parent question")),
+        "parent prompt missing from scrollback: {pages:#?}"
+    );
     session.send_key(Key::Tab).expect("return to parent");
     session
         .wait_for_text("ROOT-DRAFT-MARKER", timeout)
