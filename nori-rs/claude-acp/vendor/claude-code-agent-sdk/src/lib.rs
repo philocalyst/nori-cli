@@ -324,6 +324,8 @@ pub mod version;
 
 // Re-export commonly used types
 pub use errors::ClaudeError;
+pub use errors::CliExitError;
+pub use errors::CliNotFoundError;
 pub use errors::ImageValidationError;
 pub use errors::Result;
 pub use types::{

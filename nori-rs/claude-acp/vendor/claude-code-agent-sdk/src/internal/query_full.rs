@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::errors::ClaudeError;
+use crate::errors::CliExitError;
 use crate::errors::Result;
 use crate::types::hooks::HookCallback;
 use crate::types::hooks::HookContext;
@@ -33,6 +34,16 @@ use super::transport::Transport;
 
 /// Default timeout for control requests (60 seconds, aligned with Python SDK)
 pub const DEFAULT_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The message the background reader puts on a query's channel after the CLI's output ends, so
+/// whoever reads the channel learns that no more messages will come. It never reaches a caller as
+/// a message: the stream that reads it ends with [`ClaudeError::CliExited`].
+pub(crate) const CLI_EXITED_MESSAGE: &str = "__sdk_cli_exited";
+
+/// Whether `message` is the reader's end-of-output marker ([`CLI_EXITED_MESSAGE`]).
+pub(crate) fn is_cli_exited(message: &serde_json::Value) -> bool {
+    message.get("type").and_then(serde_json::Value::as_str) == Some(CLI_EXITED_MESSAGE)
+}
 
 /// Control request from SDK to CLI
 #[allow(dead_code)]
@@ -93,6 +104,12 @@ pub struct QueryFull {
     initialization_result: Arc<Mutex<Option<serde_json::Value>>>,
     // Configurable timeout for control requests
     control_request_timeout: Option<Duration>,
+    /// Set once the CLI's output has ended: how the process ended. From then on the query is
+    /// inactive and every request to it fails at once with [`ClaudeError::CliExited`].
+    exit: Arc<std::sync::OnceLock<CliExitError>>,
+    /// Stops the background reader, which otherwise holds the transport (and so the CLI process)
+    /// for as long as the CLI keeps its output open.
+    stop_reader: Arc<tokio::sync::Notify>,
 }
 
 impl QueryFull {
@@ -144,7 +161,26 @@ impl QueryFull {
             stdin: None,
             initialization_result: Arc::new(Mutex::new(None)),
             control_request_timeout: Some(DEFAULT_CONTROL_REQUEST_TIMEOUT),
+            exit: Arc::new(std::sync::OnceLock::new()),
+            stop_reader: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// How the CLI ended, once its output has closed; `None` while it runs.
+    pub fn exit(&self) -> Option<CliExitError> {
+        self.exit.get().cloned()
+    }
+
+    /// Stop reading from the CLI. The reader lets go of the transport, so once this query is
+    /// dropped the transport is too, and dropping it kills the CLI. For a query that failed to
+    /// start: its CLI may never answer, and nothing else would ever end it.
+    pub fn stop_reader(&self) {
+        self.stop_reader.notify_one();
+    }
+
+    /// The error for a request that failed because the CLI is gone, when it is.
+    fn exited_error(&self) -> Option<ClaudeError> {
+        self.exit().map(ClaudeError::CliExited)
     }
 
     /// Check if this QueryFull is still active
@@ -156,7 +192,7 @@ impl QueryFull {
     ///
     /// true if the query is still active (can send messages), false otherwise
     pub fn is_active(&self) -> bool {
-        !self.message_tx.is_closed()
+        self.exit.get().is_none() && !self.message_tx.is_closed()
     }
 
     /// Set the timeout for control requests.
@@ -271,6 +307,8 @@ impl QueryFull {
         let pending_responses = Arc::clone(&self.pending_responses);
         let message_tx = self.message_tx.clone();
         let stdin = self.stdin.clone();
+        let exit = Arc::clone(&self.exit);
+        let stop_reader = Arc::clone(&self.stop_reader);
 
         // Create a channel to signal when background task is ready
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -282,7 +320,18 @@ impl QueryFull {
             // Signal that we're ready to receive messages
             let _ = ready_tx.send(());
 
-            while let Some(result) = stream.next().await {
+            let mut stopped = false;
+            loop {
+                let result = tokio::select! {
+                    next = stream.next() => match next {
+                        Some(result) => result,
+                        None => break,
+                    },
+                    () = stop_reader.notified() => {
+                        stopped = true;
+                        break;
+                    }
+                };
                 tracing::trace!("SDK background reader: received message from CLI");
 
                 match result {
@@ -398,7 +447,26 @@ impl QueryFull {
                     }
                 }
             }
-            tracing::error!("SDK background reader: stream ended unexpectedly");
+            drop(stream);
+            let report = if stopped {
+                tracing::debug!("SDK background reader stopped");
+                CliExitError::default()
+            } else {
+                let report = transport_guard.exit_report().await;
+                tracing::error!(
+                    exit_code = ?report.exit_code,
+                    stderr = ?report.stderr_tail,
+                    "SDK background reader: the CLI's output ended: {report}"
+                );
+                report
+            };
+            drop(transport_guard);
+            let _ = exit.set(report);
+            // Nothing will answer the requests still waiting: fail them now rather than at their
+            // timeout. Dropping a sender wakes its waiter, which reads the exit.
+            pending_responses.lock().await.clear();
+            // And whoever reads the messages learns that none will follow.
+            let _ = message_tx.send(json!({ "type": CLI_EXITED_MESSAGE }));
         });
 
         // Wait for background task to be ready before returning
@@ -657,8 +725,21 @@ impl QueryFull {
         Ok(())
     }
 
-    /// Send control request to CLI
+    /// Send a control request to the CLI and wait for its answer.
+    ///
+    /// A CLI that has exited fails the request at once ([`ClaudeError::CliExited`]), whether it
+    /// was gone before the request was written or went away while it waited. An answer of
+    /// subtype `error` is an error, never a success with an `error` field. A CLI that stays silent
+    /// past the timeout fails it with a [`ClaudeError::Timeout`] that names the request.
     async fn send_control_request(&self, request: serde_json::Value) -> Result<serde_json::Value> {
+        if let Some(error) = self.exited_error() {
+            return Err(error);
+        }
+        let subtype = request
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("control")
+            .to_owned();
         let request_id = format!(
             "req_{}_{}",
             self.request_counter.fetch_add(1, Ordering::SeqCst),
@@ -679,78 +760,78 @@ impl QueryFull {
             "request": request
         });
 
-        let request_str = serde_json::to_string(&control_request)
-            .map_err(|e| ClaudeError::Transport(format!("Failed to serialize request: {}", e)))?;
-
-        // Write directly to stdin (bypasses transport lock held by background reader)
-        if let Some(ref stdin) = self.stdin {
-            let mut stdin_guard = stdin.lock().await;
-            if let Some(ref mut stdin_stream) = *stdin_guard {
-                stdin_stream
-                    .write_all(request_str.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        ClaudeError::Transport(format!("Failed to write control request: {}", e))
-                    })?;
-                stdin_stream.write_all(b"\n").await.map_err(|e| {
-                    ClaudeError::Transport(format!("Failed to write newline: {}", e))
-                })?;
-                stdin_stream
-                    .flush()
-                    .await
-                    .map_err(|e| ClaudeError::Transport(format!("Failed to flush: {}", e)))?;
-            } else {
-                return Err(ClaudeError::Transport("stdin not available".to_string()));
-            }
-        } else {
-            return Err(ClaudeError::Transport("stdin not set".to_string()));
+        let written = match serde_json::to_string(&control_request) {
+            Ok(request_str) => Self::write_line(self.stdin.as_ref(), &request_str).await,
+            Err(e) => Err(ClaudeError::Transport(format!(
+                "Failed to serialize request: {}",
+                e
+            ))),
+        };
+        if let Err(error) = written {
+            self.pending_responses.lock().await.remove(&request_id);
+            return Err(self.exited_error().unwrap_or(error));
         }
 
-        // Wait for response with timeout (if configured)
-        // Clone pending_responses reference for cleanup on timeout/error
-        let pending_responses = Arc::clone(&self.pending_responses);
-        let request_id_for_cleanup = request_id.clone();
-
-        let response = if let Some(timeout_duration) = self.control_request_timeout {
-            // With timeout
-            match timeout(timeout_duration, rx).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
-                    // Channel closed - clean up
-                    pending_responses
-                        .lock()
-                        .await
-                        .remove(&request_id_for_cleanup);
-                    return Err(ClaudeError::ControlProtocol(
-                        "Control request response channel closed".to_string(),
-                    ));
-                }
+        let answer = match self.control_request_timeout {
+            Some(limit) => match timeout(limit, rx).await {
+                Ok(answer) => answer,
                 Err(_) => {
-                    // Timeout - clean up the pending request to prevent memory leak
-                    pending_responses
-                        .lock()
-                        .await
-                        .remove(&request_id_for_cleanup);
-                    return Err(ClaudeError::Timeout(format!(
-                        "Control request timed out after {:?}",
-                        timeout_duration
-                    )));
+                    self.pending_responses.lock().await.remove(&request_id);
+                    return Err(self.exited_error().unwrap_or_else(|| {
+                        ClaudeError::Timeout(format!(
+                            "Claude Code did not answer its {subtype} request within {}s",
+                            limit.as_secs()
+                        ))
+                    }));
                 }
-            }
-        } else {
-            // No timeout (not recommended)
-            rx.await.map_err(|_| {
-                pending_responses
-                    .try_lock()
-                    .map(|mut guard| {
-                        guard.remove(&request_id_for_cleanup);
-                    })
-                    .ok();
-                ClaudeError::ControlProtocol("Control request response channel closed".to_string())
-            })?
+            },
+            None => rx.await,
         };
-
+        let response = match answer {
+            Ok(response) => response,
+            Err(_) => {
+                self.pending_responses.lock().await.remove(&request_id);
+                return Err(self.exited_error().unwrap_or_else(|| {
+                    ClaudeError::ControlProtocol(format!(
+                        "the {subtype} request was dropped before Claude Code answered it"
+                    ))
+                }));
+            }
+        };
+        if let Some(error) = response.get("error") {
+            let reason = error
+                .as_str()
+                .map_or_else(|| error.to_string(), str::to_owned);
+            return Err(ClaudeError::ControlProtocol(format!(
+                "Claude Code refused its {subtype} request: {reason}"
+            )));
+        }
         Ok(response)
+    }
+
+    /// Write one line of JSON to the CLI's standard input.
+    async fn write_line(
+        stdin: Option<&Arc<Mutex<Option<tokio::process::ChildStdin>>>>,
+        line: &str,
+    ) -> Result<()> {
+        let Some(stdin) = stdin else {
+            return Err(ClaudeError::Transport("stdin not set".to_string()));
+        };
+        let mut stdin_guard = stdin.lock().await;
+        let Some(stdin_stream) = stdin_guard.as_mut() else {
+            return Err(ClaudeError::Transport("stdin not available".to_string()));
+        };
+        stdin_stream.write_all(line.as_bytes()).await.map_err(|e| {
+            ClaudeError::Transport(format!("Failed to write control request: {}", e))
+        })?;
+        stdin_stream
+            .write_all(b"\n")
+            .await
+            .map_err(|e| ClaudeError::Transport(format!("Failed to write newline: {}", e)))?;
+        stdin_stream
+            .flush()
+            .await
+            .map_err(|e| ClaudeError::Transport(format!("Failed to flush: {}", e)))
     }
 
     /// Receive messages
@@ -802,6 +883,17 @@ impl QueryFull {
         let request = json!({
             "subtype": "set_model",
             "model": model
+        });
+
+        self.send_control_request(request).await?;
+        Ok(())
+    }
+
+    /// Apply Claude Code flag settings (for example `{"fastMode": true}`) to the running CLI.
+    pub async fn apply_flag_settings(&self, settings: serde_json::Value) -> Result<()> {
+        let request = json!({
+            "subtype": "apply_flag_settings",
+            "settings": settings
         });
 
         self.send_control_request(request).await?;

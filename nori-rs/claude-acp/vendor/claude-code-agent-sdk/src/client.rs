@@ -13,6 +13,8 @@ use tokio::sync::Mutex;
 use crate::errors::ClaudeError;
 use crate::errors::Result;
 use crate::internal::message_parser::MessageParser;
+use crate::internal::query_full::QueryFull;
+use crate::internal::query_full::is_cli_exited;
 use crate::internal::query_manager::QueryManager;
 use crate::internal::transport::SubprocessTransport;
 use crate::internal::transport::Transport;
@@ -66,6 +68,17 @@ use crate::types::messages::UserContentBlock;
 /// ```
 pub struct ClaudeClient {
     options: ClaudeAgentOptions,
+    /// The model every CLI process this client starts from now on launches with. It starts as
+    /// `options.model` and follows [`Self::set_model`], so a query process started after a model
+    /// change (a session's first prompt, or one after its process ended) never runs the old one.
+    launch_model: Arc<std::sync::Mutex<Option<String>>>,
+    /// Flag settings (`{"fastMode": true}`) applied since the client was made: every CLI process
+    /// started from now on launches with them (`--settings`), as the running one was told.
+    launch_flags: Arc<std::sync::Mutex<serde_json::Map<String, serde_json::Value>>>,
+    /// Whether a user message has reached a CLI process of this client, so the CLI has saved the
+    /// conversation. A process started after that (because the last one exited) resumes the
+    /// conversation by its id instead of starting it anew.
+    conversation_started: Arc<std::sync::atomic::AtomicBool>,
     /// QueryManager for creating isolated queries (Codex-style architecture)
     query_manager: Option<Arc<QueryManager>>,
     /// Current query_id for the active prompt
@@ -89,6 +102,9 @@ impl ClaudeClient {
     /// ```
     pub fn new(options: ClaudeAgentOptions) -> Self {
         Self {
+            launch_model: Arc::new(std::sync::Mutex::new(options.model.clone())),
+            launch_flags: Arc::default(),
+            conversation_started: Arc::default(),
             options,
             query_manager: None,
             current_query_id: None,
@@ -126,6 +142,9 @@ impl ClaudeClient {
         let _ = SubprocessTransport::new(prompt, options.clone())?;
 
         Ok(Self {
+            launch_model: Arc::new(std::sync::Mutex::new(options.model.clone())),
+            launch_flags: Arc::default(),
+            conversation_started: Arc::default(),
             options,
             query_manager: None,
             current_query_id: None,
@@ -243,13 +262,62 @@ impl ClaudeClient {
 
         // Clone options for the transport factory
         let options_clone = options.clone();
+        let launch_model = Arc::clone(&self.launch_model);
+        let launch_flags = Arc::clone(&self.launch_flags);
+        let conversation_started = Arc::clone(&self.conversation_started);
+        // The id the CLI saves this conversation under: the one it is told to use (a new
+        // conversation, or the copy a fork makes), else the one it resumes.
+        let conversation_id = options
+            .extra_args
+            .get("session-id")
+            .cloned()
+            .flatten()
+            .or_else(|| options.resume.clone());
 
         // Create QueryManager with a transport factory
-        // The factory creates new transports for each isolated query
+        // The factory creates new transports for each isolated query, with the model the client
+        // is set to at that moment.
         // Note: connect() is called later in create_query(), not here
         let mut query_manager = QueryManager::new(move || {
             let prompt = QueryPrompt::Streaming;
-            let transport = SubprocessTransport::new(prompt, options_clone.clone())?;
+            let mut options = options_clone.clone();
+            if let Ok(model) = launch_model.lock() {
+                options.model = model.clone();
+            }
+            // A process that replaces one which exited after the conversation began carries the
+            // conversation on: it resumes it, and neither starts a new one under the same id nor
+            // forks it again.
+            if conversation_started.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(id) = &conversation_id
+            {
+                options.resume = Some(id.clone());
+                options.fork_session = false;
+                options.extra_args.remove("session-id");
+            }
+            // Flag settings join the launch settings when those are inline JSON (or absent); a
+            // settings file is left as it is, and the running process is told instead.
+            if let Ok(flags) = launch_flags.lock()
+                && !flags.is_empty()
+            {
+                let inline = options
+                    .settings
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|settings| settings.starts_with('{'));
+                if options.settings.is_none() || inline.is_some() {
+                    let mut merged = inline
+                        .and_then(|settings| {
+                            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                                settings,
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default();
+                    merged.extend(flags.clone());
+                    options.settings = Some(serde_json::Value::Object(merged).to_string());
+                }
+            }
+            let transport = SubprocessTransport::new(prompt, options)?;
             Ok(Box::new(transport) as Box<dyn Transport>)
         });
 
@@ -274,8 +342,10 @@ impl ClaudeClient {
 
         let query_manager = Arc::new(query_manager);
 
-        // Create the first query for initialization
-        let first_query_id = query_manager.create_query().await?;
+        // The first query process is the default session's own: the first prompt goes to the
+        // process that is already running (warm, and told of any model chosen since), instead of
+        // starting a second one from the launch options.
+        let first_query_id = query_manager.get_or_create_session_query("default").await?;
 
         // Start cleanup task for inactive queries
         Arc::clone(&query_manager).start_cleanup_task();
@@ -414,6 +484,8 @@ impl ClaudeClient {
             session_id = %session_id_str,
             "Sent query to isolated query"
         );
+        self.conversation_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
@@ -560,6 +632,8 @@ impl ClaudeClient {
             session_id = %session_id_str,
             "Sent content query to isolated query"
         );
+        self.conversation_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         Ok(())
     }
@@ -637,6 +711,10 @@ impl ClaudeClient {
                 };
 
                 match message {
+                    Some(json) if is_cli_exited(&json) => {
+                        yield Err(cli_exited(&query));
+                        break;
+                    }
                     Some(json) => {
                         match MessageParser::parse(json) {
                             Ok(msg) => yield Ok(msg),
@@ -757,6 +835,11 @@ impl ClaudeClient {
                 };
 
                 match message {
+                    Some(json) if is_cli_exited(&json) => {
+                        debug!(query_id = %query_id, "The CLI's output ended mid-response");
+                        yield Err(cli_exited(&query));
+                        break;
+                    }
                     Some(json) => {
                         match MessageParser::parse(json) {
                             Ok(msg) => {
@@ -847,6 +930,10 @@ impl ClaudeClient {
     ///
     /// Returns an error if the client is not connected or if sending fails.
     pub async fn set_model(&self, model: Option<&str>) -> Result<()> {
+        // Every process started from now on launches with it, whether or not one runs to be told.
+        if let Ok(mut launch) = self.launch_model.lock() {
+            *launch = model.map(str::to_owned);
+        }
         let query_manager = self.query_manager.as_ref().ok_or_else(|| {
             ClaudeError::InvalidConfig("Client not connected. Call connect() first.".to_string())
         })?;
@@ -857,6 +944,31 @@ impl ClaudeClient {
 
         let query = query_manager.get_query(query_id)?;
         query.set_model(model).await
+    }
+
+    /// Apply Claude Code flag settings (for example `{"fastMode": true}`) to the running CLI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not connected, no query is active, or sending fails.
+    pub async fn apply_flag_settings(&self, settings: serde_json::Value) -> Result<()> {
+        // Every process started from now on launches with them, whether or not one runs to be
+        // told.
+        if let (serde_json::Value::Object(settings), Ok(mut flags)) =
+            (&settings, self.launch_flags.lock())
+        {
+            flags.extend(settings.clone());
+        }
+        let query_manager = self.query_manager.as_ref().ok_or_else(|| {
+            ClaudeError::InvalidConfig("Client not connected. Call connect() first.".to_string())
+        })?;
+
+        let query_id = self.current_query_id.as_ref().ok_or_else(|| {
+            ClaudeError::InvalidConfig("No active query. Call query() first.".to_string())
+        })?;
+
+        let query = query_manager.get_query(query_id)?;
+        query.apply_flag_settings(settings).await
     }
 
     /// Rewind tracked files to their state at a specific user message.
@@ -1095,6 +1207,11 @@ impl ClaudeClient {
         debug!("Disconnected successfully");
         Ok(())
     }
+}
+
+/// The error that ends a message stream whose CLI exited: how it ended, as far as is known.
+fn cli_exited(query: &QueryFull) -> ClaudeError {
+    ClaudeError::CliExited(query.exit().unwrap_or_default())
 }
 
 impl Drop for ClaudeClient {

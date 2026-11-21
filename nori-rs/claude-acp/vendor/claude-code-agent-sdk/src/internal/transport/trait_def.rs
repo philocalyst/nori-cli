@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::errors::CliExitError;
 use crate::errors::Result;
 
 /// Transport trait for communicating with Claude Code CLI
@@ -37,5 +38,11 @@ pub trait Transport: Send + Sync {
     /// Returns None if the transport doesn't support direct stdin access
     fn get_stdin(&self) -> Option<Arc<Mutex<Option<tokio::process::ChildStdin>>>> {
         None
+    }
+
+    /// How the process behind the transport ended, once its output has closed: its exit status
+    /// and the last lines of its standard error. A transport without a process knows nothing.
+    async fn exit_report(&mut self) -> CliExitError {
+        CliExitError::default()
     }
 }

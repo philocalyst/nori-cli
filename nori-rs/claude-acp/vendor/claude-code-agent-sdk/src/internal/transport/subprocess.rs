@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use futures::stream::Stream;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -24,6 +25,7 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::errors::ClaudeError;
+use crate::errors::CliExitError;
 use crate::errors::CliNotFoundError;
 use crate::errors::ConnectionError;
 use crate::errors::JsonDecodeError;
@@ -43,6 +45,26 @@ use super::Transport;
 use super::ring_buffer::CircularBuffer;
 
 const DEFAULT_MAX_BUFFER_SIZE: usize = 20 * 1024 * 1024; // 20MB
+
+/// How many lines of the CLI's standard error are kept for the report of how it ended.
+const STDERR_TAIL_LINES: usize = 20;
+/// How long a line of standard error kept for that report may be.
+const STDERR_LINE_LIMIT: usize = 500;
+/// How long the report of a CLI whose output closed waits for the process to exit.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The error for a CLI that could not be run at `path` because `error` says it is not there.
+fn not_found(path: &std::path::Path, error: &std::io::Error) -> Option<ClaudeError> {
+    (error.kind() == std::io::ErrorKind::NotFound).then(|| {
+        ClaudeError::CliNotFound(CliNotFoundError::new(
+            format!(
+                "Claude Code CLI not found at {}. Install it (npm install -g @anthropic-ai/claude-code) or point CLAUDE_CODE_EXECUTABLE at it.",
+                path.display()
+            ),
+            Some(path.to_path_buf()),
+        ))
+    })
+}
 
 /// Query prompt type
 #[derive(Clone)]
@@ -86,6 +108,9 @@ pub struct SubprocessTransport {
     /// Uses ringbuf for automatic old data recycling
     buffer: Arc<Mutex<CircularBuffer>>,
     ready: Arc<AtomicBool>,
+    /// The last lines the CLI wrote to standard error, which is always read: a pipe nobody drains
+    /// fills up and stops the CLI mid-write.
+    stderr_tail: Arc<std::sync::Mutex<VecDeque<String>>>,
 }
 
 impl SubprocessTransport {
@@ -127,6 +152,7 @@ impl SubprocessTransport {
             stdout: Arc::new(Mutex::new(None)),
             buffer,
             ready: Arc::new(AtomicBool::new(false)),
+            stderr_tail: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         })
     }
 
@@ -651,10 +677,12 @@ impl SubprocessTransport {
             .output()
             .await
             .map_err(|e| {
-                ClaudeError::Connection(ConnectionError::new(format!(
-                    "Failed to get Claude version: {}",
-                    e
-                )))
+                not_found(&self.cli_path, &e).unwrap_or_else(|| {
+                    ClaudeError::Connection(ConnectionError::new(format!(
+                        "Failed to get Claude version: {}",
+                        e
+                    )))
+                })
             })?;
 
         let version_output = String::from_utf8_lossy(&output.stdout);
@@ -729,11 +757,13 @@ impl Transport for SubprocessTransport {
         // Spawn process
         let mut child = cmd.spawn().map_err(|e| {
             error!("Failed to spawn Claude CLI: {}", e);
-            ClaudeError::Process(ProcessError::new(
-                format!("Failed to spawn Claude CLI process: {}", e),
-                None,
-                None,
-            ))
+            not_found(&self.cli_path, &e).unwrap_or_else(|| {
+                ClaudeError::Process(ProcessError::new(
+                    format!("Failed to spawn Claude CLI process: {}", e),
+                    None,
+                    None,
+                ))
+            })
         })?;
         info!("Claude CLI process spawned (PID: {:?})", child.id());
 
@@ -748,9 +778,11 @@ impl Transport for SubprocessTransport {
 
         let stderr = child.stderr.take();
 
-        // Spawn stderr handler if callback is provided
-        if let (Some(stderr), Some(callback)) = (stderr, &self.options.stderr_callback) {
-            let callback = Arc::clone(callback);
+        // Standard error is always drained, into the callback when there is one and into the
+        // tail the report of an unexpected exit quotes.
+        if let Some(stderr) = stderr {
+            let callback = self.options.stderr_callback.clone();
+            let tail = Arc::clone(&self.stderr_tail);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -758,7 +790,18 @@ impl Transport for SubprocessTransport {
                     if n == 0 {
                         break;
                     }
-                    callback(line.clone());
+                    if let Some(callback) = &callback {
+                        callback(line.clone());
+                    }
+                    let kept = line.trim_end();
+                    debug!(target: "claude_cli_stderr", "{kept}");
+                    let kept: String = kept.chars().take(STDERR_LINE_LIMIT).collect();
+                    if let Ok(mut tail) = tail.lock() {
+                        if tail.len() == STDERR_TAIL_LINES {
+                            tail.pop_front();
+                        }
+                        tail.push_back(kept);
+                    }
                     line.clear();
                 }
             });
@@ -938,6 +981,27 @@ impl Transport for SubprocessTransport {
 
     fn get_stdin(&self) -> Option<Arc<Mutex<Option<tokio::process::ChildStdin>>>> {
         Some(Arc::clone(&self.stdin))
+    }
+
+    async fn exit_report(&mut self) -> CliExitError {
+        let exit_code = match self.process.lock().await.as_mut() {
+            Some(process) => match tokio::time::timeout(EXIT_WAIT, process.wait()).await {
+                Ok(Ok(status)) => status.code(),
+                Ok(Err(_)) | Err(_) => None,
+            },
+            None => None,
+        };
+        // The stderr reader may still be draining what the CLI wrote last.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let stderr_tail = self
+            .stderr_tail
+            .lock()
+            .map(|tail| tail.iter().cloned().collect())
+            .unwrap_or_default();
+        CliExitError {
+            exit_code,
+            stderr_tail,
+        }
     }
 }
 

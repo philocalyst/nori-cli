@@ -165,18 +165,24 @@ impl QueryManager {
             chrono::Utc::now().timestamp_micros()
         );
 
+        // A CLI that is not installed, or one that exited, says so in its own error; anything else
+        // is a transport failure.
+        let keep = |context: &str, error: ClaudeError| match error {
+            ClaudeError::CliNotFound(_) | ClaudeError::CliExited(_) => error,
+            other => ClaudeError::Transport(format!("{context}: {other}")),
+        };
+
         // Create new transport for this query
         let mut transport = {
             let factory = self.transport_factory.lock().await;
-            (factory)()
-                .map_err(|e| ClaudeError::Transport(format!("Failed to create transport: {}", e)))?
+            (factory)().map_err(|e| keep("Failed to create transport", e))?
         };
 
         // Connect the transport
         transport
             .connect()
             .await
-            .map_err(|e| ClaudeError::Transport(format!("Failed to connect transport: {}", e)))?;
+            .map_err(|e| keep("Failed to connect transport", e))?;
 
         // Extract stdin for direct access (avoids transport lock deadlock)
         let stdin = transport.get_stdin();
@@ -207,10 +213,15 @@ impl QueryManager {
         // Start the background reader
         query.start().await?;
 
-        // Initialize with hooks and agents
+        // Initialize with hooks and agents. A CLI that fails to (one that never answers, most of
+        // all) is stopped here: the query that would have owned it is dropped, and nothing else
+        // would ever end it.
         let hooks = self.hooks.lock().await.clone();
         let agents = self.agents.lock().await.clone();
-        query.initialize(hooks, agents).await?;
+        if let Err(error) = query.initialize(hooks, agents).await {
+            query.stop_reader();
+            return Err(error);
+        }
 
         // Store in DashMap
         self.queries.insert(query_id.clone(), Arc::new(query));
@@ -256,36 +267,43 @@ impl QueryManager {
     ///
     /// Returns an error if query creation or initialization fails
     pub async fn get_or_create_session_query(&self, session_id: &str) -> Result<String> {
-        // Check if session already has a query
-        if let Some(entry) = self.session_queries.get(session_id) {
-            let query_id = entry.value().clone();
-            // Verify the query is still active
-            if let Some(query) = self.queries.get(&query_id) {
-                if query.is_active() {
+        // Which query the session has, and whether it still runs. The map guards are dropped
+        // before either map is changed: a DashMap shard cannot be written while this thread still
+        // reads it, and trying blocks the thread forever, and with it every request of the
+        // connection.
+        let existing = self
+            .session_queries
+            .get(session_id)
+            .map(|entry| entry.value().clone());
+        if let Some(query_id) = existing {
+            let active = self.queries.get(&query_id).map(|query| query.is_active());
+            match active {
+                Some(true) => {
                     tracing::debug!(
                         session_id = %session_id,
                         query_id = %query_id,
                         "Reusing existing query for session"
                     );
                     return Ok(query_id);
-                } else {
-                    // Query is inactive, remove it
-                    tracing::warn!(
+                }
+                Some(false) => {
+                    // Its CLI exited: a new one takes its place.
+                    tracing::info!(
                         session_id = %session_id,
                         query_id = %query_id,
-                        "Existing query for session is inactive, removing"
+                        "The session's CLI has exited; starting a new one"
                     );
                     self.session_queries.remove(session_id);
                     self.queries.remove(&query_id);
                 }
-            } else {
-                // Query not found in queries map, remove stale session mapping
-                tracing::warn!(
-                    session_id = %session_id,
-                    query_id = %query_id,
-                    "Query not found for session, removing stale mapping"
-                );
-                self.session_queries.remove(session_id);
+                None => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        query_id = %query_id,
+                        "Query not found for session, removing stale mapping"
+                    );
+                    self.session_queries.remove(session_id);
+                }
             }
         }
 

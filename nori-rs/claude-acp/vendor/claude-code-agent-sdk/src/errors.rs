@@ -42,6 +42,11 @@ pub enum ClaudeError {
     #[error("CLI not found: {0}")]
     CliNotFound(#[from] CliNotFoundError),
 
+    /// The CLI process ended (or closed its output) while the SDK was still talking to it.
+    /// Requests to it fail at once with this instead of waiting for a timeout.
+    #[error("{0}")]
+    CliExited(CliExitError),
+
     /// Image validation error
     #[error("Image validation error: {0}")]
     ImageValidation(#[from] ImageValidationError),
@@ -78,6 +83,38 @@ impl CliNotFoundError {
         }
     }
 }
+
+/// How a Claude Code CLI process ended: its exit status, when it could be collected, and the last
+/// lines it wrote to standard error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CliExitError {
+    /// The process's exit code; `None` when it was killed by a signal or is still unreaped.
+    pub exit_code: Option<i32>,
+    /// The last lines of its standard error, oldest first.
+    pub stderr_tail: Vec<String>,
+}
+
+impl std::fmt::Display for CliExitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Claude Code stopped unexpectedly")?;
+        if let Some(code) = self.exit_code {
+            write!(formatter, " (exit status {code})")?;
+        }
+        // The last thing it said is usually why.
+        if let Some(line) = self
+            .stderr_tail
+            .iter()
+            .rev()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+        {
+            write!(formatter, ": {line}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CliExitError {}
 
 /// Error when connecting to Claude Code CLI
 #[derive(Debug, Error)]

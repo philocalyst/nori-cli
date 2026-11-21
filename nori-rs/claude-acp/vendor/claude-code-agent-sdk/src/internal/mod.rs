@@ -5,3 +5,6 @@ pub mod message_parser;
 pub mod query_full;
 pub mod query_manager;
 pub mod transport;
+
+#[cfg(test)]
+mod cli_exit_tests;
