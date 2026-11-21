@@ -249,6 +249,13 @@ async fn dispatch(
         }
         "monitor_stop" => service.monitor_stop(parameters(arguments)?).await,
         "monitor_rearm" => service.monitor_rearm(parameters(arguments)?).await,
+        "job_start" => service.job_start(parameters(arguments)?).await,
+        "job_list" => {
+            no_arguments(name, &arguments)?;
+            service.job_list().await
+        }
+        "job_read" => service.job_read(parameters(arguments)?).await,
+        "job_stop" => service.job_stop(parameters(arguments)?).await,
         "agent_capabilities" => {
             no_arguments(name, &arguments)?;
             service.agent_capabilities().await

@@ -177,6 +177,7 @@ impl NoriClientService {
             + Self::git_tool_router()
             + Self::forge_tool_router()
             + Self::monitor_tool_router()
+            + Self::job_tool_router()
             + Self::conversation_tool_router();
         bash_tool::apply_tool_selection(&mut tool_router, shared.tool_selection.as_ref());
         Self {
@@ -218,6 +219,7 @@ impl NoriClientService {
             + Self::bash_tool_router()
             + Self::task_tool_router()
             + Self::monitor_tool_router()
+            + Self::job_tool_router()
             + Self::conversation_tool_router();
         tool_router.list_all()
     }

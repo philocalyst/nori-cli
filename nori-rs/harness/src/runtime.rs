@@ -1389,6 +1389,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
         let command_recorder_cell = Arc::clone(&recorder_cell);
         let command_recording_enabled = Arc::clone(&recording_enabled);
         backend.bind_program_runtime();
+        backend.publish_events_to_monitors(event_tx.clone());
         let (handoff_tx, mut handoff_rx) =
             unbounded_channel::<crate::recovery::handoff::HandoffRequest>();
         backend.bind_handoff(handoff_tx.clone());
