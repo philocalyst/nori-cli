@@ -72,6 +72,41 @@ async fn a_grown_session_is_digested_from_where_its_last_digest_stopped() {
 }
 
 #[tokio::test]
+async fn a_corrupt_cursor_is_rebuilt_even_when_the_transcript_did_not_grow() {
+    let home = tempfile::tempdir().unwrap();
+    let recorder = TranscriptRecorder::new(home.path(), home.path(), None, "0.1.0", None)
+        .await
+        .unwrap();
+    recorder
+        .record_user_message("m1", "first question", vec![])
+        .await
+        .unwrap();
+    recorder.flush().await.unwrap();
+    let index = SessionIndex::open(home.path());
+    assert!(
+        index
+            .sync_session(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap()
+    );
+
+    let cursor_path = digest::cursor_path(
+        &index.inner.root,
+        recorder.project_id(),
+        recorder.session_id(),
+    );
+    std::fs::write(&cursor_path, b"not a cursor").unwrap();
+
+    assert!(
+        index
+            .sync_session(recorder.project_id(), recorder.session_id())
+            .await
+            .unwrap()
+    );
+    assert_eq!(asked(&index, &recorder), vec!["first question".to_owned()]);
+}
+
+#[tokio::test]
 async fn a_rewind_digests_the_visible_conversation_again() {
     let home = tempfile::tempdir().unwrap();
     let recorder = TranscriptRecorder::new(home.path(), home.path(), None, "0.1.0", None)

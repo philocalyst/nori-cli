@@ -253,27 +253,32 @@ impl SessionIndex {
         let root = &self.inner.root;
         let cursor_path = digest::cursor_path(root, project_id, session_id);
         let turns_path = digest::digest_path(root, project_id, session_id);
+        let bloom_path = digest::bloom_path(root, project_id, session_id);
         let entry = self
             .catalog_entry(session_id)
             .filter(|entry| entry.header.project_id == project_id);
-        // The digest's stamp is where its cursor stopped: a digest read to the file's end is
-        // current without reading the cursor.
+        let turns_len = std::fs::metadata(&turns_path)
+            .ok()
+            .map(|metadata| i64::try_from(metadata.len()).unwrap_or(i64::MAX));
+        // A matching source length is current only when the cursor and its finalized turns are
+        // still readable. A corrupt cursor or a truncated turns file must be rebuilt.
         if entry
             .as_ref()
             .is_some_and(|entry| entry.header.source.len == len)
-            && cursor_path.exists()
+            && cursor::Cursor::load(&cursor_path, source, len).is_some_and(|cursor| {
+                cursor.read == len
+                    && turns_len.is_some_and(|turns_len| cursor.turns_bytes <= turns_len)
+            })
+            && bloom_path.exists()
         {
             return Ok(false);
         }
         // A cursor continues a digest only when the digest it belongs to is whole: its header
         // and filter loaded, and its turns file holds what the cursor says.
-        let turns_len = std::fs::metadata(&turns_path).map_or(0, |metadata| {
-            i64::try_from(metadata.len()).unwrap_or(i64::MAX)
-        });
         let saved = entry
             .as_ref()
             .and_then(|_| cursor::Cursor::load(&cursor_path, source, len))
-            .filter(|cursor| cursor.turns_bytes <= turns_len);
+            .filter(|cursor| turns_len.is_some_and(|turns_len| cursor.turns_bytes <= turns_len));
         let mut cursor = saved.unwrap_or_else(|| cursor::Cursor::start(source));
         let before = cursor.read;
         cursor.advance(&file)?;
@@ -322,7 +327,6 @@ impl SessionIndex {
                 .map(String::as_str)
                 .chain(ready.iter().chain(&tail).flat_map(DigestTurn::texts))
         };
-        let bloom_path = digest::bloom_path(root, project_id, session_id);
         let bloom = match previous {
             Some(mut bloom) => {
                 let mut patch = bloom::Patch::new();
