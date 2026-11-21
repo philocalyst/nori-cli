@@ -171,7 +171,7 @@ pub fn classify_failure(error: &anyhow::Error) -> FailureDetails {
         // Agents say why in `data.detail`; Codex's in-process agent puts it in `data.message`
         // under a generic "Internal error", which is where the usage-limit reset date lives, and
         // the Claude driver makes `data` the reason itself.
-        let detail = acp_error.data.as_ref().and_then(|data| match data {
+        let reason = acp_error.data.as_ref().and_then(|data| match data {
             serde_json::Value::String(reason) => Some(reason.clone()),
             _ => ["detail", "message"].into_iter().find_map(|key| {
                 data.get(key)
@@ -179,11 +179,34 @@ pub fn classify_failure(error: &anyhow::Error) -> FailureDetails {
                     .map(str::to_string)
             }),
         });
+        // A provider's own JSON body handed through as text (Anthropic's `{"type":"error",...}`,
+        // OpenAI's `{"error":{"code":"string_above_max_length",...}}`) is classified by its
+        // structure and read as its sentence; a person never sees the JSON.
+        let reason_body = reason.as_deref().and_then(ProviderBody::find);
+        let message_body = ProviderBody::find(&acp_error.message);
         let class = classify_structured(acp_error)
+            .or_else(|| {
+                reason_body
+                    .as_ref()
+                    .or(message_body.as_ref())
+                    .and_then(|body| {
+                        let mut unwrapped = acp_error.clone();
+                        unwrapped.data = Some(body.value.clone());
+                        classify_structured(&unwrapped)
+                    })
+            })
             .unwrap_or_else(|| classify_text(&format!("{acp_error:?}")));
+        let message = match &message_body {
+            Some(body) => body.sentence(),
+            None => Some(acp_error.message.clone()),
+        };
+        let detail = match &reason_body {
+            Some(body) => body.sentence(),
+            None => reason,
+        };
         return FailureDetails {
             class,
-            message: Some(acp_error.message.clone()),
+            message,
             detail,
         };
     }
@@ -191,6 +214,52 @@ pub fn classify_failure(error: &anyhow::Error) -> FailureDetails {
         class: classify_text(&format!("{error:?}")),
         message: None,
         detail: None,
+    }
+}
+
+/// A provider's error body found inside an agent's text, after whatever the agent said first
+/// (`API Error: 529 `, Codex's `Error running remote compact task: `).
+struct ProviderBody {
+    prefix: String,
+    value: serde_json::Value,
+}
+
+impl ProviderBody {
+    /// The first JSON object in `text`, when there is one; anything after it is ignored.
+    fn find(text: &str) -> Option<Self> {
+        let start = text.find('{')?;
+        let value = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<serde_json::Value>()
+            .next()?
+            .ok()?;
+        value.is_object().then(|| Self {
+            prefix: text[..start]
+                .trim_end()
+                .trim_end_matches(':')
+                .trim_end()
+                .to_owned(),
+            value,
+        })
+    }
+
+    /// What a person reads: the provider's own sentence (`error.message`, `message`,
+    /// `detail`), after the agent's prefix. `None` when the body has no sentence and nothing
+    /// came before it.
+    fn sentence(&self) -> Option<String> {
+        let sentence = [self.value.get("error"), Some(&self.value)]
+            .into_iter()
+            .flatten()
+            .find_map(|scope| match scope {
+                serde_json::Value::String(sentence) => Some(sentence.clone()),
+                _ => ["message", "detail"]
+                    .into_iter()
+                    .find_map(|key| scope.get(key)?.as_str().map(str::to_owned)),
+            });
+        match (self.prefix.is_empty(), sentence) {
+            (true, sentence) => sentence,
+            (false, Some(sentence)) => Some(format!("{}: {sentence}", self.prefix)),
+            (false, None) => Some(self.prefix.clone()),
+        }
     }
 }
 
@@ -273,7 +342,7 @@ fn classify_identifier(identifier: &str, data: Option<&serde_json::Value>) -> Op
         | "connection_error"
         | "timeout_error"
         | "request_timeout" => FailureClass::Network,
-        "agent_not_running" => FailureClass::ExecutableNotFound,
+        "agent_not_running" | "executable_not_found" => FailureClass::ExecutableNotFound,
         "authentication_error" | "unauthorized" | "invalid_api_key" => FailureClass::Auth,
         "not_found_error" | "model_not_found" | "model_not_available" | "unsupported_model" => {
             FailureClass::ModelUnavailable
@@ -281,7 +350,8 @@ fn classify_identifier(identifier: &str, data: Option<&serde_json::Value>) -> Op
         "context_window_exceeded"
         | "context_length_exceeded"
         | "prompt_too_long"
-        | "request_too_large" => FailureClass::PromptTooLong,
+        | "request_too_large"
+        | "string_above_max_length" => FailureClass::PromptTooLong,
         _ => return None,
     })
 }
@@ -384,6 +454,11 @@ pub fn classify_text(error: &str) -> FailureClass {
         "context length",
         "context_length",
         "maximum context",
+        // A provider that caps one input string (OpenAI Responses: 10 MiB) says so rather than
+        // naming a context window; the cause is the same, a prompt that is too big.
+        "string too long",
+        "string_above_max_length",
+        "largestringparam",
     ]) {
         FailureClass::PromptTooLong
     } else if has(&[
@@ -404,6 +479,7 @@ pub fn classify_text(error: &str) -> FailureClass {
     } else if has(&[
         "unauthorized",
         "unauthenticated",
+        "not authenticated",
         "authentication",
         "authorization",
         "auth_required",
@@ -579,5 +655,34 @@ mod tests {
         ] {
             assert!(!is_subscription_exhausted(&error));
         }
+    }
+
+    #[test]
+    fn a_string_over_the_providers_limit_is_a_prompt_too_long() {
+        // The shapes a Codex session reported, with the ACP data the host receives.
+        let direct = serde_json::json!({
+            "type": "error",
+            "error": {
+                "message": "Invalid response.create payload: Invalid 'input[6].content[0].text': string too long. Expected a string with maximum length 10485760, but got a string with length 15324530 instead.",
+                "type": "invalid_request_error"
+            },
+            "status": 400
+        });
+        let compact = serde_json::json!({
+            "message": "Error running remote compact task: {\"error\": {\"message\": \"[LargeStringParam][input[6].content[0].text][string_above_max_length] got a string with length 19722588\", \"type\": \"invalid_request_error\"}}"
+        });
+        let coded = serde_json::json!({"error": {"code": "string_above_max_length"}});
+        for data in [direct, compact, coded] {
+            assert_eq!(
+                classify_failure(&chain_with(acp::Error::internal_error().data(data))).class,
+                FailureClass::PromptTooLong
+            );
+        }
+        assert_eq!(
+            classify_text(
+                "Internal error: string too long. Expected a string with maximum length 10485760"
+            ),
+            FailureClass::PromptTooLong
+        );
     }
 }
