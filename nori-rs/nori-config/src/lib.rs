@@ -36,6 +36,7 @@ pub use config_types::TrustLevel;
 pub use edits::NoriConfigEdits;
 pub use git_log::CommitSummary;
 pub use git_remote::DiffStats;
+pub use git_repo::FileVersions;
 pub use git_repo::GitRepo;
 pub use git_root::GitFacts;
 pub use git_root::resolve_root_git_project_for_trust;
