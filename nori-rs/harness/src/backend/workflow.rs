@@ -28,6 +28,8 @@ pub(crate) struct WorkflowState {
     /// How failed requests are retried and where the session falls back to. Children carry the
     /// user's policy too, even though they run no workflow of their own.
     pub(super) recovery: nori_workflow::RecoveryPolicy,
+    /// Whether an independent reviewer checks a goal the agent calls complete.
+    pub(super) goals: nori_workflow::GoalsPolicy,
     /// The agent has been told the active workflow's rules.
     told: bool,
     /// Hook turns sent since the user's last turn.
@@ -143,20 +145,26 @@ pub(super) async fn prepare_workflow(
     let (loaded, snapshot) = receiver
         .await
         .map_err(|error| anyhow::anyhow!("Workflow policy loader stopped: {error}"))?;
-    let (active, recovery) = match loaded {
+    let (active, recovery, goals) = match loaded {
         Ok(policy) if child => (
             policy.tools.map(|tools| Workflow {
                 tools: Some(tools),
                 ..Default::default()
             }),
             policy.recovery,
+            policy.goals,
         ),
-        Ok(policy) => (Some(policy.clone()), policy.recovery),
+        Ok(policy) => (
+            Some(policy.clone()),
+            policy.recovery,
+            policy.goals,
+        ),
         Err(error) => return Err(anyhow::anyhow!("Workflow policy failed to load: {error}")),
     };
     let workflow = Arc::new(Mutex::new(WorkflowState {
         active,
         recovery,
+        goals,
         ..Default::default()
     }));
     let machine = Arc::new(OnceCell::new_with(Some(snapshot)));

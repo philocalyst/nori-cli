@@ -15,7 +15,7 @@ pub(crate) enum GoalStatus {
     Complete,
 }
 
-pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool. Nori delivers changed goal context automatically when supported; do not routinely poll `get_goal`. Use `get_goal` only when you need to inspect the current state.\n- When the requested work is verified complete, call `update_goal` with status `complete` and check its result.\n- When genuinely blocked, call `update_goal` with status `blocked` and check its result.";
+pub(super) const NORI_GOAL_CONTROL_INSTRUCTIONS: &str = "Nori CLI owns this goal. Use only Nori's goal tools (`get_goal`, `update_goal`), never another goal tool. Nori delivers changed goal context automatically when supported; do not routinely poll `get_goal`. Use `get_goal` only when you need to inspect the current state.\n- When the requested work is verified complete, call `update_goal` with status `complete` and check its result: Nori may have an independent reviewer check the transcript, and if the result says the goal is not complete yet, keep working and call `update_goal` again only when the transcript shows what it found missing.\n- When genuinely blocked, call `update_goal` with status `blocked` and check its result.";
 
 fn goal_control_context() -> String {
     format!("<goal_control>\n{NORI_GOAL_CONTROL_INSTRUCTIONS}\n</goal_control>")
@@ -87,6 +87,14 @@ struct StoredThreadGoal {
     updated_at: i64,
 }
 
+/// What a conversation has been told of its goal, kept to give back when the prompt that carried
+/// it never reached the agent.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GoalDelivery {
+    revision: Option<i64>,
+    goal: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ThreadGoalState {
     goal: Option<StoredThreadGoal>,
@@ -101,6 +109,10 @@ pub(crate) struct ThreadGoalState {
     /// or fallback) until the next extension-driven goal; snapshots from a
     /// stale native loop are ignored while set.
     ext_snapshots_blocked: bool,
+    /// `Continue` verdicts of the goal judge in a row for the current goal: the agent said
+    /// complete and the judge found more to do. Any change of the goal's status or objective
+    /// starts the count again.
+    judge_disagreements: i64,
 }
 
 pub(crate) fn unavailable_notice() -> SessionUpdateInfo {
@@ -215,6 +227,20 @@ impl ThreadGoalState {
         Some(context)
     }
 
+    /// What the conversation has been told so far, as [`Self::restore_delivery`] takes it back.
+    pub(crate) fn delivery(&self) -> GoalDelivery {
+        GoalDelivery {
+            revision: self.delivered_revision,
+            goal: self.delivered_goal,
+        }
+    }
+
+    /// Forget a delivery that did not reach the agent: the next prompt delivers the goal again.
+    pub(crate) fn restore_delivery(&mut self, delivery: GoalDelivery) {
+        self.delivered_revision = delivery.revision;
+        self.delivered_goal = delivery.goal;
+    }
+
     pub(crate) fn continuation_prompt(&self, now: i64) -> Option<String> {
         let goal = self.snapshot(now)?;
         if goal.status != GoalStatus::Active {
@@ -317,6 +343,7 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
         };
         let snapshot = goal.snapshot(now);
         self.goal = Some(goal);
+        self.judge_disagreements = 0;
         if changed {
             self.revision = self.revision.saturating_add(1);
         }
@@ -336,12 +363,25 @@ Before deciding that the goal is achieved, treat completion as unproven and veri
         let snapshot = goal.snapshot(now);
         if changed {
             self.revision = self.revision.saturating_add(1);
+            self.judge_disagreements = 0;
         }
         Ok(snapshot)
     }
 
+    /// How many times in a row the goal judge has found the goal not yet done.
+    pub(crate) fn judge_disagreements(&self) -> i64 {
+        self.judge_disagreements
+    }
+
+    /// The goal judge found the goal not yet done again; returns the run so far.
+    pub(crate) fn note_judge_disagreement(&mut self) -> i64 {
+        self.judge_disagreements = self.judge_disagreements.saturating_add(1);
+        self.judge_disagreements
+    }
+
     pub(crate) fn clear(&mut self) -> bool {
         let removed = self.goal.take().is_some();
+        self.judge_disagreements = 0;
         if removed {
             self.revision = self.revision.saturating_add(1);
         }
@@ -740,24 +780,6 @@ impl AcpBackend {
         }))
     }
 
-    pub(super) async fn take_goal_context_for_prompt(&self) -> Option<String> {
-        let client = self.goal_mcp_http_server.lock().await;
-        if client.is_none() {
-            return None;
-        }
-        drop(client);
-        {
-            let mut state = self.thread_goal_state.lock().await;
-            // While the agent's native goal loop drives, it owns goal context
-            // and the nori-client instructions would point at the wrong
-            // control plane.
-            if state.ext_driven() {
-                return None;
-            }
-            state.take_goal_context(now_seconds())
-        }
-    }
-
     async fn goal_automation_available(&self) -> bool {
         self.goal_mcp_http_server.lock().await.is_some()
     }
@@ -833,6 +855,45 @@ mod tests {
 
         assert_eq!(goal.status, GoalStatus::Active);
         assert_eq!(goal.time_used_seconds, 45);
+    }
+
+    #[test]
+    fn judge_disagreements_count_in_a_row_and_start_again_with_any_change_of_the_goal() {
+        let mut goals = ThreadGoalState::default();
+        assert_eq!(goals.judge_disagreements(), 0);
+        goals
+            .set_objective("Keep going".to_string(), None, 10)
+            .expect("valid objective");
+        assert_eq!(goals.note_judge_disagreement(), 1);
+        assert_eq!(goals.note_judge_disagreement(), 2);
+        assert_eq!(goals.judge_disagreements(), 2);
+
+        // Setting the status it already has changes nothing, so the run goes on.
+        goals
+            .set_status(GoalStatus::Active, 20)
+            .expect("existing goal");
+        assert_eq!(goals.judge_disagreements(), 2);
+
+        // Pausing (the person's decision, or the judge's) and resuming start the run again.
+        goals
+            .set_status(GoalStatus::Paused, 30)
+            .expect("existing goal");
+        assert_eq!(goals.judge_disagreements(), 0);
+        assert_eq!(goals.note_judge_disagreement(), 1);
+        goals
+            .set_status(GoalStatus::Active, 40)
+            .expect("existing goal");
+        assert_eq!(goals.judge_disagreements(), 0);
+
+        // So do a new objective and a cleared goal.
+        goals.note_judge_disagreement();
+        goals
+            .set_objective("Another".to_string(), None, 50)
+            .expect("valid objective");
+        assert_eq!(goals.judge_disagreements(), 0);
+        goals.note_judge_disagreement();
+        goals.clear();
+        assert_eq!(goals.judge_disagreements(), 0);
     }
 
     #[test]
