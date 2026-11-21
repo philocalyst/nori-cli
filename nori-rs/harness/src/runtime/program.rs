@@ -14,6 +14,7 @@ mod home;
 mod host;
 mod usage;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use anyhow::anyhow;
 use nori_conduit::FileTransport;
 use nori_conduit::RunConfig;
 use nori_conduit::UnavailableToolRuntime;
-use nori_conduit::load_source;
+use nori_conduit::load_source_with;
 use nori_conduit::run::new_run_id;
 use nori_conduit::run_program;
 use tokio::sync::RwLock;
@@ -48,12 +49,14 @@ pub(crate) async fn execute(
     backend: &Arc<AcpBackend>,
     recorder_cell: &Arc<RwLock<Option<Arc<TranscriptRecorder>>>>,
 ) -> anyhow::Result<ConversationProgramResult> {
-    execute_source(source, None, backend, recorder_cell).await
+    execute_source(source, None, &BTreeMap::new(), backend, recorder_cell).await
 }
 
+/// Run a program, or a skill with its `arguments` (see `nori_conduit::load_source_with`).
 pub(crate) async fn execute_source(
     source: &str,
     path: Option<PathBuf>,
+    arguments: &BTreeMap<String, String>,
     backend: &Arc<AcpBackend>,
     recorder_cell: &Arc<RwLock<Option<Arc<TranscriptRecorder>>>>,
 ) -> anyhow::Result<ConversationProgramResult> {
@@ -68,7 +71,8 @@ pub(crate) async fn execute_source(
         .record_command(
             "conversation-program",
             serde_json::json!({
-                "run": run, "source": source, "path": path, "generation": generation,
+                "run": run, "source": source, "path": path, "arguments": arguments,
+                "generation": generation,
             })
             .to_string(),
         )
@@ -79,8 +83,11 @@ pub(crate) async fn execute_source(
         let compiled = {
             let source = source.to_owned();
             let path = path.clone();
-            tokio::task::spawn_blocking(move || load_source(&source, path.as_deref(), properties))
-                .await??
+            let arguments = arguments.clone();
+            tokio::task::spawn_blocking(move || {
+                load_source_with(&source, path.as_deref(), properties, &arguments)
+            })
+            .await??
         };
         let host = Arc::new(host::HarnessProgramHost::new(
             Arc::clone(backend),
