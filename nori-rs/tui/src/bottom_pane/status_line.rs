@@ -21,13 +21,15 @@ use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use super::footer::FooterProps;
-use crate::bottom_pane::textarea::VimModeState;
+use nori_editor::EditorMode;
 
 /// Context use above this is drawn as a warning.
 const CONTEXT_WARN_PERCENT: i64 = 85;
 /// Columns between the segments of a group.
 const SEPARATOR: &str = "  ·  ";
-/// The longest the model label gets before it is cut.
+/// Between the agent, model and options in the model label.
+const LABEL_SEPARATOR: &str = " · ";
+/// The longest a model name gets when it has to be cut.
 const MODEL_LABEL_MAX_COLUMNS: usize = 44;
 
 /// Something the session wants said for a while, in the status line (not in the transcript, which
@@ -192,7 +194,10 @@ pub(crate) fn mode_of(props: &FooterProps) -> Mode {
         Mode::Rewind(turn, of)
     } else if props.bash_mode {
         Mode::Bash
-    } else if props.vim_mode_state == Some(VimModeState::Normal) {
+    } else if matches!(
+        props.editor_mode,
+        Some(EditorMode::Normal | EditorMode::Select | EditorMode::Menu(_) | EditorMode::Prompt)
+    ) {
         Mode::Normal
     } else {
         Mode::Insert
@@ -200,6 +205,11 @@ pub(crate) fn mode_of(props: &FooterProps) -> Mode {
 }
 
 /// Draw the status line into `area` (one row).
+///
+/// Nothing is cut mid-word. A segment that does not fit is dropped whole: the agent name of the
+/// model label first, then its effort and other options, then the model name is cut as the last
+/// resort. On the right, whole groups shed from the left, but only once the model name no longer
+/// fits beside them.
 pub(crate) fn render(area: Rect, buf: &mut Buffer, props: &FooterProps) {
     if area.is_empty() {
         return;
@@ -209,20 +219,32 @@ pub(crate) fn render(area: Rect, buf: &mut Buffer, props: &FooterProps) {
     let row = Rect { height: 1, ..area };
     buf.set_style(row, bar);
 
-    let mut left = vec![badge(mode_of(props), &theme)];
+    let width = usize::from(area.width);
+    let badge = badge(mode_of(props), &theme);
+    let badge_cols = badge.width();
     let enabled = |segment| props.footer_segment_config.is_enabled(segment);
-    let right = right_segments(props, &theme, enabled(FooterSegment::GitBranch));
-    let right_width = group_width(&right);
-    let room = usize::from(area.width)
-        .saturating_sub(left[0].width() + 2)
-        .saturating_sub(right_width + usize::from(right_width > 0) * 2);
-    if let Some(label) = props
+    let model = props
         .model_label
-        .as_ref()
+        .as_deref()
         .filter(|_| enabled(FooterSegment::Model))
-    {
-        let label = fit(label, room.min(MODEL_LABEL_MAX_COLUMNS));
+        .filter(|label| !label.is_empty());
+
+    let mut right = right_segments(props, &theme, enabled(FooterSegment::GitBranch));
+    let model_floor = model.map_or(0, |label| {
+        model_name(label).width().min(MODEL_LABEL_MAX_COLUMNS)
+    });
+    while !right.is_empty() && badge_cols + 2 + model_floor + right_columns(&right) > width {
+        right.remove(0);
+    }
+    let right_cols = right_columns(&right);
+
+    let mut left = vec![badge];
+    let mut left_cols = badge_cols;
+    let room = width.saturating_sub(right_cols + badge_cols + 2);
+    if let Some(label) = model {
+        let label = fit_model_label(label, room);
         if !label.is_empty() {
+            left_cols += 2 + label.width();
             left.push(Span::raw("  "));
             left.push(Span::styled(label, theme.text_secondary));
         }
@@ -231,8 +253,9 @@ pub(crate) fn render(area: Rect, buf: &mut Buffer, props: &FooterProps) {
         .status_note
         .as_ref()
         .and_then(|note| note.text(std::time::Instant::now()))
+        && left_cols + SEPARATOR.width() + text.width() + right_cols <= width
     {
-        left.push(Span::raw("  ·  "));
+        left.push(Span::raw(SEPARATOR));
         left.push(Span::styled(text, theme.accent_amber));
     }
     Line::from(left).style(bar).render(row, buf);
@@ -290,15 +313,19 @@ fn right_segments(
             theme.accent_cyan,
         )]);
     }
-    if props.monitor_count > 0 {
-        let noun = if props.monitor_count == 1 {
-            "monitor"
-        } else {
-            "monitors"
-        };
+    let super::footer::Background { monitors, jobs } = props.background;
+    if monitors > 0 {
+        let noun = if monitors == 1 { "monitor" } else { "monitors" };
         groups.push(vec![Span::styled(
-            format!("◉ {} {noun}", props.monitor_count),
+            format!("◉ {monitors} {noun}"),
             theme.accent_mint,
+        )]);
+    }
+    if jobs > 0 {
+        let noun = if jobs == 1 { "job" } else { "jobs" };
+        groups.push(vec![Span::styled(
+            format!("⚙ {jobs} {noun}"),
+            theme.accent_violet,
         )]);
     }
     groups
@@ -310,6 +337,42 @@ fn group_width(groups: &[Vec<Span<'static>>]) -> usize {
         .map(|group| group.iter().map(Span::width).sum::<usize>())
         .sum();
     spans + SEPARATOR.width() * groups.len().saturating_sub(1)
+}
+
+/// The columns the right group takes: its width, then two columns of gap and the one-column
+/// margin at the row's end.
+fn right_columns(groups: &[Vec<Span<'static>>]) -> usize {
+    if groups.is_empty() {
+        0
+    } else {
+        group_width(groups) + 3
+    }
+}
+
+/// The model segment of a label built as agent, model, then options (`footer_label` in the chat
+/// widget joins them with ` · `).
+fn model_name(label: &str) -> &str {
+    label.split(LABEL_SEPARATOR).nth(1).unwrap_or_default()
+}
+
+/// The model label cut to `columns`. Whole segments go first: the agent, then the options after
+/// the model. The model name is cut only when it does not fit alone.
+fn fit_model_label(label: &str, columns: usize) -> String {
+    if label.width() <= columns {
+        return label.to_owned();
+    }
+    let Some((_agent, rest)) = label.split_once(LABEL_SEPARATOR) else {
+        // A label of one segment is the agent, which is the first thing to go.
+        return String::new();
+    };
+    if rest.width() <= columns {
+        return rest.to_owned();
+    }
+    let model = model_name(label);
+    if model.width() <= columns {
+        return model.to_owned();
+    }
+    fit(model, columns.min(MODEL_LABEL_MAX_COLUMNS))
 }
 
 fn join(groups: Vec<Vec<Span<'static>>>, theme: &Theme) -> Line<'static> {
@@ -361,5 +424,69 @@ mod tests {
     fn a_long_label_is_cut_with_an_ellipsis() {
         assert_eq!(fit("Mock ACP · Mock Default Model", 12), "Mock ACP · …");
         assert_eq!(fit("short", 12), "short");
+    }
+
+    /// The status line drawn at `width`, as the text of its one row.
+    fn row_text(props: &FooterProps, width: u16) -> String {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        render(area, &mut buf, props);
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    fn props_with_model(label: &str) -> FooterProps {
+        FooterProps {
+            model_label: Some(label.to_owned()),
+            ..FooterProps::default()
+        }
+    }
+
+    #[test]
+    fn a_long_model_name_keeps_its_words_and_loses_the_agent_first() {
+        let props = props_with_model("Mock ACP · Mock Frontier Model Extended Reasoning · Medium");
+
+        assert_eq!(
+            row_text(&props, 60),
+            " INS   Mock Frontier Model Extended Reasoning · Medium"
+        );
+        assert_eq!(
+            row_text(&props, 44),
+            " INS   Mock Frontier Model Extended Reasoni…"
+        );
+        assert_eq!(row_text(&props, 36), " INS   Mock Frontier Model Extended…");
+    }
+
+    #[test]
+    fn a_short_model_name_keeps_its_effort_until_the_row_is_narrower_still() {
+        let props = props_with_model("Mock ACP · Mock Default Model · Medium");
+
+        assert_eq!(
+            row_text(&props, 60),
+            " INS   Mock ACP · Mock Default Model · Medium"
+        );
+        assert_eq!(row_text(&props, 44), " INS   Mock Default Model · Medium");
+        assert_eq!(row_text(&props, 26), " INS   Mock Default Model");
+    }
+
+    #[test]
+    fn a_right_side_group_is_dropped_whole_before_the_model_name_is_cut() {
+        let props = FooterProps {
+            git_branch: Some("main".to_owned()),
+            ..props_with_model("Mock ACP · Mock Frontier Model Extended Reasoning · Medium")
+        };
+
+        assert_eq!(
+            row_text(&props, 44),
+            " INS   Mock Frontier Model Extended Reasoni…"
+        );
+        assert!(
+            row_text(&props, 80).ends_with("⎇ main"),
+            "a wide row keeps the branch on the right"
+        );
     }
 }

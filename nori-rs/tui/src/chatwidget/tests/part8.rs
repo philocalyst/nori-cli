@@ -482,6 +482,7 @@ textarea_top_right = [
         .expect("draw chat with custom footer layout");
     let contents = terminal.backend().vt100().screen().contents();
 
+    insta::assert_snapshot!("custom_context_footer", contents);
     assert!(
         contents.contains("16% / 258k"),
         "custom footer should compose used percentage and window size: {contents:?}"

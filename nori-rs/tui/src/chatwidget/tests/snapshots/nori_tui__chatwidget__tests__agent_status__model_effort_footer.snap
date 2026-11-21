@@ -1,8 +1,9 @@
 ---
 source: tui/src/chatwidget/tests/agent_status.rs
+assertion_line: 178
 expression: "super::part10::render_bottom_pane(&mut chat, 80)"
 ---
 
 › ! for shell commands
 
-                                                Claude Code · GPT-6 Astra · High
+ INS   Claude Code · GPT-6 Astra · High

@@ -1,4 +1,3 @@
-use crate::bottom_pane::textarea::VimModeState;
 use crate::key_hint;
 use crate::system_info::NoriVersionSource;
 use crate::ui_consts::FOOTER_INDENT_COLS;
@@ -9,6 +8,7 @@ use nori_config::FooterLayoutConfig;
 use nori_config::FooterLayoutItem;
 use nori_config::FooterSegment;
 use nori_config::FooterSegmentConfig;
+use nori_editor::EditorMode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -27,7 +27,16 @@ const FOOTER_GROUP_MIN_GAP_COLS: u16 = 2;
 /// share one line with git, context, and approvals.
 const SESSION_TITLE_MAX_CHARS: usize = 24;
 
-#[derive(Clone, Debug)]
+/// What runs in the background for the session, as the status line counts it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Background {
+    /// Monitors the agent armed that are watching now.
+    pub(crate) monitors: i64,
+    /// Background jobs that have not ended (running, or on a machine that does not answer).
+    pub(crate) jobs: i64,
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FooterProps {
     pub(crate) mode: FooterMode,
     pub(crate) is_task_running: bool,
@@ -57,7 +66,8 @@ pub(crate) struct FooterProps {
     /// Cached tokens from the external agent transcript, if available.
     pub(crate) cached_tokens: Option<i64>,
     /// Vim mode state - only shown when vim mode is enabled.
-    pub(crate) vim_mode_state: Option<VimModeState>,
+    /// The editor's mode, when its keymap is modal.
+    pub(crate) editor_mode: Option<EditorMode>,
     /// Short summary of the first user prompt for this session.
     pub(crate) prompt_summary: Option<String>,
     /// Agent-supplied session title from ACP session-info updates. Already
@@ -78,8 +88,8 @@ pub(crate) struct FooterProps {
     pub(crate) cloud_session: Option<String>,
     /// Number of currently active subagents shown as a compact statusline badge.
     pub(crate) active_subagent_count: i64,
-    /// Monitors the agent armed that are watching now.
-    pub(crate) monitor_count: i64,
+    /// What runs in the background for the session.
+    pub(crate) background: Background,
     /// Active in-place rewind turn badge `(current, total)` when focusing past turns.
     pub(crate) rewind_badge: Option<(i64, i64)>,
     /// The composer holds a shell command (it starts with `!`).
@@ -92,7 +102,7 @@ pub(crate) struct FooterProps {
     pub(crate) key_help: Vec<nori_config::HelpRow>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum FooterMode {
     /// A reminder that a second Ctrl+C quits, in place of the status line for a moment.
     CtrlCReminder,
@@ -101,6 +111,7 @@ pub(crate) enum FooterMode {
     /// The key list, opened with `?`.
     ShortcutOverlay,
     /// The status line while there is text in the composer.
+    #[default]
     ContextOnly,
 }
 
@@ -127,7 +138,43 @@ pub(crate) fn footer_height(props: &FooterProps) -> u16 {
 
 pub(crate) fn render_footer(area: Rect, buf: &mut Buffer, props: &FooterProps) {
     if is_status_line(props.mode) {
-        super::status_line::render(area, buf, props);
+        let mut default_layout = FooterLayoutConfig::default();
+        for corner in [
+            &props.footer_layout_config.textarea_top_left,
+            &props.footer_layout_config.textarea_top_right,
+            &props.footer_layout_config.textarea_bottom_left,
+            &props.footer_layout_config.textarea_bottom_right,
+        ] {
+            default_layout
+                .footer_left
+                .retain(|item| !corner.contains(item));
+            default_layout
+                .footer_right
+                .retain(|item| !corner.contains(item));
+        }
+        let default_segments = FooterSegmentConfig::default();
+        let customized = props.footer_layout_config.footer_left != default_layout.footer_left
+            || props.footer_layout_config.footer_right != default_layout.footer_right
+            || FooterSegment::all_variants().iter().any(|segment| {
+                props.footer_segment_config.is_enabled(*segment)
+                    != default_segments.is_enabled(*segment)
+            });
+        if customized {
+            buf.set_style(area, crate::style::component_theme().statusline);
+            render_footer_row(
+                area,
+                buf,
+                FooterRow {
+                    left: join_footer_segments(&segments_for(
+                        props,
+                        &props.footer_layout_config.footer_left,
+                    )),
+                    right: segments_for(props, &props.footer_layout_config.footer_right),
+                },
+            );
+        } else {
+            super::status_line::render(area, buf, props);
+        }
         return;
     }
     for (line_index, row) in footer_rows(props).into_iter().enumerate() {
@@ -338,12 +385,14 @@ fn builtin_footer_segment(props: &FooterProps, segment: FooterSegment) -> Option
             let title = truncate_label(title, SESSION_TITLE_MAX_CHARS);
             Line::from(vec!["Title: ".dim(), Span::from(title).dim()])
         }),
-        FooterSegment::VimMode => props.vim_mode_state.map(|vim_state| {
-            let (label, style_fn): (&str, fn(Span<'static>) -> Span<'static>) = match vim_state {
-                VimModeState::Normal => ("NORMAL", |s| s.light_blue().bold()),
-                VimModeState::Insert => ("INSERT", |s| s.green()),
-            };
-            Line::from(vec![style_fn(Span::from(label))])
+        FooterSegment::VimMode => props.editor_mode.map(|mode| {
+            let label = Span::from(mode.name());
+            Line::from(vec![match mode {
+                EditorMode::Insert => label.green(),
+                EditorMode::Normal => label.light_blue().bold(),
+                EditorMode::Select | EditorMode::Replace => label.magenta().bold(),
+                EditorMode::Menu(_) | EditorMode::Prompt => label.cyan().bold(),
+            }])
         }),
         FooterSegment::GitBranch => props.git_branch.as_ref().map(|branch| {
             if props.is_worktree {

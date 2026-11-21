@@ -515,8 +515,8 @@ impl BottomPane {
     }
 
     /// How many monitors the agent has armed and running.
-    pub(crate) fn set_monitor_count(&mut self, count: i64) {
-        self.composer.set_monitor_count(count);
+    pub(crate) fn set_background(&mut self, background: footer::Background) {
+        self.composer.set_background(background);
     }
 
     pub(crate) fn paste_clipboard(&mut self, command: nori_editor::ClipboardCommand, text: &str) {
