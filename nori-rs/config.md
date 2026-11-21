@@ -47,6 +47,16 @@ known-good models the adapter does not advertise, so you can select one instead
 of typing its id; choosing one follows the same reject → persist-here → restart
 path.
 
+## Code intelligence: `nudox`
+
+```toml
+# Every session gets the nudox MCP server when `nudox` is installed. Default: true.
+nudox = false
+```
+
+A server named `nudox` under `[mcp_servers]` (enabled or not) replaces Nori's. See
+[`docs/nudox.md`](../docs/nudox.md).
+
 ## Custom agents: `[[agents]]`
 
 Each `[[agents]]` block defines an additional ACP agent (bring-your-own).
