@@ -1,23 +1,25 @@
 ---
 source: tui/src/pager_overlay/transcript_tests.rs
+assertion_line: 233
 expression: text(&render(&mut overlay))
 ---
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / /
-
 › Why does the parser fail?
 
-
-• It reads past the end.
+  It reads past the end.
   Here is why.
   And the fix.
 
-
 › Fix it
 
-
-• Fixed.
+  Fixed.
+~
+~
+~
+~
+~
+~
 ~
 ~
 ───────────────────────────────────────────────────── 100% ─
- [/] responses   esc cancel
- enter roll back   space fork subagent
+ TRANSCRIPT

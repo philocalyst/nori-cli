@@ -1,23 +1,25 @@
 ---
 source: tui/src/pager_overlay/transcript_tests.rs
+assertion_line: 196
 expression: text(&render(&mut overlay))
 ---
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / /
+› Why does the parser fail?
 
-› ┌ Message ─────────────────────────────────────────────┐
-  │› 1. Edit this prompt                                 │
-  │  2. Rewind here and restore files                    │
-• │                                                      │
-  │  New conversation before it, prompt in the composer  │
-  └ enter to choose · esc to close ──────────────────────┘
-
+  It reads past the end.
+  Here is why.
+  And the fix.
 
 › Fix it
-
-
-• Fixed.
+  ┌ Message ─────────────────────────────────────────────┐
+  │› 1. Edit this prompt                                 │
+~ │  2. Rewind here and restore files                    │
+~ │                                                      │
+~ │  New conversation before it, prompt in the composer  │
+~ └ enter to choose · esc to close ──────────────────────┘
+~
+~
 ~
 ~
 ───────────────────────────────────────────────────── 100% ─
- ↑/↓ to scroll   pgup/pgdn to page   home/end to jump
- q to quit   esc to edit prev   [/] to select   enter for ac
+ TRANSCRIPT

@@ -620,12 +620,12 @@ mod tests {
     }
 
     #[test]
-    fn edit_prev_hint_is_visible() {
+    fn transcript_footer_shows_its_mode_badge() {
         let mut overlay = TranscriptOverlay::new(vec![Arc::new(TestCell {
             lines: vec![Line::from("hello")],
         })]);
 
-        // Render into a small buffer and assert the backtrack hint is present
+        // Render into a small buffer and assert the transcript mode badge is present
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         overlay.render(area, &mut buf);
@@ -639,8 +639,8 @@ mod tests {
             s.push('\n');
         }
         assert!(
-            s.contains("edit prev"),
-            "expected 'edit prev' hint in overlay footer, got: {s:?}"
+            s.contains(" TRANSCRIPT "),
+            "expected the transcript mode badge in the overlay footer, got: {s:?}"
         );
     }
 
