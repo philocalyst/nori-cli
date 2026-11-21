@@ -168,6 +168,39 @@ impl GitRepo {
     /// `git diff <base>` followed by every untracked file as a new file. With `color`, it uses
     /// git's default palette. `None` when `base` does not name a commit.
     pub fn diff_text(&self, base: &str, color: bool) -> Option<String> {
+        let palette = Palette::new(color);
+        let mut out = String::new();
+        for file in self.versions_since(base)? {
+            write_file_diff(
+                &mut out,
+                &palette,
+                &file.path,
+                file.old.as_ref().map(|(id, data)| (*id, data.as_slice())),
+                file.old_mode,
+                file.new.as_deref(),
+                file.new_mode,
+            );
+        }
+        Some(out)
+    }
+
+    /// Every file of the working tree that differs from the revision `base` (untracked files
+    /// included, last), with both versions: what a diff of them shows. `None` when `base` does
+    /// not name a commit.
+    pub fn file_versions_since(&self, base: &str) -> Option<Vec<FileVersions>> {
+        Some(
+            self.versions_since(base)?
+                .into_iter()
+                .map(|file| FileVersions {
+                    path: file.path,
+                    old: file.old.map(|(_, data)| data),
+                    new: file.new,
+                })
+                .collect(),
+        )
+    }
+
+    fn versions_since(&self, base: &str) -> Option<Vec<Versions>> {
         let workdir = self.repo.workdir()?.to_path_buf();
         let base_tree = match self
             .repo
@@ -239,8 +272,7 @@ impl GitRepo {
         }
         untracked.sort();
 
-        let palette = Palette::new(color);
-        let mut out = String::new();
+        let mut versions = Vec::new();
         for path in paths {
             let Ok(relative) = gix::path::from_bstr(path.as_ref() as &gix::bstr::BStr) else {
                 continue;
@@ -258,15 +290,13 @@ impl GitRepo {
             let full = workdir.join(&relative);
             let new = std::fs::read(&full).ok();
             let new_mode = new.as_ref().map(|_| worktree_mode(&full));
-            write_file_diff(
-                &mut out,
-                &palette,
-                &path.to_string(),
-                old.as_ref().map(|(id, data)| (*id, data.as_slice())),
+            versions.push(Versions {
+                path: path.to_string(),
+                old,
                 old_mode,
-                new.as_deref(),
+                new,
                 new_mode,
-            );
+            });
         }
         for path in untracked {
             let Ok(relative) = gix::path::from_bstr(path.as_ref() as &gix::bstr::BStr) else {
@@ -276,17 +306,15 @@ impl GitRepo {
             let Ok(content) = std::fs::read(&full) else {
                 continue;
             };
-            write_file_diff(
-                &mut out,
-                &palette,
-                &path.to_string(),
-                None,
-                None,
-                Some(&content),
-                Some(worktree_mode(&full)),
-            );
+            versions.push(Versions {
+                path: path.to_string(),
+                old: None,
+                old_mode: None,
+                new: Some(content),
+                new_mode: Some(worktree_mode(&full)),
+            });
         }
-        Some(out)
+        Some(versions)
     }
 
     /// The tracked files that differ between HEAD and the working tree, with both versions.
@@ -346,6 +374,25 @@ impl GitRepo {
             .flatten()
             .map(|id| id.to_string())
     }
+}
+
+/// A file of the working tree that differs from a revision: its two versions, either of which
+/// may be missing (added, deleted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVersions {
+    /// Relative to the work tree.
+    pub path: String,
+    pub old: Option<Vec<u8>>,
+    pub new: Option<Vec<u8>>,
+}
+
+/// [`FileVersions`] with what a textual diff header needs too.
+struct Versions {
+    path: String,
+    old: Option<(gix::ObjectId, Vec<u8>)>,
+    old_mode: Option<u32>,
+    new: Option<Vec<u8>>,
+    new_mode: Option<u32>,
 }
 
 /// ANSI sequences for the parts of a diff, or nothing at all.
