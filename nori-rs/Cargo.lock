@@ -10574,6 +10574,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nori-rex"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nori-script"
 version = "0.0.0"
 dependencies = [

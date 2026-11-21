@@ -48,6 +48,7 @@ members = [
     "harness",
     "host-tools",
     "machines",
+    "rex",
     "installed",
     "mock-acp-agent",
     "world",
@@ -110,6 +111,7 @@ nori-forge = { path = "forge" }
 nori-harness = { path = "harness" }
 nori-host-tools = { path = "host-tools" }
 nori-machines = { path = "machines" }
+nori-rex = { path = "rex" }
 nori-exec = { path = "exec" }
 nori-installed = { path = "installed" }
 nori-script = { path = "script" }
