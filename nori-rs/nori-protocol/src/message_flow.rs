@@ -126,6 +126,7 @@ pub fn message_flow(event: &SessionEvent) -> MessageFlow {
             | NoriEvent::Monitor(_)
             | NoriEvent::AgentSilent(_)
             | NoriEvent::AgentHeard
+            | NoriEvent::SessionMoveRequested { .. }
             | NoriEvent::RequestWithdrawn(_) => MessageFlow::Transparent,
         },
     }

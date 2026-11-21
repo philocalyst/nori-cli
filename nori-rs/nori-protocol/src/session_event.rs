@@ -119,6 +119,12 @@ pub enum NoriEvent {
     AgentSilent(AgentSilent),
     /// The agent that was silent did something. Any activity clears the silence.
     AgentHeard,
+    /// A plugin's `session.move` asks the frontend that owns the terminal to move this session to
+    /// `machine`. The harness cannot: the handover (a Rex pane, or `ssh -t` in this terminal) is
+    /// the frontend's, so it runs its own move flow and the person sees that flow's lines.
+    SessionMoveRequested {
+        machine: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
