@@ -33,6 +33,66 @@ const MAX_ACTIVITY_CHARS: usize = 240;
 /// delta costs the same however long the line it continues is.
 const ACTIVITY_SCAN_BYTES: usize = MAX_ACTIVITY_CHARS * 4;
 
+/// The longest a derived name is.
+const MAX_NAME_CHARS: usize = 48;
+
+/// The first non-empty line of `text`, shortened to a name's length.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    crate::text_formatting::truncate_text(line, MAX_NAME_CHARS)
+}
+
+/// How a subagent describes itself. Every view that names a subagent asks this one place, so a
+/// subagent is called the same thing in its lane, its summary, the switcher and a peer message.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Identity {
+    /// What its owner calls it: an actor's alias, a provider's nickname.
+    pub(super) name: Option<String>,
+    /// Its type (`Reviewer`, `Explore`).
+    pub(super) title: Option<String>,
+    /// What it was asked to do.
+    pub(super) description: Option<String>,
+}
+
+impl Identity {
+    /// What the subagent is called: the name its owner gave it, else what it was asked to do (the
+    /// first line, shortened), else its type, else `subagent`.
+    pub(super) fn label(&self) -> String {
+        [&self.name, &self.description, &self.title]
+            .into_iter()
+            .flatten()
+            .map(|text| first_line(text))
+            .find(|label| !label.is_empty())
+            .unwrap_or_else(|| "subagent".to_owned())
+    }
+
+    /// The type of the child, shown next to its name when it says something the name does not:
+    /// a title that only repeats the label is not a type.
+    pub(super) fn kind(&self) -> Option<String> {
+        let label = self.label();
+        self.title
+            .as_deref()
+            .map(first_line)
+            .filter(|title| !title.is_empty() && *title != label)
+    }
+
+    /// What the child was asked to do, when its name is not already that.
+    pub(super) fn task(&self) -> Option<String> {
+        let task = first_line(self.description.as_deref()?);
+        (!task.is_empty() && task != self.label()).then_some(task)
+    }
+
+    pub(super) fn apply(&mut self, update: &nori_protocol::SubagentUpdate) {
+        update.name.clone().apply_to(&mut self.name);
+        update.title.clone().apply_to(&mut self.title);
+        update.description.clone().apply_to(&mut self.description);
+    }
+}
+
 /// Identity of a running subagent within its tree. Ids grow and are never reused, so ordering by
 /// id is the order in which subagents appeared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,6 +136,8 @@ pub(super) struct Node {
     pub(super) history_parent: Option<NodeId>,
     /// Running subagents this one announced.
     pub(super) children: BTreeSet<NodeId>,
+    /// What the child is called: an actor's alias, a provider's nickname.
+    pub(super) name: Option<String>,
     pub(super) title: Option<String>,
     pub(super) description: Option<String>,
     /// Known only through a launcher that reported completion at once while its work continues.
@@ -224,6 +286,7 @@ impl Node {
             parent: None,
             history_parent: None,
             children: BTreeSet::new(),
+            name: None,
             title: None,
             description: None,
             async_launch: false,
@@ -244,20 +307,24 @@ impl Node {
     }
 
     /// The main label: what the child was asked to do, else its type.
-    pub(super) fn label(&self) -> &str {
-        self.description
-            .as_deref()
-            .or(self.title.as_deref())
-            .unwrap_or("subagent")
+    pub(super) fn identity(&self) -> Identity {
+        Identity {
+            name: self.name.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+        }
     }
 
-    /// The type of the child, shown next to the task when it says something the task does not:
-    /// a title that only repeats the description is not a type.
-    pub(super) fn kind(&self) -> Option<&str> {
-        match (&self.description, &self.title) {
-            (Some(description), Some(title)) if description != title => Some(title),
-            _ => None,
-        }
+    pub(super) fn label(&self) -> String {
+        self.identity().label()
+    }
+
+    pub(super) fn kind(&self) -> Option<String> {
+        self.identity().kind()
+    }
+
+    pub(super) fn task(&self) -> Option<String> {
+        self.identity().task()
     }
 
     pub(super) fn touch(&mut self) {

@@ -8,6 +8,7 @@ use ratatui::text::Line;
 
 use super::SPINNER_PERIOD;
 use super::SubagentTree;
+use super::node::Node;
 use super::node::NodeId;
 use crate::chatwidget::ChatWidget;
 use crate::history_cell::AgentMarkdownCell;
@@ -136,7 +137,7 @@ impl SubagentTree {
             let parent_label = node
                 .parent
                 .and_then(|parent| self.live.get(&parent))
-                .map(|parent| parent.label().to_owned())
+                .map(Node::label)
                 .or_else(|| {
                     node.history_parent
                         .and_then(|parent| self.ended.get(&parent))
@@ -153,10 +154,7 @@ impl SubagentTree {
                 target: Target::Subagent(key(*id)),
                 title: node.label().to_owned(),
                 parent,
-                agent: node
-                    .agent
-                    .clone()
-                    .or_else(|| node.kind().map(str::to_owned)),
+                agent: node.agent.clone().or_else(|| node.kind()),
                 model: node.model.clone(),
                 status: if node.idle {
                     Status::Idle

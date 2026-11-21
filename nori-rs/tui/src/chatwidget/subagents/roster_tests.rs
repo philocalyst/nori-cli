@@ -30,6 +30,7 @@ fn announce(tree: &mut SubagentTree, parent: &acp::SessionId, index: usize, now:
             session_id: session(index),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Set("general-purpose".into()),
             description: Patch::Set(format!("task {index}")),
             state: Patch::Set(SubagentState::Running),
@@ -45,6 +46,7 @@ fn end(tree: &mut SubagentTree, index: usize, outcome: SubagentOutcome, now: Ins
             session_id: session(index),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(outcome)),
@@ -257,11 +259,12 @@ fn idle_child_resumes_with_the_same_history_and_identity() {
         session_id: session(1),
         agent: Patch::Keep,
         model: Patch::Keep,
+        name: Patch::Keep,
         title: Patch::Keep,
         description: Patch::Keep,
         state: Patch::Set(state),
     };
-    tree.on_update(state(SubagentState::Idle), base);
+    tree.on_update(state(SubagentState::Idle { interrupted: true }), base);
     assert_eq!(tree.running_count(), 0);
     assert_eq!(find(&tree.entries(base).0, 1).status, Status::Idle);
     tree.on_update(state(SubagentState::Running), base);
@@ -288,6 +291,7 @@ fn announced_agent_identity_survives_child_completion() {
             session_id: session(1),
             agent: Patch::Set("claude-code".to_owned()),
             model: Patch::Set("anthropic/claude-sonnet-4".to_owned()),
+            name: Patch::Keep,
             title: Patch::Set("Research".to_owned()),
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Running),
@@ -324,6 +328,7 @@ fn announced_agent_identity_survives_child_completion() {
             session_id: session(1),
             agent: Patch::Keep,
             model: Patch::Set("deepseek/deepseek-chat".to_owned()),
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Keep,

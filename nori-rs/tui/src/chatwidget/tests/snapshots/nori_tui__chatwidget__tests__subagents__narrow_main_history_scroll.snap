@@ -1,6 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
-assertion_line: 483
+assertion_line: 541
 expression: rendered
 ---
 
@@ -25,5 +25,6 @@ Latest response
 
 
 
-
 › Ask Nori to do anything
+
+ INS

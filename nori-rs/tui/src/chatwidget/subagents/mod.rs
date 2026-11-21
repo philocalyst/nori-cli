@@ -10,6 +10,7 @@
 //! and the root-session updates tagged with its id, stand in for the announcement.
 
 mod cell;
+mod census;
 mod events;
 mod lanes;
 mod node;

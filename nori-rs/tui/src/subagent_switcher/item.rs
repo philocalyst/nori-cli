@@ -34,7 +34,8 @@ pub(crate) struct ActorItem {
     pub(crate) animations: bool,
 }
 
-/// The glyph for a status: the spinner while running, a check, a cross, a slashed circle.
+/// The glyph for a status: the spinner while running, an open circle at rest, a check, a cross, a
+/// slashed circle.
 pub(crate) fn status_glyph(
     status: Status,
     tick: i64,
@@ -46,7 +47,8 @@ pub(crate) fn status_glyph(
             let frame = usize::try_from(tick.rem_euclid(10)).unwrap_or(0);
             Span::styled(SPINNER_FRAMES[frame], theme.accent_cyan)
         }
-        Status::Running | Status::Idle => Span::styled("●", theme.accent_cyan),
+        Status::Running => Span::styled("●", theme.accent_cyan),
+        Status::Idle => Span::styled("○", theme.faint),
         Status::Completed => Span::styled("✓", theme.accent_mint),
         Status::Failed => Span::styled("✗", theme.accent_coral),
         Status::Cancelled => Span::styled("⊘", theme.faint),

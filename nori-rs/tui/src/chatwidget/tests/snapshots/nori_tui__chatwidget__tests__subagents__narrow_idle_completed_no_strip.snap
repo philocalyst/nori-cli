@@ -1,7 +1,9 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 598
 expression: rendered
 ---
 
-
 › Ask Nori to do anything
+
+ INS

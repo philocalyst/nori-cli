@@ -38,6 +38,7 @@ fn update(
         session_id: session(child),
         agent: Patch::Keep,
         model: Patch::Keep,
+        name: Patch::Keep,
         title: Patch::Set(title.to_owned()),
         description: Patch::Set(description.to_owned()),
         state: Patch::Set(state),
@@ -58,6 +59,7 @@ fn finish(tree: &mut SubagentTree, parent: &acp::SessionId, child: i64) {
             session_id: session(child),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Ended(SubagentOutcome::Completed {
@@ -207,7 +209,8 @@ fn reactivated_grandchild_rebuilds_completed_parent_under_running_grandparent() 
         3
     );
     let parent = &finished[0].nested[0];
-    let lines = plain(&parent.display_lines(100));
+    // The card keeps one row for what is nested; its transcript carries the rebuilt child.
+    let lines = plain(&parent.transcript_lines(100));
     assert!(lines.iter().any(|line| line.contains("child")), "{lines:?}");
     let record = tree
         .ended
@@ -250,6 +253,7 @@ fn resumed_nested_child_keeps_parent_kind_and_archived_body_until_parent_finishe
             session_id: session(2),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Running),
@@ -300,4 +304,38 @@ fn resumed_nested_child_keeps_parent_kind_and_archived_body_until_parent_finishe
             .iter()
             .any(|line| line.contains("nested child"))
     }));
+}
+
+#[test]
+fn a_turn_that_ends_by_itself_finishes_the_child_but_an_interrupted_one_does_not() {
+    let (mut tree, root) = make_tree();
+    announce(&mut tree, &root, 1, "worker");
+    announce(&mut tree, &root, 2, "stopped");
+    let idle = |child, interrupted| {
+        update(
+            &root,
+            child,
+            "worker-kind",
+            "",
+            SubagentState::Idle { interrupted },
+        )
+    };
+
+    tree.on_update(idle(1, false), Instant::now());
+    let finished = tree.take_finished();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        finished[0].outcome,
+        SubagentOutcome::Completed {
+            stop_reason: Some("end_turn".to_owned())
+        }
+    );
+
+    tree.on_update(idle(2, true), Instant::now());
+    assert!(tree.take_finished().is_empty());
+    assert_eq!(tree.running_count(), 0);
+
+    // The finished child's next turn brings it back.
+    announce(&mut tree, &root, 1, "worker");
+    assert_eq!(tree.running_count(), 1);
 }

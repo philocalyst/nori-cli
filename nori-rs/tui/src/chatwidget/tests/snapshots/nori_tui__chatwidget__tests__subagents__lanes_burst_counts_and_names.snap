@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 741
+expression: rendered
+---
+
+◈ main · 2 running  ○1 ✓1
+▌ ⠋ auth  reviewer                                ▌ ⠋ config  reviewer
+▌ starting · Audit the auth middleware            ▌ starting · Trace the config loader's callers
+▌ ⋮ 2 nested · ○1 ✓1
+
+› Ask Nori to do anything
+
+ INS

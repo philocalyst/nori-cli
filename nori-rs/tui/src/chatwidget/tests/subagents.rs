@@ -345,7 +345,9 @@ fn running_subagent_cards_render_in_chat_and_are_clickable() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        rendered.contains("● 2 agents"),
+        rendered
+            .lines()
+            .any(|line| line.trim_end().ends_with("● 2")),
         "statusline should show compact agent count:\n{rendered}"
     );
     let (entries, _) = chat.subagents.entries(Instant::now());
@@ -409,11 +411,14 @@ fn child_login_uses_the_announced_agent_and_never_falls_back_to_main() {
         nori_protocol::SubagentUpdate {
             parent_session_id: root,
             session_id: acp::SessionId::new("child"),
+            name: nori_protocol::Patch::Keep,
             title: nori_protocol::Patch::Keep,
             description: nori_protocol::Patch::Keep,
             agent: nori_protocol::Patch::Set("unknown-child-provider".to_owned()),
             model: nori_protocol::Patch::Keep,
-            state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle),
+            state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Idle {
+                interrupted: false,
+            }),
         },
         Instant::now(),
     );
@@ -551,7 +556,11 @@ fn narrow_strip_is_removed_when_all_children_finish() {
     let root = acp::SessionId::new("root");
     chat.subagents.set_root(root.clone());
     for (session, title, state) in [
-        ("idle", "Research", nori_protocol::SubagentState::Idle),
+        (
+            "idle",
+            "Research",
+            nori_protocol::SubagentState::Idle { interrupted: true },
+        ),
         (
             "done",
             "Review",
@@ -566,6 +575,7 @@ fn narrow_strip_is_removed_when_all_children_finish() {
                 session_id: acp::SessionId::new(session),
                 agent: nori_protocol::Patch::Keep,
                 model: nori_protocol::Patch::Keep,
+                name: nori_protocol::Patch::Keep,
                 title: nori_protocol::Patch::Set(title.to_owned()),
                 description: nori_protocol::Patch::Keep,
                 state: nori_protocol::Patch::Set(state),
@@ -605,6 +615,7 @@ fn child_queue_updates_do_not_replace_the_main_queue() {
             session_id: child.clone(),
             agent: nori_protocol::Patch::Keep,
             model: nori_protocol::Patch::Keep,
+            name: nori_protocol::Patch::Keep,
             title: nori_protocol::Patch::Keep,
             description: nori_protocol::Patch::Keep,
             state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Running),
@@ -641,4 +652,93 @@ fn child_queue_updates_do_not_replace_the_main_queue() {
     assert!(chat.bottom_pane.has_queued_user_messages());
     chat.set_focused_subagent_view(None, Vec::new(), 0);
     assert!(!chat.bottom_pane.has_queued_user_messages());
+}
+
+#[test]
+fn lanes_name_each_subagent_and_count_the_whole_burst_with_idle_as_an_open_circle() {
+    use crate::render::renderable::Renderable;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.bottom_pane
+        .set_composer_placeholder_for_test("Ask Nori to do anything");
+    chat.subagents.set_root(acp::SessionId::new("root"));
+    // lead -> auth, config; auth -> token-scout, session-scout.
+    for (session, parent, name, task, state) in [
+        (
+            "auth",
+            "root",
+            "auth",
+            "Audit the auth middleware",
+            nori_protocol::SubagentState::Running,
+        ),
+        (
+            "config",
+            "root",
+            "config",
+            "Trace the config loader's callers",
+            nori_protocol::SubagentState::Running,
+        ),
+        (
+            "token-scout",
+            "auth",
+            "token-scout",
+            "Read src/auth/token.rs",
+            nori_protocol::SubagentState::Running,
+        ),
+        (
+            "session-scout",
+            "auth",
+            "session-scout",
+            "Read src/auth/session.rs",
+            nori_protocol::SubagentState::Idle { interrupted: true },
+        ),
+    ] {
+        chat.subagents.on_update(
+            nori_protocol::SubagentUpdate {
+                parent_session_id: acp::SessionId::new(parent),
+                session_id: acp::SessionId::new(session),
+                agent: nori_protocol::Patch::Keep,
+                model: nori_protocol::Patch::Keep,
+                name: nori_protocol::Patch::Set(name.to_owned()),
+                title: nori_protocol::Patch::Set("reviewer".to_owned()),
+                description: nori_protocol::Patch::Set(task.to_owned()),
+                state: nori_protocol::Patch::Set(state),
+            },
+            Instant::now(),
+        );
+    }
+    // One scout finished: it counts under the header though it sits below a running parent.
+    chat.subagents.on_update(
+        nori_protocol::SubagentUpdate {
+            parent_session_id: acp::SessionId::new("auth"),
+            session_id: acp::SessionId::new("token-scout"),
+            agent: nori_protocol::Patch::Keep,
+            model: nori_protocol::Patch::Keep,
+            name: nori_protocol::Patch::Keep,
+            title: nori_protocol::Patch::Keep,
+            description: nori_protocol::Patch::Keep,
+            state: nori_protocol::Patch::Set(nori_protocol::SubagentState::Ended(
+                nori_protocol::SubagentOutcome::Completed { stop_reason: None },
+            )),
+        },
+        Instant::now(),
+    );
+    chat.set_screen_rows(24);
+    let area = Rect::new(0, 0, 100, 24);
+    let mut buffer = Buffer::empty(area);
+    chat.render(area, &mut buffer);
+    let rendered = (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("lanes_burst_counts_and_names", rendered);
+    assert_eq!(chat.subagents.running_count(), 2);
 }

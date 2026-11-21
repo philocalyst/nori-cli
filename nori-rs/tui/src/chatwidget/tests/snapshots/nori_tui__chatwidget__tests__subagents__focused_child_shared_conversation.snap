@@ -1,6 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
-assertion_line: 393
+assertion_line: 400
 expression: rendered
 ---
 
@@ -16,5 +16,6 @@ Failed to load session sample: not found
 
 
 
-
 › Ask Nori to do anything
+
+ INS

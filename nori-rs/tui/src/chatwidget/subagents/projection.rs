@@ -13,15 +13,15 @@ use nori_protocol::acp::v1::AgentNotification;
 use super::node::Node;
 use crate::history_cell::HistoryCell;
 
+/// A response cell's index among the projected cells, with the journal range it came from.
+pub(crate) type ResponseSource = (usize, ConversationResponseBoundary);
+
+/// A child's transcript cells, and the source of each response among them.
+pub(crate) type ChildHistory = (Vec<Arc<dyn HistoryCell>>, Vec<ResponseSource>);
+
 /// Replay the same child update parser used by the live view, associating response sources by
 /// event order rather than comparing message text. Tool input and output remain in the transcript.
-pub(crate) fn project_child_history(
-    events: &[SessionEvent],
-    cwd: &Path,
-) -> (
-    Vec<Arc<dyn HistoryCell>>,
-    Vec<(usize, ConversationResponseBoundary)>,
-) {
+pub(crate) fn project_child_history(events: &[SessionEvent], cwd: &Path) -> ChildHistory {
     let mut node = Node::new(Instant::now());
     let mut boundaries = Vec::new();
     for event in events {

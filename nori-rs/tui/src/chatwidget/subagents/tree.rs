@@ -21,6 +21,7 @@ use nori_protocol::acp::v1 as acp;
 use nori_protocol::acp::v1::SessionId;
 
 use super::node::CellContext;
+use super::node::Identity;
 use super::node::Node;
 use super::node::NodeId;
 use crate::history_cell::HistoryCell;
@@ -88,6 +89,8 @@ pub(super) struct EndedRecord {
     pub(super) history_parent: Option<NodeId>,
     pub(super) revision: i64,
     pub(super) finished: FinishedSubagent,
+    /// What it was called, kept so a late announcement can rename the card.
+    pub(super) identity: Identity,
     /// The label of the running subagent that started it, when it had one.
     pub(super) parent: Option<String>,
     pub(super) parent_id: Option<NodeId>,
@@ -119,7 +122,9 @@ pub(crate) enum ChildTarget<'a> {
 pub(crate) struct SubagentTree {
     /// Running subagents by id, so iteration is in the order they appeared.
     pub(super) live: BTreeMap<NodeId, Node>,
-    idle_count: i64,
+    /// When the current burst of work began: what finished since is what the lanes' tally
+    /// counts. A burst begins when a subagent starts or resumes while none is running.
+    pub(super) burst_since: Instant,
     by_session: HashMap<SessionId, Link>,
     by_launcher: HashMap<String, Link>,
     root_session_id: Option<SessionId>,
@@ -156,7 +161,7 @@ impl SubagentTree {
     pub(crate) fn new(cwd: std::path::PathBuf, animations: bool) -> Self {
         Self {
             live: BTreeMap::new(),
-            idle_count: 0,
+            burst_since: Instant::now(),
             by_session: HashMap::new(),
             by_launcher: HashMap::new(),
             root_session_id: None,
@@ -194,9 +199,7 @@ impl SubagentTree {
     }
 
     pub(crate) fn running_count(&self) -> usize {
-        self.live
-            .len()
-            .saturating_sub(usize::try_from(self.idle_count).unwrap_or(0))
+        self.live.values().filter(|node| !node.idle).count()
     }
 
     pub(crate) fn has_running(&self) -> bool {
@@ -225,7 +228,7 @@ impl SubagentTree {
         let Some(Link::Live(id)) = self.by_session.get(session_id) else {
             return None;
         };
-        Some(self.live.get(id)?.label().to_owned())
+        Some(self.live.get(id)?.label())
     }
 
     /// Whether `call_id` is a root tool call that stands for a subagent.
@@ -236,6 +239,9 @@ impl SubagentTree {
     fn create(&mut self, now: Instant) -> NodeId {
         self.next_id += 1;
         let id = NodeId(self.next_id);
+        if self.running_count() == 0 {
+            self.burst_since = now;
+        }
         self.live.insert(id, Node::new(now));
         id
     }
@@ -267,18 +273,18 @@ impl SubagentTree {
         ) {
             return None;
         }
+        if self.running_count() == 0 {
+            self.burst_since = now;
+        }
         // Its failure, if it is still held back, never happened as far as the transcript goes.
         self.finished.retain(|finished| finished.node_id != id);
         let mut node = Node::new(now);
         node.session_id = Some(session_id.clone());
         node.agent = record.agent.clone();
         node.model = record.finished.model.clone();
-        if let Some(kind) = &record.finished.kind {
-            node.title = Some(kind.clone());
-            node.description = Some(record.finished.label.clone());
-        } else {
-            node.title = Some(record.finished.label.clone());
-        }
+        node.name = record.identity.name.clone();
+        node.title = record.identity.title.clone();
+        node.description = record.identity.description.clone();
         node.history_parent = record.history_parent;
         node.archived = record.finished.detail.clone();
         node.nested_by_id = record
@@ -362,6 +368,10 @@ impl SubagentTree {
     /// An announcement, or a change to a child already announced.
     pub(crate) fn on_update(&mut self, update: SubagentUpdate, now: Instant) {
         self.revision += 1;
+        let was_running = match self.by_session.get(&update.session_id) {
+            Some(Link::Live(id)) => self.live.get(id).is_some_and(|node| !node.idle),
+            Some(Link::Ended(_)) | None => false,
+        };
         let id = if matches!(update.state, Patch::Set(SubagentState::Running)) {
             self.reactivate_session(&update.session_id, now)
                 .or_else(|| self.node_for_session(&update.session_id, now))
@@ -375,11 +385,10 @@ impl SubagentTree {
                 .find(|record| record.session_id.as_ref() == Some(&update.session_id))
             {
                 update.agent.clone().apply_to(&mut record.agent);
-                update.model.apply_to(&mut record.finished.model);
-                update.title.apply_to(&mut record.finished.kind);
-                let mut label = Some(std::mem::take(&mut record.finished.label));
-                update.description.apply_to(&mut label);
-                record.finished.label = label.unwrap_or_default();
+                update.model.clone().apply_to(&mut record.finished.model);
+                record.identity.apply(&update);
+                record.finished.kind = record.identity.kind();
+                record.finished.label = record.identity.label();
                 record.revision = record.revision.saturating_add(1);
             }
             return;
@@ -393,6 +402,7 @@ impl SubagentTree {
             node.history_parent = Some(parent);
         }
         if let Some(node) = self.live.get_mut(&id) {
+            update.name.apply_to(&mut node.name);
             update.title.apply_to(&mut node.title);
             update.description.apply_to(&mut node.description);
             update.agent.apply_to(&mut node.agent);
@@ -403,11 +413,22 @@ impl SubagentTree {
             nori_protocol::Patch::Set(SubagentState::Ended(outcome)) => {
                 self.finish(id, outcome, None, now);
             }
-            nori_protocol::Patch::Set(state @ (SubagentState::Running | SubagentState::Idle)) => {
+            nori_protocol::Patch::Set(SubagentState::Idle { interrupted: false })
+                if was_running =>
+            {
+                // The turn ended by itself: the child finished its work, as one that reports
+                // `completed` does. It stays reachable; its next turn reactivates it.
+                let outcome = SubagentOutcome::Completed {
+                    stop_reason: Some("end_turn".to_owned()),
+                };
+                self.finish(id, outcome, None, now);
+            }
+            nori_protocol::Patch::Set(
+                state @ (SubagentState::Running | SubagentState::Idle { .. }),
+            ) => {
                 if let Some(node) = self.live.get_mut(&id) {
-                    let idle = matches!(state, SubagentState::Idle);
+                    let idle = matches!(state, SubagentState::Idle { .. });
                     if idle != node.idle {
-                        self.idle_count += if idle { 1 } else { -1 };
                         node.idle = idle;
                         node.touch();
                     }
@@ -476,6 +497,9 @@ impl SubagentTree {
             if node.description.is_none() {
                 node.description = stand_in.description;
             }
+            if node.name.is_none() {
+                node.name = stand_in.name;
+            }
             if node.title.is_none() {
                 node.title = stand_in.title;
             }
@@ -491,7 +515,7 @@ impl SubagentTree {
             return "main".to_owned();
         }
         match self.by_session.get(session_id) {
-            Some(Link::Live(id)) => self.live.get(id).map(|node| node.label().to_owned()),
+            Some(Link::Live(id)) => self.live.get(id).map(Node::label),
             Some(Link::Ended(id)) => self
                 .ended
                 .get(id)
@@ -631,11 +655,33 @@ impl SubagentTree {
         let announced = node.session_id.is_some();
         // The launcher's title starts as the tool's name and becomes the task once the adapter
         // fills it in; an announced child carries its own description.
-        if !announced
-            && !snapshot.title.is_empty()
-            && !matches!(snapshot.title.as_str(), "Task" | "Agent")
-        {
-            node.description = Some(snapshot.title.clone());
+        if !announced {
+            // What the Task/Agent tool was asked to launch: its own name when it has one, its
+            // type and its task. Claude's call input carries them even while its title is still
+            // the tool's name.
+            let input = |key: &str| {
+                snapshot
+                    .raw_input
+                    .as_ref()
+                    .and_then(|input| input.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+            };
+            if let Some(name) = input("name") {
+                node.name = Some(name);
+            }
+            if let Some(kind) = input("subagent_type") {
+                node.title = Some(kind);
+            }
+            if let Some(task) = input("description") {
+                node.description = Some(task);
+            } else if !snapshot.title.is_empty()
+                && !matches!(snapshot.title.as_str(), "Task" | "Agent")
+            {
+                node.description = Some(snapshot.title.clone());
+            }
         }
         node.async_launch |= async_launch;
         node.touch();
@@ -702,9 +748,6 @@ impl SubagentTree {
         let Some(mut node) = self.live.remove(&id) else {
             return;
         };
-        if node.idle {
-            self.idle_count -= 1;
-        }
         let session_id = node.session_id.take();
         if let Some(session_id) = &session_id {
             self.by_session.insert(session_id.clone(), Link::Ended(id));
@@ -729,8 +772,8 @@ impl SubagentTree {
         }
         let finished = FinishedSubagent {
             node_id: id,
-            label: node.label().to_owned(),
-            kind: node.kind().map(str::to_owned),
+            label: node.label(),
+            kind: node.kind(),
             agent: node.agent.clone(),
             model: node.model.clone(),
             outcome,
@@ -744,7 +787,7 @@ impl SubagentTree {
         let parent_label = node
             .parent
             .and_then(|parent| self.live.get(&parent))
-            .map(|parent| parent.label().to_owned());
+            .map(Node::label);
         self.ended.insert(
             id,
             EndedRecord {
@@ -754,6 +797,7 @@ impl SubagentTree {
                 history_parent: node.history_parent,
                 revision: i64::MIN,
                 finished: finished.clone(),
+                identity: node.identity(),
                 parent: parent_label,
                 parent_id,
                 ended_at: now,

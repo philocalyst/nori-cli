@@ -29,6 +29,7 @@ fn update(parent: acp::SessionId, child: usize, state: SubagentState) -> Subagen
         session_id: session(child),
         agent: Patch::Keep,
         model: Patch::Keep,
+        name: Patch::Keep,
         title: Patch::Set("general-purpose".into()),
         description: Patch::Set(format!("task {child}")),
         state: Patch::Set(state),
@@ -223,7 +224,7 @@ fn a_finished_grandchild_is_nested_in_its_parent_and_reported_once() {
     assert_eq!(
         tree.display_order(usize::MAX)
             .iter()
-            .map(|(_id, node, depth)| (node.label().to_owned(), *depth))
+            .map(|(_id, node, depth)| (node.label(), *depth))
             .collect::<Vec<_>>(),
         vec![("task 1".to_owned(), 0), ("task 2".to_owned(), 1)]
     );

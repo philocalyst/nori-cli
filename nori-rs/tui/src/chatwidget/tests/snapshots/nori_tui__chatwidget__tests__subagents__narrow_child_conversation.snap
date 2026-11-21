@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/subagents.rs
+assertion_line: 504
 expression: rendered
 ---
 
@@ -26,4 +27,4 @@ I found the failure.
 
 › Ask Nori to do anything
 
-  ● 2 agents
+ INS                      ● 2

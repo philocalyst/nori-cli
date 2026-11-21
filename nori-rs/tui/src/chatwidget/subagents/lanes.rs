@@ -141,17 +141,13 @@ impl InChatSubagents<'_> {
         }
     }
 
-    /// Running subagents that no running subagent owns: the lanes' first level.
+    /// Running subagents that no running subagent owns: the lanes' first level. A running child
+    /// of an idle parent is one too, so it is never hidden behind the parent that rests.
     fn roots(&self) -> Vec<NodeId> {
         self.tree
             .live
             .iter()
-            .filter(|(_, node)| {
-                !node.idle
-                    && node
-                        .parent
-                        .is_none_or(|parent| !self.tree.live.contains_key(&parent))
-            })
+            .filter(|(id, node)| !node.idle && !self.tree.has_running_ancestor(**id))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -257,7 +253,7 @@ impl InChatSubagents<'_> {
         // Name, then state, model, elapsed, activity: a narrow row loses them from the end.
         let mut segments = vec![Segment::new(
             0,
-            vec![Span::styled(node.label().to_owned(), chrome.strong())],
+            vec![Span::styled(node.label(), chrome.strong())],
         )];
         let who = who(chrome, node);
         if !who.is_empty() {
@@ -297,7 +293,10 @@ impl InChatSubagents<'_> {
         }
         let running = self.below(id).running;
         let text = match running {
-            0 => "starting…".to_owned(),
+            0 => node.task().map_or_else(
+                || "starting…".to_owned(),
+                |task| format!("starting · {task}"),
+            ),
             1 => "starting · 1 child running".to_owned(),
             count => format!("starting · {count} children running"),
         };
@@ -371,7 +370,7 @@ impl InChatSubagents<'_> {
                 hits: Vec::new(),
             };
         }
-        let mut lines = vec![self.header(&chrome, &roots, width)];
+        let mut lines = vec![self.header(&chrome, width)];
         let mut hits = Vec::new();
         let budget = self.budget();
         let parallel = width >= PARALLEL_MIN_WIDTH && roots.len() >= 2 && self.focused.is_none();
@@ -383,18 +382,10 @@ impl InChatSubagents<'_> {
         Laid { lines, hits }
     }
 
-    /// `◈ main · 3 running`.
-    fn header(&self, chrome: &Chrome, roots: &[NodeId], width: usize) -> Line<'static> {
-        let mut counts = Counts::default();
-        for root in roots {
-            counts.running += 1;
-            let below = self.below(*root);
-            counts.running += below.running;
-            counts.idle += below.idle;
-            counts.done += below.done;
-            counts.failed += below.failed;
-            counts.cancelled += below.cancelled;
-        }
+    /// `◈ main · 3 running  ○1 ✓2`: every subagent of this burst of work, wherever it sits in
+    /// the tree, the same numbers the status line shows.
+    fn header(&self, chrome: &Chrome, width: usize) -> Line<'static> {
+        let counts = self.tree.census();
         let mut segments = vec![Segment::new(
             0,
             vec![
@@ -659,7 +650,7 @@ fn who(chrome: &Chrome, node: &Node) -> Vec<Span<'static>> {
         return identity;
     }
     node.kind()
-        .map(|kind| vec![Span::styled(kind.to_owned(), chrome.muted())])
+        .map(|kind| vec![Span::styled(kind, chrome.muted())])
         .unwrap_or_default()
 }
 
