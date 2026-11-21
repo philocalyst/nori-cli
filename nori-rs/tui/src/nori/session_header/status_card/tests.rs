@@ -5,6 +5,7 @@ use nori_harness::TranscriptTokenUsage;
 use nori_protocol::acp::v1 as acp;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 use crate::history_cell::HistoryCell;
 use crate::nori::agent_config_state::AgentConfigState;
@@ -136,13 +137,15 @@ fn instruction_files() -> Vec<InstructionFile> {
 
 #[test]
 fn compact_agent_row_is_provider_only_before_configuration() {
+    // The one-line welcome does not name the agent; the status card's agent row does, and with
+    // nothing advertised it is the last row.
     let rendered = render(
         model("claude-code", "/home/user/project"),
-        DisplayMode::Compact,
+        DisplayMode::Full,
     );
 
     assert!(
-        rendered.contains("Agent        Claude\n") || rendered.ends_with("Agent        Claude"),
+        rendered.ends_with("Agent        Claude"),
         "an agent that has advertised nothing must show its provider alone, got:\n{rendered}"
     );
 }
@@ -152,26 +155,37 @@ fn compact_agent_row_orders_model_thought_level_then_advertised_order() {
     let model = model("claude-code", "/home/user/project");
     configure(&model, "claude-code", &claude_options(true));
 
-    let rendered = render(model, DisplayMode::Compact);
+    let rendered = render(model, DisplayMode::Full);
 
     assert!(
-        rendered.contains("Agent        Claude · Opus 5 · xhigh · Plan · Fast mode"),
-        "agent row must read provider, model, thought level, then advertised order, got:\n{rendered}"
+        rendered.contains(concat!(
+            "               Model      Opus 5\n",
+            "               Effort     xhigh\n",
+            "               Mode       Plan\n",
+            "               Fast mode  On",
+        )),
+        "the agent block must read model, thought level, then advertised order, got:\n{rendered}"
     );
 }
 
 #[test]
 fn compact_agent_row_drops_toggles_that_are_off() {
-    let model = model("claude-code", "/home/user/project");
-    configure(&model, "claude-code", &claude_options(false));
+    let status = model("claude-code", "/home/user/project");
+    configure(&status, "claude-code", &claude_options(false));
 
-    let rendered = render(model, DisplayMode::Compact);
+    let rendered = render(status, DisplayMode::Full);
 
     assert!(
-        !rendered.contains("Fast mode"),
-        "a boolean toggle reads by presence on the compact row, got:\n{rendered}"
+        rendered.contains("Fast mode  Off"),
+        "the agent block reads a toggle that is off as Off, got:\n{rendered}"
     );
-    assert!(rendered.contains("Claude · Opus 5 · xhigh · Plan"));
+    let welcome_model = model("claude-code", "/home/user/project");
+    configure(&welcome_model, "claude-code", &claude_options(false));
+    let welcome = render(welcome_model, DisplayMode::Compact);
+    assert!(
+        !welcome.contains("Fast mode") && !welcome.contains("Opus 5"),
+        "the one-line welcome names no agent configuration, got:\n{welcome}"
+    );
 }
 
 #[test]
@@ -179,7 +193,7 @@ fn compact_agent_row_drops_toggles_that_are_off() {
 fn only_the_provider_name_carries_colour() {
     let view = model("claude-code", "/home/user/project");
     configure(&view, "claude-code", &claude_options(true));
-    let cell = NoriSessionHeaderCell::new(view).with_display_mode(DisplayMode::Compact);
+    let cell = NoriSessionHeaderCell::new(view).with_display_mode(DisplayMode::Full);
 
     let lines = cell.display_lines(80);
     let agent_row = lines
@@ -214,13 +228,10 @@ fn compact_block_uses_the_prompt_accent_and_plain_labels() {
     let lines = cell.display_lines(80);
     assert_eq!(lines[0].spans[0].content, "  › ");
     assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
-
-    let system = lines
-        .iter()
-        .find(|line| line.to_string().contains("System"))
-        .expect("System row");
-    assert!(system.to_string().starts_with("  System       "));
-    assert!(!system.to_string().contains(':'));
+    assert!(
+        !lines[0].to_string().contains(':'),
+        "the welcome line uses plain labels, got: {lines:?}"
+    );
 }
 
 #[test]
@@ -233,17 +244,19 @@ fn compact_block_summarizes_location_and_approvals() {
 
     let rendered = render(view, DisplayMode::Compact);
 
-    let system = rendered
-        .lines()
-        .find(|line| line.trim_start().starts_with("System"))
-        .expect("System row");
-    assert_eq!(
-        system,
-        "  System       /home/user/project · Agent approvals"
-    );
+    assert_eq!(rendered, "  › Nori CLI vtest  ·  /home/user/project");
     assert!(
         !rendered.contains("senior-swe"),
         "the welcome card must not show skillsets, got:\n{rendered}"
+    );
+
+    // The approval mode is on the status card, which the welcome line does not repeat.
+    let mut card = model("claude-code", "/home/user/project");
+    card.approval_mode_label = Some("Agent".to_string());
+    let status = render(card, DisplayMode::Full);
+    assert!(
+        status.lines().any(|line| line == "  Approvals    Agent"),
+        "the status card names the approval mode, got:\n{status}"
     );
 }
 
@@ -293,6 +306,30 @@ fn compact_mode_snapshot() {
     configure(&view, "claude-code", &claude_options(true));
 
     insta::assert_snapshot!(render(view, DisplayMode::Compact));
+}
+
+#[test]
+fn compact_line_never_wraps_and_keeps_the_path_tail_at_phone_widths() {
+    let directory = "/private/tmp/nori-qa-sessions/mobileqa/work";
+    for (width, expected) in [
+        (
+            80,
+            "  › Nori CLI vtest  ·  /private/tmp/nori-qa-sessions/mobileqa/work",
+        ),
+        (44, "  › Nori CLI vtest  ·  …/mobileqa/work"),
+        (36, "  › Nori CLI  ·  …/mobileqa/work"),
+    ] {
+        let cell = NoriSessionHeaderCell::new(model("claude-code", directory))
+            .with_display_mode(DisplayMode::Compact);
+
+        let rendered = render_lines(&cell.display_lines(width));
+
+        assert_eq!(rendered, expected, "at width {width}");
+        assert!(
+            UnicodeWidthStr::width(rendered.as_str()) <= usize::from(width),
+            "the welcome line must fit {width} columns, got {rendered:?}"
+        );
+    }
 }
 
 // =========================================================================

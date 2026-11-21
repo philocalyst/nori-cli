@@ -225,19 +225,95 @@ pub(super) fn context_value(context: &ContextStatus) -> Option<String> {
     })
 }
 
-/// Where the session is, for the one-line welcome: the directory (home as `~`), or the cloud
-/// session.
-pub(super) fn compact_location(model: &StatusViewModel, inner_width: usize) -> String {
+/// The one-line welcome: the prompt marker, the product name and version, then where the session
+/// is. It is always one row no wider than `width`. When the row is narrow the version goes first,
+/// then the separator narrows, and the location is cut to what is left.
+pub(super) fn compact_line(model: &StatusViewModel, width: usize) -> Line<'static> {
+    /// The least the location is given before the version and the wide separator give way.
+    const MIN_LOCATION_COLUMNS: usize = 16;
+    const PROMPT: &str = "  › ";
+    const NAME: &str = "Nori CLI";
+    const WIDE_SEPARATOR: &str = "  ·  ";
+    const NARROW_SEPARATOR: &str = " · ";
+
+    let version = format!(" v{}", model.version);
+    let fixed = |version: &str, separator: &str| {
+        PROMPT.width() + NAME.width() + version.width() + separator.width()
+    };
+    let (version, separator) = [
+        (version.as_str(), WIDE_SEPARATOR),
+        (version.as_str(), NARROW_SEPARATOR),
+        ("", WIDE_SEPARATOR),
+        ("", NARROW_SEPARATOR),
+    ]
+    .into_iter()
+    .find(|&(version, separator)| {
+        width.saturating_sub(fixed(version, separator)) >= MIN_LOCATION_COLUMNS
+    })
+    .unwrap_or(("", NARROW_SEPARATOR));
+    let location = compact_location(model, width.saturating_sub(fixed(version, separator)));
+
+    Line::from(vec![
+        Span::from(PROMPT).green(),
+        Span::from(NAME).bold(),
+        Span::from(version.to_owned()).dim(),
+        Span::from(separator.to_owned()).dim(),
+        Span::from(location).dim(),
+    ])
+}
+
+/// Where the session is, cut to `max_width` columns: the directory (home as `~`), or the cloud
+/// session, whose title goes first when it does not fit.
+fn compact_location(model: &StatusViewModel, max_width: usize) -> String {
     match &model.cloud_session {
-        Some(cloud) => match &cloud.title {
-            Some(title) => format!("{} ({title})", cloud.id),
-            None => cloud.id.clone(),
-        },
-        None => format_directory(
-            &model.directory,
-            Some(inner_width.saturating_sub(STATUS_VALUE_OFFSET)),
-        ),
+        Some(cloud) => cloud
+            .title
+            .as_ref()
+            .map(|title| format!("{} ({title})", cloud.id))
+            .filter(|text| text.width() <= max_width)
+            .unwrap_or_else(|| tail_path(&cloud.id, max_width)),
+        None => tail_path(&format_directory(&model.directory, None), max_width),
     }
+}
+
+/// `path` cut from the front to `max_width` columns. It keeps as many of its last components as fit
+/// behind an ellipsis, so the basename survives. A basename too long for that is cut from its front.
+fn tail_path(path: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if path.width() <= max_width {
+        return path.to_owned();
+    }
+
+    let separator = std::path::MAIN_SEPARATOR;
+    let mut tail = String::new();
+    for component in path
+        .rsplit(separator)
+        .filter(|component| !component.is_empty())
+    {
+        let candidate = if tail.is_empty() {
+            component.to_owned()
+        } else {
+            format!("{component}{separator}{tail}")
+        };
+        if format!("…{separator}{candidate}").width() > max_width {
+            break;
+        }
+        tail = candidate;
+    }
+    if !tail.is_empty() {
+        return format!("…{separator}{tail}");
+    }
+
+    let mut kept = String::new();
+    for ch in path.chars().rev() {
+        if format!("…{ch}{kept}").width() > max_width {
+            break;
+        }
+        kept.insert(0, ch);
+    }
+    format!("…{kept}")
 }
 
 /// The full `/status` card: session metadata, then the agent's configuration,

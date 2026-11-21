@@ -357,7 +357,7 @@ fn format_directory(directory: &Path, max_width: Option<usize>) -> String {
 /// Controls the amount of status information shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
-    /// Session header at start: compact system and agent summary only.
+    /// Session header at start: one line saying where the session is.
     Compact,
     /// `/status` command: complete metadata plus the local instruction-file outline.
     Full,
@@ -391,25 +391,21 @@ impl HistoryCell for NoriSessionHeaderCell {
         }
         let inner_width = usize::from(width.saturating_sub(2)).min(NORI_HEADER_MAX_INNER_WIDTH);
 
-        // The prompt marker is the sole Nori accent. The title and version use
-        // ordinary text hierarchy and the block deliberately has no surface or border.
-        let title = vec![
-            Span::from("  › ").green(),
-            Span::from("Nori CLI").bold(),
-            Span::from(format!(" v{}", self.model.version)).dim(),
-        ];
         match self.display_mode {
-            // One quiet line: the status line under the composer already names the agent and
-            // model, so the welcome says only where this is.
+            // One quiet line that never wraps: the status line under the composer already names
+            // the agent and model, so the welcome says only where this is.
             DisplayMode::Compact => {
-                let mut line = title;
-                line.push(Span::from("  ·  ").dim());
-                line.push(
-                    Span::from(status_card::compact_location(&self.model, inner_width)).dim(),
-                );
-                vec![Line::from(line)]
+                let line_width = usize::from(width).min(NORI_HEADER_MAX_INNER_WIDTH);
+                vec![status_card::compact_line(&self.model, line_width)]
             }
             DisplayMode::Full => {
+                // The prompt marker is the sole Nori accent. The title and version use
+                // ordinary text hierarchy and the block deliberately has no surface or border.
+                let title = vec![
+                    Span::from("  › ").green(),
+                    Span::from("Nori CLI").bold(),
+                    Span::from(format!(" v{}", self.model.version)).dim(),
+                ];
                 let mut lines = vec![Line::from(title), Line::from("")];
                 lines.extend(status_card::full_lines(&self.model, inner_width));
                 lines

@@ -71,35 +71,31 @@ fn history_text(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> Stri
         .collect()
 }
 
-fn agent_row(chat: &ChatWidget, display_mode: DisplayMode) -> String {
-    let cell =
-        NoriSessionHeaderCell::new(chat.live_status_view_model()).with_display_mode(display_mode);
+/// The status card as a session shows it now, built from the live status view.
+fn status_card_text(chat: &ChatWidget) -> String {
+    let cell = NoriSessionHeaderCell::new(chat.live_status_view_model())
+        .with_display_mode(DisplayMode::Full);
     lines_to_single_string(&cell.display_lines(80))
-        .lines()
-        .find(|line| line.trim_start().starts_with("Agent"))
-        .unwrap_or_default()
-        .to_string()
 }
 
 #[test]
 fn advertised_configuration_reaches_the_status_views() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
 
-    // The welcome card is written before the agent advertises anything, so it
-    // holds the live handle and must not guess at that point.
-    let welcome = NoriSessionHeaderCell::new(chat.live_status_view_model())
-        .with_display_mode(DisplayMode::Compact);
+    // The status views hold the live handle and must not guess before the agent
+    // advertises anything.
     assert!(
-        lines_to_single_string(&welcome.display_lines(80)).contains("Agent        Claude\n"),
-        "before configuration the row is the provider name alone"
+        status_card_text(&chat)
+            .lines()
+            .any(|line| line == "  Agent        Claude"),
+        "before configuration the agent row is the provider name alone"
     );
 
     chat.handle_acp_session_config_update(&claude_options("opus-5"));
 
     assert!(
-        lines_to_single_string(&welcome.display_lines(80))
-            .contains("Agent        Claude · Opus 5 · xhigh · Plan"),
-        "the welcome card fills in once the agent advertises its configuration"
+        status_card_text(&chat).contains("Model   Opus 5"),
+        "the status views fill in once the agent advertises its configuration"
     );
 }
 
@@ -123,7 +119,7 @@ fn status_output_is_detached_from_later_configuration_changes() {
         "printed /status output must not change after the fact"
     );
     assert!(
-        agent_row(&chat, DisplayMode::Compact).contains("Sonnet 5"),
+        status_card_text(&chat).contains("Sonnet 5"),
         "later cards do show the new value"
     );
 }
@@ -188,12 +184,12 @@ fn successful_mutations_and_snapshots_update_the_tracked_configuration() {
 
     // The options a successful `set_session_config_option` echoes back.
     chat.sync_acp_session_config_snapshot(&claude_options("sonnet-5"));
-    assert!(agent_row(&chat, DisplayMode::Compact).contains("Sonnet 5"));
+    assert!(status_card_text(&chat).contains("Sonnet 5"));
 
     // A stale generation must not clobber the tracked configuration.
     chat.handle_acp_session_config_snapshot(snapshot_in_flight, &claude_options("opus-5"));
     assert!(
-        agent_row(&chat, DisplayMode::Compact).contains("Sonnet 5"),
+        status_card_text(&chat).contains("Sonnet 5"),
         "a snapshot from a previous session generation is ignored"
     );
 
@@ -201,7 +197,7 @@ fn successful_mutations_and_snapshots_update_the_tracked_configuration() {
         chat.acp_mode_config_generation,
         &claude_options("opus-5"),
     );
-    assert!(agent_row(&chat, DisplayMode::Compact).contains("Opus 5"));
+    assert!(status_card_text(&chat).contains("Opus 5"));
 }
 
 #[test]
@@ -216,33 +212,18 @@ fn the_mode_cycle_is_derived_from_the_tracked_configuration() {
 
 #[test]
 fn the_config_picker_opens_from_the_tracked_configuration() {
-    use crate::render::renderable::Renderable;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
     chat.handle_acp_session_config_update(&claude_options("opus-5"));
 
     // No harness handle is available here: opening the panel must still work,
     // because the advertised configuration is already tracked.
     chat.open_session_config_popup();
 
-    let area = Rect::new(0, 0, 84, chat.bottom_pane.desired_height(84));
-    let mut buffer = Buffer::empty(area);
-    chat.bottom_pane.render(area, &mut buffer);
-    let rendered = (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let labels = shown_choice_labels(&mut rx);
     for expected in ["Mode (Plan)", "Model (Opus 5)", "Effort (xhigh)"] {
         assert!(
-            rendered.contains(expected),
-            "the config panel must list {expected:?}, got:\n{rendered}"
+            labels.iter().any(|label| label.contains(expected)),
+            "the config panel must list {expected:?}, got: {labels:?}"
         );
     }
 }
@@ -289,9 +270,14 @@ fn the_welcome_card_is_written_before_any_session_starts() {
 
     let card = history_text(&mut rx);
     assert!(
-        card.contains("Nori CLI") && card.contains("Agent        Claude\n"),
-        "an unprompted session still gets a card, with the provider name alone \
-         on the agent row, got:\n{card}"
+        card.contains("Nori CLI") && card.trim_end().lines().count() == 1,
+        "an unprompted session still gets a one-line card, got:\n{card}"
+    );
+    assert!(
+        status_card_text(&chat)
+            .lines()
+            .any(|line| line == "  Agent        Claude"),
+        "the status card shows the provider name alone on the agent row"
     );
 }
 
@@ -325,8 +311,12 @@ fn a_session_start_carrying_configuration_renders_it_on_the_welcome_card() {
 
     let welcome = last_history_cell(&mut rx).expect("welcome card");
     assert!(
-        lines_to_single_string(&welcome.display_lines(80))
-            .contains("Agent        Claude · Opus 5 · xhigh · Plan"),
-        "the agent's session/new configuration must reach the very first card"
+        lines_to_single_string(&welcome.display_lines(80)).contains("Nori CLI"),
+        "the very first card is the one-line welcome"
+    );
+    let status = status_card_text(&chat);
+    assert!(
+        status.contains("Model   Opus 5") && status.contains("Effort  xhigh"),
+        "the agent's session/new configuration must reach the status card, got:\n{status}"
     );
 }
