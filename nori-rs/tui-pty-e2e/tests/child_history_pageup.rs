@@ -48,7 +48,9 @@ fn pageup_reaches_inherited_long_child_history() {
         .map(|page| session.scrollback_contents(page * 20))
         .collect();
     assert!(
-        pages.iter().any(|page| page.contains("long history parent question")),
+        pages
+            .iter()
+            .any(|page| page.contains("long history parent question")),
         "parent prompt missing from scrollback: {pages:#?}"
     );
     session.send_key(Key::Tab).expect("return to parent");
