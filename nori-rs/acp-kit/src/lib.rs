@@ -28,6 +28,7 @@ mod host;
 mod mcp;
 mod options;
 mod provider;
+mod provider_text;
 mod registration;
 mod serve;
 mod sessions;

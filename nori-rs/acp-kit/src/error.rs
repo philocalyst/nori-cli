@@ -13,6 +13,9 @@ use agent_client_protocol as acp;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::provider_text::Identified;
+use crate::provider_text::ProviderText;
+
 /// `-32010`: the service behind the agent could not be reached.
 const UNREACHABLE_CODE: i32 = -32010;
 /// `-32012`: the session exists but cannot be reattached.
@@ -73,6 +76,7 @@ impl FailureKind {
         let has = |needles: &[&str]| needles.iter().any(|needle| message.contains(needle));
         if has(&[
             "usage limit",
+            "credit balance is too low",
             "exceeded your usage",
             "out of extra usage",
             "insufficient_quota",
@@ -86,7 +90,14 @@ impl FailureKind {
             Some(Self::RateLimited)
         } else if has(&["overloaded", "at capacity", "capacity", "529"]) {
             Some(Self::Capacity)
-        } else if has(&["prompt is too long", "context length", "context window"]) {
+        } else if has(&[
+            "prompt is too long",
+            "context length",
+            "context window",
+            "string too long",
+            "string_above_max_length",
+            "largestringparam",
+        ]) {
             Some(Self::PromptTooLong)
         } else if has(&[
             "model not found",
@@ -125,6 +136,10 @@ pub enum AgentError {
     /// the person has to start it. Not a network problem.
     #[error("agent backend not running: {0}")]
     NotRunning(String),
+    /// The program the agent runs is not installed, so the person has to install it. Reported as
+    /// a missing executable with the agent's own install hint, not as a service to start.
+    #[error("executable not found: {0}")]
+    ExecutableNotFound(String),
     /// The request cannot be served in the state the agent is in, such as a second prompt on a
     /// session that is still running one.
     #[error("{0}")]
@@ -159,20 +174,27 @@ impl AgentError {
         Self::InvalidParams(detail.into())
     }
 
-    /// A provider failure, classified from its HTTP status and message when either says.
+    /// A provider failure, classified from what `message` says. A provider's JSON body inside the
+    /// message (Claude Code's `API Error: 529 {...}`, an OpenAI `{"error":{...}}`) is read for its
+    /// identifiers and its sentence: the identifiers classify it before `status` and the prose
+    /// do, and the sentence, never the body, is the detail a person reads.
     pub fn provider(status: Option<i32>, message: impl Into<String>) -> Self {
-        let detail = message.into();
-        match status
-            .and_then(FailureKind::from_http_status)
-            .or_else(|| FailureKind::from_message(&detail))
+        let text = ProviderText::parse(&message.into());
+        let identified = text.identified().or_else(|| match status {
+            Some(401) => Some(Identified::Auth),
+            Some(status) => FailureKind::from_http_status(status).map(Identified::Kind),
+            None => None,
+        });
+        match identified.or_else(|| FailureKind::from_message(&text.sentence).map(Identified::Kind))
         {
-            Some(kind) => Self::Provider {
+            Some(Identified::Auth) => Self::AuthRequired(text.sentence),
+            Some(Identified::Kind(kind)) => Self::Provider {
                 kind,
-                detail,
+                detail: text.sentence,
                 resets_at: None,
                 retry_after: None,
             },
-            None => Self::Internal(detail),
+            None => Self::Internal(text.sentence),
         }
     }
 
@@ -209,6 +231,13 @@ impl From<AgentError> for acp::Error {
                     object.insert("code".to_owned(), json!("agent_not_running"));
                 }
                 acp::Error::new(NOT_RUNNING_CODE, "Agent backend not running").data(data)
+            }
+            AgentError::ExecutableNotFound(detail) => {
+                let mut data = detail_data(&detail);
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("code".to_owned(), json!("executable_not_found"));
+                }
+                acp::Error::internal_error().data(data)
             }
             AgentError::Busy(detail) | AgentError::InvalidParams(detail) => {
                 acp::Error::invalid_params().data(detail_data(&detail))
@@ -260,5 +289,53 @@ impl From<acp::Error> for AgentError {
 impl From<serde_json::Error> for AgentError {
     fn from(error: serde_json::Error) -> Self {
         Self::Internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn data(error: AgentError) -> Value {
+        acp::Error::from(error).data.unwrap_or_default()
+    }
+
+    #[test]
+    fn a_spent_credit_balance_reaches_the_host_as_its_sentence_and_a_quota() {
+        let error = AgentError::provider(
+            None,
+            r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#,
+        );
+        assert_eq!(
+            data(error),
+            json!({
+                "detail": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+                "code": "usage_limit_reached",
+            })
+        );
+    }
+
+    #[test]
+    fn a_prompt_too_long_body_is_never_the_detail() {
+        let error = AgentError::provider(
+            None,
+            r#"API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 215000 tokens > 200000 maximum"}}"#,
+        );
+        assert_eq!(
+            data(error),
+            json!({
+                "detail": "prompt is too long: 215000 tokens > 200000 maximum",
+                "code": "prompt_too_long",
+            })
+        );
+    }
+
+    #[test]
+    fn unclassified_prose_stays_an_internal_error_with_its_words() {
+        assert_eq!(
+            data(AgentError::provider(None, "something odd happened")),
+            json!({"detail": "something odd happened"})
+        );
     }
 }
