@@ -75,14 +75,23 @@ impl ModelIdentity {
             value.rsplit_once('/').map_or(value, |(_, suffix)| suffix)
         };
         let key = normalized(selected);
+        // The key names the model without its version, which is kept apart: `Claude Haiku 5.5`
+        // and Claude Code's floating `haiku` are one model, and only two stated versions can
+        // tell routes apart. Claude's tiers are named by Claude Code without the family.
+        let unversioned: String = key
+            .chars()
+            .filter(|ch| !ch.is_ascii_digit() && *ch != '.')
+            .collect();
+        let key = match unversioned.as_str() {
+            "default" | "auto" | "automatic" => "automatic".to_owned(),
+            "haiku" | "sonnet" | "opus" | "fable" => format!("claude{unversioned}"),
+            "" => key,
+            _ => unversioned,
+        };
         Self {
-            key: if matches!(key.as_str(), "default" | "auto" | "automatic") {
-                "automatic".into()
-            } else {
-                key
-            },
-            version: version(value),
-            variant: variant(value),
+            key,
+            version: version(value).or_else(|| version(selected)),
+            variant: variant(value).or_else(|| variant(selected)),
         }
     }
 
@@ -256,4 +265,51 @@ pub fn variant(value: &str) -> Option<String> {
         .into_iter()
         .find(|variant| tokens.iter().any(|token| token == variant))
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn one_model_is_one_model_on_every_agent_and_versions_still_tell_models_apart() {
+        let same = |a: (&str, &str), b: (&str, &str)| {
+            ModelIdentity::of(a.0, a.1).is_same_model(&ModelIdentity::of(b.0, b.1))
+        };
+        assert_eq!(
+            [
+                // Claude Code's floating tier and a gateway's versioned id.
+                same(
+                    ("Haiku", "haiku"),
+                    ("Claude Haiku 5.5", "anthropic/claude-haiku-5-5")
+                ),
+                same(
+                    ("Sonnet", "sonnet"),
+                    ("Claude Sonnet 5.5", "claude-sonnet-5-5")
+                ),
+                // The same id behind two providers.
+                same(
+                    ("Claude Haiku 5.5", "anthropic/claude-haiku-5-5"),
+                    ("Claude Haiku 5.5", "opencode/claude-haiku-5-5"),
+                ),
+                same(
+                    ("GPT-6.1 Terra", "gpt-6.1-terra"),
+                    ("GPT-6.1 Terra", "openai/gpt-6.1-terra")
+                ),
+                // Two stated versions, two models; two tiers, two models.
+                same(
+                    ("Claude Opus 5.5", "claude-opus-5-5"),
+                    ("Claude Opus 5", "claude-opus-5")
+                ),
+                same(
+                    ("GPT-6 Astra", "gpt-6-astra"),
+                    ("GPT-6.1 Astra", "gpt-6.1-astra")
+                ),
+                same(("Haiku", "haiku"), ("Sonnet", "sonnet")),
+                same(("Claude Opus 5.5", "opus"), ("Claude Opus 5", "opus")),
+            ],
+            [true, true, true, true, false, false, false, false]
+        );
+    }
 }
