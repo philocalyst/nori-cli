@@ -26,6 +26,7 @@ pub use nori_acp_host::connection;
 pub use user_notification::UserNotification;
 pub use user_notification::UserNotifier;
 pub mod hooks;
+pub mod injected_context;
 pub mod message_history;
 pub(crate) mod normalized;
 pub use nori_acp_host::registry;
