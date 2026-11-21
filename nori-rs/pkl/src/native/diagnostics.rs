@@ -153,8 +153,96 @@ fn declaration_note(frame: &ErrorFrame) -> String {
     format!("\n  declared at {}:{line}:{column}: {text}", frame.module)
 }
 
+/// The byte range, within `value` (a local's initializer), of what raised `message`: the name
+/// that did not resolve, the `throw(...)` call, or the whole initializer.
+fn failing_range(message: &str, value: &str) -> std::ops::Range<usize> {
+    let trimmed = value.trim();
+    let lead = value.len() - value.trim_start().len();
+    let whole = lead..lead + trimmed.len();
+    if let Some(name) = quoted(message, "Cannot find ", '`', '`')
+        && let Some(at) = value.find(name)
+    {
+        return at..at + name.len();
+    }
+    let Some(start) = value.find("throw(") else {
+        return whole;
+    };
+    let mut depth = 0_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in value[start..].char_indices() {
+        match (in_string, character) {
+            (true, _) if escaped => escaped = false,
+            (true, '\\') => escaped = true,
+            (true, '"') => in_string = false,
+            (true, _) => {}
+            (false, '"') => in_string = true,
+            (false, '(') => depth += 1,
+            (false, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return start..start + offset + 1;
+                }
+            }
+            (false, _) => {}
+        }
+    }
+    whole
+}
+
+/// The `local` that raised `message`, with where it was used: an error inside a `local` is
+/// placed at the failing expression in the local, then the property that read the local.
+fn locate_local(evaluator: &pklr::Evaluator, message: &str) -> Option<String> {
+    let locals = evaluator.error_locals(message);
+    let first = locals.first()?;
+    let mut out = String::new();
+    for local in locals.iter().take(3) {
+        let value = local
+            .value
+            .clone()
+            .unwrap_or_else(|| local.declaration.clone());
+        let range = failing_range(message, &local.source[value.clone()]);
+        out.push_str(&excerpt(&Site {
+            module: &local.module,
+            text: &local.source,
+            start: value.start + range.start,
+            end: value.start + range.end,
+        }));
+    }
+    if locals.len() > 3 {
+        out.push_str(&format!(
+            "\n  ... and {} more place(s) that fit",
+            locals.len() - 3
+        ));
+    }
+    out.push_str(&format!("\n  in local `{}`", first.property));
+    let used = evaluator
+        .error_declaration()
+        .filter(|(seen, _)| seen == message)
+        .map(|(_, frame)| frame)
+        .into_iter()
+        .chain(evaluator.error_frames().into_iter().rev())
+        .find(|frame| {
+            !locals
+                .iter()
+                .any(|local| local.module == frame.module && local.declaration == frame.declaration)
+        });
+    if let Some(frame) = used {
+        let (line, column) = line_col(&frame.source, frame.declaration.start);
+        let text = source_line(&frame.source, line).trim();
+        out.push_str(&format!(
+            ", used by `{}` at {}:{line}:{column}: {text}",
+            frame.property, frame.module
+        ));
+    }
+    Some(out)
+}
+
 /// Where in the module text the evaluation error `message` arose, as appended excerpts.
 fn locate_eval(evaluator: &pklr::Evaluator, message: &str, source: &str, file: &str) -> String {
+    if let Some(located) = locate_local(evaluator, message) {
+        return located;
+    }
     let declaration = evaluator
         .error_declaration()
         .filter(|(seen, _)| seen == message)

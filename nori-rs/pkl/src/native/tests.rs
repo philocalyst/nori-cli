@@ -220,3 +220,46 @@ items = (super.items) {
         })
     );
 }
+
+#[test]
+fn an_error_inside_a_local_is_reported_at_the_local() {
+    let base = "module Base\nname: String\nactors: Mapping<String, Dynamic> = new Mapping {}\n";
+    let cases = [
+        (
+            "local x = throw(\"boom\")\nname = x\n",
+            "boom\n  --> repl:text:1:11\n   | local x = throw(\"boom\")\n   |           ^^^^^^^^^^^^^\n  in local `x`",
+        ),
+        (
+            "o {\n  local x: Int(this > 5) = 1\n  name = x\n}\n",
+            "Type constraint `this > 5` violated.\nValue: 1\n  --> repl:text:2:28\n   |   local x: Int(this > 5) = 1\n   |                            ^\n  in local `x`",
+        ),
+        (
+            "local x = nothere + 1\nname = x\n",
+            "Cannot find property `nothere`.\n  --> repl:text:1:11\n   | local x = nothere + 1\n   |           ^^^^^^^\n  in local `x`",
+        ),
+        (
+            "amends \"nori:Base\"\nlocal members = throw(\"boom\")\nname = \"n\"\nactors { for (i, m in members) { [\"m\\(i)\"] { agent = m } } }\n",
+            "boom\n  --> repl:text:2:17\n   | local members = throw(\"boom\")\n   |                 ^^^^^^^^^^^^^\n  in local `members`",
+        ),
+    ];
+    for (source, expected) in cases {
+        let options = EvaluatorOptions::preconfigured().virtual_module("nori:Base", base);
+        let error = evaluate::<serde_json::Value>(source, &options).unwrap_err();
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn a_parameter_default_in_a_mapping_entry_body_is_kept() {
+    let plugin = "open module nori.Plugin\n\
+        class Parameter {\n  description: String = \"\"\n  default: String?\n}\n\
+        class Command {\n  parameters: Mapping<String, Parameter>\n}\n\
+        commands: Mapping<String, Command>\n";
+    let source = "amends \"nori:Plugin\"\ncommands { [\"to\"] { parameters { [\"machine\"] { description = \"d\"; default = \"h1\" } } } }\n";
+    let options = EvaluatorOptions::preconfigured().virtual_module("nori:Plugin", plugin);
+    let value: serde_json::Value = evaluate(source, &options).unwrap();
+    assert_eq!(
+        value["commands"]["to"]["parameters"]["machine"],
+        json!({"description": "d", "default": "h1"})
+    );
+}
