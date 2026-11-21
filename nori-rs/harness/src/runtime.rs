@@ -2222,36 +2222,21 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     break;
                 }
             }
+            let evidence = observe_context_event(&context_timeline, &event).await;
+            // Each event is journaled once, with Nori's observation of it, before the frontend
+            // sees it. A transcript that already holds the history being replayed does not record
+            // it again.
             if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
                 && let Some(recorder) = current_cell(&recorder_cell).read().await.clone()
                 && !(in_replay && recorder.continues_recorded_session())
             {
-                match recorder.record_received_event(&event).await {
+                match recorder.record_received_event(&evidence).await {
                     Ok(Some((start, end))) if is_assistant_chunk && !in_replay => {
                         response_boundary = Some((recorder.session_id().to_owned(), start, end));
                     }
                     Ok(_) => {}
                     Err(error) => {
                         tracing::error!(%error, "failed to record received session event");
-                        break;
-                    }
-                }
-            }
-            let evidence = observe_context_event(&context_timeline, &event).await;
-            // A transcript that already holds the history being replayed does not record it again.
-            if recording_enabled.load(std::sync::atomic::Ordering::Acquire)
-                && let Some(recorder) = current_cell(&recorder_cell).read().await.clone()
-                && !(in_replay && recorder.continues_recorded_session())
-            {
-                match recorder.record_session_event(&evidence).await {
-                    Ok(Some(id)) if is_assistant_chunk && !in_replay => {
-                        if let Some((_, _, end)) = &mut response_boundary {
-                            *end = id;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "failed to record public session event");
                         break;
                     }
                 }
