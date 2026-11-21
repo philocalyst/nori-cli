@@ -70,6 +70,10 @@ pub enum KeyAction {
     OpenTranscript,
     OpenEditor,
     OpenActorPanel,
+    /// Open the action palette (works mid-draft; the draft is kept).
+    Palette,
+    /// `↑` at the top of the composer: walk back to earlier prompts; fixed.
+    WalkBack,
     /// Typing that means something at the start of the composer; fixed.
     ShowKeys,
     ShellMode,
@@ -154,10 +158,26 @@ impl Default for Keymap {
             entries: vec![
                 entry(
                     Composer,
+                    A::Palette,
+                    "composer.palette",
+                    keys(&["alt+x"]),
+                    "actions: model, effort, sessions, settings… (keeps the draft)",
+                    true,
+                ),
+                entry(
+                    Composer,
+                    A::WalkBack,
+                    "composer.walk_back",
+                    Source::Fixed("↑"),
+                    "at the top of the draft: earlier prompts; Enter rewinds there",
+                    true,
+                ),
+                entry(
+                    Composer,
                     A::EnterFocus,
                     "composer.focus_back",
                     keys(&["esc"]),
-                    "interrupt a turn, or step back to the last prompt",
+                    "interrupt a turn, or stop running subagents",
                     true,
                 ),
                 entry(
