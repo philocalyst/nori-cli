@@ -7,9 +7,12 @@
 //! runtime task, and restoring (the only thing that reads the disk or asks git)
 //! runs only when the user asks for `/undo`.
 //!
-//! This is a deliberate reduction from tree snapshots. Edits the agent makes
-//! without reporting a diff (for example through a shell command) are not
-//! reversible, and an undo says so when the turn ran commands.
+//! Edits the agent makes without reporting a diff (for example through a shell command) are not in
+//! that journal. Where the working directory is inside a git work tree, every turn therefore also
+//! records the project's tree before its prompt is sent (see [`tree`] and [`turn_tree`]), and undo
+//! restores from that tree first, so a turn that ran `sed` or `rm` is reverted like one that used
+//! the agent's editor. Without a snapshot (no git, a tree too big to capture, a capture that
+//! failed) the journal alone applies, and an undo says so when the turn ran commands.
 //!
 //! What an edit replaced comes from the agent's report alone, never from reading the file when the
 //! report arrives (the write may already have landed): a diff with `old_text` replaced that text; a
@@ -21,8 +24,12 @@
 //! Undo is non-destructive by construction: whatever it would delete or overwrite is first copied to
 //! `$NORI_HOME/undo-trash` (see [`trash`]), and the result says where.
 
+mod changed_view;
 mod git_head;
 mod trash;
+mod tree;
+mod tree_undo;
+mod turn_tree;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -93,6 +100,7 @@ struct TurnEdits {
     /// without scanning.
     call_index: HashMap<String, usize>,
     ran_commands: bool,
+    trees: turn_tree::TurnTrees,
 }
 
 impl TurnEdits {
@@ -108,7 +116,12 @@ impl TurnEdits {
     }
 
     fn is_undoable(&self) -> bool {
-        !self.calls.is_empty() || self.ran_commands
+        match self.trees.changed() {
+            // The snapshot saw nothing change; only an edit the agent reported can still matter
+            // (to a file the snapshot ignores).
+            Some(changed) => changed || !self.calls.is_empty(),
+            None => !self.calls.is_empty() || self.ran_commands,
+        }
     }
 }
 
@@ -128,6 +141,8 @@ pub struct RestoreReport {
     pub skipped: Vec<(PathBuf, String)>,
     /// Files undo deleted or overwrote, and where their content was kept first.
     pub kept: Vec<(PathBuf, PathBuf)>,
+    /// The paths in `restored` came from the turn snapshot, not from the edit journal.
+    pub from_snapshot: bool,
     pub ran_commands: bool,
 }
 
@@ -136,6 +151,8 @@ pub struct EditJournal {
     turns: Mutex<Vec<TurnEdits>>,
     next_turn_id: std::sync::atomic::AtomicU64,
     trash: UndoTrash,
+    /// The project's tree snapshots; `None` for a journal that keeps only reported edits.
+    snapshots: Option<turn_tree::TurnSnapshots>,
 }
 
 impl Default for EditJournal {
@@ -150,10 +167,10 @@ impl EditJournal {
             turns: Mutex::new(Vec::new()),
             next_turn_id: std::sync::atomic::AtomicU64::new(0),
             trash: UndoTrash::under_nori_home(&uuid::Uuid::new_v4().to_string()),
+            snapshots: None,
         }
     }
 
-    #[cfg(test)]
     fn with_trash(trash: UndoTrash) -> Self {
         Self {
             trash,
@@ -178,6 +195,7 @@ impl EditJournal {
             calls: Vec::new(),
             call_index: HashMap::new(),
             ran_commands: false,
+            trees: turn_tree::TurnTrees::default(),
         });
     }
 
@@ -248,7 +266,10 @@ impl EditJournal {
             .filter(|turn| turn.is_undoable())
             .enumerate()
             .map(|(index, turn)| {
-                let files = turn.touched_paths();
+                let files = match turn.trees.changed_files {
+                    Some(changed) if changed > 0 => changed as usize,
+                    Some(_) | None => turn.touched_paths(),
+                };
                 let short_id = match (files, turn.ran_commands) {
                     (0, _) => "commands only".to_string(),
                     (1, _) => "1 file".to_string(),
@@ -517,6 +538,11 @@ fn restore_turn(turn: &TurnEdits, trash: &UndoTrash) -> RestoreReport {
 
 fn completion_message(label: &str, reports: &[RestoreReport]) -> (bool, String) {
     let restored: usize = reports.iter().map(|report| report.restored.len()).sum();
+    let from_snapshot: usize = reports
+        .iter()
+        .filter(|report| report.from_snapshot)
+        .map(|report| report.restored.len())
+        .sum();
     let skipped: Vec<&(PathBuf, String)> = reports
         .iter()
         .flat_map(|report| report.skipped.iter())
@@ -527,6 +553,17 @@ fn completion_message(label: &str, reports: &[RestoreReport]) -> (bool, String) 
         1 => format!("Undo restored 1 file for \"{label}\"."),
         restored => format!("Undo restored {restored} files for \"{label}\"."),
     };
+    if from_snapshot > 0 {
+        let from_journal = restored - from_snapshot;
+        message.push_str(&match from_journal {
+            0 => format!(
+                "\n{from_snapshot} from the turn snapshot, which also covers what commands changed."
+            ),
+            from_journal => format!(
+                "\n{from_snapshot} from the turn snapshot, {from_journal} from the edit journal."
+            ),
+        });
+    }
     for (path, reason) in &skipped {
         message.push_str(&format!("\nSkipped {}: {reason}.", path.display()));
     }
@@ -608,15 +645,7 @@ pub async fn handle_undo_to(
                 .last()
                 .map(|turn| turn.label.clone())
                 .unwrap_or_default();
-            let trash = journal.trash.clone();
-            match tokio::task::spawn_blocking(move || {
-                trash.prune();
-                turns
-                    .iter()
-                    .map(|turn| restore_turn(turn, &trash))
-                    .collect::<Vec<_>>()
-            })
-            .await
+            match tree_undo::restore(journal.snapshots.as_ref(), journal.trash.clone(), turns).await
             {
                 Ok(reports) => {
                     info!(turns = reports.len(), "Undo restored recorded edits");

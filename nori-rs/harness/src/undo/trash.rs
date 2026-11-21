@@ -32,7 +32,7 @@ impl UndoTrash {
         }
     }
 
-    #[cfg(test)]
+    /// The trash kept at `root`.
     pub(crate) fn at(root: PathBuf) -> Self {
         Self { root: Some(root) }
     }
