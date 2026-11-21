@@ -1,0 +1,20 @@
+[package]
+name = "helix-lsp"
+description = "Async LSP client (client, transport, JSON-RPC) from Helix, vendored for Nori without the editor"
+version = "25.7.1"
+# Upstream's edition: `impl Future` returns must not capture `&self` (see client.rs).
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/helix-editor/helix"
+publish = false
+
+[dependencies]
+helix-lsp-types = { path = "../helix-lsp-types" }
+
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
