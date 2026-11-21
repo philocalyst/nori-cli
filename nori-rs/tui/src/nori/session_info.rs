@@ -94,21 +94,6 @@ pub(crate) struct SessionInfoDisplay {
 }
 
 impl SessionInfoDisplay {
-    pub(crate) fn text(&self) -> String {
-        if self.assignments.is_empty() {
-            return self.header.clone();
-        }
-        format!(
-            "{}\n  {}",
-            self.header,
-            self.assignments
-                .iter()
-                .map(|assignment| format!("{}={}", assignment.name, assignment.value))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-
     /// Whether this reports a failure. Those stay in the history: a toast is gone in seconds, and
     /// an agent-side error must not be missed.
     pub(crate) fn reports_error(&self) -> bool {

@@ -904,7 +904,8 @@ fn nori_connection_status_with_other_metadata_uses_standard_rendering() {
         },
         "vendor": {
             "field": true
-        }
+        },
+        "error": {"message": "temporary overload"}
     })
     .as_object()
     .expect("metadata object")
@@ -944,7 +945,8 @@ fn unknown_session_info_fields_render_types_without_values_in_stable_order() {
                 "count": 7
             },
             "secret": "also-must-not-leak"
-        }
+        },
+        "error": {"message": "temporary overload"}
     })
     .as_object()
     .expect("metadata object")
@@ -996,7 +998,8 @@ fn codex_metadata_from_a_custom_agent_uses_the_unknown_fallback() {
                 "type": "active",
                 "activeFlags": ["waitingOnApproval"]
             }
-        }
+        },
+        "error": {"message": "temporary overload"}
     })
     .as_object()
     .expect("metadata object")
@@ -1036,7 +1039,8 @@ fn malformed_known_codex_fields_use_the_unknown_fallback() {
                 "activeFlags": excessive_flags
             },
             "archived": "must-not-leak"
-        }
+        },
+        "error": {"message": "temporary overload"}
     })
     .as_object()
     .expect("metadata object")
@@ -1068,10 +1072,11 @@ fn session_info_headers_sanitize_and_bound_agent_identity() {
     let generation = chat.session_generation;
     let oversized_version = "v".repeat(500);
     let oversized_name = "n".repeat(100_000);
-    let meta = serde_json::json!({"vendor": {"field": true}})
-        .as_object()
-        .expect("metadata object")
-        .clone();
+    let meta =
+        serde_json::json!({"vendor": {"field": true}, "error": {"message": "temporary overload"}})
+            .as_object()
+            .expect("metadata object")
+            .clone();
 
     chat.handle_session_event(
         generation,
@@ -1111,7 +1116,7 @@ fn deeply_nested_unknown_metadata_stops_at_a_bounded_path() {
     for depth in (0..40).rev() {
         nested = serde_json::json!({format!("level{depth}"): nested});
     }
-    let meta = serde_json::json!({"vendor": nested})
+    let meta = serde_json::json!({"vendor": nested, "error": {"message": "temporary overload"}})
         .as_object()
         .expect("metadata object")
         .clone();
@@ -1129,6 +1134,14 @@ fn deeply_nested_unknown_metadata_stops_at_a_bounded_path() {
     assert!(rendered.contains("=<object>"), "{rendered}");
     assert!(!rendered.contains("level39=<string>"), "{rendered}");
     assert!(!rendered.contains("private-value"), "{rendered}");
+}
+
+/// A session-info update carrying an error, the one kind the transcript shows.
+fn error_metadata() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({"error": {"message": "temporary overload"}})
+        .as_object()
+        .expect("metadata object")
+        .clone()
 }
 
 #[test]
@@ -1150,7 +1163,9 @@ fn replayed_session_info_updates_identify_the_replay_source() {
     chat.handle_session_event(
         generation,
         session_info_update(
-            nori_protocol::acp::v1::SessionInfoUpdate::new().title("Recovered title"),
+            nori_protocol::acp::v1::SessionInfoUpdate::new()
+                .title("Recovered title")
+                .meta(error_metadata()),
         ),
     );
     chat.handle_session_event(
@@ -1176,7 +1191,9 @@ fn replayed_session_info_updates_identify_the_replay_source() {
     chat.handle_session_event(
         generation,
         session_info_update(
-            nori_protocol::acp::v1::SessionInfoUpdate::new().title("Transcript title"),
+            nori_protocol::acp::v1::SessionInfoUpdate::new()
+                .title("Transcript title")
+                .meta(error_metadata()),
         ),
     );
     chat.handle_session_event(
@@ -1191,7 +1208,11 @@ fn replayed_session_info_updates_identify_the_replay_source() {
 
     chat.handle_session_event(
         generation,
-        session_info_update(nori_protocol::acp::v1::SessionInfoUpdate::new().title("Live title")),
+        session_info_update(
+            nori_protocol::acp::v1::SessionInfoUpdate::new()
+                .title("Live title")
+                .meta(error_metadata()),
+        ),
     );
     let live = history_text(&mut rx);
     assert!(
