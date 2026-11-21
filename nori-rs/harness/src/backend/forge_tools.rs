@@ -71,7 +71,7 @@ pub(crate) struct PullRequestRequest {
 #[tool_router(router = forge_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "How this branch (or `branch`) stands on GitHub: its pull request, whether HEAD is pushed, and the checks on the pushed commit, failed and unfinished ones by name. With `logs`, the end of each failed Actions job's log.",
+        description = "How this branch (or `branch`) stands on GitHub: its pull request, whether HEAD is pushed, and the checks on the pushed commit, failed and unfinished ones by name. With `logs`, the end of each failed Actions job's log. A snapshot: to wait for checks, arm `monitor_start` with `source: ci` instead of calling this again.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     pub(crate) async fn ci_status(
@@ -92,7 +92,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Open a pull request from the pushed current branch, or update the open one's title and description. Checks the workflow's pull request rules and may ask the user first. Returns the pull request.",
+        description = "Open a pull request from the pushed current branch, or update the open one's title and description. Push the branch first. Checks the workflow's pull request rules and may ask the user first. Returns the pull request.",
         annotations(
             destructive_hint = false,
             idempotent_hint = false,
