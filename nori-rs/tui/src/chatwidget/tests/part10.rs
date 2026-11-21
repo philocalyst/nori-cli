@@ -1966,8 +1966,8 @@ fn only_the_correlated_successful_prompt_response_completes_the_turn() {
     assert_eq!(next_loop_iteration(&mut rx), Some((4, 10)));
 }
 
-/// A turn that ended in a failure must not also render the generic
-/// "Conversation interrupted" cell — the surfaced error already explains it.
+/// A turn that ended in a failure must not also render the "interrupted" marker: the surfaced
+/// error already explains it.
 #[test]
 fn failure_completion_does_not_add_interrupted_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
@@ -1975,12 +1975,12 @@ fn failure_completion_does_not_add_interrupted_cell() {
     deliver_completion(&mut chat, Some(crate::presentation::TurnFailure::Fatal));
 
     assert!(
-        !history_text(&mut rx).contains("Conversation interrupted"),
+        !history_text(&mut rx).contains("interrupted"),
         "a failure completion should not add the interrupted cell"
     );
 }
 
-/// A genuine user cancellation (no failure) still renders the interrupted cell.
+/// A genuine user cancellation (no failure) still renders the interrupted marker.
 #[test]
 fn user_cancellation_adds_interrupted_cell() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
@@ -1988,7 +1988,7 @@ fn user_cancellation_adds_interrupted_cell() {
     deliver_completion(&mut chat, None);
 
     assert!(
-        history_text(&mut rx).contains("Conversation interrupted"),
+        history_text(&mut rx).contains("▌ interrupted"),
         "a clean user cancellation should add the interrupted cell"
     );
 }

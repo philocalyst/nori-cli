@@ -1,13 +1,12 @@
 ---
 source: tui/src/chatwidget/tests/part8.rs
+assertion_line: 212
 expression: rendered
 ---
-• clue.
+  clue.
 
-⚠ Code Mode is unavailable
+▲ Code Mode is unavailable
 
-────────────────────────────────────────────────────────────────────────────────
+  Nori can continue.
 
-• Nori can continue.
-
-• hello world
+  hello world

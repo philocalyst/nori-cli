@@ -273,7 +273,7 @@ impl ChatWidget {
             self.cancel_loop();
         }
         // A failure already surfaces its own error cell; only a clean user
-        // cancellation shows the generic "interrupted" notice.
+        // cancellation is marked "interrupted".
         let interrupted = completed.stop_reason == nori_protocol::acp::v1::StopReason::Cancelled
             && completed.failure.is_none();
         let has_final_message = completed
@@ -287,13 +287,6 @@ impl ChatWidget {
         self.pending_echoes.clear();
         self.subagents_turn_ended(interrupted);
         self.on_task_complete(completed.last_agent_message);
-        if interrupted {
-            self.push_notice_with_hint(
-                NoticeKind::Info,
-                "Interrupted".to_owned(),
-                Some("tell the model what to do differently".to_owned()),
-            );
-        }
         self.note_turn_end(completed.stop_reason, completed.failure.is_some());
     }
 }

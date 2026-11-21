@@ -160,16 +160,20 @@ impl ChatWidget {
     }
 
     /// Add a cell that is not part of the answer being streamed (a subagent that finished, a
-    /// message between agents, a route change): after the message if one is streaming, now if
-    /// not. A stream is never cut, and never flushed half a word, to make room for one.
+    /// message between agents, a route change): now if nothing is streaming or the answer so far
+    /// ends a paragraph, else after the message. A paragraph is never cut, and never flushed
+    /// half a word, to make room for one.
     pub(in crate::chatwidget) fn add_side_cell(
         &mut self,
         cell: impl crate::history_cell::HistoryCell + 'static,
     ) {
-        if self.stream_controller.is_some() {
-            self.deferred_cells.push(Box::new(cell));
-        } else {
-            self.add_to_history(cell);
+        match &self.stream_controller {
+            Some(stream) if !stream.at_paragraph_end() => self.deferred_cells.push(Box::new(cell)),
+            Some(_) => {
+                self.flush_answer_stream_with_separator();
+                self.add_to_history(cell);
+            }
+            None => self.add_to_history(cell),
         }
     }
 
