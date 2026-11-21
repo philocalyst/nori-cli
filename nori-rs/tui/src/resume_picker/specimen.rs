@@ -31,18 +31,19 @@ fn entry(
         ordinal,
         session_id: format!("session-{ordinal}"),
         project_id: Some("project".to_owned()),
+        local_session_id: Some(format!("session-{ordinal}")),
         title: title.to_owned(),
-        started_at: (chrono::Utc::now() - chrono::Duration::minutes(age_minutes)).to_rfc3339(),
+        agent_titled: false,
+        active_at: (chrono::Utc::now() - chrono::Duration::minutes(age_minutes)).to_rfc3339(),
         agent: Some(agent.to_owned()),
         model: Some(model.to_owned()),
         branch: Some(branch.to_owned()),
         cwd: Some("/Users/dev/Projects/nori-cli".to_owned()),
         user_turns: Some(turns),
+        moved_to: None,
         revision: 0,
-        delegated: false,
-        parent: None,
         hidden: false,
-        guides: String::new(),
+        current: false,
         action: ResumeAction::StartFresh,
     }
 }
@@ -75,7 +76,7 @@ fn digest_turns() -> SessionDigest {
             branch: Some("instant-core".to_owned()),
             title: None,
             user_turns: 2,
-            acp_session_id: None,
+            acp_session_ids: Vec::new(),
             delegated: false,
             source: SourceStamp {
                 len: 0,
@@ -197,7 +198,14 @@ pub fn resume_specimen(width: u16, height: u16, query: &str) -> String {
 
 impl ResumeOverlay {
     pub(super) fn specimen(entries: Vec<ResumeEntry>) -> Self {
-        Self::build(entries, None, false, "Sessions")
+        Self::build(
+            entries,
+            None,
+            false,
+            "Sessions",
+            None,
+            "No sessions recorded yet.".to_owned(),
+        )
     }
 
     pub(super) fn specimen_query(&mut self, query: &str, hits: Vec<(i64, usize, &str)>) {

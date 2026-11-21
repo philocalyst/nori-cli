@@ -14,10 +14,20 @@ impl App {
                 nori_home,
                 target,
             } => {
-                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new_sessions(
-                    crate::resume_picker::helix_overlay::SessionPurpose::Reference { target },
-                    sessions,
-                    nori_home,
+                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new(
+                    crate::resume_picker::helix_overlay::ResumeSetup {
+                        purpose: crate::resume_picker::helix_overlay::SessionPurpose::Reference {
+                            target,
+                        },
+                        nori_home,
+                        sessions,
+                        agent_sessions: Vec::new(),
+                        current: None,
+                        offer_new: false,
+                        cancel_candidate_on_dismiss: false,
+                        scope: "this project".to_owned(),
+                        widen: None,
+                    },
                 );
                 let _ = tui.set_mouse_capture(true);
                 self.overlay = Some(Overlay::Resume(Box::new(overlay)));
@@ -48,46 +58,6 @@ impl App {
                         self.chat_widget.restore_composer_draft(draft);
                     }
                 }
-            }
-            AppEvent::ShowViewonlySessionPicker {
-                sessions,
-                nori_home,
-            } => {
-                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new_sessions(
-                    crate::resume_picker::helix_overlay::SessionPurpose::ViewOnly,
-                    sessions.into_iter().map(|info| (info, None)).collect(),
-                    nori_home,
-                );
-                let _ = tui.set_mouse_capture(true);
-                self.overlay = Some(Overlay::Resume(Box::new(overlay)));
-                tui.frame_requester().schedule_frame();
-            }
-            AppEvent::LoadViewonlyTranscript {
-                nori_home,
-                project_id,
-                session_id,
-            } => {
-                let tx = self.app_event_tx.clone();
-                tokio::spawn(async move {
-                    let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-                    match loader.load_transcript(&project_id, &session_id).await {
-                        Ok(transcript) => {
-                            let entries =
-                                crate::viewonly_transcript::transcript_to_entries(&transcript);
-                            tx.send(AppEvent::DisplayViewonlyTranscript { entries });
-                        }
-                        Err(e) => {
-                            tx.send(AppEvent::InsertHistoryCell(Box::new(
-                                crate::history_cell::new_error_event(format!(
-                                    "Failed to load transcript: {e}"
-                                )),
-                            )));
-                        }
-                    }
-                });
-            }
-            AppEvent::DisplayViewonlyTranscript { entries } => {
-                self.display_viewonly_transcript(entries);
             }
             AppEvent::ShowChoicePicker(spec) => {
                 let overlay =

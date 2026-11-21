@@ -14,6 +14,7 @@ use nori_tui_components::Theme;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 
+use super::SessionPickerInfo;
 use super::helix_entry::ResumeEntry;
 use super::preview;
 use crate::tui::FrameRequester;
@@ -27,6 +28,11 @@ pub(super) enum Message {
         hits: Vec<SessionHit>,
     },
     Preview(Preview<i64>),
+    /// The sessions of the scope that was switched to, loaded off the UI thread.
+    Rows {
+        all_chats: bool,
+        sessions: Vec<SessionPickerInfo>,
+    },
 }
 
 pub(super) struct Search {
@@ -130,7 +136,9 @@ impl Background {
         let _ = self.search.send(Some(search));
     }
 
-    /// Build the preview of `entry` for `request` on a blocking task.
+    /// Build the preview of `entry` for `request` on a blocking task. A session that is not
+    /// indexed yet is indexed now, ahead of the rest: the preview says so meanwhile, and its
+    /// row's new header asks for the preview again once it is.
     pub(super) fn load_preview(
         &self,
         request: PreviewRequest<i64>,
@@ -138,13 +146,32 @@ impl Background {
         theme: Theme,
     ) {
         let (index, tx, frames) = (self.index.clone(), self.tx.clone(), self.frames.clone());
-        tokio::task::spawn_blocking(move || {
-            let digest = entry
-                .project_id
-                .as_deref()
-                .and_then(|project| index.digest(project, &entry.session_id));
+        tokio::spawn(async move {
+            let ids = entry.project_id.clone().zip(entry.local_session_id.clone());
+            let read = index.clone();
+            let lookup = ids.clone();
+            let digest = tokio::task::spawn_blocking(move || {
+                lookup.and_then(|(project, session)| read.digest(&project, &session))
+            })
+            .await
+            .ok()
+            .flatten();
             let built = preview::from_digest(&request, &entry, digest.as_ref(), &theme);
             let _ = tx.send(Message::Preview(built));
+            frames.schedule_frame();
+            let (None, Some((project, session))) = (digest, ids) else {
+                return;
+            };
+            if !matches!(index.sync_session(&project, &session).await, Ok(true)) {
+                return;
+            }
+            let headers = tokio::task::spawn_blocking(move || index.headers())
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|header| header.session_id == session)
+                .collect();
+            let _ = tx.send(Message::Headers(headers));
             frames.schedule_frame();
         });
     }

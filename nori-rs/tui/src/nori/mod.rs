@@ -12,7 +12,6 @@ pub(crate) mod git_commit;
 pub(crate) mod onboarding;
 pub(crate) mod providers_panel;
 pub(crate) mod reference_session_picker;
-pub(crate) mod resume_session_picker;
 pub(crate) mod session_config_mode;
 pub(crate) mod session_config_picker;
 pub(crate) mod session_header;

@@ -9,27 +9,32 @@ impl App {
         event: AppEvent,
     ) -> Result<bool> {
         match event {
-            AppEvent::ShowResumeSessionPicker {
-                sessions,
-                nori_home,
-            } => {
-                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new_local(
-                    sessions, nori_home,
-                );
+            AppEvent::ShowResumeSessionPicker(setup) => {
+                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new(*setup);
                 let _ = tui.set_mouse_capture(true);
                 self.overlay = Some(Overlay::Resume(Box::new(overlay)));
+                crate::latency::settle(crate::latency::Interaction::PickerOpen);
                 tui.frame_requester().schedule_frame();
             }
-            AppEvent::ShowHelixAcpResumePicker {
-                sessions,
-                cancel_candidate_on_dismiss,
-            } => {
-                let overlay = crate::resume_picker::helix_overlay::ResumeOverlay::new_acp(
-                    sessions,
-                    cancel_candidate_on_dismiss,
-                );
-                let _ = tui.set_mouse_capture(true);
-                self.overlay = Some(Overlay::Resume(Box::new(overlay)));
+            AppEvent::ResumePickerAgentSessions(sessions) => {
+                if let Some(Overlay::Resume(resume)) = &mut self.overlay {
+                    resume.add_agent_sessions(&sessions);
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            AppEvent::ResumeSession {
+                nori_home,
+                project_id,
+                session_id,
+            } if nori_harness::portable::moved_to(&nori_home, &project_id, &session_id)
+                .is_some() =>
+            {
+                // It continues on the machine it moved to: go there rather than split it here.
+                if let Some(moved) =
+                    nori_harness::portable::moved_to(&nori_home, &project_id, &session_id)
+                {
+                    self.follow_moved(moved, session_id);
+                }
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::ResumeSession {
@@ -39,6 +44,7 @@ impl App {
             } => {
                 // Reading and parsing a long transcript must not hold up the UI: it loads on a
                 // task and the resume continues when it arrives.
+                crate::latency::begin(crate::latency::Interaction::Resume, false);
                 self.chat_widget
                     .add_info_message("Loading session…".to_string(), None);
                 let tx = self.app_event_tx.clone();
@@ -50,7 +56,11 @@ impl App {
                         .await;
                     let transcript = match allowed {
                         Ok(()) => loader
-                            .load_transcript(&project_id, &session_id)
+                            .load_transcript_tail(
+                                &project_id,
+                                &session_id,
+                                nori_harness::transcript::RESUME_TAIL_BYTES,
+                            )
                             .await
                             .map(Box::new)
                             .map_err(|error| error.to_string()),
@@ -63,6 +73,7 @@ impl App {
             AppEvent::ResumeTranscriptLoaded { transcript } => match transcript {
                 Ok(transcript) => {
                     let transcript = *transcript;
+                    self.resume_left_out = transcript.left_out();
                     let acp_session_id = transcript.latest_acp_session_id();
                     let display_name =
                         crate::nori::agent_picker::get_agent_info(&self.config.active_agent)
@@ -144,6 +155,7 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
                 Err(error) => {
+                    crate::latency::abandon(crate::latency::Interaction::Resume);
                     self.chat_widget
                         .add_error_message(format!("Failed to load session transcript: {error}"));
                     // A resume chosen at startup falls back to a fresh session.

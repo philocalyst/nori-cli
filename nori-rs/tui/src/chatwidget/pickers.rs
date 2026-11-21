@@ -2,6 +2,11 @@ use super::*;
 
 impl ChatWidget {
     pub(crate) fn open_providers_popup(&mut self) {
+        // Whether each account is signed in is asked of its own login while the panel is open.
+        crate::nori::providers_panel::begin_checks(
+            &self.app_event_tx,
+            self.frame_requester.clone(),
+        );
         self.app_event_tx.send(AppEvent::ShowChoicePicker(Box::new(
             crate::nori::providers_panel::spec(&self.config.nori_home, &self.config.active_agent),
         )));
@@ -11,19 +16,6 @@ impl ChatWidget {
         let mut params = crate::nori::agent_picker::provider_picker_params();
         params.subtitle = Some(error.to_string());
         self.bottom_pane.show_selection_view(params);
-    }
-
-    pub(crate) fn set_acp_wire_recording_enabled(&mut self, enabled: bool) {
-        self.bottom_pane.set_acp_wire_recording_enabled(enabled);
-    }
-
-    pub(crate) fn replace_agent_popup(&mut self, recording_enabled: bool) {
-        if !self.bottom_pane.has_active_view() {
-            return;
-        }
-        let _ = recording_enabled;
-        let params = crate::nori::agent_picker::provider_picker_params();
-        self.bottom_pane.replace_selection_view(params);
     }
 
     /// Show a selection view in the bottom pane.
@@ -55,187 +47,84 @@ impl ChatWidget {
         });
     }
 
-    /// Open the viewonly session picker to select a previous session to view.
-    pub(crate) fn open_viewonly_session_picker(&mut self) {
-        let cwd = self.config.cwd.clone();
-        let tx = self.app_event_tx.clone();
-
-        // Get NORI_HOME - if not available, show error
-        let nori_home = self.config.nori_home.clone();
-
-        let nori_home_for_event = nori_home.clone();
-        tokio::spawn(async move {
-            let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-            match loader.find_session_metadata_for_cwd(&cwd).await {
-                Ok(metadata) => {
-                    let sessions: Vec<crate::resume_picker::SessionPickerInfo> = metadata
-                        .into_iter()
-                        .map(crate::resume_picker::SessionPickerInfo::from)
-                        .collect();
-                    if sessions.is_empty() {
-                        tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
-                            crate::history_cell::new_error_event(
-                                "No previous sessions found for this project.".to_string(),
-                            ),
-                        )));
-                    } else {
-                        tx.send(crate::app_event::AppEvent::ShowViewonlySessionPicker {
-                            sessions,
-                            nori_home: nori_home_for_event,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
-                        crate::history_cell::new_error_event(format!(
-                            "Failed to load sessions: {e}"
-                        )),
-                    )));
-                }
-            }
-        });
-    }
-
+    /// `/resume`: one list of this project's recorded sessions of the active agent and the
+    /// sessions the agent itself lists that Nori has no record of. Every row resumes into a
+    /// live session.
     pub(crate) fn open_resume_session_picker(&mut self) {
         let Some(handle) = self.harness_handle.clone() else {
             self.app_event_tx
                 .send(crate::app_event::AppEvent::OpenAgentSessionPicker);
             return;
         };
-        // When the live agent advertises ACP `session/list`, source the picker
-        // from the agent itself (and resume over ACP) instead of the local
-        // transcript store. Resuming a listed session goes over ACP via
-        // `session/load` (history replay) or `session/resume` (live reattach),
-        // so the agent must advertise at least one of the two; without either,
-        // fall back to the local-transcript picker.
-        if self.session_agent_capabilities.session_list
+        // The agent's own sessions are offered when it advertises ACP `session/list` and can
+        // reopen a listed session (`session/load` or `session/resume`).
+        let lists_sessions = self.session_agent_capabilities.session_list
             && (self.session_agent_capabilities.load_session
-                || self.session_agent_capabilities.session_resume)
-        {
-            let cwd = self.config.cwd.clone();
-            let tx = self.app_event_tx.clone();
-            tokio::spawn(async move {
-                match handle.list_sessions(cwd).await {
-                    // An empty list still opens the picker: the pinned
-                    // "Start a new session" row is the entry point.
-                    Ok(sessions) => {
-                        tx.send(crate::app_event::AppEvent::ShowHelixAcpResumePicker {
-                            sessions,
-                            cancel_candidate_on_dismiss: false,
-                        });
-                    }
-                    Err(e) => {
-                        tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
-                            crate::history_cell::new_error_event(format!(
-                                "Failed to list sessions from the agent: {e}"
-                            )),
-                        )));
-                    }
-                }
-            });
-            return;
-        }
-
-        self.open_local_resume_session_picker();
-    }
-
-    pub(crate) fn open_local_resume_session_picker(&mut self) {
-        let started = std::time::Instant::now();
+                || self.session_agent_capabilities.session_resume);
         let cwd = self.config.cwd.clone();
         let tx = self.app_event_tx.clone();
-        let model = self.config.active_agent.clone();
-
-        tracing::info!(
-            target: "nori_resume",
-            phase = "open_resume_session_picker.start",
-            cwd = %cwd.display(),
-            agent = %model,
-            "starting /resume pre-picker session load",
-        );
-
-        let nori_home = self.config.nori_home.clone();
-
-        tracing::info!(
-            target: "nori_resume",
-            phase = "open_resume_session_picker.nori_home_resolved",
-            elapsed_ms = started.elapsed().as_millis(),
-            nori_home = %nori_home.display(),
-            "resolved NORI_HOME for /resume picker",
-        );
-
-        let nori_home_for_event = nori_home.clone();
-        tokio::spawn(async move {
-            let task_started = std::time::Instant::now();
-            tracing::info!(
-                target: "nori_resume",
-                phase = "open_resume_session_picker.load_task.start",
-                cwd = %cwd.display(),
-                agent = %model,
-                nori_home = %nori_home.display(),
-                "spawned /resume pre-picker load task",
-            );
-            match crate::nori::resume_session_picker::load_resumable_sessions(
-                &nori_home, &cwd, &model,
-            )
-            .await
-            {
-                Ok(sessions) => {
-                    tracing::info!(
-                        target: "nori_resume",
-                        phase = "open_resume_session_picker.load_task.loaded",
-                        elapsed_ms = task_started.elapsed().as_millis(),
-                        session_count = sessions.len(),
-                        "loaded resumable sessions for /resume picker",
-                    );
-                    if sessions.is_empty() {
-                        tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
-                            crate::history_cell::new_error_event(
-                                "No resumable sessions found for this project and agent."
-                                    .to_string(),
-                            ),
-                        )));
-                    } else {
-                        tx.send(crate::app_event::AppEvent::ShowResumeSessionPicker {
-                            sessions,
-                            nori_home: nori_home_for_event,
-                        });
-                        tracing::info!(
-                            target: "nori_resume",
-                            phase = "open_resume_session_picker.load_task.event_sent",
-                            elapsed_ms = task_started.elapsed().as_millis(),
-                            "sent ShowResumeSessionPicker event",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "nori_resume",
-                        phase = "open_resume_session_picker.load_task.error",
-                        elapsed_ms = task_started.elapsed().as_millis(),
-                        error = %e,
-                        "failed to load resumable sessions for /resume picker",
-                    );
-                    tx.send(crate::app_event::AppEvent::InsertHistoryCell(Box::new(
-                        crate::history_cell::new_error_event(format!(
-                            "Failed to load sessions: {e}"
-                        )),
-                    )));
+        let request = self.resume_picker_request();
+        // The records and the agent's listing are read at once; the picker opens with the
+        // records and takes the agent's sessions when they come.
+        let agent_listing = async move {
+            if !lists_sessions {
+                return Vec::new();
+            }
+            match handle.list_sessions(cwd).await {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    // The records are still worth listing.
+                    tracing::warn!("The agent could not list its sessions: {error}");
+                    Vec::new()
                 }
             }
-        });
+        };
+        crate::latency::begin(crate::latency::Interaction::PickerOpen, false);
+        tokio::spawn(request.send_with_agent_listing(tx, agent_listing));
     }
 
-    /// Show the resume picker populated from the agent's ACP `session/list`.
-    pub(crate) fn show_acp_resume_session_picker(
+    fn resume_picker_request(&self) -> crate::resume_picker::load::ResumeRequest {
+        crate::resume_picker::load::ResumeRequest {
+            nori_home: self.config.nori_home.clone(),
+            cwd: self.config.cwd.clone(),
+            agent: self.config.active_agent.clone(),
+            current: self.conversation_id().map(|id| id.to_string()),
+        }
+    }
+
+    /// Show the resume picker over this project's records of the active agent's sessions and
+    /// `agent_sessions`, the ones the agent lists.
+    pub(crate) fn show_resume_picker(
+        &mut self,
+        agent_sessions: Vec<nori_protocol::acp::v1::SessionInfo>,
+    ) {
+        let request = self.resume_picker_request();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move { request.send(tx, agent_sessions).await });
+    }
+
+    /// Show the resume picker over only the sessions an agent lists, with "start a new
+    /// session" above them: the agent is not this session's (a candidate being switched to, or
+    /// a cloud broker), so Nori's records of other agents' sessions do not apply.
+    pub(crate) fn show_agent_session_picker(
         &mut self,
         sessions: Vec<nori_protocol::acp::v1::SessionInfo>,
         cancel_candidate_on_dismiss: bool,
     ) {
         self.app_event_tx
-            .send(crate::app_event::AppEvent::ShowHelixAcpResumePicker {
-                sessions,
-                cancel_candidate_on_dismiss,
-            });
+            .send(crate::app_event::AppEvent::ShowResumeSessionPicker(
+                Box::new(crate::resume_picker::helix_overlay::ResumeSetup {
+                    purpose: crate::resume_picker::helix_overlay::SessionPurpose::Resume,
+                    nori_home: self.config.nori_home.clone(),
+                    sessions: Vec::new(),
+                    agent_sessions: sessions,
+                    current: None,
+                    offer_new: true,
+                    cancel_candidate_on_dismiss,
+                    scope: format!("{} sessions", self.config.active_agent),
+                    widen: None,
+                }),
+            ));
     }
 
     /// Open the Nori CLI settings popup, optionally selecting `focus`'s row.
@@ -797,17 +686,22 @@ impl ChatWidget {
         config_id: String,
         value: String,
         option_name: String,
-        value_name: String,
         is_custom_model: bool,
         origin: crate::nori::session_config_picker::ConfigPickerOrigin,
         route_token: Option<i64>,
     ) {
         if let Some(handle) = self.harness_handle.clone() {
+            if matches!(
+                origin,
+                crate::nori::session_config_picker::ConfigPickerOrigin::Direct
+                    | crate::nori::session_config_picker::ConfigPickerOrigin::Panel
+            ) {
+                self.show_chosen_option(&config_id, &value);
+            }
             let app_event_tx = self.app_event_tx.clone();
             let generation = self.acp_mode_config_generation;
             let agent = self.config.active_agent.clone();
             let option_name_for_result = option_name;
-            let value_name_for_result = value_name;
             let config_id_for_result = config_id.clone();
             let value_for_result = value.clone();
             tokio::spawn(async move {
@@ -839,7 +733,6 @@ impl ChatWidget {
                             config_id: config_id_for_result,
                             value: value_for_result,
                             option_name: option_name_for_result,
-                            value_name: value_name_for_result,
                             is_custom_model,
                             origin,
                             config_options: Some(config_options),
@@ -855,7 +748,6 @@ impl ChatWidget {
                             config_id: config_id_for_result,
                             value: value_for_result,
                             option_name: option_name_for_result,
-                            value_name: value_name_for_result,
                             is_custom_model,
                             origin,
                             config_options: None,

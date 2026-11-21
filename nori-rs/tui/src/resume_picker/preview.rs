@@ -13,6 +13,9 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 
 use super::helix_entry::ResumeEntry;
+use super::place::clip_left;
+use super::place::is_here;
+use super::place::shorten_home;
 use crate::helix_picker::clip;
 use crate::render::bash_highlight::highlight_bash_spans;
 
@@ -21,31 +24,39 @@ const MAX_TURNS: usize = 2000;
 /// Lines of a tool's output shown under it.
 const OUTPUT_PREVIEW_LINES: usize = 3;
 
-pub(super) fn title_line(entry: &ResumeEntry, theme: &Theme) -> Line<'static> {
-    let mut parts: Vec<String> = Vec::new();
-    // The directory is news only when it is not the one Nori runs in.
-    let here = std::env::current_dir().ok();
-    parts.extend(
-        entry
-            .cwd
-            .as_deref()
-            .filter(|cwd| here.as_deref() != Some(std::path::Path::new(cwd)))
-            .map(shorten_home),
-    );
-    parts.extend(entry.agent.clone());
-    parts.extend(entry.model.clone());
-    Line::from(Span::styled(parts.join(" · "), theme.text_secondary))
+/// The preview's title: where the session ran when that is not here (its end kept, as it is
+/// what differs), then the agent and model. `width` is the pane's, of which the hit counter takes
+/// the right edge.
+pub(super) fn title_line(entry: &ResumeEntry, width: u16, theme: &Theme) -> Line<'static> {
+    let rest = [entry.agent.as_deref(), entry.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let place = entry
+        .cwd
+        .as_deref()
+        .filter(|cwd| !is_here(cwd))
+        .map(shorten_home);
+    let text = match place {
+        Some(place) => {
+            let room = usize::from(width)
+                .saturating_sub(HIT_COUNTER_WIDTH)
+                .saturating_sub(if rest.is_empty() { 0 } else { rest.len() + 3 });
+            let place = clip_left(&place, room);
+            if rest.is_empty() {
+                place
+            } else {
+                format!("{place} · {rest}")
+            }
+        }
+        None => rest,
+    };
+    Line::from(Span::styled(text, theme.text_secondary))
 }
 
-fn shorten_home(path: &str) -> String {
-    match dirs::home_dir() {
-        Some(home) => match path.strip_prefix(home.to_string_lossy().as_ref()) {
-            Some(rest) => format!("~{rest}"),
-            None => path.to_owned(),
-        },
-        None => path.to_owned(),
-    }
-}
+/// Columns at the right of the preview's title the hit counter (`Hit 12/34`) may take.
+const HIT_COUNTER_WIDTH: usize = 12;
 
 /// The preview of a digest, wrapped to the request's width.
 pub(super) fn from_digest(
@@ -76,7 +87,7 @@ pub(super) fn from_digest(
     }
     request.answer(
         entry.revision,
-        title_line(entry, theme),
+        title_line(entry, request.width, theme),
         lines,
         PreviewAnchor::FirstMatch,
     )
@@ -107,14 +118,14 @@ pub(super) fn from_entry(
         if let Some(cwd) = &entry.cwd {
             lines.push(fact("Directory", &shorten_home(cwd)));
         }
-        if !entry.started_at.is_empty() {
-            lines.push(fact("Updated", &entry.started_at));
+        if !entry.active_at.is_empty() {
+            lines.push(fact("Updated", &entry.active_at));
         }
         lines.push(fact("Session", &entry.session_id));
     }
     request.answer(
         entry.revision,
-        title_line(entry, theme),
+        title_line(entry, request.width, theme),
         lines,
         PreviewAnchor::Top,
     )

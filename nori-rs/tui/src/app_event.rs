@@ -643,10 +643,9 @@ pub(crate) enum AppEvent {
         result: Result<String, String>,
     },
 
-    /// Show searchable past conversations for insertion into the draft; each session comes
-    /// with the agent that recorded it.
+    /// Show searchable past conversations for insertion into the draft.
     ShowReferenceSessionPicker {
-        sessions: Vec<(crate::resume_picker::SessionPickerInfo, Option<String>)>,
+        sessions: Vec<crate::resume_picker::SessionPickerInfo>,
         nori_home: PathBuf,
         target: crate::subagent_switcher::Target,
     },
@@ -665,38 +664,18 @@ pub(crate) enum AppEvent {
         target: crate::subagent_switcher::Target,
     },
 
-    /// Show the viewonly session picker with loaded sessions.
-    ShowViewonlySessionPicker {
-        /// The loaded session metadata for the picker
-        sessions: Vec<crate::resume_picker::SessionPickerInfo>,
-        /// The NORI_HOME path for loading transcripts
-        nori_home: PathBuf,
+    /// Show the resume picker: one list of the recorded sessions and the sessions the agent
+    /// lists that Nori has no record of. The picker fills its rows and searches full text from
+    /// the on-disk index by itself.
+    ShowResumeSessionPicker(Box<crate::resume_picker::helix_overlay::ResumeSetup>),
+    /// A candidate agent's model, effort and binding were put in place (or were not): take it.
+    CandidateCommitted {
+        generation: SessionGeneration,
+        started: Box<nori_protocol::SessionStarted>,
+        outcome: crate::app::candidate_commit::CommitOutcome,
     },
-
-    /// Load and display a transcript in view-only mode.
-    LoadViewonlyTranscript {
-        /// The NORI_HOME path
-        nori_home: PathBuf,
-        /// Project identifier
-        project_id: String,
-        /// Session identifier
-        session_id: String,
-    },
-
-    /// Display a loaded transcript in the history view.
-    DisplayViewonlyTranscript {
-        /// The transcript entries to display
-        entries: Vec<crate::viewonly_transcript::ViewonlyEntry>,
-    },
-
-    /// Show the resume session picker over the transcripts of this `NORI_HOME`. The picker
-    /// fills its rows and searches full text from the on-disk index by itself.
-    ShowResumeSessionPicker {
-        /// The loaded session metadata for the picker
-        sessions: Vec<crate::resume_picker::SessionPickerInfo>,
-        /// The NORI_HOME path
-        nori_home: PathBuf,
-    },
+    /// The agent's own sessions, listed after the resume picker opened without them.
+    ResumePickerAgentSessions(Vec<nori_protocol::acp::v1::SessionInfo>),
 
     /// Resume a previous session via ACP session/load or client-side replay.
     ResumeSession {
@@ -711,13 +690,6 @@ pub(crate) enum AppEvent {
     /// The transcript of a session being resumed finished loading.
     ResumeTranscriptLoaded {
         transcript: Result<Box<nori_harness::transcript::Transcript>, String>,
-    },
-
-    /// Show the resume session picker sourced from the live agent's ACP
-    /// `session/list` rather than the local transcript store.
-    ShowHelixAcpResumePicker {
-        sessions: Vec<nori_protocol::acp::v1::SessionInfo>,
-        cancel_candidate_on_dismiss: bool,
     },
 
     /// Resume a session reported by the agent's `session/list`, via

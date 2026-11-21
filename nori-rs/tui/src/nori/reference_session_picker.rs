@@ -4,25 +4,17 @@
 
 use std::path::Path;
 
-use nori_harness::transcript::TranscriptLoader;
+use nori_harness::session_index::DigestTurn;
+use nori_harness::session_index::TurnRole;
 
 use crate::resume_picker::SessionPickerInfo;
 
-/// The sessions of this project, each with the agent that recorded it.
-pub(crate) async fn load(
-    nori_home: &Path,
-    cwd: &Path,
-) -> std::io::Result<Vec<(SessionPickerInfo, Option<String>)>> {
-    let metadata = TranscriptLoader::new(nori_home.to_path_buf())
-        .find_session_metadata_for_cwd(cwd)
-        .await?;
-    Ok(metadata
-        .into_iter()
-        .map(|item| {
-            let agent = item.agent.clone();
-            (SessionPickerInfo::from(item), agent)
-        })
-        .collect())
+/// The sessions of this project, each with the agent that recorded it, most recently active
+/// first.
+pub(crate) async fn load(nori_home: &Path, cwd: &Path) -> std::io::Result<Vec<SessionPickerInfo>> {
+    Ok(crate::resume_picker::load::load(nori_home, Some(cwd), None)
+        .await?
+        .sessions)
 }
 
 /// Include a bounded, explicitly labelled tail of actual user and assistant messages.
@@ -30,29 +22,19 @@ pub(crate) fn format_reference(
     project_id: &str,
     session_id: &str,
     agent: &str,
-    transcript: &nori_harness::transcript::Transcript,
+    turns: &[DigestTurn],
 ) -> String {
-    let entries = crate::viewonly_transcript::transcript_to_entries(transcript);
-    format_reference_entries(project_id, session_id, agent, &entries)
-}
-
-fn format_reference_entries(
-    project_id: &str,
-    session_id: &str,
-    agent: &str,
-    entries: &[crate::viewonly_transcript::ViewonlyEntry],
-) -> String {
-    use crate::viewonly_transcript::ViewonlyEntry;
     const MAX_CHARS: usize = 12_000;
     let mut remaining = MAX_CHARS;
     let mut parts = Vec::new();
     let mut truncated = false;
-    for entry in entries.iter().rev() {
-        let (role, content) = match entry {
-            ViewonlyEntry::User { content } => ("User", content),
-            ViewonlyEntry::Assistant { content } => ("Assistant", content),
-            ViewonlyEntry::Thinking { .. } | ViewonlyEntry::Info { .. } => continue,
+    for turn in turns.iter().rev() {
+        let role = match turn.role {
+            TurnRole::User => "User",
+            TurnRole::Assistant => "Assistant",
+            TurnRole::Tool => continue,
         };
+        let content = &turn.text;
         if remaining == 0 {
             truncated = true;
             break;
@@ -90,16 +72,17 @@ mod tests {
 
     #[test]
     fn reference_contains_bounded_actual_conversation_tail() {
-        use crate::viewonly_transcript::ViewonlyEntry;
-        let entries = vec![
-            ViewonlyEntry::User {
-                content: "earlier question".to_owned(),
-            },
-            ViewonlyEntry::Assistant {
-                content: "é".repeat(12_005),
-            },
+        let turn = |role, text: String| DigestTurn {
+            role,
+            text,
+            command: None,
+            output: None,
+        };
+        let turns = vec![
+            turn(TurnRole::User, "earlier question".to_owned()),
+            turn(TurnRole::Assistant, "é".repeat(12_005)),
         ];
-        let text = format_reference_entries("p", "s", "codex", &entries);
+        let text = format_reference("p", "s", "codex", &turns);
         assert!(text.starts_with("@session[project=p, id=s, agent=codex]\n--- Conversation excerpt (earlier content omitted) ---\nAssistant: "));
         assert!(!text.contains("earlier question"));
         assert_eq!(text.matches('é').count(), 12_000);

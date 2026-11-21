@@ -1,16 +1,16 @@
 //! `/resume`: pick a recorded session. One Helix picker ([`helix_overlay::ResumeOverlay`]) over
-//! the sessions of a project, searched by fuzzy fields and by full text from the on-disk index
-//! (see `nori_harness::session_index`), with a preview of the selected conversation.
+//! the sessions of a project, most recently active first, searched by fuzzy fields and by full
+//! text from the on-disk index (see `nori_harness::session_index`), with a preview of the
+//! selected conversation. Every row resumes into a live session.
 //!
 //! [`run_resume_picker`] hosts the picker before the app starts (`nori resume`); inside the app
-//! the same overlay is shown by the app's overlay machinery.
+//! the same overlay is shown by the app's overlay machinery. [`load`] reads the rows.
 
 use std::path::Path;
 use std::path::PathBuf;
 
 use color_eyre::eyre::Result;
 use nori_harness::transcript::SessionMetadata;
-use nori_harness::transcript::TranscriptLoader;
 use tokio_stream::StreamExt;
 
 use crate::tui::Tui;
@@ -18,6 +18,8 @@ use crate::tui::Tui;
 mod background;
 mod helix_entry;
 pub(crate) mod helix_overlay;
+pub(crate) mod load;
+mod place;
 mod preview;
 #[cfg(feature = "storybook")]
 pub mod specimen;
@@ -29,12 +31,19 @@ pub struct SessionPickerInfo {
     pub project_id: String,
     /// When the session started (ISO 8601).
     pub started_at: String,
+    /// When anything was last recorded in it (ISO 8601): what rows are ordered and dated by.
+    pub last_active_at: String,
+    /// The agent (and so the account) that recorded it, as its slug.
+    pub agent: Option<String>,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub branch: Option<String>,
+    /// What it was about, once the index has read it.
+    pub title: Option<String>,
     /// Exact number of user turns, once known.
-    pub user_turn_count: Option<usize>,
-    /// The first user message, once known.
-    pub first_message_preview: Option<String>,
-    /// A delegated child: shown under its parent, never opened on its own.
-    pub delegated: bool,
+    pub user_turn_count: Option<i64>,
+    /// The machine it moved to, when it left this home.
+    pub moved_to: Option<String>,
 }
 
 impl From<SessionMetadata> for SessionPickerInfo {
@@ -43,9 +52,14 @@ impl From<SessionMetadata> for SessionPickerInfo {
             session_id: session.session_id,
             project_id: session.project_id,
             started_at: session.started_at,
+            last_active_at: session.last_active_at,
+            agent: session.agent,
+            cwd: Some(session.cwd.display().to_string()),
+            model: None,
+            branch: None,
+            title: None,
             user_turn_count: None,
-            first_message_preview: None,
-            delegated: session.delegated,
+            moved_to: None,
         }
     }
 }
@@ -62,66 +76,60 @@ pub struct ResumeTarget {
 pub enum ResumeSelection {
     StartFresh,
     Resume(ResumeTarget),
-    /// Ctrl-C in the picker: quit Nori.
+    /// Esc or Ctrl-C in the startup picker: `nori resume` ends without starting anything.
     Exit,
 }
 
-/// Interactive session picker for `nori resume`: lists the recorded sessions of the current
-/// project (or all with `show_all`), optionally of one agent.
+/// Interactive session picker for `nori resume`, over the sessions `listing` read: the current
+/// project's (or every project's), optionally of one agent. Esc or Ctrl-C leaves without
+/// starting a session; choosing a row resumes it under the agent that recorded it.
 pub async fn run_resume_picker(
     tui: &mut Tui,
     nori_home: &Path,
-    agent_filter: Option<&str>,
-    show_all: bool,
+    listing: load::ResumeListing,
+    scope: &str,
 ) -> Result<ResumeSelection> {
-    let filter_cwd = if show_all {
-        None
-    } else {
-        std::env::current_dir().ok()
-    };
-    let loader = TranscriptLoader::new(nori_home.to_path_buf());
-    let sessions: Vec<SessionPickerInfo> = loader
-        .list_resumable_session_metadata(filter_cwd.as_deref(), agent_filter)
-        .await?
-        .into_iter()
-        .map(SessionPickerInfo::from)
-        .collect();
-    let mut overlay = helix_overlay::ResumeOverlay::new_local(sessions, nori_home.to_path_buf());
+    let mut overlay = helix_overlay::ResumeOverlay::new(helix_overlay::ResumeSetup {
+        purpose: helix_overlay::SessionPurpose::Resume,
+        nori_home: nori_home.to_path_buf(),
+        sessions: listing.sessions,
+        agent_sessions: Vec::new(),
+        current: None,
+        offer_new: false,
+        cancel_candidate_on_dismiss: false,
+        scope: scope.to_owned(),
+        widen: None,
+    });
 
     tui.frame_requester().schedule_frame();
     let mut tui_events = tui.event_stream().fuse();
     loop {
         let Some(event) = tui_events.next().await else {
-            return Ok(ResumeSelection::StartFresh);
+            return Ok(ResumeSelection::Exit);
         };
         overlay.handle_event(tui, event)?;
         match overlay.take_outcome() {
             helix_overlay::ResumeOutcome::Pending => {}
-            helix_overlay::ResumeOutcome::Cancelled { .. } => {
-                return Ok(if overlay.was_interrupted() {
-                    ResumeSelection::Exit
-                } else {
-                    ResumeSelection::StartFresh
-                });
-            }
+            helix_overlay::ResumeOutcome::Cancelled { .. } => return Ok(ResumeSelection::Exit),
             helix_overlay::ResumeOutcome::Selected(action) => match action {
-                helix_overlay::ResumeAction::StartFresh
-                | helix_overlay::ResumeAction::Acp { .. }
-                | helix_overlay::ResumeAction::ViewOnly { .. }
-                | helix_overlay::ResumeAction::Reference { .. } => {
-                    return Ok(ResumeSelection::StartFresh);
-                }
                 helix_overlay::ResumeAction::Local {
                     nori_home,
                     project_id,
                     session_id,
+                    agent,
                 } => {
                     return Ok(ResumeSelection::Resume(ResumeTarget {
                         nori_home,
                         project_id,
                         session_id,
-                        agent: agent_filter.map(str::to_owned),
+                        agent,
                     }));
+                }
+                helix_overlay::ResumeAction::StartFresh
+                | helix_overlay::ResumeAction::Acp { .. }
+                | helix_overlay::ResumeAction::Current
+                | helix_overlay::ResumeAction::Reference { .. } => {
+                    unreachable!("the startup picker lists only recorded sessions")
                 }
             },
         }

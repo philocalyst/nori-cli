@@ -98,7 +98,6 @@ mod tui;
 mod ui_consts;
 mod ui_types;
 mod usage;
-mod viewonly_transcript;
 
 // Nori-specific update modules
 // Re-export as pub mod for external access to UpdateAction type
@@ -511,65 +510,110 @@ async fn run_ratatui_app(
                 );
             }
         }
-    } else if cli.resume_last {
-        let filter_cwd = if cli.resume_show_all {
-            None
-        } else {
-            Some(config.cwd.as_path())
-        };
-        match transcript_loader
-            .list_resumable_session_metadata(filter_cwd, resume_agent_filter)
-            .await
-        {
-            // The most recently active conversation: delegated children are not candidates.
-            Ok(sessions) => {
-                match nori_harness::session_index::SessionIndex::open(&config.nori_home)
-                    .roots(sessions)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .next()
-                {
-                    Some(metadata) => match resume_target_from_metadata(
-                        config.nori_home.clone(),
-                        metadata,
-                        resume_agent_filter,
-                    ) {
-                        Ok(target) => resume_picker::ResumeSelection::Resume(target),
-                        Err(message) => {
-                            return resume_startup_error(&mut tui, message);
-                        }
-                    },
-                    None => resume_picker::ResumeSelection::StartFresh,
+    } else if cli.resume_last || cli.resume_picker {
+        // The same list for both: this project's (or every project's) recorded conversations,
+        // most recently active first, of the requested agent when there is one.
+        let cwd = (!cli.resume_show_all).then_some(config.cwd.as_path());
+        let listing =
+            match resume_picker::load::load(&config.nori_home, cwd, resume_agent_filter).await {
+                Ok(listing) => listing,
+                Err(error) => {
+                    return resume_startup_error(
+                        &mut tui,
+                        format!("Could not read the recorded sessions: {error}"),
+                    );
                 }
-            }
-            Err(_) => resume_picker::ResumeSelection::StartFresh,
+            };
+        let place = if cli.resume_show_all {
+            "any project".to_owned()
+        } else {
+            config.cwd.display().to_string()
+        };
+        let by_agent = resume_agent_filter
+            .map(|agent| format!(" of agent `{agent}`"))
+            .unwrap_or_default();
+        if listing.sessions.is_empty() {
+            let advice = if cli.resume_show_all {
+                "Run `nori` to start one."
+            } else {
+                "Run `nori` to start one, or `nori resume --all` to look in every project."
+            };
+            return resume_startup_error(
+                &mut tui,
+                format!("No recorded sessions{by_agent} to resume in {place}. {advice}"),
+            );
         }
-    } else if cli.resume_picker {
-        match resume_picker::run_resume_picker(
-            &mut tui,
-            &config.nori_home,
-            resume_agent_filter,
-            cli.resume_show_all,
-        )
-        .await?
-        {
-            resume_picker::ResumeSelection::Exit => {
-                restore();
-                session_log::log_session_end();
-                return Ok(AppExitInfo {
-                    immediate_exit: false,
-                    token_usage: crate::ui_types::TokenUsage::default(),
-                    conversation_id: None,
-                    conversation_has_activity: false,
-                    update_action: None,
-                });
-            }
-            other => other,
+        let scope = match (cli.resume_show_all, resume_agent_filter) {
+            (true, Some(agent)) => format!("{agent} · all projects"),
+            (true, None) => "all projects".to_owned(),
+            (false, Some(agent)) => format!("{agent} · this project"),
+            (false, None) => "this project".to_owned(),
+        };
+        if cli.resume_last {
+            let newest = &listing.sessions[0];
+            resume_picker::ResumeSelection::Resume(resume_picker::ResumeTarget {
+                nori_home: config.nori_home.clone(),
+                project_id: newest.project_id.clone(),
+                session_id: newest.session_id.clone(),
+                agent: newest.agent.clone(),
+            })
+        } else {
+            resume_picker::run_resume_picker(&mut tui, &config.nori_home, listing, &scope).await?
         }
     } else {
         resume_picker::ResumeSelection::StartFresh
     };
+
+    if matches!(resume_selection, resume_picker::ResumeSelection::Exit) {
+        // The picker was drawn inline: leave the terminal as it was found.
+        let _ = tui.terminal.clear();
+        restore();
+        session_log::log_session_end();
+        return Ok(AppExitInfo {
+            immediate_exit: false,
+            token_usage: crate::ui_types::TokenUsage::default(),
+            conversation_id: None,
+            conversation_has_activity: false,
+            update_action: None,
+            handover: None,
+        });
+    }
+
+    // A conversation that moved to another machine continues there, not here: this terminal
+    // goes to it (`docs/machines.md`).
+    if let resume_picker::ResumeSelection::Resume(target) = &resume_selection
+        && let Some(moved) = nori_harness::portable::moved_to(
+            &target.nori_home,
+            &target.project_id,
+            &target.session_id,
+        )
+    {
+        let _ = tui.terminal.clear();
+        restore();
+        session_log::log_session_end();
+        // The TUI is gone; the last line tells the person where the conversation went.
+        let _ = writeln!(
+            std::io::stdout(),
+            "This conversation moved to {} ({}) and continues there.",
+            moved.machine,
+            moved.cwd
+        );
+        return Ok(AppExitInfo {
+            immediate_exit: false,
+            token_usage: crate::ui_types::TokenUsage::default(),
+            conversation_id: None,
+            conversation_has_activity: false,
+            update_action: None,
+            handover: moved.launcher.map(|launcher| {
+                vec![
+                    "ssh".to_owned(),
+                    "-t".to_owned(),
+                    moved.ssh,
+                    format!("/bin/sh {launcher}"),
+                ]
+            }),
+        });
+    }
 
     startup_trace::mark("resume_selected");
     if let resume_picker::ResumeSelection::Resume(target) = &resume_selection
@@ -659,6 +703,7 @@ fn resume_startup_error(tui: &mut Tui, message: String) -> color_eyre::Result<Ap
         conversation_id: None,
         conversation_has_activity: false,
         update_action: None,
+        handover: None,
     })
 }
 
@@ -716,6 +761,7 @@ mod tests {
             session_id: "session-123".to_string(),
             project_id: "project-123".to_string(),
             started_at: "2025-01-01T00:00:00Z".to_string(),
+            last_active_at: "2025-01-01T00:00:00Z".to_string(),
             cwd: PathBuf::from("/tmp/project"),
             agent: agent.map(str::to_string),
             delegated: false,
