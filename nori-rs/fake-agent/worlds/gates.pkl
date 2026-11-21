@@ -1,0 +1,86 @@
+/// Gates: a `nori:Gate` module in `$NORI_HOME/gates/` decides before the agent's request or tool
+/// call goes through, and a stop gate carries a turn on. The test writes the gates (and the
+/// session reads them when it boots); the world is only the agent they act on.
+///
+///   * `push` asks permission to force-push. A gate refuses; the agent says what it was told.
+///   * `bash` calls the host `bash` tool with an `echo`; a gate rewrites the command.
+///   * `wipe` calls `bash` with a command a gate refuses; the agent says what it read.
+///   * `edit` edits `src/lib.rs` and says it is done; a stop gate hands it one more prompt
+///     (`<gate_continue ...>`), which it answers without mentioning tests, and the turn then ends.
+///
+///     cargo test -p nori-world --test gates
+amends "nori:World"
+
+name = "gates"
+description = "An agent that asks permission, calls bash and edits files, for gates to act on."
+default_agent = "lead"
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models {
+      new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+    }
+    scenes {
+      new Scene {
+        name = "continued"
+        on = new Matching { pattern = "<gate_continue" }
+        steps { new Say { text = "I have nothing more to add." } }
+      }
+      new Scene {
+        name = "push"
+        on = new Matching { pattern = "^push$" }
+        steps {
+          new Permission {
+            tool = new ToolSpec {
+              title = "git push --force origin main"
+              tool_kind = "execute"
+              input = new Dynamic { command = "git push --force origin main" }
+            }
+            on_allow { new Say { text = "The push went through." } }
+            on_deny { new Say { text = "The push was refused." } }
+          }
+        }
+      }
+      new Scene {
+        name = "bash"
+        on = new Matching { pattern = "^bash$" }
+        steps {
+          new HostTool {
+            name = "bash"
+            arguments = new Dynamic { command = "echo pushing origin" }
+          }
+          new Say { text = "The command ran." }
+        }
+      }
+      new Scene {
+        name = "wipe"
+        on = new Matching { pattern = "^wipe$" }
+        steps {
+          new HostTool {
+            name = "bash"
+            arguments = new Dynamic { command = "rm -rf /" }
+            expect_error = true
+          }
+          new Say { text = "The command was refused." }
+        }
+      }
+      new Scene {
+        name = "edit"
+        on = new Matching { pattern = "^edit$" }
+        steps {
+          new Tool {
+            title = "Edit src/lib.rs"
+            tool_kind = "edit"
+            locations { new Location { path = "src/lib.rs"; line = 1 } }
+            content { new DiffContent { path = "src/lib.rs"; old_text = "fn a() {}\n"; new_text = "fn a() { b() }\n" } }
+          }
+          new Say { text = "I changed the code." }
+        }
+      }
+      new Scene {
+        steps { new Say { text = "You said: {{prompt}}" } }
+      }
+    }
+  }
+}
