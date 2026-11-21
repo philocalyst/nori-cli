@@ -1,0 +1,19 @@
+/// Do not let the agent stop after changing Rust or TypeScript without saying the tests passed.
+///
+/// A `stop` gate runs when the agent ends its turn. This rule applies when the turn changed a
+/// source file and the agent's last message does not claim a passing test run; it continues the
+/// turn once with a hidden prompt, then lets the agent stop whatever it answers.
+amends "nori:Gate"
+
+name = "tests-before-done"
+description = "Run the tests before ending a turn that changed code"
+on = "stop"
+rules {
+  new StopRule {
+    changed { "**/*.rs"; "**/*.ts"; "**/*.tsx" }
+    last_message = new Not { regex = "(?i)(tests?|suite|checks?)\\b.{0,40}\\b(pass|passed|passing|green|ok)\\b" }
+    decision = "continue"
+    message = "You changed code this turn but did not report a passing test run. Run the project's tests now and fix what fails; then say what you ran and what it showed."
+    max_continues = 1
+  }
+}

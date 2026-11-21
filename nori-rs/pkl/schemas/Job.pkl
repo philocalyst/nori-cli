@@ -1,0 +1,92 @@
+/// A named background process Nori supervises: a dev server, a watcher, a long test run.
+///
+/// A job outlives the turn that started it, the session and Nori itself, and runs on this machine
+/// or another one. Evaluating the module only produces data; the supervisor starts the process.
+/// Put the module in `jobs/<name>.pkl` under `$NORI_HOME` or the project's `.nori` directory.
+///
+///     amends "nori:Job"
+///     name = "web"
+///     description = "The dev server on :5173"
+///     command = "pnpm dev"
+///     cwd = "web"
+///     ready = new Ready { pattern = "Local:.*5173"; timeout = 60.s }
+///     restart = new Restart { on = "failure"; max = 3; backoff = 2.s }
+///     wake = new JobWake { on_exit = true; on_ready = true; on_output = "(?i)error|panic" }
+///
+/// Durations are Pkl durations (`500.ms`, `2.s`, `5.min`). Regular expressions use Rust regex
+/// syntax. The agent never polls a job: it is woken when something the `wake` block names happens.
+open module nori.Job
+
+local typealias RestartOn = "never"|"failure"|"always"
+
+/// When the job counts as started: a line of its output matches `pattern`.
+class Ready {
+  /// A regular expression matched against each output line.
+  pattern: String
+  /// How long to wait for a matching line before the job is reported as not ready.
+  timeout: Duration = 60.s
+}
+
+/// What to do when the job ends.
+class Restart {
+  /// `never` leaves it ended, `failure` restarts after a non-zero exit, `always` restarts after
+  /// any exit that was not a stop.
+  on: RestartOn = "never"
+  /// How many restarts in a row before giving up.
+  max: Int = 3
+  /// The wait before the first restart; it grows with each attempt.
+  backoff: Duration = 2.s
+}
+
+/// What wakes the agent that started the job.
+class JobWake {
+  /// Wake when the job exits.
+  on_exit: Boolean = true
+  /// Wake when the job becomes ready.
+  on_ready: Boolean = false
+  /// Wake when an output line matches this regular expression.
+  on_output: String?
+  /// Wake when the job is lost: its process vanished without an exit code, or its machine restarted.
+  on_lost: Boolean = true
+}
+
+/// The job's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit.
+/// It is what `job_start` and monitors refer to.
+name: String
+
+/// One line saying what the job is.
+description: String = ""
+
+/// The shell command to run.
+command: String
+
+/// Where it runs: `local`, or a machine from the roster.
+machine: String = "local"
+
+/// The working directory, relative to the project (or absolute). Unset means the session's.
+cwd: String?
+
+/// Extra environment variables. Values whose names look secret are never journaled.
+env: Mapping<String, String>
+
+/// How to tell the job is ready. Without it a job is ready as soon as it is running.
+ready: Ready?
+
+/// What to do when the job ends.
+restart: Restart
+
+/// What wakes the agent.
+wake: JobWake
+
+/// A shell command whose exit status 0 means the job did what it should. The harness runs it once
+/// the job is ready and again after the job exits; Nori only declares it here.
+check: String?
+
+/// Output is kept in rotating logs; each stream rotates at this many bytes.
+max_log_bytes: Int = 67108864
+
+/// Stop the job after it has run this long. Unset means no limit.
+timeout: Duration?
+
+/// How long a stop waits after TERM before it sends KILL.
+stop_grace: Duration = 5.s

@@ -10463,14 +10463,18 @@ dependencies = [
 name = "nori-pkl"
 version = "0.0.0"
 dependencies = [
+ "chrono",
+ "globset",
  "nori-pkl-runtime",
  "nori-workflow",
  "pretty_assertions",
+ "regex",
  "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

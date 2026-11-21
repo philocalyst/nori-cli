@@ -1,0 +1,217 @@
+/// What to watch and what to do when it happens: triggers, an optional condition, and actions.
+///
+/// A monitor module arms one monitor in every session it applies to; an agent can arm the same
+/// value at runtime with `monitor_start`. Evaluating the module only produces data. Time triggers
+/// read the session's clock, so in a world they are virtual and exact.
+///
+///     amends "nori:Monitor"
+///     name = "nightly-deps"
+///     on { new Cron { expression = "0 3 * * 1-5" } }
+///     actions {
+///       new RunJob { job = "deps-audit" }
+///       new Wake { message = "The dependency audit ran:\n{{event}}\nFix anything critical." }
+///     }
+///
+/// Durations are Pkl durations (`30.s`, `5.min`). Regular expressions use Rust regex syntax and
+/// match the text of an event. Action text may use `{{event}}`, what fired.
+open module nori.Monitor
+
+local typealias WakeMode = "immediate"|"digest"|"boundary"
+
+/// Something that makes the monitor fire. Each subclass has a fixed `kind`.
+abstract class Trigger {
+  /// The trigger's name in the monitor API.
+  abstract kind: String
+}
+
+/// Fires on a period.
+class Every extends Trigger {
+  kind = "every"
+  /// The time between firings.
+  interval: Duration
+}
+
+/// Fires once at an instant.
+class At extends Trigger {
+  kind = "at"
+  /// An RFC 3339 timestamp (`2026-12-01T09:00:00+01:00`) or a local time of day (`17:30`).
+  time: String
+}
+
+/// Fires on a cron schedule.
+class Cron extends Trigger {
+  kind = "cron"
+  /// Five fields (minute hour day-of-month month day-of-week), or six with seconds first.
+  expression: String
+}
+
+/// Fires when the session has been idle that long, once per idle stretch.
+class Idle extends Trigger {
+  kind = "idle"
+  /// The idle time.
+  after: Duration
+}
+
+/// Fires on events of the session itself.
+class Session extends Trigger {
+  kind = "session"
+  /// Which events: `turn_ended`, `turn_failed`, `route_changed`, `subagent_ended`,
+  /// `permission_requested` or `quota_low`.
+  events: Listing<"turn_ended"|"turn_failed"|"route_changed"|"subagent_ended"|"permission_requested"|"quota_low">
+}
+
+/// Fires on what happens to a job.
+class Job extends Trigger {
+  kind = "job"
+  /// The job's `name`.
+  job: String
+  /// Which changes: `ready`, `exited`, `failed`, `lost`, or `output` (each output line).
+  on: Listing<"ready"|"exited"|"failed"|"lost"|"output">
+}
+
+/// Fires on each line a command prints. The command runs for the monitor alone.
+class Output extends Trigger {
+  kind = "output"
+  /// The shell command to run.
+  command: String
+  /// The working directory. Unset means the session's.
+  cwd: String?
+  /// Also watch the command's error stream.
+  stderr: Boolean = false
+}
+
+/// Fires on each line appended to a file.
+class File extends Trigger {
+  kind = "file"
+  /// The file to follow.
+  path: String
+  /// Read the lines already there too, not only new ones.
+  from_start: Boolean = false
+}
+
+/// Fires when files are created, modified or deleted.
+class Watch extends Trigger {
+  kind = "watch"
+  /// Paths or directories to watch.
+  paths: Listing<String>
+  /// Which changes count: `created`, `modified`, `deleted`. Empty means all.
+  kinds: Listing<"created"|"modified"|"deleted">
+}
+
+/// Fires when the value at a URL changes.
+class Http extends Trigger {
+  kind = "http"
+  /// The URL to poll.
+  url: String
+  /// The time between checks.
+  interval: Duration = 30.s
+  /// A dotted path into a JSON response; only that value is compared. Unset compares the body.
+  json_path: String?
+  /// A regular expression applied to the response; its first match (or group) is compared.
+  regex: String?
+}
+
+/// Fires when CI checks have decided.
+class Ci extends Trigger {
+  kind = "ci"
+  /// The branch to watch. Unset means the current one.
+  branch: String?
+}
+
+/// Fires on what a peer actor does.
+class Actor extends Trigger {
+  kind = "actor"
+  /// The actor's alias.
+  actor: String
+  /// What to follow: `state`, `results`, `replies`. Empty means all.
+  track: Listing<"state"|"results"|"replies">
+}
+
+/// Something done when the monitor fires. Each subclass has a fixed `kind`.
+abstract class Action {
+  /// The action's name in the monitor API.
+  abstract kind: String
+}
+
+/// Give the agent a hidden prompt. The default action when `actions` is empty.
+class Wake extends Action {
+  kind = "wake"
+  /// The prompt; `{{event}}` is what fired. Unset wakes with the event alone.
+  message: String?
+}
+
+/// Queue a visible prompt, as if the person had typed it.
+class Prompt extends Action {
+  kind = "prompt"
+  /// The prompt's text.
+  text: String
+}
+
+/// Notify the person with an OS notification and one transcript line; the agent is not woken.
+class Notify extends Action {
+  kind = "notify"
+  /// The notification's title.
+  title: String?
+  /// The notification's text.
+  body: String?
+}
+
+/// Start a job module.
+class RunJob extends Action {
+  kind = "run_job"
+  /// The job's `name`.
+  job: String
+}
+
+/// Stop a running job.
+class StopJob extends Action {
+  kind = "stop_job"
+  /// The job's `name`.
+  job: String
+}
+
+/// Run a skill; its result is delivered like a wake.
+class RunSkill extends Action {
+  kind = "run_skill"
+  /// The skill's `name`.
+  skill: String
+  /// Values for the skill's parameters.
+  arguments: Mapping<String, String>
+}
+
+/// The monitor's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit.
+name: String
+
+/// One line saying what the monitor is for.
+description: String = ""
+
+/// What makes it fire. At least one trigger.
+on: Listing<Trigger>
+
+/// A regular expression an event's text must match to fire.
+filter: String?
+
+/// Regular expressions that mark an event as a failure when they match.
+fail_on: Listing<String>
+
+/// A regular expression that ends the monitor when an event matches it.
+until: String?
+
+/// What to do when it fires, in order. Empty means wake the agent with the event.
+actions: Listing<Action>
+
+/// How a wake is delivered: `immediate` at the next safe point, `digest` gathered for `digest`
+/// and delivered together, `boundary` only when the turn ends.
+wake: WakeMode = "immediate"
+
+/// How long a digest gathers events.
+digest: Duration = 30.s
+
+/// Gather bursts of events closer together than this into one firing.
+debounce: Duration?
+
+/// End the monitor after it has fired this many times.
+max_fires: Int?
+
+/// End the monitor after this long.
+expires: Duration?

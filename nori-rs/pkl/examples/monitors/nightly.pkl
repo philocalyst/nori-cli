@@ -1,0 +1,20 @@
+/// Audit dependencies every weeknight, and again whenever a turn fails while the audit job runs.
+///
+/// Three triggers feed one monitor; two actions run in order: start the `deps-audit` job, then
+/// wake the agent with what fired.
+amends "nori:Monitor"
+
+name = "nightly-deps"
+description = "Dependency audit on weeknights"
+on {
+  new Cron { expression = "0 3 * * 1-5" }
+  new Every { interval = 12.h }
+  new Job { job = "deps-audit"; on { "failed"; "lost" } }
+}
+actions {
+  new RunJob { job = "deps-audit" }
+  new Wake { message = "The dependency audit ran:\n{{event}}\nFix anything critical." }
+}
+wake = "digest"
+digest = 5.min
+max_fires = 30

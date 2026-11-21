@@ -1,0 +1,15 @@
+/// The dev server on :5173, supervised in the background.
+///
+/// Ready when Vite prints its local address; restarted up to three times after a crash; wakes the
+/// agent when it is ready, exits, or prints an error. `check` says the server answers.
+amends "nori:Job"
+
+name = "web"
+description = "The dev server on :5173"
+command = "pnpm dev"
+cwd = "web"
+env { ["NODE_ENV"] = "development" }
+ready = new Ready { pattern = "Local:.*5173"; timeout = 60.s }
+restart = new Restart { on = "failure"; max = 3; backoff = 2.s }
+wake = new JobWake { on_exit = true; on_ready = true; on_output = "(?i)error|panic" }
+check = "curl -fsS http://localhost:5173/ > /dev/null"

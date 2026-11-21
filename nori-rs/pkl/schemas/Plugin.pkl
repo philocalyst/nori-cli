@@ -1,0 +1,176 @@
+/// A plugin: commands built from typed operations on Nori itself.
+///
+/// The API is the set of operations, and a plugin is data, so what it may do is visible before it
+/// runs. A command runs from the TUI (`/name`), from Rex or another client, or with
+/// `nori plugin run <plugin> <command>`. Text fields may use `{{parameter}}` for the command's
+/// parameters; naming a parameter the command does not declare is an error.
+///
+///     amends "nori:Plugin"
+///     name = "move"
+///     commands {
+///       ["to"] {
+///         description = "Move this session to another machine"
+///         parameters { ["machine"] { description = "A machine from the roster" } }
+///         operations { new SessionMove { machine = "{{machine}}" } }
+///       }
+///     }
+open module nori.Plugin
+
+/// Where the choices for an argument come from: the frontend lists them, so a person picks instead
+/// of typing. `machines` is the roster, `models`, `efforts` and `modes` are the agent's own,
+/// `agents` the agents Nori can start, `skills` this session's skills, `files` the project's files
+/// and `sessions` the sessions that can be resumed.
+typealias ChoiceFrom = "machines"|"models"|"efforts"|"modes"|"agents"|"skills"|"files"|"sessions"
+
+/// What part of Nori a command is about, for grouping in the command palette.
+typealias Category = "conversation"|"session"|"model"|"agent"|"machine"|"context"|"view"|"settings"|"account"|"tools"|"plugin"
+
+/// When a command takes effect: `now` when it is chosen, `on_send` when the prompt it is attached
+/// to is sent (chosen with a draft open, it becomes a chip in the draft).
+typealias Effect = "now"|"on_send"
+
+/// One argument of a command.
+class Parameter {
+  /// What the argument is, shown in help and menus.
+  description: String = ""
+  /// The value used when the caller gives none. Setting it makes the argument optional.
+  default: String?
+  /// Whether the caller must give a value (a parameter with a `default` never needs one).
+  required: Boolean = true
+  /// The values the argument may take, offered as a menu. A `default` must be one of them. Not
+  /// together with `from`.
+  choices: Listing<String>
+  /// Where the frontend gets the choices from. Not together with `choices`.
+  from: ChoiceFrom?
+}
+
+/// What must hold for a command to run; the palette shows it dimmed, with the reason, otherwise.
+class Requires {
+  /// No turn may be running.
+  idle: Boolean = false
+  /// Only in the main conversation, not a subagent's view.
+  main: Boolean = false
+  /// Only for a session on this machine.
+  `local`: Boolean = false
+  /// Only for a cloud session.
+  cloud: Boolean = false
+}
+
+/// One step of a command: something Nori does to itself. Each subclass has a fixed `kind`.
+abstract class Operation {
+  /// The operation's name in the Nori API.
+  abstract kind: String
+}
+
+/// Report what the session is: agent, model, machine, cwd, jobs, monitors and permissions.
+class SessionDescribe extends Operation {
+  kind = "session.describe"
+}
+
+/// Bundle the session into a file.
+class SessionExport extends Operation {
+  kind = "session.export"
+  /// Where to write the bundle. Unset means a file in the session's directory.
+  path: String?
+}
+
+/// Move the whole session to another machine at the next turn boundary.
+class SessionMove extends Operation {
+  kind = "session.move"
+  /// The target machine from the roster.
+  machine: String
+}
+
+/// Start a job module by name.
+class JobStart extends Operation {
+  kind = "job.start"
+  /// The job's `name`.
+  job: String
+}
+
+/// Stop a running job.
+class JobStop extends Operation {
+  kind = "job.stop"
+  /// The job's `name`.
+  job: String
+}
+
+/// Arm a monitor module by name.
+class MonitorStart extends Operation {
+  kind = "monitor.start"
+  /// The monitor's `name`.
+  monitor: String
+}
+
+/// Disarm a monitor.
+class MonitorStop extends Operation {
+  kind = "monitor.stop"
+  /// The monitor's `name`.
+  monitor: String
+}
+
+/// Run a skill.
+class SkillRun extends Operation {
+  kind = "skill.run"
+  /// The skill's `name`.
+  skill: String
+  /// Values for the skill's parameters.
+  arguments: Mapping<String, String>
+}
+
+/// Tell the person with an OS notification and one transcript line.
+class NotifyOp extends Operation {
+  kind = "notify"
+  /// The notification's title.
+  title: String?
+  /// The notification's text.
+  body: String?
+}
+
+/// Queue a prompt for the agent, as if the person had typed it.
+class PromptOp extends Operation {
+  kind = "prompt"
+  /// The prompt's text.
+  text: String
+}
+
+/// Change a configuration option (model, effort, mode); applied at the next safe point.
+class ConfigSet extends Operation {
+  kind = "config.set"
+  /// The option's key.
+  key: String
+  /// The new value.
+  value: String
+}
+
+/// A named action of the plugin.
+class Command {
+  /// What the command does, shown in the command palette and menus.
+  description: String = ""
+  /// What the palette lists it as. Unset means the description.
+  title: String?
+  /// What a person types after `/` to run it. Unset means `<plugin>-<command>`. The first is the
+  /// canonical name; lowercase letters, digits, `-` and `_`.
+  names: Listing<String>
+  /// More words the palette finds it by.
+  keywords: Listing<String>
+  /// The palette group.
+  category: Category = "plugin"
+  /// When it takes effect.
+  effect: Effect = "now"
+  /// What must hold for it to run.
+  requires: Requires = new Requires {}
+  /// The command's arguments by name.
+  parameters: Mapping<String, Parameter>
+  /// What it does, in order.
+  operations: Listing<Operation>
+}
+
+/// The plugin's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit.
+name: String
+
+/// One line saying what the plugin is for.
+description: String = ""
+
+/// The plugin's commands by name.
+commands: Mapping<String, Command>

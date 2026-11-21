@@ -1,0 +1,41 @@
+/// Rex's commands for a Nori session: move it to another machine, say where it runs, park it.
+///
+/// `move` is the whole point: `session.move { machine }` takes the session, its permissions and
+/// its jobs to the target machine and continues it there. Rex runs a command with
+/// `_nori/plugin.run`, with `nori plugin run rex move machine=NAME`, or as `/rex move NAME`.
+amends "nori:Plugin"
+
+name = "rex"
+description = "Move this session between machines, see where it runs, park its dev server"
+commands {
+  ["move"] {
+    description = "Move this session to another machine"
+    title = "Move session to another machine"
+    keywords { "remote"; "ssh"; "transfer"; "rex" }
+    category = "machine"
+    parameters {
+      ["machine"] { description = "A machine from the roster"; from = "machines" }
+    }
+    operations {
+      new SessionMove { machine = "{{machine}}" }
+    }
+  }
+  ["where"] {
+    description = "Say what this session is: agent, model, machine, cwd, jobs, monitors, permissions"
+    title = "Where is this session?"
+    keywords { "describe"; "machine"; "status" }
+    category = "session"
+    operations {
+      new SessionDescribe {}
+    }
+  }
+  ["park"] {
+    description = "Stop the dev server and tell the person"
+    keywords { "stop"; "dev server" }
+    category = "tools"
+    operations {
+      new JobStop { job = "web" }
+      new NotifyOp { title = "Parked"; body = "The dev server is stopped" }
+    }
+  }
+}

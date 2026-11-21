@@ -11,7 +11,7 @@
 ///     cargo run -p nori-conduit --example program_check -- pkl/examples/two-worlds.pkl --run
 amends "nori:Program"
 
-import "nori:Skill" as Skill
+import "nori:Toolset" as Toolset
 import "nori:Tool" as Tool
 
 name = "two-worlds"
@@ -27,8 +27,8 @@ worlds {
   }
 }
 
-skills {
-  new Skill.SkillSpec {
+toolsets {
+  new Toolset.ToolsetSpec {
     name = "minimal-diff"
     description = "Keep experiments small and tested."
     instructions = new Listing { "Keep every change under src/ minimal and run the tests before you report." }
@@ -58,7 +58,7 @@ actors {
     role = "implementation"
     world = "spike"
     isolation = "sandbox"
-    skills = new Listing { "minimal-diff" }
+    toolsets = new Listing { "minimal-diff" }
     // Its Nori `bash` may run only git and cargo, and only touch these paths.
     sandbox {
       allowed_tools = new Listing { "bash:git"; "bash:cargo" }

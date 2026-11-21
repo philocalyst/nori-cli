@@ -8,13 +8,18 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
+globset = "0.4"
 nori-workflow = { workspace = true }
 pklr = { package = "nori-pkl-runtime", path = "../../vendor/pkl-native" }
 serde = { workspace = true, features = ["derive"] }
+regex = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = "0.37.2"
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -1,0 +1,30 @@
+/// Run every `bash` call on the build machine, and turn a bare `git push` into a dry run.
+///
+/// A `host_tool` gate sees the arguments of a call to one of Nori's own tools and can rewrite them;
+/// the agent's result says what was changed. The first rule that matches decides, so a push that
+/// is already a dry run is let through before the rule that would add the flag, and it keeps the
+/// machine it asked for.
+amends "nori:Gate"
+
+name = "force-machine"
+description = "bash runs on h16; pushes are dry runs"
+on = "host_tool"
+rules {
+  new HostToolRule {
+    tools { "bash" }
+    arguments { ["command"] = "^git push\\b.*--dry-run" }
+    decision = "allow"
+  }
+  new HostToolRule {
+    tools { "bash" }
+    arguments { ["command"] = "^git push\\b" }
+    decision = "rewrite"
+    append { ["command"] = "--dry-run" }
+  }
+  new HostToolRule {
+    tools { "bash" }
+    absent { "machine" }
+    decision = "rewrite"
+    set { ["machine"] = "h16" }
+  }
+}

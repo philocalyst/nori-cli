@@ -1,0 +1,147 @@
+/// A synchronous rule on the hot path: ordered rules, each a matcher and a decision, consulted
+/// before something happens.
+///
+/// Monitors observe and act afterwards; a gate decides first. Every gate is compiled once, when
+/// the modules load, into a Rust matcher: checking one never evaluates Pkl and never spawns
+/// anything, and every decision is journaled. The first rule that matches, in the order of the
+/// gate's `rules` (gates are consulted by name), decides; when none matches Nori does what it
+/// always did.
+///
+/// A gate listens to one event, `on`, and holds the rules of that event:
+///
+///   * `permission`: an agent asked the person for permission (`session/request_permission`).
+///     Rules are `PermissionRule`s and decide `allow`, `deny` or `ask`.
+///   * `host_tool`: an agent called one of Nori's own tools (`bash`, `job_start`, ...). Rules are
+///     `HostToolRule`s and decide `allow`, `deny` or `rewrite`.
+///   * `stop`: the agent ended its turn. Rules are `StopRule`s and decide `continue` or `pass`.
+///
+///     amends "nori:Gate"
+///     name = "no-force-push"
+///     on = "permission"
+///     rules {
+///       new PermissionRule {
+///         command = "git push.* (--force|-f)( |$)"
+///         decision = "deny"
+///         reason = "Never force-push. Push normally or ask the person."
+///       }
+///     }
+///
+/// Regular expressions use Rust regex syntax and may match anywhere in the text. Globs use `*`
+/// (within one directory level), `**` (any depth), `?` and `{a,b}`; they are matched against paths
+/// relative to the project (absolute outside it).
+open module nori.Gate
+
+/// A regular expression the text must match, or a `Not` it must not.
+typealias Pattern = String|Not
+
+/// Matches text that the regular expression does not match.
+class Not {
+  /// The regular expression.
+  regex: String
+}
+
+/// One rule of a gate: when its matchers all hold, its decision applies. Each subclass has a
+/// fixed `kind` and belongs to one event.
+abstract class Rule {
+  /// The rule's name in the gate API.
+  abstract kind: String
+}
+
+/// A rule of a `permission` gate. A matcher left out matches anything; all that are given must
+/// hold.
+class PermissionRule extends Rule {
+  kind = "permission"
+
+  /// The ACP kinds of tool the request is for: `read`, `edit`, `delete`, `move`, `search`,
+  /// `execute`, `think`, `fetch`, `switch_mode`, `other`. Empty matches any.
+  kinds: Listing<"read"|"edit"|"delete"|"move"|"search"|"execute"|"think"|"fetch"|"switch_mode"|"other">
+
+  /// What the request is titled (for a command, usually the command itself).
+  title: Pattern?
+
+  /// The command the tool call runs, from the call's input (`command`, with `args` appended).
+  /// A call with no command never matches.
+  command: Pattern?
+
+  /// Matches when at least one file the call names (its locations and path inputs) matches one
+  /// of these globs.
+  paths: Listing<String>
+
+  /// Matches only when every file the call names matches one of these globs (and it names at
+  /// least one). Use this, not `paths`, to allow what stays inside a directory.
+  only_paths: Listing<String>
+
+  /// What to do. `allow` answers the request as approved and `deny` as refused, without asking the
+  /// person. `ask` always asks the person, even where the approval policy would approve and a
+  /// saved allow rule would answer; a saved refusal still holds.
+  decision: "allow"|"deny"|"ask"
+
+  /// With `deny`: what the agent is told. Required: say what to do instead.
+  reason: String?
+}
+
+/// A rule of a `host_tool` gate: a call to one of Nori's own tools.
+class HostToolRule extends Rule {
+  kind = "host_tool"
+
+  /// The tools this applies to, by name (`bash`, `job_start`, `git_commit`, ...). Empty matches
+  /// any tool.
+  tools: Listing<String>
+
+  /// Regular expressions its arguments must match, by argument name. A string argument is matched
+  /// as it is, any other as its JSON text. An argument the call does not pass never matches.
+  arguments: Mapping<String, Pattern>
+
+  /// Arguments the call must not pass at all.
+  absent: Listing<String>
+
+  /// What to do. `allow` lets the call through unchanged and stops looking at later rules; `deny`
+  /// returns `reason` as the tool's error; `rewrite` applies `set` and `append` and runs the call
+  /// that results (the agent's result says so).
+  decision: "allow"|"deny"|"rewrite"
+
+  /// With `deny`: the tool's error, which the agent reads. Required: say what to do instead.
+  reason: String?
+
+  /// With `rewrite`: arguments to set to a new value (whatever type the argument takes).
+  set: Mapping<String, Any>
+
+  /// With `rewrite`: text added after a string argument, separated by a space, applied after
+  /// `set` (an argument that is not set and not passed becomes the text alone).
+  append: Mapping<String, String>
+}
+
+/// A rule of a `stop` gate: the agent ended a turn of its own (`end_turn`).
+class StopRule extends Rule {
+  kind = "stop"
+
+  /// What the agent's last message of the turn says.
+  last_message: Pattern?
+
+  /// Matches only when the turn changed (the edit journal) a file matching one of these globs.
+  /// `**` stands for any file. Empty ignores files.
+  changed: Listing<String>
+
+  /// What to do. `continue` hands the agent `message` as a hidden prompt, at most `max_continues`
+  /// times for each prompt of the person, and `pass` lets the turn end (and stops looking at later
+  /// rules).
+  decision: "continue"|"pass"
+
+  /// With `continue`: the hidden prompt. Required.
+  message: String?
+
+  /// With `continue`: how many times this rule may continue the turn of one prompt of the person.
+  max_continues: Int = 1
+}
+
+/// The gate's name: lowercase letters, digits, `-` and `_`, starting with a letter or digit.
+name: String
+
+/// One line saying what the gate is for.
+description: String = ""
+
+/// The event the gate listens to.
+on: "permission"|"host_tool"|"stop"
+
+/// The rules, in order; the first that matches decides. At least one, all of the gate's event.
+rules: Listing<Rule>

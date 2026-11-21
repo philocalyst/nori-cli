@@ -1,0 +1,22 @@
+/// Refuse force pushes, however the agent spells them, and always ask before any other push.
+///
+/// Both rules read the command of a permission request. The first one that matches decides, so the
+/// refusal comes before the question. The agent reads the `reason` as the refusal.
+amends "nori:Gate"
+
+name = "no-force-push"
+description = "Never force-push; ask before any push"
+on = "permission"
+rules {
+  new PermissionRule {
+    kinds { "execute" }
+    command = "\\bgit\\s+push\\b.*(--force|--force-with-lease|\\s-f(\\s|$))"
+    decision = "deny"
+    reason = "Force-pushing is not allowed here. Push without --force, or tell the person why it is needed."
+  }
+  new PermissionRule {
+    kinds { "execute" }
+    command = "\\bgit\\s+push\\b"
+    decision = "ask"
+  }
+}

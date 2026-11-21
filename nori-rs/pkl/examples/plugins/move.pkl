@@ -1,0 +1,19 @@
+/// Move this session to another machine, and tell the person where it went.
+///
+/// `/move to h16003mac` runs `to` with `machine = "h16003mac"`.
+amends "nori:Plugin"
+
+name = "move"
+description = "Move the session between machines"
+commands {
+  ["to"] {
+    description = "Move this session to another machine"
+    parameters {
+      ["machine"] { description = "A machine from the roster" }
+    }
+    operations {
+      new SessionMove { machine = "{{machine}}" }
+      new NotifyOp { title = "Session moved"; body = "Now running on {{machine}}" }
+    }
+  }
+}
