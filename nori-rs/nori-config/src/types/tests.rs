@@ -970,8 +970,9 @@ fn test_footer_segment_default_order() {
 fn test_footer_segment_config_default_is_lean_subset() {
     let config = FooterSegmentConfig::default();
 
-    // Segments enabled by default: where you are, how much room is left, which
-    // mode is active, plus self-hiding state that only appears when it is true.
+    // Segments enabled by default: where you are, which conversation this is,
+    // how much room is left, which mode is active, plus self-hiding state that
+    // only appears when it is true.
     let expected_enabled = [
         FooterSegment::Context,
         FooterSegment::GitBranch,
@@ -980,13 +981,13 @@ fn test_footer_segment_config_default_is_lean_subset() {
         FooterSegment::ModeIndicator,
         FooterSegment::WorktreeName,
         FooterSegment::CloudSession,
+        FooterSegment::SessionTitle,
     ];
     // Segments disabled by default: static, restated by the transcript, or
     // otherwise only meaningful after opting into the related workflow. Each
     // stays reachable through `/status` and `[tui.footer_segments]`.
     let expected_disabled = [
         FooterSegment::PromptSummary,
-        FooterSegment::SessionTitle,
         FooterSegment::GitStats,
         FooterSegment::ContextUsedPercent,
         FooterSegment::ContextRemainingPercent,
@@ -1112,6 +1113,7 @@ fn test_footer_layout_default_left_group_is_location_plus_opt_ins() {
             FooterSegment::GitBranch,
             FooterSegment::WorktreeName,
             FooterSegment::CloudSession,
+            FooterSegment::SessionTitle,
         ]
     );
 
@@ -1122,7 +1124,6 @@ fn test_footer_layout_default_left_group_is_location_plus_opt_ins() {
         FooterSegment::Skillset,
         FooterSegment::NoriVersion,
         FooterSegment::TokenUsage,
-        FooterSegment::SessionTitle,
         FooterSegment::PromptSummary,
         FooterSegment::GitStats,
     ] {

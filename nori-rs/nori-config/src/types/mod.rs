@@ -1729,15 +1729,16 @@ pub struct FooterSegmentConfig {
 impl Default for FooterSegmentConfig {
     fn default() -> Self {
         // Quiet defaults: an idle local shell shows where you are (branch,
-        // worktree), how much room is left (context), and which agent mode is
-        // active. Everything else is either self-hiding state that only
-        // appears when it is true (cloud session, vim mode) or off, because it
-        // is static, restates the transcript, or belongs in `/status`:
-        // approvals, skillset, skillset version, session title, and cumulative
-        // token usage. Each stays one `[tui.footer_segments]` line away.
+        // worktree), which conversation this is (its title, the same one the
+        // terminal's tab and the pickers show), how much room is left
+        // (context), and which agent mode is active. Everything else is either
+        // self-hiding state that only appears when it is true (cloud session,
+        // vim mode) or off, because it is static or belongs in `/status`:
+        // approvals, skillset, skillset version, and cumulative token usage.
+        // Each stays one `[tui.footer_segments]` line away.
         Self {
             prompt_summary: false,
-            session_title: false,
+            session_title: true,
             vim_mode: true,
             git_branch: true,
             worktree_name: true,
