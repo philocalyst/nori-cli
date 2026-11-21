@@ -1290,6 +1290,12 @@ impl MockAgent {
         if request_permission || std::env::var("MOCK_AGENT_REQUEST_PERMISSION").is_ok() {
             eprintln!("Mock agent: requesting permission from client");
 
+            // `mock:request-permission-always:<command>` asks about that command and also offers
+            // "always allow" and "always reject" options.
+            let always_command = prompt_text
+                .split_once("mock:request-permission-always:")
+                .map(|(_, command)| command.trim().to_owned());
+
             // Create a tool call update describing the operation
             let tool_call_id = acp::ToolCallId::new("permission-test-001");
             let tool_call = acp::ToolCallUpdate::new(
@@ -1300,14 +1306,21 @@ impl MockAgent {
                     .status(acp::ToolCallStatus::Pending)
                     .content(vec![acp::ToolCallContent::Content(acp::Content::new(
                         acp::ContentBlock::Text(acp::TextContent::new(
-                            "echo 'Hello from permission test'",
+                            always_command
+                                .as_deref()
+                                .unwrap_or("echo 'Hello from permission test'"),
                         )),
                     ))])
-                    .raw_input(json!({"command": "echo", "args": ["Hello from permission test"]})),
+                    .raw_input(match &always_command {
+                        Some(command) => json!({"command": command}),
+                        None => {
+                            json!({"command": "echo", "args": ["Hello from permission test"]})
+                        }
+                    }),
             );
 
             // Create permission options: allow once and reject once
-            let options = vec![
+            let mut options = vec![
                 acp::PermissionOption::new(
                     acp::PermissionOptionId::new("allow"),
                     "Allow",
@@ -1319,6 +1332,18 @@ impl MockAgent {
                     acp::PermissionOptionKind::RejectOnce,
                 ),
             ];
+            if always_command.is_some() {
+                options.push(acp::PermissionOption::new(
+                    acp::PermissionOptionId::new("allow_always"),
+                    "Always allow",
+                    acp::PermissionOptionKind::AllowAlways,
+                ));
+                options.push(acp::PermissionOption::new(
+                    acp::PermissionOptionId::new("reject_always"),
+                    "Always reject",
+                    acp::PermissionOptionKind::RejectAlways,
+                ));
+            }
 
             // Request permission from client
             match self
