@@ -1,0 +1,46 @@
+/// The `nori:Kit` presets and helpers: a Claude-shaped agent that reads, edits with permission,
+/// runs the tests, and hands a check to a Task subagent; a Codex-shaped one with a native child.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/kit-demo.pkl "fix the parser"
+amends "nori:World"
+import "nori:Kit"
+
+name = "kit-demo"
+description = "Agents built from nori:Kit presets and step helpers."
+default_agent = "claude"
+
+agents {
+  ["claude"] = (Kit.claudeLike) {
+    scenes {
+      Kit.onCommand("review", new Listing { Kit.say("Reviewed: nothing to add.") })
+      new Scene {
+        name = "fix"
+        times = 1
+        steps {
+          Kit.think("The parser reads one token too far.")
+          Kit.readFile("src/parser.rs")
+          Kit.askToEdit("src/parser.rs", "let end = pos + 1;", "let end = pos;")
+          Kit.shell("cargo test -p parser", "test result: ok. 12 passed\n", 0)
+          Kit.claudeTask("Explore", "Check the lexer agrees", "Does the lexer stop at the same token?", new Listing {
+            Kit.readFile("src/lexer.rs")
+            Kit.say("It does.")
+          })
+          Kit.stream("Fixed: the parser read one token too far; the tests pass.", 4, 30.ms)
+        }
+      }
+      Kit.matching(".*", new Listing { Kit.fail("capacity", "The fake provider is overloaded.") })
+    }
+  }
+  ["codex"] = (Kit.codexLike) {
+    scenes {
+      new Scene {
+        steps {
+          Kit.codexChild("scout", "explorer", "Find the callers of parse()", new Listing {
+            Kit.search("parse\\(", "src/main.rs:12\nsrc/cli.rs:40\n")
+          })
+          Kit.say("Two callers.")
+        }
+      }
+    }
+  }
+}
