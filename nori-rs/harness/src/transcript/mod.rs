@@ -14,8 +14,11 @@
 //!       └── {session-id}.jsonl # Individual session transcript
 //! ```
 
+mod config_state;
+mod context_digest;
 mod context_timeline;
 pub(crate) mod fork_context;
+mod heads;
 mod loader;
 mod parse;
 mod project;
@@ -32,7 +35,10 @@ pub(crate) const SESSIONS_DIR: &str = "sessions";
 /// Project metadata filename
 pub(crate) const PROJECT_METADATA_FILE: &str = "project.json";
 
+pub(crate) use config_state::newest_config_option_update;
+pub(crate) use config_state::recorded_config_options;
 pub use loader::ProjectInfo;
+pub use loader::RESUME_TAIL_BYTES;
 pub use loader::SessionInfo;
 pub use loader::SessionMetadata;
 pub use loader::Transcript;

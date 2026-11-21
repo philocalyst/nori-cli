@@ -62,6 +62,9 @@ pub struct SessionMetadata {
     pub project_id: String,
     /// When the session started
     pub started_at: String,
+    /// When anything was last recorded in the session (ISO 8601): what "most recent" means for
+    /// a conversation that was resumed after it started. Falls back to `started_at`.
+    pub last_active_at: String,
     /// Working directory for the session
     pub cwd: PathBuf,
     /// ACP agent used for the session (e.g., "claude-code", "codex", "gemini")
@@ -85,6 +88,8 @@ pub struct Transcript {
     pub(crate) requires_fresh_binding: bool,
     /// Canonical record IDs, aligned with entries for Pkl-backed sessions.
     pub(crate) event_ids: Vec<i64>,
+    /// Visible entries older than [`Self::entries`] holds, when only the newest were read.
+    pub(crate) left_out: i64,
 }
 
 /// A schema-independent record exposed by a loaded transcript.
@@ -117,6 +122,12 @@ impl PartialEq for TranscriptRecord<'_> {
 }
 
 impl Transcript {
+    /// How many of the conversation's entries before the ones read were left on disk: a resume
+    /// reads only the newest turns of a long conversation.
+    pub fn left_out(&self) -> i64 {
+        self.left_out
+    }
+
     /// The agent session to resume: the one started last in this transcript. A resumed session
     /// goes on recording into the transcript it was resumed from, so a session started since
     /// (by a replay into a new session, or a compaction) can be newer than the metadata's.
@@ -232,7 +243,7 @@ impl TranscriptLoader {
     }
 
     /// Get the base path for transcripts.
-    fn transcripts_base(&self) -> PathBuf {
+    pub(super) fn transcripts_base(&self) -> PathBuf {
         self.nori_home.join(TRANSCRIPTS_DIR).join(BY_PROJECT_DIR)
     }
 
@@ -390,7 +401,7 @@ impl TranscriptLoader {
             }
         }
 
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        sessions.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
 
         tracing::info!(
             target: "nori_resume",
@@ -460,39 +471,27 @@ impl TranscriptLoader {
         &self,
         session_id: &str,
     ) -> io::Result<Option<SessionMetadata>> {
-        for project in self.list_projects().await? {
-            let sessions = self.list_session_metadata(&project.id).await?;
-            if let Some(session) = sessions
-                .into_iter()
-                .find(|session| session.session_id == session_id)
+        // The session's file names it: only the project that has it is read, and only it.
+        let base = self.transcripts_base();
+        let mut projects = match tokio::fs::read_dir(&base).await {
+            Ok(projects) => projects,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        while let Some(project) = projects.next_entry().await? {
+            let Some(project_id) = project.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = self.session_path(&project_id, session_id);
+            if tokio::fs::try_exists(&path).await.unwrap_or(false)
+                || tokio::fs::try_exists(path.with_extension("pkl"))
+                    .await
+                    .unwrap_or(false)
             {
-                return Ok(Some(session));
+                return load_session_metadata(&path, &project_id).await.map(Some);
             }
         }
         Ok(None)
-    }
-
-    /// List transcript session metadata for startup resume flows.
-    pub async fn list_resumable_session_metadata(
-        &self,
-        cwd: Option<&Path>,
-        agent_filter: Option<&str>,
-    ) -> io::Result<Vec<SessionMetadata>> {
-        let mut sessions = if let Some(cwd) = cwd {
-            self.find_session_metadata_for_cwd(cwd).await?
-        } else {
-            let mut sessions = Vec::new();
-            for project in self.list_projects().await? {
-                sessions.extend(self.list_session_metadata(&project.id).await?);
-            }
-            sessions
-        };
-
-        if let Some(agent_filter) = agent_filter {
-            sessions.retain(|session| session.agent.as_deref() == Some(agent_filter));
-        }
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        Ok(sessions)
     }
 
     /// Load a complete transcript for display.
@@ -508,6 +507,18 @@ impl TranscriptLoader {
             .join(format!("{session_id}.jsonl"));
 
         load_transcript_from_path(&path).await
+    }
+
+    /// Load the newest turns of a transcript, about `budget` bytes of entries (see
+    /// [`RESUME_TAIL_BYTES`]), with its whole-history facts: what resuming it needs. A long
+    /// conversation resumes in the time its last turns take to read.
+    pub async fn load_transcript_tail(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        budget: i64,
+    ) -> io::Result<Transcript> {
+        load_transcript_tail_from_path(&self.session_path(project_id, session_id), budget).await
     }
 
     /// Load just the session metadata (for quick listing).
@@ -683,60 +694,39 @@ async fn load_session_info(path: &Path, project_id: &str) -> io::Result<SessionI
 
 async fn load_session_metadata(path: &Path, project_id: &str) -> io::Result<SessionMetadata> {
     let meta = load_session_meta_from_path(path).await?;
+    let last_active_at = last_recorded_at(path).unwrap_or_else(|| meta.started_at.clone());
     Ok(SessionMetadata {
         session_id: meta.session_id,
         project_id: project_id.to_string(),
         started_at: meta.started_at,
+        last_active_at,
         cwd: meta.cwd,
         agent: meta.agent,
         delegated: meta.delegated,
     })
 }
 
+/// When the transcript at `path` (or its canonical journal) was last written to.
+pub(super) fn last_recorded_at(path: &Path) -> Option<String> {
+    [path.to_path_buf(), path.with_extension("pkl")]
+        .iter()
+        .filter_map(|candidate| std::fs::metadata(candidate).ok()?.modified().ok())
+        .max()
+        .map(|modified| {
+            chrono::DateTime::<chrono::Utc>::from(modified)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
+}
+
 /// Load session metadata from the first line of a transcript file.
 async fn load_session_meta_from_path(path: &Path) -> io::Result<SessionMetaEntry> {
     let log_path = path.with_extension("pkl");
     if log_path.exists() {
-        // The metadata as the full load derives it, read in one pass that decodes only the first
-        // metadata entry and the backend bindings: everything else is kept as an id, so a rewind
-        // can still hide a binding.
+        // The metadata as the full load derives it: the first metadata entry and the bindings,
+        // found through the journal's index without decoding the conversation.
         return tokio::task::spawn_blocking(move || {
-            let mut meta = None;
-            let mut last_rewind = None;
-            let mut visible: Vec<(i64, Option<serde_json::Value>)> = Vec::new();
-            nori_conversation::ConversationLog::scan(&log_path, |record| {
-                match &record.event {
-                    nori_conversation::Event::Rewind { head } => {
-                        last_rewind = Some(record.id);
-                        let keep = head.map_or(0, |head| {
-                            visible
-                                .iter()
-                                .position(|(id, _)| *id == head)
-                                .map_or(visible.len(), |index| index + 1)
-                        });
-                        visible.truncate(keep);
-                    }
-                    _ => {
-                        if meta.is_none()
-                            && let Some(Ok(line)) = transcript_entry(&record)
-                            && let TranscriptEntry::SessionMeta(found) = line.entry
-                        {
-                            meta = Some(found);
-                        }
-                        visible.push((record.id, backend_bound(&record).map(|(_, value)| value)));
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            })?;
-            let mut meta = meta.ok_or_else(|| {
-                io::Error::other("conversation log does not contain session metadata")
-            })?;
-            let binding = visible
-                .into_iter()
-                .rev()
-                .find_map(|(id, value)| value.map(|value| (id, value)));
-            bind_meta(&mut meta, last_rewind, binding);
-            Ok(meta)
+            let log = nori_conversation::ConversationLog::open(&log_path)?;
+            journal_meta(&log).map(|(meta, _, _)| meta)
         })
         .await
         .map_err(io::Error::other)?;
@@ -777,8 +767,9 @@ async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<Str
             nori_conversation::ConversationLog::scan(&log_path, |record| {
                 if let Some(Ok(line)) = transcript_entry(&record)
                     && let TranscriptEntry::User(user) = line.entry
+                    && let Some(words) = preview_of(&user.content)
                 {
-                    preview = Some(truncate_preview(&user.content));
+                    preview = Some(words);
                     return std::ops::ControlFlow::Break(());
                 }
                 std::ops::ControlFlow::Continue(())
@@ -824,8 +815,10 @@ async fn load_first_user_preview_from_path(path: &Path) -> io::Result<Option<Str
 
         let parsed: TranscriptLine = serde_json::from_str(&line)
             .map_err(|e| io::Error::other(format!("failed to parse user line: {e}")))?;
-        if let TranscriptEntry::User(user) = parsed.entry {
-            return Ok(Some(truncate_preview(&user.content)));
+        if let TranscriptEntry::User(user) = parsed.entry
+            && let Some(words) = preview_of(&user.content)
+        {
+            return Ok(Some(words));
         }
     }
 
@@ -956,12 +949,17 @@ fn transcript_entry(record: &nori_conversation::Record) -> Option<io::Result<Tra
     }
 }
 
-fn truncate_preview(content: &str) -> String {
-    if content.chars().count() > 50 {
-        let truncated: String = content.chars().take(50).collect();
-        format!("{truncated}...")
+/// The start of what the user asked in `content`, without the context Nori injected; `None` when
+/// the message was only that context.
+fn preview_of(content: &str) -> Option<String> {
+    let words = crate::injected_context::user_words(content);
+    if words.is_empty() {
+        None
+    } else if words.chars().count() > 50 {
+        let truncated: String = words.chars().take(50).collect();
+        Some(format!("{truncated}..."))
     } else {
-        content.to_string()
+        Some(words)
     }
 }
 
@@ -970,60 +968,200 @@ fn truncate_preview(content: &str) -> String {
 /// Lines that fail to deserialize (e.g. unknown entry types from older or newer
 /// versions) are silently skipped so that transcripts remain loadable across
 /// schema changes.
+/// A session belongs to the project it is filed under: one that moved between machines (or
+/// homes) carries the project id of where it was recorded, and continues where it is now.
+fn locate(meta: &mut SessionMetaEntry, path: &Path) {
+    if let Some(project) = path
+        .parent()
+        .filter(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name == super::SESSIONS_DIR)
+        })
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    {
+        meta.project_id = project.to_owned();
+    }
+}
+
+/// The first session metadata a journal records (a fork's comes after its source anchor).
+pub(super) fn session_meta_of(
+    log: &nori_conversation::ConversationLog,
+) -> io::Result<SessionMetaEntry> {
+    let entries = (1..=i64::try_from(log.len()).unwrap_or(i64::MAX))
+        .filter(|id| log.name(*id) == Some(TRANSCRIPT_ENTRY));
+    for record in log.records(entries) {
+        if let TranscriptEntry::SessionMeta(meta) = parse_entry(record)?.entry {
+            return Ok(meta);
+        }
+    }
+    Err(io::Error::other(
+        "conversation log does not contain session metadata",
+    ))
+}
+
+fn parse_entry(
+    record: io::Result<std::sync::Arc<nori_conversation::Record>>,
+) -> io::Result<super::types::TranscriptLine> {
+    match &record?.event {
+        nori_conversation::Event::Operation { args, .. } => {
+            serde_json::from_str(args).map_err(io::Error::other)
+        }
+        _ => Err(io::Error::other("transcript entry is not an operation")),
+    }
+}
+
+/// Whether `line` opens a turn: the person's prompt, in either transcript schema.
+fn starts_turn(line: &super::types::TranscriptLine) -> bool {
+    match &line.entry {
+        TranscriptEntry::User(_) => true,
+        TranscriptEntry::SessionEvent(entry) => {
+            !entry.historical_evidence
+                && matches!(
+                    &entry.event,
+                    nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                        nori_protocol::acp::v1::AgentNotification::SessionNotification(
+                            notification
+                        ),
+                    )) if matches!(
+                        notification.update,
+                        nori_protocol::acp::v1::SessionUpdate::UserMessageChunk(_)
+                    )
+                )
+        }
+        TranscriptEntry::SessionMeta(_)
+        | TranscriptEntry::Assistant(_)
+        | TranscriptEntry::ClientEvent(_)
+        | TranscriptEntry::ToolCall(_)
+        | TranscriptEntry::ToolResult(_)
+        | TranscriptEntry::PatchApply(_) => false,
+    }
+}
+
+/// A journal's session metadata brought up to date with its last visible backend binding, the
+/// bound ACP session, and whether a rewind since requires a fresh binding.
+fn journal_meta(
+    log: &nori_conversation::ConversationLog,
+) -> io::Result<(SessionMetaEntry, Option<String>, bool)> {
+    let mut meta = session_meta_of(log)?;
+    let last_rewind = (1..=i64::try_from(log.len()).unwrap_or(i64::MAX))
+        .rev()
+        .find(|id| log.kind(*id) == Some(nori_conversation::Kind::Rewind));
+    let visible_binding = match log
+        .visible_named(nori_conversation::Kind::Command, "backend-bound")
+        .last()
+    {
+        Some(id) => backend_bound(log.record(*id)?.as_ref()),
+        None => None,
+    };
+    let (backend_binding, requires_fresh_binding) =
+        bind_meta(&mut meta, last_rewind, visible_binding);
+    Ok((meta, backend_binding, requires_fresh_binding))
+}
+
+/// Load a journaled transcript: every visible entry, or with `tail` only the newest of them.
+fn load_journal(log_path: &Path, path: &Path, tail: Option<i64>) -> io::Result<Transcript> {
+    let started = Instant::now();
+    let log = nori_conversation::ConversationLog::open(log_path)?;
+    let indexed = started.elapsed();
+    let entry_ids = log.visible_named(nori_conversation::Kind::Operation, TRANSCRIPT_ENTRY);
+    let (event_ids, entries) = match tail {
+        None => {
+            let entries = log
+                .records(entry_ids.iter().copied())
+                .map(parse_entry)
+                .collect::<io::Result<Vec<_>>>()?;
+            (entry_ids.clone(), entries)
+        }
+        Some(budget) => newest_entries(&log, &entry_ids, budget)?,
+    };
+    let left_out = i64::try_from(entry_ids.len() - entries.len()).unwrap_or(i64::MAX);
+    let (mut meta, backend_binding, requires_fresh_binding) = journal_meta(&log)?;
+    locate(&mut meta, path);
+    tracing::info!(
+        target: "nori_resume",
+        phase = "transcript_loader.load_journal",
+        path = %path.display(),
+        records = log.len(),
+        entries = entries.len(),
+        left_out,
+        indexed_ms = indexed.as_millis(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "loaded journal",
+    );
+    Ok(Transcript {
+        meta,
+        entries,
+        backend_binding,
+        requires_fresh_binding,
+        event_ids,
+        left_out,
+    })
+}
+
+/// The newest of the transcript entries `ids` whose journal lines come to `budget` bytes,
+/// rounded up to the start of a turn: newest first until the budget is spent and a turn starts;
+/// a turn longer than a few budgets (an agent at work for hours) is cut inside, where its events
+/// go on. Oldest first, with their ids.
+pub(crate) fn newest_entries(
+    log: &nori_conversation::ConversationLog,
+    ids: &[nori_conversation::EventId],
+    budget: i64,
+) -> io::Result<(
+    Vec<nori_conversation::EventId>,
+    Vec<super::types::TranscriptLine>,
+)> {
+    let mut taken = Vec::new();
+    let mut bytes = 0;
+    for (id, record) in ids
+        .iter()
+        .rev()
+        .copied()
+        .zip(log.records(ids.iter().rev().copied()))
+    {
+        let line = parse_entry(record)?;
+        let opens_turn = starts_turn(&line);
+        bytes += log.line_len(id).unwrap_or(0);
+        taken.push((id, line));
+        if bytes >= budget && (opens_turn || bytes >= budget.saturating_mul(4)) {
+            break;
+        }
+    }
+    taken.reverse();
+    Ok(taken.into_iter().unzip())
+}
+
+/// How much of a long conversation's newest history a resume reads: the bytes of its newest
+/// entries, rounded up to the start of a turn. The screen shows its last screens of it; the
+/// rest of a conversation is left on disk until something asks for it.
+pub const RESUME_TAIL_BYTES: i64 = 512 << 10;
+
+/// The name of the journal operation that holds a transcript entry.
+const TRANSCRIPT_ENTRY: &str = "transcript-entry";
+
 pub(super) async fn load_transcript_from_path(path: &Path) -> io::Result<Transcript> {
+    load_from_path(path, None).await
+}
+
+/// The transcript at `path` with only its newest entries, about `budget` bytes of them from the
+/// start of a turn: what a resume shows and continues from. Whole-history facts (its metadata,
+/// binding) are read as for a full load.
+pub(super) async fn load_transcript_tail_from_path(
+    path: &Path,
+    budget: i64,
+) -> io::Result<Transcript> {
+    load_from_path(path, Some(budget)).await
+}
+
+async fn load_from_path(path: &Path, tail: Option<i64>) -> io::Result<Transcript> {
     let log_path = path.with_extension("pkl");
     if log_path.exists() {
-        let log = nori_conversation::ConversationLog::open(log_path)?;
-        let parse_entry = |record: &nori_conversation::Record| match &record.event {
-            nori_conversation::Event::Operation { name, args } if name == "transcript-entry" => {
-                Some(
-                    serde_json::from_str::<super::types::TranscriptLine>(args)
-                        .map_err(io::Error::other),
-                )
-            }
-            _ => None,
-        };
-        let event_ids = log.projection().visible().iter().filter(|record| matches!(&record.event, nori_conversation::Event::Operation { name, .. } if name == "transcript-entry")).map(|record| record.id).collect();
-        let entries = log
-            .projection()
-            .visible()
-            .iter()
-            .filter_map(parse_entry)
-            .collect::<io::Result<Vec<_>>>()?;
-        let mut meta = log
-            .records()
-            .iter()
-            .filter_map(parse_entry)
-            .find_map(|line| match line {
-                Ok(super::types::TranscriptLine {
-                    entry: TranscriptEntry::SessionMeta(meta),
-                    ..
-                }) => Some(Ok(meta)),
-                Err(error) => Some(Err(error)),
-                Ok(_) => None,
-            })
-            .transpose()?
-            .ok_or_else(|| {
-                io::Error::other("conversation log does not contain session metadata")
-            })?;
-        let last_rewind = log.records().iter().rev().find_map(|record| {
-            matches!(&record.event, nori_conversation::Event::Rewind { .. }).then_some(record.id)
-        });
-        let visible_binding = log
-            .projection()
-            .visible()
-            .iter()
-            .rev()
-            .find_map(backend_bound);
-        let (backend_binding, requires_fresh_binding) =
-            bind_meta(&mut meta, last_rewind, visible_binding);
-        return Ok(Transcript {
-            meta,
-            entries,
-            backend_binding,
-            requires_fresh_binding,
-            event_ids,
-        });
+        let path = path.to_path_buf();
+        // Indexing and decoding are work proportional to what is read: off the async workers.
+        return tokio::task::spawn_blocking(move || load_journal(&log_path, &path, tail))
+            .await
+            .map_err(io::Error::other)?;
     }
     let started = Instant::now();
     let bytes = tokio::fs::read(path).await?;
@@ -1077,12 +1215,15 @@ pub(super) async fn load_transcript_from_path(path: &Path) -> io::Result<Transcr
         "loaded full transcript",
     );
 
+    let mut meta = parsed.meta;
+    locate(&mut meta, path);
     Ok(Transcript {
-        meta: parsed.meta,
+        meta,
         entries: parsed.entries,
         backend_binding: None,
         requires_fresh_binding: false,
         event_ids: Vec::new(),
+        left_out: 0,
     })
 }
 

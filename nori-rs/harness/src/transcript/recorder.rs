@@ -38,9 +38,14 @@ use super::types::now_iso8601;
 
 /// Commands sent to the background writer task.
 enum TranscriptCmd {
-    Write(Box<TranscriptEntry>),
-    Flush { ack: oneshot::Sender<()> },
-    Shutdown { ack: oneshot::Sender<()> },
+    /// One transcript line, already serialized (with its line end) for the journal.
+    Write(String),
+    Flush {
+        ack: oneshot::Sender<()>,
+    },
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 /// Records transcript entries for a session.
@@ -49,6 +54,8 @@ enum TranscriptCmd {
 pub struct TranscriptRecorder {
     tx: Sender<TranscriptCmd>,
     conversation: Option<Arc<Mutex<ConversationLog>>>,
+    /// Journal records a failed write held back, oldest first: written before anything newer.
+    held: Arc<Mutex<Held>>,
     session_id: String,
     project_id: String,
     transcript_path: PathBuf,
@@ -196,6 +203,7 @@ impl TranscriptRecorder {
         tokio::spawn(transcript_writer(file, rx, session_meta));
 
         Ok(Self {
+            held: Arc::default(),
             tx,
             conversation,
             session_id,
@@ -267,11 +275,12 @@ impl TranscriptRecorder {
         let parent_path = sessions_dir.join(format!("{forked_from}.pkl"));
         if parent_path.exists() {
             let parent = ConversationLog::open(parent_path)?;
-            if let (Some(start), Some(end)) = (
-                parent.projection().visible().first(),
-                parent.projection().visible().last(),
-            ) {
-                let payload = serde_json::json!({ "session_id": forked_from, "start": start.id, "end": end.id }).to_string();
+            if let (Some(start), Some(end)) =
+                (parent.visible_ids().first(), parent.visible_ids().last())
+            {
+                let payload =
+                    serde_json::json!({ "session_id": forked_from, "start": start, "end": end })
+                        .to_string();
                 log.append(Event::Command {
                     name: "fork-source".into(),
                     payload,
@@ -306,6 +315,7 @@ impl TranscriptRecorder {
         tokio::spawn(run_writer_loop(file, rx));
 
         Ok(Self {
+            held: Arc::default(),
             tx,
             conversation,
             session_id,
@@ -347,6 +357,7 @@ impl TranscriptRecorder {
         let (tx, rx) = mpsc::channel::<TranscriptCmd>(256);
         tokio::spawn(run_writer_loop(file, rx));
         Ok(Self {
+            held: Arc::default(),
             tx,
             conversation,
             session_id: meta.session_id.clone(),
@@ -383,6 +394,18 @@ impl TranscriptRecorder {
     ) -> io::Result<Option<i64>> {
         self.send_entry_with_id(TranscriptEntry::SessionEvent(event.clone()))
             .await
+            .map(|ids| ids.map(|(_, id)| id))
+    }
+
+    /// Record an event the agent sent, with Nori's observation of it: the one journal record of
+    /// that event. Returns the first visible record's id and the new record's, the range a
+    /// response that ends here spans.
+    pub(crate) async fn record_received_event(
+        &self,
+        event: &SessionEventEntry,
+    ) -> io::Result<Option<(i64, i64)>> {
+        self.send_entry_with_id(TranscriptEntry::SessionEvent(event.clone()))
+            .await
     }
 
     /// Resolve a stable range within this session's current visible projection.
@@ -401,68 +424,73 @@ impl TranscriptRecorder {
             .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
         log.lock()
             .await
-            .projection()
-            .slice(nori_conversation::SliceRef { start, end })
+            .slice(nori_conversation::SliceRef { start, end })?
             .ok_or_else(|| io::Error::other("fork source range is not visible"))
     }
 
     /// Capture the current visible conversation as provider fallback context.
     pub async fn visible_context(&self) -> io::Result<String> {
-        let head = self.conversation_head().await;
-        self.projected_context(head).await
+        self.visible_context_at_head()
+            .await
+            .map(|(context, _)| context)
     }
 
-    /// Compute the text fallback for a prospective head without modifying the log.
+    /// The visible conversation as fallback context, and the head it was read at.
+    pub async fn visible_context_at_head(&self) -> io::Result<(String, Option<i64>)> {
+        let head = self.conversation_head().await;
+        let context = self.projected_context(head).await?;
+        Ok((context, head))
+    }
+
+    /// Compute the text fallback for a prospective head without modifying the log. Reading the
+    /// whole conversation takes as long as it is long, so it runs on a blocking thread.
     pub(crate) async fn projected_context(&self, head: Option<i64>) -> io::Result<String> {
         let log = self
             .conversation
-            .as_ref()
+            .clone()
             .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
-        let log = log.lock().await;
-        let visible = log.projection().visible();
+        tokio::task::spawn_blocking(move || Self::project_context(&log, head))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    fn project_context(log: &Mutex<ConversationLog>, head: Option<i64>) -> io::Result<String> {
+        let log = log.blocking_lock();
+        let visible = log.visible_ids();
         let length = match head {
             Some(id) => visible
-                .iter()
-                .position(|record| record.id == id)
+                .binary_search(&id)
                 .map(|index| index + 1)
-                .ok_or_else(|| io::Error::other("rewind head is not visible"))?,
+                .map_err(|_| io::Error::other("rewind head is not visible"))?,
             None => 0,
         };
-        let entries = visible[..length]
+        let visible = &visible[..length];
+        let entry_ids = visible
             .iter()
-            .filter_map(|record| match &record.event {
-                Event::Operation { name, args } if name == "transcript-entry" => {
-                    Some(serde_json::from_str::<TranscriptLine>(args).map_err(io::Error::other))
-                }
-                _ => None,
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let meta = log
-            .records()
-            .iter()
-            .filter_map(|record| match &record.event {
-                Event::Operation { name, args } if name == "transcript-entry" => {
-                    serde_json::from_str::<TranscriptLine>(args).ok()
-                }
-                _ => None,
-            })
-            .find_map(|line| match line.entry {
-                TranscriptEntry::SessionMeta(meta) => Some(meta),
-                _ => None,
-            })
-            .ok_or_else(|| io::Error::other("conversation log has no session metadata"))?;
+            .copied()
+            .filter(|id| log.name(*id) == Some("transcript-entry"))
+            .collect::<Vec<_>>();
+        // Only the newest history fits in any agent's context, so only that much is read: a
+        // switch in a conversation of hundreds of megabytes is as quick as in a short one.
+        let (_, entries) = super::loader::newest_entries(&log, &entry_ids, HANDOFF_TAIL_BYTES)?;
+        let left_out = entry_ids.len() - entries.len();
+        let meta = super::loader::session_meta_of(&log)?;
         let transcript = super::loader::Transcript {
             meta,
             entries,
             backend_binding: None,
             requires_fresh_binding: false,
             event_ids: Vec::new(),
+            left_out: i64::try_from(left_out).unwrap_or(i64::MAX),
         };
-        let has_fork_seed = visible[..length].iter().any(|record| {
-            matches!(
-                &record.event, Event::Command { name, .. } if name == "fork-context"
-            )
-        });
+        let earlier = if left_out > 0 {
+            "Earlier turns of this conversation are left out; this is its newest part.\n"
+        } else {
+            ""
+        };
+        let has_fork_seed = visible
+            .iter()
+            .any(|id| log.name(*id) == Some("fork-context"));
         if has_fork_seed {
             // The archived source is provenance, not live context: a rewind may select an
             // earlier inherited response. Build from visible replay-safe entries so discarded
@@ -479,48 +507,62 @@ impl TranscriptRecorder {
                 })
                 .collect();
             Ok(format!(
-                "Visible conversation history:\n{}",
+                "{earlier}Visible conversation history:\n{}",
                 serde_json::to_string(&updates).map_err(io::Error::other)?
             ))
         } else {
-            Ok(crate::backend::transcript_to_summary(&transcript))
+            Ok(format!(
+                "{earlier}{}",
+                crate::backend::transcript_to_summary(&transcript)
+            ))
         }
     }
 
     /// The payloads of every visible record of the command `name`, oldest first.
     pub(crate) async fn journaled_commands(&self, name: &str) -> io::Result<Vec<String>> {
+        Ok(self
+            .journaled_commands_of(&[name])
+            .await?
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect())
+    }
+
+    /// Every visible record of any of the commands `names`, as `(name, payload)`, oldest first:
+    /// for readers whose records mean something relative to another command's.
+    pub(crate) async fn journaled_commands_of(
+        &self,
+        names: &[&str],
+    ) -> io::Result<Vec<(String, String)>> {
         let Some(log) = &self.conversation else {
             return Ok(Vec::new());
         };
         let log = log.lock().await;
-        Ok(log
-            .projection()
-            .visible()
-            .iter()
-            .filter_map(|record| match &record.event {
-                Event::Command {
-                    name: recorded,
-                    payload,
-                } if recorded == name => Some(payload.clone()),
-                _ => None,
+        let ids = log.visible_where(|kind, name| {
+            kind == nori_conversation::Kind::Command
+                && name.is_some_and(|name| names.contains(&name))
+        });
+        log.records(ids)
+            .filter_map(|record| match record {
+                Ok(record) => match &record.event {
+                    Event::Command { name, payload } => Some(Ok((name.clone(), payload.clone()))),
+                    _ => None,
+                },
+                Err(error) => Some(Err(error)),
             })
-            .collect())
+            .collect()
     }
 
     /// Most recent visible payload for a previously recorded command.
     pub(crate) async fn recorded_command_payload(&self, name: &str) -> Option<String> {
         let log = self.conversation.as_ref()?.lock().await;
-        log.projection()
-            .visible()
-            .iter()
-            .rev()
-            .find_map(|record| match &record.event {
-                Event::Command {
-                    name: recorded_name,
-                    payload,
-                } if recorded_name == name => Some(payload.clone()),
-                _ => None,
-            })
+        let newest = *log
+            .visible_named(nori_conversation::Kind::Command, name)
+            .last()?;
+        match &log.record(newest).ok()?.event {
+            Event::Command { payload, .. } => Some(payload.clone()),
+            _ => None,
+        }
     }
 
     /// Record the identity of an engine bound to this conversation.
@@ -528,9 +570,11 @@ impl TranscriptRecorder {
         self.record_command("backend-bound", payload).await
     }
 
-    pub(crate) async fn conversation_head(&self) -> Option<i64> {
+    /// The id of the newest visible record: it changes with everything recorded, so equal heads
+    /// mean an unchanged conversation without reading it again.
+    pub async fn conversation_head(&self) -> Option<i64> {
         match &self.conversation {
-            Some(log) => log.lock().await.projection().head(),
+            Some(log) => log.lock().await.head(),
             None => None,
         }
     }
@@ -541,7 +585,68 @@ impl TranscriptRecorder {
             .conversation
             .as_ref()
             .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
-        Ok(log.lock().await.projection().visible().to_vec())
+        let log = log.lock().await;
+        log.visible()
+            .map(|record| record.map(Arc::unwrap_or_clone))
+            .collect()
+    }
+
+    /// The visible records `pick` chooses by kind and name, oldest first. Only those are read:
+    /// the journal's index knows every record's kind and name, so asking for a few commands of a
+    /// long conversation costs those commands.
+    pub(crate) async fn visible_records_where(
+        &self,
+        pick: impl Fn(nori_conversation::Kind, Option<&str>) -> bool,
+    ) -> io::Result<Vec<nori_conversation::Record>> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        let log = log.lock().await;
+        let ids = log.visible_where(pick);
+        log.records(ids)
+            .map(|record| record.map(Arc::unwrap_or_clone))
+            .collect()
+    }
+
+    /// The visible session events whose record mentions `needle` (an id, written literally into
+    /// its line), oldest first. Lines are searched as written and only the matches decoded, so
+    /// what a long conversation says about one child costs one read of it.
+    pub(crate) async fn visible_session_events_mentioning(
+        &self,
+        needle: &str,
+    ) -> io::Result<Vec<nori_protocol::SessionEvent>> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        let log = log.lock().await;
+        let ids = log.visible_containing(needle)?;
+        let mut events = Vec::new();
+        for record in log.records(ids) {
+            if let Event::Operation { name, args } = &record?.event
+                && name == "transcript-entry"
+                && let Ok(TranscriptLine {
+                    entry: TranscriptEntry::SessionEvent(entry),
+                    ..
+                }) = serde_json::from_str::<TranscriptLine>(args)
+                && !entry.historical_evidence
+            {
+                events.push(entry.event);
+            }
+        }
+        Ok(events)
+    }
+
+    /// The first and last visible record ids, read from the journal's index.
+    pub(crate) async fn visible_span(&self) -> io::Result<Option<(i64, i64)>> {
+        let log = self
+            .conversation
+            .as_ref()
+            .ok_or_else(|| io::Error::other("legacy session has no event log"))?;
+        let log = log.lock().await;
+        let ids = log.visible_ids();
+        Ok(ids.first().copied().zip(ids.last().copied()))
     }
 
     /// Move the visible head while retaining all previous records.
@@ -575,26 +680,6 @@ impl TranscriptRecorder {
         Ok(())
     }
 
-    /// Persist the received event before the live timeline applies it.
-    pub(crate) async fn record_received_event(
-        &self,
-        event: &nori_protocol::SessionEvent,
-    ) -> io::Result<Option<(i64, i64)>> {
-        if let Some(log) = &self.conversation {
-            let mut log = log.lock().await;
-            let record = log.append(Event::SessionEvent {
-                payload: serde_json::to_string(event)?,
-            })?;
-            let start = log
-                .projection()
-                .visible()
-                .first()
-                .map_or(record.id, |first| first.id);
-            return Ok(Some((start, record.id)));
-        }
-        Ok(None)
-    }
-
     /// Persist a submitted harness command before executing it.
     pub(crate) async fn record_command(&self, name: &str, payload: String) -> io::Result<()> {
         if let Some(log) = &self.conversation {
@@ -614,14 +699,14 @@ impl TranscriptRecorder {
             return Ok(Vec::new());
         };
         let log = log.lock().await;
+        let ids = log.visible_named(
+            nori_conversation::Kind::Command,
+            crate::backend::queue_journal::QUEUE_COMMAND,
+        );
         let records = log
-            .projection()
-            .visible()
-            .iter()
-            .filter_map(|record| match &record.event {
-                Event::Command { name, payload }
-                    if name == crate::backend::queue_journal::QUEUE_COMMAND =>
-                {
+            .records(ids)
+            .filter_map(|record| match &record.ok()?.event {
+                Event::Command { payload, .. } => {
                     serde_json::from_str::<crate::backend::queue_journal::QueueRecord>(payload).ok()
                 }
                 _ => None,
@@ -650,8 +735,21 @@ impl TranscriptRecorder {
             .map_err(|e| IoError::other(format!("failed to queue transcript shutdown: {e}")))?;
         rx.await
             .map_err(|e| IoError::other(format!("failed waiting for transcript shutdown: {e}")))?;
-        // The transcript is complete: bring its full-text index digest up to date.
-        crate::session_index::SessionIndex::sync_after_session(&self.transcript_path);
+        // Records reach the disk in the background as they are appended; a clean end is where
+        // the rest is made durable.
+        if let Some(log) = self.conversation.clone() {
+            let synced = tokio::task::spawn_blocking(move || log.blocking_lock().sync()).await;
+            if let Ok(Err(error)) | Err(error) = synced.map_err(IoError::other) {
+                tracing::warn!(%error, "could not flush the conversation journal");
+            }
+        }
+        // The transcript is complete: bring its full-text index digest up to date, so the next
+        // picker lists the session with its title.
+        crate::session_index::SessionIndex::sync_after_session(
+            &self.transcript_path,
+            std::time::Duration::from_millis(1500),
+        )
+        .await;
         Ok(())
     }
 
@@ -675,23 +773,28 @@ impl TranscriptRecorder {
         self.send_entry_with_id(entry).await.map(drop)
     }
 
-    async fn send_entry_with_id(&self, entry: TranscriptEntry) -> io::Result<Option<i64>> {
+    /// Journal `entry` and queue it for the JSONL view. Returns the first visible record's id and
+    /// the new record's, when the session has a journal.
+    async fn send_entry_with_id(&self, entry: TranscriptEntry) -> io::Result<Option<(i64, i64)>> {
+        // One serialization serves the journal and the JSONL view.
+        let line = serialize_line(&TranscriptLine::new(entry))?;
         let id = if let Some(log) = &self.conversation {
-            let line = TranscriptLine::new(entry.clone());
-            Some(
-                log.lock()
-                    .await
-                    .append(Event::Operation {
-                        name: "transcript-entry".into(),
-                        args: serde_json::to_string(&line)?,
-                    })?
-                    .id,
-            )
+            let mut log = log.lock().await;
+            let args = line.trim_end_matches('\n').to_owned();
+            let mut held = self.held.lock().await;
+            match append_in_order(&mut log, &mut held, args)? {
+                Some(record) => {
+                    let start = log.visible_ids().first().copied().unwrap_or(record.id);
+                    Some((start, record.id))
+                }
+                // Held back: written once writing works again; the conversation goes on.
+                None => None,
+            }
         } else {
             None
         };
         self.tx
-            .send(TranscriptCmd::Write(Box::new(entry)))
+            .send(TranscriptCmd::Write(line))
             .await
             .map_err(|e| IoError::other(format!("failed to queue transcript entry: {e}")))?;
         Ok(id)
@@ -712,13 +815,111 @@ async fn transcript_writer(
     run_writer_loop(file, rx).await
 }
 
-/// Process writer commands against an already-opened, already-seeded file.
+/// Journal records a failed write held back, and their size.
+#[derive(Default)]
+struct Held {
+    records: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+/// How much of a conversation's newest history a switch to another agent reads: comfortably more
+/// than the most any agent is given (`ContextBudget::CEILING`), as journal lines carry more than
+/// the summary keeps of them.
+const HANDOFF_TAIL_BYTES: i64 = 8 << 20;
+
+/// The most a session holds in memory while writes fail; past it the oldest records go (and the
+/// log says so), so a disk that stays full cannot take the process down with it.
+const MAX_HELD_BYTES: usize = 256 * 1024 * 1024;
+
+/// Append what was held back, then `args`, in order. `Ok(None)` when the journal cannot be
+/// written now (the disk is full, the write failed): the record waits in `held` and the session
+/// goes on. A write cut short leaves the log needing a re-read, which happens first. Any other
+/// error (another writer got there first) is returned as before, and nothing is held for it.
+fn append_in_order(
+    log: &mut ConversationLog,
+    held: &mut Held,
+    args: String,
+) -> io::Result<Option<std::sync::Arc<nori_conversation::Record>>> {
+    held.bytes += args.len();
+    held.records.push_back(args);
+    let mut last = None;
+    while let Some(next) = held.records.front() {
+        let event = Event::Operation {
+            name: "transcript-entry".into(),
+            args: next.clone(),
+        };
+        let appended = match log.append(event.clone()) {
+            Err(error) if needs_refresh(&error) => log.refresh().and_then(|()| log.append(event)),
+            other => other,
+        };
+        match appended {
+            Ok(record) => {
+                if let Some(done) = held.records.pop_front() {
+                    held.bytes -= done.len();
+                }
+                last = Some(record);
+            }
+            Err(error) if is_write_failure(&error) => {
+                crate::storage_health::failed("this conversation's journal", &error);
+                while held.bytes > MAX_HELD_BYTES {
+                    let Some(dropped) = held.records.pop_front() else {
+                        break;
+                    };
+                    held.bytes -= dropped.len();
+                    tracing::error!("dropped a journal record held while writes fail");
+                }
+                return Ok(None);
+            }
+            Err(error) => {
+                if let Some(new) = held.records.pop_back() {
+                    held.bytes -= new.len();
+                }
+                return Err(error);
+            }
+        }
+    }
+    crate::storage_health::recovered();
+    Ok(last)
+}
+
+/// The journal refuses appends after a write was cut short, until it is re-read.
+fn needs_refresh(error: &io::Error) -> bool {
+    error.to_string().contains("refreshed")
+}
+
+/// A failure of the disk, not of the journal's own rules: what holding the record waits out.
+fn is_write_failure(error: &io::Error) -> bool {
+    crate::storage_health::is_full(error)
+        || needs_refresh(error)
+        || matches!(
+            error.kind(),
+            io::ErrorKind::WriteZero
+                | io::ErrorKind::StorageFull
+                | io::ErrorKind::ReadOnlyFilesystem
+        )
+        || error.raw_os_error() == Some(5)
+}
+
+/// Process writer commands against an already-opened, already-seeded file. The JSONL file is a
+/// view of the journal: a line that cannot be written is skipped (the journal keeps it), and
+/// whatever a failed write left of it is cut off so the next line starts clean.
 async fn run_writer_loop(mut file: File, mut rx: mpsc::Receiver<TranscriptCmd>) -> io::Result<()> {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            TranscriptCmd::Write(entry) => {
-                let line = TranscriptLine::new(*entry);
-                write_line(&mut file, &line).await?;
+            TranscriptCmd::Write(line) => {
+                let before = file.metadata().await.map(|meta| meta.len()).ok();
+                let written = async {
+                    file.write_all(line.as_bytes()).await?;
+                    file.flush().await
+                }
+                .await;
+                if let Err(error) = written {
+                    crate::storage_health::failed("this conversation's transcript", &error);
+                    if let Some(before) = before {
+                        let _ = file.set_len(before).await;
+                        let _ = file.seek(std::io::SeekFrom::Start(before)).await;
+                    }
+                }
             }
             TranscriptCmd::Flush { ack } => {
                 if let Err(e) = file.flush().await {
@@ -1006,8 +1207,8 @@ mod tests {
 
         recorder.shutdown().await.unwrap();
         let log = ConversationLog::open(recorder.transcript_path().with_extension("pkl")).unwrap();
-        assert!(log.projection().visible().iter().any(|record| matches!(
-            &record.event,
+        assert!(log.visible().any(|record| matches!(
+            &record.unwrap().event,
             Event::Command { name, payload }
                 if name == "handoff-attempt" && payload.contains("secret-ranked-candidate")
         )));
@@ -1126,7 +1327,7 @@ mod tests {
         )) if boundary.transcript_id == recorder.session_id() && boundary.end == end)
         );
         let log = ConversationLog::open(recorder.transcript_path().with_extension("pkl")).unwrap();
-        assert!(log.records().iter().any(|record| match &record.event {
+        assert!(log.all().any(|record| match &record.unwrap().event {
             Event::Operation { args, .. } => args.contains("hidden"),
             _ => false,
         }));
@@ -1153,7 +1354,7 @@ mod tests {
 
         let path = recorder.transcript_path().with_extension("pkl");
         let mut log = ConversationLog::open(&path).unwrap();
-        let head = log.projection().visible()[1].id;
+        let head = log.visible_ids()[1];
         log.append(Event::Rewind { head: Some(head) }).unwrap();
         drop(log);
         let loader = super::super::TranscriptLoader::new(dir.path().to_path_buf());
@@ -1186,7 +1387,7 @@ mod tests {
             Some("first")
         );
         let reopened = ConversationLog::open(path).unwrap();
-        assert_eq!(reopened.records().len(), 4);
+        assert_eq!(reopened.len(), 4);
     }
 
     #[tokio::test]

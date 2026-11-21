@@ -35,6 +35,7 @@ pub mod remote_agent;
 pub mod runtime;
 pub(crate) mod session_event_fanout;
 pub mod session_index;
+pub mod storage_health;
 pub mod tracing_setup;
 pub mod transcript;
 pub mod transcript_discovery;

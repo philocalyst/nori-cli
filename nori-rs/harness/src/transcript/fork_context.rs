@@ -1,11 +1,11 @@
 //! Serialize an exact visible event-log slice as historical context for a child.
 
+pub(crate) use super::context_digest::Keep;
 use super::types::TranscriptEntry;
 use super::types::TranscriptLine;
+use crate::context_budget::ContextBudget;
 use nori_conversation::Event;
 use nori_conversation::Record;
-use serde_json::Value;
-use serde_json::json;
 
 /// Materialize only conversation entries; provider bindings and control commands remain inert
 /// in the archived source context. Appending these entries assigns fresh child-local record IDs.
@@ -119,9 +119,45 @@ pub(crate) fn child_bindings_from_records(records: &[Record]) -> Vec<(String, St
     bindings.into_iter().collect()
 }
 
-/// Keep each projected record and its full payload in order, including tool activity.
-pub(crate) fn context_from_records(records: Vec<Record>) -> serde_json::Result<String> {
-    let attachments: Vec<nori_protocol::acp::v1::ContentBlock> =
+/// Whether a record is bookkeeping about the fork itself, which a child never inherits.
+fn is_inert(record: &Record) -> bool {
+    match &record.event {
+        Event::Command { name, .. } => {
+            name == "fork-context"
+                || name == "fork-source"
+                || name.starts_with("native-child-journal:")
+                || name.starts_with("managed-child-journal:")
+                || name == "actor-delta"
+                || name == "actor-snapshot"
+        }
+        Event::Operation { name, args } => {
+            name == "transcript-entry"
+                && serde_json::from_str::<TranscriptLine>(args).is_ok_and(|line| {
+                    matches!(line.entry, TranscriptEntry::SessionEvent(entry)
+                        if matches!(entry.event, nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(_))))
+                })
+        }
+        Event::Message { .. }
+        | Event::ToolCall { .. }
+        | Event::ToolResult { .. }
+        | Event::Rewind { .. }
+        | Event::Fork { .. }
+        | Event::SessionEvent { .. }
+        | Event::Unknown { .. } => false,
+    }
+}
+
+const HISTORY_INTRO: &str = "The following is the selected conversation event history, in order. Some records describe the same event in different forms.";
+
+/// The selected history as text for a prompt, within `budget`: the records in order (see
+/// [`context_digest`](super::context_digest)), then the selected non-text user content (images)
+/// as a typed block that rides the provider wire separately, newest first within a quarter of
+/// the budget. Whatever does not fit is left out and said so, never sent whole.
+pub(crate) fn context_from_records(
+    records: Vec<Record>,
+    budget: ContextBudget,
+) -> serde_json::Result<String> {
+    let mut attachments: Vec<nori_protocol::acp::v1::ContentBlock> =
         replay_entries_from_records(&records, "context")
             .into_iter()
             .filter_map(|line| match line.entry {
@@ -146,49 +182,52 @@ pub(crate) fn context_from_records(records: Vec<Record>) -> serde_json::Result<S
                 _ => None,
             })
             .collect();
-    let events: Vec<Value> = records
-        .into_iter()
-        .filter(|record| !matches!(&record.event, Event::Command { name, .. } if name == "fork-context" || name == "fork-source" || name.starts_with("native-child-journal:") || name.starts_with("managed-child-journal:") || name == "actor-delta" || name == "actor-snapshot"))
-        .filter(|record| !matches!(&record.event, Event::Operation { name, args } if name == "transcript-entry" && serde_json::from_str::<TranscriptLine>(args).is_ok_and(|line| matches!(line.entry, TranscriptEntry::SessionEvent(entry) if matches!(entry.event, nori_protocol::SessionEvent::Acp(nori_protocol::AcpEvent::ChildNotification(_)))))))
-        .map(|record| {
-            let event = match record.event {
-                Event::Message { role, content } => {
-                    json!({"type": "message", "role": role, "content": content})
-                }
-                Event::ToolCall { id, name, input } => {
-                    json!({"type": "tool_call", "id": id, "name": name, "input": input})
-                }
-                Event::ToolResult { id, output } => {
-                    json!({"type": "tool_result", "id": id, "output": output})
-                }
-                Event::Rewind { head } => json!({"type": "rewind", "head": head}),
-                Event::Fork { source } => {
-                    json!({"type": "fork", "start": source.start, "end": source.end})
-                }
-                Event::Operation { name, args } => {
-                    json!({"type": "operation", "name": name, "args": args})
-                }
-                Event::Command { name, payload } => {
-                    json!({"type": "command", "name": name, "payload": payload})
-                }
-                Event::SessionEvent { payload } => {
-                    json!({"type": "session_event", "payload": payload})
-                }
-                Event::Unknown { form } => json!({"type": "unknown", "form": form}),
-            };
-            json!({"id": record.id, "command_id": record.command_id, "event": event})
-        })
-        .collect();
-    let mut context = format!(
-        "The following is the selected conversation event history, in order. Some records describe the same event in different forms.\n{}",
-        Value::Array(events)
+    let attachment_count = attachments.len();
+    let mut attachment_bytes = 0;
+    let mut kept_attachments = Vec::new();
+    while let Some(block) = attachments.pop() {
+        let size = serde_json::to_string(&block)?.len();
+        // Two brackets around the array, and a comma between blocks.
+        if attachment_bytes + size + 1 > budget.attachment_bytes().saturating_sub(2) {
+            break;
+        }
+        attachment_bytes += size;
+        kept_attachments.push(block);
+    }
+    kept_attachments.reverse();
+    let selected: Vec<&Record> = records.iter().filter(|record| !is_inert(record)).collect();
+    let digest = super::context_digest::digest(
+        &selected,
+        // What is left, less the wrapper text around the history, the notice and the tags.
+        budget.bytes().saturating_sub(attachment_bytes + 512),
+        Keep::Newest,
     );
-    if !attachments.is_empty() {
+    let mut context = format!("{HISTORY_INTRO}\n{}", digest.json);
+    if attachment_count > kept_attachments.len() {
+        context.push_str(&format!(
+            "\n[{} earlier attachments (images or files) left out to fit the size budget]",
+            attachment_count - kept_attachments.len()
+        ));
+    }
+    if !kept_attachments.is_empty() {
         context.push_str("\n<nori-typed-history>");
-        context.push_str(&serde_json::to_string(&attachments)?);
+        context.push_str(&serde_json::to_string(&kept_attachments)?);
         context.push_str("</nori-typed-history>");
     }
     Ok(context)
+}
+
+/// A page of the log for the `conversation_context` tool: the same rendering and budget, but
+/// the page keeps its oldest records when it must cut, and names where the next one starts.
+pub(crate) fn page_from_records(
+    records: &[Record],
+    max_bytes: usize,
+    keep: Keep,
+) -> super::context_digest::Digest {
+    let selected: Vec<&Record> = records.iter().filter(|record| !is_inert(record)).collect();
+    let mut digest = super::context_digest::digest(&selected, max_bytes, keep);
+    digest.json = format!("{HISTORY_INTRO}\n{}", digest.json);
+    digest
 }
 
 /// Recover selected non-text user content from a fork checkpoint for the provider wire.
@@ -214,6 +253,12 @@ pub(crate) fn take_typed_history(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
+    use serde_json::json;
+
+    fn budget() -> ContextBudget {
+        ContextBudget::for_window(None)
+    }
 
     #[test]
     fn selected_typed_content_and_failed_receipts_survive_projection() {
@@ -253,7 +298,7 @@ mod tests {
             .collect();
         assert_eq!(replay_entries_from_records(&records, "source").len(), 2);
         let mut checkpoint =
-            crate::compact::checkpoint(&context_from_records(records).unwrap(), None);
+            crate::compact::checkpoint(&context_from_records(records, budget()).unwrap(), None);
         assert_eq!(take_typed_history(&mut checkpoint), vec![image]);
         assert!(!checkpoint.contains("<nori-typed-history>"));
     }
@@ -291,7 +336,7 @@ mod tests {
                 },
             },
         ];
-        let context = context_from_records(records).unwrap();
+        let context = context_from_records(records, budget()).unwrap();
         assert!(!context.contains("old checkpoint"));
         assert!(!context.contains("Y2hpbGQ="));
         let mut checkpoint = crate::compact::checkpoint(&context, None);
@@ -300,24 +345,27 @@ mod tests {
 
     #[test]
     fn keeps_projected_events_and_full_payloads_in_order() {
-        let context = context_from_records(vec![
-            Record {
-                id: 3,
-                command_id: None,
-                event: Event::Message {
-                    role: "user".into(),
-                    content: "question".into(),
+        let context = context_from_records(
+            vec![
+                Record {
+                    id: 3,
+                    command_id: None,
+                    event: Event::Message {
+                        role: "user".into(),
+                        content: "question".into(),
+                    },
                 },
-            },
-            Record {
-                id: 7,
-                command_id: None,
-                event: Event::ToolResult {
-                    id: "t".into(),
-                    output: "full result".into(),
+                Record {
+                    id: 7,
+                    command_id: None,
+                    event: Event::ToolResult {
+                        id: "t".into(),
+                        output: "full result".into(),
+                    },
                 },
-            },
-        ])
+            ],
+            budget(),
+        )
         .unwrap();
         let json = context.lines().last().unwrap();
         let events: Value = serde_json::from_str(json).unwrap();
@@ -328,5 +376,68 @@ mod tests {
                 {"id": 7, "command_id": null, "event": {"type": "tool_result", "id": "t", "output": "full result"}}
             ])
         );
+    }
+
+    #[test]
+    fn a_huge_history_and_its_images_stay_within_the_budget() {
+        use nori_protocol::AcpEvent;
+        use nori_protocol::SessionEvent;
+        use nori_protocol::acp::v1 as acp;
+        let budget = ContextBudget::for_window(Some(258_000));
+        let entry = |event: SessionEvent| {
+            serde_json::to_string(&TranscriptLine::new(TranscriptEntry::SessionEvent(
+                super::super::types::SessionEventEntry::new(event),
+            )))
+            .unwrap()
+        };
+        let image = |data: String| {
+            let chunk = acp::ContentChunk::new(acp::ContentBlock::Image(acp::ImageContent::new(
+                data,
+                "image/png",
+            )));
+            SessionEvent::Acp(AcpEvent::Notification(
+                acp::AgentNotification::SessionNotification(acp::SessionNotification::new(
+                    acp::SessionId::new("s"),
+                    acp::SessionUpdate::UserMessageChunk(chunk),
+                )),
+            ))
+        };
+        let mut records: Vec<Record> = Vec::new();
+        for turn in 0..60_i64 {
+            records.push(Record {
+                id: turn * 3 + 1,
+                command_id: None,
+                event: Event::Message {
+                    role: "user".into(),
+                    content: format!("question {turn}"),
+                },
+            });
+            records.push(Record {
+                id: turn * 3 + 2,
+                command_id: None,
+                event: Event::ToolResult {
+                    id: format!("call-{turn}"),
+                    output: "x".repeat(1024 * 1024),
+                },
+            });
+            records.push(Record {
+                id: turn * 3 + 3,
+                command_id: None,
+                event: Event::Operation {
+                    name: "transcript-entry".into(),
+                    args: entry(image("A".repeat(20 * 1024))),
+                },
+            });
+        }
+        let context = context_from_records(records, budget).unwrap();
+        // 60 MB of tool output and 1.2 MB of images become one block inside the budget.
+        assert!(context.len() <= budget.bytes(), "{}", context.len());
+        assert!(context.contains("question 59"));
+        assert!(context.contains("earlier attachments"));
+        let mut checkpoint = crate::compact::checkpoint(&context, None);
+        assert!(checkpoint.len() <= budget.bytes() + 1024);
+        let images = take_typed_history(&mut checkpoint);
+        assert!(!images.is_empty());
+        assert!(serde_json::to_string(&images).unwrap().len() <= budget.attachment_bytes());
     }
 }
