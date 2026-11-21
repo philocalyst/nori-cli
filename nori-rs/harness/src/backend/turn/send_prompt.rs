@@ -183,6 +183,7 @@ impl AcpBackend {
                         handoff.prompt = Some(crate::recovery::handoff::HandoffPrompt {
                             content: original_content_for_task,
                             meta: original_meta,
+                            request_id: wire_request_id.clone(),
                         });
                         let _ = prompt_result_tx
                             .send(InboundEvent::PromptResultFor {
@@ -248,11 +249,11 @@ impl AcpBackend {
             .clone();
         let _ = owner_tx.send(owner);
 
+        // The marker is the handed-over request's ID (or `true` from older callers).
         let handoff_retry = prompt_meta
             .as_ref()
             .and_then(|meta| meta.get(nori_protocol::HANDOFF_RETRY_META_KEY))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+            .is_some_and(|marker| *marker != serde_json::Value::Bool(false));
         if prompt_kind == QueuedPromptKind::User && !handoff_retry {
             if let Some(recorder) = self.transcript_recorder.read().await.clone()
                 && let Some(display_text) = display_text.as_deref()

@@ -364,9 +364,11 @@ async fn replace(live: Live<'_>, request: HandoffRequest, mut cancel: watch::Rec
             }
             if let Some(prompt) = request.prompt.filter(|_| !cancelled_late) {
                 let mut meta = prompt.meta.unwrap_or_default();
+                // The retry answers under the request ID the client is waiting on.
                 meta.insert(
                     nori_protocol::HANDOFF_RETRY_META_KEY.to_owned(),
-                    serde_json::Value::Bool(true),
+                    serde_json::to_value(&prompt.request_id)
+                        .unwrap_or(serde_json::Value::Bool(true)),
                 );
                 let (response_tx, response_rx) = oneshot::channel();
                 live.prompt_queue

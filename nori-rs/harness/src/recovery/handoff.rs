@@ -15,6 +15,9 @@ pub(crate) struct HandoffPrompt {
     pub(crate) content: Vec<acp::ContentBlock>,
     /// The prompt's metadata, which keeps its echo identity so the transcript shows it once.
     pub(crate) meta: Option<acp::Meta>,
+    /// The prompt's request ID on the public stream. The new route answers under it, so a client
+    /// waiting on the request it sent sees it end, wherever it ended.
+    pub(crate) request_id: acp::RequestId,
 }
 
 pub(crate) struct HandoffRequest {

@@ -146,6 +146,14 @@ pub(crate) fn pardon(conversation: &str, route: &RouteRef) {
     }
 }
 
+/// `route`'s usage has reset: drop every exclusion that covers it.
+pub(crate) fn lift(conversation: &str, route: &RouteRef) {
+    let mut ledger = LEDGER.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(entries) = ledger.get_or_insert_default().get_mut(conversation) {
+        entries.retain(|entry| !entry.exclusion.covers(route));
+    }
+}
+
 pub(crate) fn primary(conversation: &str) -> Option<Primary> {
     PRIMARIES
         .lock()

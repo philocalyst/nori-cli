@@ -29,6 +29,10 @@ use crate::recovery::ledger;
 use crate::recovery::ledger::Recheck;
 use crate::recovery::plan;
 
+/// How long an agent that could not run (not signed in, missing, failing to start) is left out
+/// of a conversation's fallback routes.
+const AGENT_UNRUNNABLE_FOR_SECONDS: i64 = 15 * 60;
+
 pub(super) struct PromptRun {
     pub(super) wire_request_id: acp::RequestId,
     pub(super) result: anyhow::Result<acp::StopReason>,
@@ -83,7 +87,7 @@ impl AcpBackend {
     pub(super) async fn prompt_with_recovery(
         &self,
         session_id: acp::SessionId,
-        prompt: Vec<acp::ContentBlock>,
+        mut prompt: Vec<acp::ContentBlock>,
         prompt_meta: Option<acp::Meta>,
         mut transport_started: Option<oneshot::Sender<anyhow::Result<acp::RequestId>>>,
         kind: QueuedPromptKind,
@@ -91,11 +95,36 @@ impl AcpBackend {
     ) -> PromptRun {
         let mut cancelled = self.recovery.cancelled();
         let mut engine_slot: Option<Engine> = None;
+        // A prompt handed over by a fallback runs on a route Nori chose, not the person: if that
+        // route cannot run at all, the fallback goes on to the next one.
+        let continues_fallback = prompt_meta
+            .as_ref()
+            .is_some_and(|meta| meta.contains_key(nori_protocol::HANDOFF_RETRY_META_KEY));
         let mut current = self.current_route();
         // The turn has one request ID on the public stream, the first attempt's, whatever the
-        // later attempts are called on the wire.
-        let mut first_id: Option<acp::RequestId> = None;
+        // later attempts are called on the wire. A prompt handed over from another route keeps
+        // the ID it had there, so its client sees the request it sent end.
+        let mut first_id: Option<acp::RequestId> = prompt_meta
+            .as_ref()
+            .and_then(|meta| meta.get(nori_protocol::HANDOFF_RETRY_META_KEY))
+            .filter(|marker| !marker.is_boolean())
+            .and_then(|marker| serde_json::from_value(marker.clone()).ok());
+        if let Some(original) = first_id.clone()
+            && let Some(started) = transport_started.take()
+        {
+            // The turn is keyed by the handed-over ID from its first attempt.
+            let (forward_tx, forward_rx) = oneshot::channel();
+            transport_started = Some(forward_tx);
+            tokio::spawn(async move {
+                if let Ok(result) = forward_rx.await {
+                    let _ = started.send(result.map(|_| original));
+                }
+            });
+        }
         let mut attempt_no: i64 = 0;
+        // The prompt as first sent and the steps of `compaction.shrink_ladder` not yet tried,
+        // set up the first time a provider refuses the prompt as too long.
+        let mut ladder: Option<(Vec<acp::ContentBlock>, std::collections::VecDeque<f64>)> = None;
         loop {
             attempt_no += 1;
             let (wire_request_id, result) = self
@@ -122,13 +151,54 @@ impl AcpBackend {
             };
             let details = classify_failure(&err);
             let failure = details.class.kind();
+            // History Nori put into the prompt is the one part of it Nori may cut: a provider
+            // that refuses the prompt as too long is sent the checkpoint cut to each step of the
+            // policy's shrink ladder in turn, each a fraction of the checkpoint as first built.
+            if failure == nori_workflow::FailureKind::PromptTooLong {
+                if ladder.is_none() {
+                    let steps = self.session_policy().await.compaction.shrink_ladder;
+                    ladder = Some((prompt.clone(), steps.into()));
+                }
+                if let Some((original, steps)) = ladder.as_mut() {
+                    let mut cut = None;
+                    while let Some(fraction) = steps.pop_front() {
+                        let mut smaller = original.clone();
+                        if crate::context_budget::shrink_prompt_checkpoint(&mut smaller, fraction) {
+                            cut = Some((smaller, fraction));
+                            break;
+                        }
+                    }
+                    if let Some((smaller, fraction)) = cut {
+                        prompt = smaller;
+                        self.supersede_attempt(
+                            attempt_no,
+                            turn_seq,
+                            nori_protocol::SupersededBy::Retry,
+                        )
+                        .await;
+                        self.recovery_notice(format!(
+                            "The earlier conversation sent with this prompt was too long for the \
+                             model; retrying with a shorter summary of it ({}% of its size).",
+                            (fraction * 100.0).round()
+                        ))
+                        .await;
+                        continue;
+                    }
+                }
+            }
             let conversation = self.conversation_id.read().await.to_string();
             let policy = match engine_slot {
                 Some(_) => None,
                 None => Some(self.recovery_in_force().await),
             };
             let engine = engine_slot.get_or_insert_with(|| {
-                Engine::new(policy.unwrap_or_else(|| nori_workflow::RecoveryPolicy::default().base))
+                let recovery =
+                    policy.unwrap_or_else(|| nori_workflow::RecoveryPolicy::default().base);
+                if continues_fallback {
+                    Engine::continuing(recovery)
+                } else {
+                    Engine::new(recovery)
+                }
             });
             self.note_failed_route(&conversation, &current, &details, engine.recovery())
                 .await;
@@ -136,9 +206,19 @@ impl AcpBackend {
                 let excluded = ledger::exclusions(&conversation);
                 let home = self.nori_home.clone();
                 let config = self.orchestrator.config().clone();
+                // How long until a spent usage limit resets, when the provider says.
+                let reset_in = match &details.class {
+                    nori_acp_host::FailureClass::QuotaExhausted {
+                        resets_at: Some(resets_at),
+                    } => ledger::parse_reset(resets_at)
+                        .and_then(|at| u64::try_from(at - ledger::now_seconds()).ok())
+                        .map(std::time::Duration::from_secs),
+                    _ => None,
+                };
                 engine.decide(
                     failure,
                     details.class.retry_after(),
+                    reset_in,
                     unit_random(),
                     kind == QueuedPromptKind::User,
                     |fallback| {
@@ -173,28 +253,10 @@ impl AcpBackend {
                 Decision::Retry { .. } => Some(nori_protocol::SupersededBy::Retry),
                 Decision::Fallback { .. } => Some(nori_protocol::SupersededBy::Route),
                 Decision::Surface { .. } => None,
+                Decision::WaitForReset { .. } => Some(nori_protocol::SupersededBy::Retry),
             };
             if let Some(by) = superseded_by {
-                self.wait_for_prompt_phase().await;
-                let _ = self
-                    .backend_event_tx
-                    .send(BackendEvent::Public(SessionEvent::Nori(
-                        NoriEvent::AttemptSuperseded(nori_protocol::AttemptSuperseded {
-                            attempt: attempt_no,
-                            by,
-                        }),
-                    )))
-                    .await;
-            }
-            if let Some(turn_seq) = turn_seq
-                && superseded_by.is_some()
-            {
-                let _ = self
-                    .session_event_tx
-                    .send(session_runtime_driver::SessionRuntimeInput::Reducer(
-                        session_reducer::InboundEvent::AttemptEnded { turn_seq },
-                    ))
-                    .await;
+                self.supersede_attempt(attempt_no, turn_seq, by).await;
             }
             match decision {
                 Decision::Retry {
@@ -327,7 +389,12 @@ impl AcpBackend {
                                 step,
                                 remaining,
                             }) => Some((to, step, remaining)),
-                            Some(Decision::Retry { .. } | Decision::Surface { .. }) | None => None,
+                            Some(
+                                Decision::Retry { .. }
+                                | Decision::Surface { .. }
+                                | Decision::WaitForReset { .. },
+                            )
+                            | None => None,
                         };
                     }
                     if !switched {
@@ -338,6 +405,45 @@ impl AcpBackend {
                         .await;
                         return self.give_up(wire_request_id, err).await;
                     }
+                }
+                Decision::WaitForReset { delay } => {
+                    let at = chrono::Local::now()
+                        + chrono::Duration::from_std(delay)
+                            .unwrap_or_else(|_| chrono::Duration::zero());
+                    self.recovery_notice(format!(
+                        "{} on {current}; this turn continues when it resets, at {} (Esc stops waiting).",
+                        capitalized(failure.label()),
+                        at.format("%a %H:%M")
+                    ))
+                    .await;
+                    self.wait_for_prompt_phase().await;
+                    let _ = self
+                        .backend_event_tx
+                        .send(BackendEvent::Public(SessionEvent::Nori(
+                            NoriEvent::RetryScheduled(nori_protocol::RetryScheduled {
+                                class: failure,
+                                attempt: 1,
+                                max_attempts: 0,
+                                wait_ms: i64::try_from(delay.as_millis()).unwrap_or(i64::MAX),
+                                detail: details.message.clone(),
+                            }),
+                        )))
+                        .await;
+                    if wait_unless_cancelled(delay, &mut cancelled).await {
+                        self.connection
+                            .announce_prompt_stop(
+                                wire_request_id.clone(),
+                                acp::StopReason::Cancelled,
+                            )
+                            .await;
+                        return PromptRun {
+                            wire_request_id,
+                            result: Ok(acp::StopReason::Cancelled),
+                            handoff: None,
+                        };
+                    }
+                    // The limit has reset: the route is usable again for this conversation.
+                    ledger::lift(&conversation, &current);
                 }
                 Decision::Surface { no_route_left } => {
                     if no_route_left {
@@ -350,6 +456,31 @@ impl AcpBackend {
                     return self.give_up(wire_request_id, err).await;
                 }
             }
+        }
+    }
+
+    /// The attempt that failed is over: tell the stream and the turn, so that what it left
+    /// running stops showing as running.
+    async fn supersede_attempt(
+        &self,
+        attempt: i64,
+        turn_seq: Option<i64>,
+        by: nori_protocol::SupersededBy,
+    ) {
+        self.wait_for_prompt_phase().await;
+        let _ = self
+            .backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(
+                NoriEvent::AttemptSuperseded(nori_protocol::AttemptSuperseded { attempt, by }),
+            )))
+            .await;
+        if let Some(turn_seq) = turn_seq {
+            let _ = self
+                .session_event_tx
+                .send(session_runtime_driver::SessionRuntimeInput::Reducer(
+                    session_reducer::InboundEvent::AttemptEnded { turn_seq },
+                ))
+                .await;
         }
     }
 
@@ -404,14 +535,28 @@ impl AcpBackend {
                 }
                 ledger::exclude(conversation, Exclusion::Route(route.clone()), None, false);
             }
+            // An agent that is not signed in, not installed or does not start cannot run any
+            // of its models: none is offered as a fallback for a while (a sign-in brings it
+            // back then).
+            nori_acp_host::FailureClass::Auth
+            | nori_acp_host::FailureClass::ExecutableNotFound
+            | nori_acp_host::FailureClass::Initialization => {
+                let lapses = chrono::Utc::now().timestamp() + AGENT_UNRUNNABLE_FOR_SECONDS;
+                ledger::exclude(
+                    conversation,
+                    Exclusion::Provider {
+                        agent: route.agent.clone(),
+                        provider: None,
+                    },
+                    Some(lapses),
+                    false,
+                );
+            }
             nori_acp_host::FailureClass::RateLimited { .. }
             | nori_acp_host::FailureClass::Capacity
             | nori_acp_host::FailureClass::ServerError
             | nori_acp_host::FailureClass::Network
-            | nori_acp_host::FailureClass::Auth
             | nori_acp_host::FailureClass::PromptTooLong
-            | nori_acp_host::FailureClass::ExecutableNotFound
-            | nori_acp_host::FailureClass::Initialization
             | nori_acp_host::FailureClass::SessionNotFound
             | nori_acp_host::FailureClass::SessionNotResumable
             | nori_acp_host::FailureClass::NoActiveSession
