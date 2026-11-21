@@ -230,6 +230,28 @@ async fn test_handle_message_read_tool() {
 }
 
 #[tokio::test]
+async fn read_image_returns_mcp_image_content() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("image.png"), [137, 80, 78, 71]).unwrap();
+    let server = AcpMcpServer::new("test", "1.0.0");
+    server.set_cwd(dir.path().to_path_buf());
+    server.set_session_id("test-session");
+    let response = server
+        .handle_message(serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "Read", "arguments": {"file_path": "image.png"}}
+        }))
+        .await
+        .unwrap();
+    pretty_assertions::assert_eq!(
+        response["content"][1],
+        serde_json::json!({
+            "type": "image", "mimeType": "image/png", "data": "iVBORw=="
+        })
+    );
+}
+
+#[tokio::test]
 async fn test_handle_message_missing_method() {
     let server = AcpMcpServer::new("test-server", "1.0.0");
 

@@ -10148,6 +10148,7 @@ dependencies = [
  "libc",
  "nori-acp-kit",
  "nori-host-tools",
+ "nori-tools",
  "pretty_assertions",
  "process-wrap 9.1.1",
  "regex",

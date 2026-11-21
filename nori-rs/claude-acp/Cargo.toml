@@ -16,6 +16,8 @@ workspace = true
 nori-acp-kit = { workspace = true }
 # The tools Nori hands an agent built into its own process.
 nori-host-tools = { workspace = true }
+# The file tools (Read, Write, Edit) run on the shared implementation.
+nori-tools = { workspace = true }
 claude-code-agent-sdk = { version = "0.1.39", features = [] }
 
 tokio = { workspace = true, features = [

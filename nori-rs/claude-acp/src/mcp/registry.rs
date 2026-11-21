@@ -49,6 +49,9 @@ pub struct ToolResult {
     /// The file change this call made, reported to the client as a diff.
     #[serde(skip)]
     pub diff: Option<FileDiff>,
+    /// Images returned to the model as MCP image content.
+    #[serde(skip)]
+    pub images: Vec<nori_tools::ImageAttachment>,
 }
 
 impl ToolResult {
@@ -60,6 +63,7 @@ impl ToolResult {
             is_error: false,
             metadata: None,
             diff: None,
+            images: Vec::new(),
         }
     }
 
@@ -71,13 +75,35 @@ impl ToolResult {
             is_error: true,
             metadata: None,
             diff: None,
+            images: Vec::new(),
         }
     }
 
-    /// Report the file change this call made.
-    pub fn with_diff(mut self, diff: FileDiff) -> Self {
-        self.diff = Some(diff);
-        self
+    /// The result of a `nori_tools` file tool: its text for the model, and the first change as
+    /// the diff the client's edit journal records. Files too large to journal are changed
+    /// without a reported diff, as the journal could not restore them either.
+    pub fn from_file_tool(result: nori_tools::ToolResult) -> Self {
+        let diff = result.changes.iter().find_map(|change| {
+            let new_text = change.new_text.clone()?;
+            let journalable = |text: &String| text.len() as u64 <= MAX_JOURNALED_BYTES;
+            (journalable(&new_text) && change.old_text.as_ref().is_none_or(journalable)).then(
+                || FileDiff {
+                    path: change.path.clone(),
+                    old_text: change.old_text.clone(),
+                    new_text,
+                },
+            )
+        });
+        let metadata = (!result.changes.is_empty()).then(|| result.structured());
+        let mut out = if result.is_error {
+            Self::error(result.text)
+        } else {
+            Self::success(result.text)
+        };
+        out.diff = diff;
+        out.metadata = metadata;
+        out.images = result.images;
+        out
     }
 
     /// Create a result with metadata
@@ -118,20 +144,35 @@ pub struct ToolContext {
     connection_cx: Option<Cx>,
     /// Permission checker for tool-level permission checks
     pub permission_checker: Option<Arc<tokio::sync::RwLock<PermissionChecker>>>,
+    /// The session's file tools: one workspace, so the read ledger spans the session's calls
+    workspace: nori_tools::Workspace,
 }
 
 impl ToolContext {
     /// Create a new tool context
     pub fn new(session_id: impl Into<String>, cwd: impl Into<std::path::PathBuf>) -> Self {
+        let cwd = cwd.into();
         Self {
             session_id: session_id.into(),
-            cwd: cwd.into(),
+            workspace: nori_tools::Workspace::local(&cwd),
+            cwd,
             background_processes: None,
             terminal_client: None,
             tool_use_id: None,
             connection_cx: None,
             permission_checker: None,
         }
+    }
+
+    /// Use the session's file workspace instead of a fresh one.
+    pub fn with_workspace(mut self, workspace: nori_tools::Workspace) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// The file tools' workspace.
+    pub fn workspace(&self) -> &nori_tools::Workspace {
+        &self.workspace
     }
 
     /// Set the background process manager

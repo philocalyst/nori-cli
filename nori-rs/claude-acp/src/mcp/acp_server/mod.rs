@@ -104,6 +104,8 @@ pub struct AcpMcpServer {
     /// - OnceLock provides lock-free reads after initialization
     /// - No deadlock risk
     cwd: OnceLock<std::path::PathBuf>,
+    /// The session's file tools, with the read ledger their edits are checked against
+    workspace: OnceLock<nori_tools::Workspace>,
     /// Permission checker for tool-level permission checks
     permission_checker: OnceLock<Arc<RwLock<PermissionChecker>>>,
     /// Cancel callback - called when MCP cancellation notification is received
@@ -142,6 +144,7 @@ impl AcpMcpServer {
             terminal_client: OnceLock::new(),
             background_processes: OnceLock::new(),
             cwd: OnceLock::new(),
+            workspace: OnceLock::new(),
             permission_checker: OnceLock::new(),
             cancel_callback: Arc::new(Mutex::new(None)),
         }
@@ -290,7 +293,11 @@ impl AcpMcpServer {
         let connection_cx = self.connection_cx.get();
         let permission_checker = self.permission_checker.get();
 
-        let mut context = ToolContext::new(session_id.to_string(), cwd);
+        let workspace = self
+            .workspace
+            .get_or_init(|| nori_tools::Workspace::local(&cwd))
+            .clone();
+        let mut context = ToolContext::new(session_id.to_string(), cwd).with_workspace(workspace);
 
         if let Some(client) = terminal_client {
             context = context.with_terminal_client(client.clone());

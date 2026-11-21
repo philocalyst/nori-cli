@@ -158,11 +158,20 @@ impl SdkMcpServer for AcpMcpServer {
                     "Tool execution completed"
                 );
 
+                use base64::Engine as _;
+                let mut content = vec![serde_json::json!({
+                    "type": "text",
+                    "text": result.content
+                })];
+                content.extend(result.images.iter().map(|image| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": base64::engine::general_purpose::STANDARD.encode(&image.data),
+                        "mimeType": image.mime_type,
+                    })
+                }));
                 Ok(serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": result.content
-                    }],
+                    "content": content,
                     "is_error": result.is_error
                 }))
             }
