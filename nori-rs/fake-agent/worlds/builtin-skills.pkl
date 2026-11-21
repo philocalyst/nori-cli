@@ -1,0 +1,88 @@
+/// Nori's built-in skills (`impact`, `council`) through the real harness. The lead lists the skills,
+/// runs `impact`, and runs `council` with two members; the agents the skills name (`claude-code`,
+/// `codex`, `gemini`) are this world's agents. Nothing here reads a project: the analyst answers
+/// the two phases of `impact` as a world, so the test proves the program, not nudox.
+///
+///     scene "list": the lead lists the skills there are.
+///     scene "impact": the lead runs `impact` with `declarations` from the prompt.
+///     scene "council": the lead runs `council` for two members with the prompt as its request.
+amends "nori:World"
+
+name = "builtin-skills"
+description = "The built-in impact and council skills, with world agents as their actors."
+default_agent = "lead"
+
+local fake = new Model { id = "fake-sonnet"; context_window = 200000 }
+
+agents {
+  ["lead"] {
+    models { fake }
+    scenes {
+      new Scene {
+        name = "list"
+        on = new Matching { pattern = "(?i)^list" }
+        steps {
+          new HostTool { name = "skill"; title = "List skills"; bind = "skills" }
+          new Say { text = "Skills: {{skills.skills}}" }
+        }
+      }
+      new Scene {
+        name = "impact"
+        on = new Matching { pattern = "(?i)^impact" }
+        steps {
+          new HostTool {
+            name = "skill"
+            title = "Assess the impact"
+            arguments = new Dynamic {
+              ["name"] = "impact"
+              ["arguments"] = new Dynamic { ["declarations"] = "{{prompt}}"; ["depth"] = "3" }
+            }
+            bind = "report"
+          }
+          new Say { text = "Impact report: {{report.value}}" }
+        }
+      }
+      new Scene {
+        name = "council"
+        on = new Matching { pattern = "(?i)^council" }
+        steps {
+          new HostTool {
+            name = "skill"
+            title = "Ask the council"
+            arguments = new Dynamic {
+              ["name"] = "council"
+              ["arguments"] = new Dynamic { ["request"] = "{{prompt}}"; ["count"] = "2" }
+            }
+            bind = "verdict"
+          }
+          new Say { text = "The council reported: {{verdict.value}}" }
+        }
+      }
+    }
+  }
+  // The analyst of `impact` and the first council member, and the chair, are Claude.
+  ["claude-code"] {
+    efforts { "medium"; "high" }
+    models { new Model { id = "opus"; context_window = 200000 }; new Model { id = "sonnet"; context_window = 200000 } }
+    scenes {
+      new Scene {
+        on = new Matching { pattern = "Phase 1 of 2" }
+        steps { new Say { text = "STATE: ready\nIndex: ready\nDeclarations: parse_config | function | signature | rust:app::parse_config" } }
+      }
+      new Scene {
+        on = new Matching { pattern = "Phase 2 of 2" }
+        steps { new Say { text = "## Impact\nMedium: 2 direct users [references rust:app::parse_config]" } }
+      }
+      new Scene {
+        on = new Matching { pattern = "You chair a council" }
+        steps { new Say { text = "Chair: agreed, ship it. Table: {{prompt}}" } }
+      }
+      new Scene { steps { new Say { text = "Member 1: looks fine. Score: 8/10" } } }
+    }
+  }
+  ["codex"] {
+    efforts { "medium"; "high" }
+    models { fake }
+    scenes { new Scene { steps { new Say { text = "Member 2: one nit. Score: 7/10" } } } }
+  }
+}
