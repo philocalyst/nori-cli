@@ -151,6 +151,7 @@ impl AcpBackend {
         let backend = self.clone();
         tokio::spawn(async move { backend.deliver_task_results_if_idle().await });
         self.monitor_turn_boundary();
+        self.edit_journal.capture_turn_end();
         self.maybe_watch_ci(generation).await;
     }
 

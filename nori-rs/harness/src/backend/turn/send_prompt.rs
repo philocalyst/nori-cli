@@ -65,6 +65,14 @@ impl AcpBackend {
             }
             QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact => {}
         }
+        let snapshot_turn = if matches!(
+            prompt_kind,
+            QueuedPromptKind::Compact | QueuedPromptKind::NativeCompact
+        ) {
+            None
+        } else {
+            self.edit_journal.latest_turn_id()
+        };
         let client_request_started = self
             .pending_prompt_submissions
             .lock()
@@ -81,6 +89,9 @@ impl AcpBackend {
         let original_content_for_task = original_content.clone();
         let prompt_task = tokio::spawn(async move {
             let session_id = backend.session_id.read().await.clone();
+            if let Some(turn) = snapshot_turn {
+                backend.edit_journal.capture_turn_start(turn).await;
+            }
             let mut prompt = prompt;
             // The first prompt to reach a session a compaction, fork, or resume prepared opens
             // with its checkpoint, whichever prompt that is.

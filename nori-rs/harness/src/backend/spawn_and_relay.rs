@@ -386,7 +386,11 @@ impl AcpBackend {
             prompt_result_tx: prompt_result_tx.clone(),
             prompt_phase_gate: Arc::new(Mutex::new(None)),
             notify_after_idle: config.notify_after_idle,
-            edit_journal: Arc::new(EditJournal::new()),
+            edit_journal: Arc::new(EditJournal::for_cwd(
+                &cwd,
+                &config.nori_home,
+                backend_event_tx.clone(),
+            )),
             is_first_prompt: Arc::new(Mutex::new(true)),
             workflow,
             machine_snapshot,
