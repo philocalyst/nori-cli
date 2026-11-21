@@ -114,6 +114,17 @@ pub trait HostedAgent: Send + Sync + 'static {
         response: Result<acp::ClientResponse, acp::Error>,
     ) -> impl Future<Output = Result<(), acp::Error>> + Send;
 
+    /// Answer an extension request (a `_nori/...` method) from the remote client. A host that
+    /// offers none says the method does not exist, as ACP does for any method it lacks.
+    fn ext_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> impl Future<Output = Result<serde_json::Value, acp::Error>> + Send {
+        let _ = (method, params);
+        async { Err(acp::Error::method_not_found()) }
+    }
+
     /// Register the calling connection as the single remote consumer,
     /// replacing any previous one (last connect wins). Replacing a consumer
     /// cancels the replaced controller's unanswered delegated requests.

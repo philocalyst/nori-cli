@@ -12,6 +12,7 @@ use agent_client_protocol::Agent;
 use agent_client_protocol::Client;
 use agent_client_protocol::ConnectionTo;
 use agent_client_protocol::Responder;
+use agent_client_protocol::UntypedMessage;
 use axum::extract::ws::CloseFrame;
 use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
@@ -275,6 +276,26 @@ async fn serve_gated_connection<H: HostedAgent>(
                         Ok(()) => responder.respond(acp::CloseSessionResponse::new()),
                         Err(error) => responder.respond_with_error(error),
                     }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let hosted = hosted.clone();
+                async move |request: UntypedMessage,
+                            responder: Responder<serde_json::Value>,
+                            cx: ConnectionTo<Client>| {
+                    // Nori's own methods (`_nori/plugins`, `_nori/plugin.run`). A run can take as
+                    // long as a skill does, so it never holds up the connection.
+                    let hosted = hosted.clone();
+                    let method = request.method().to_owned();
+                    let params = request.params().clone();
+                    cx.spawn(async move {
+                        let result = hosted.ext_request(&method, params).await;
+                        responder.respond_with_result(result)
+                    })?;
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
