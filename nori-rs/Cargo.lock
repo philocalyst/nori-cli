@@ -10555,18 +10555,17 @@ dependencies = [
 name = "nori-opencode-acp"
 version = "0.0.0"
 dependencies = [
- "base64 0.22.1",
- "eventsource-stream",
- "futures",
- "libc",
+ "dirs",
  "nori-acp-kit",
+ "nori-engine",
+ "nori-llm",
  "pretty_assertions",
- "reqwest 0.12.28",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
- "uuid",
+ "wiremock",
 ]
 
 [[package]]
