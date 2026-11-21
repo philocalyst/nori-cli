@@ -2,37 +2,20 @@
 //!
 //! The host calls [`fold_environment`] with the environment configured for the agent, because a
 //! process shared with other agents has no per-agent environment: `CODEX_CONFIG` (JSON) becomes
-//! `codex -c` overrides, and Nori's full-access policy is enforced last so nothing in an
-//! account's configuration can relax it.
+//! `codex -c` overrides. Approvals are the engine's modes, not configuration, so nothing here
+//! enforces a policy.
 
 use std::collections::HashMap;
 
 use nori_acp_kit::InProcessSpec;
 
-/// Policy keys Nori owns; configuration for them is dropped before the enforced values go in.
-const OWNED_KEYS: [&str; 4] = [
-    "approval_policy",
-    "sandbox_mode",
-    "default_permissions",
-    "permission_profile",
-];
-
-/// `spec` with the environment's Codex configuration folded into its overrides and full access
-/// enforced.
+/// `spec` with the environment's Codex configuration folded into its overrides.
 pub(crate) fn fold_environment(
     mut spec: InProcessSpec,
     env: &HashMap<String, String>,
 ) -> InProcessSpec {
     spec.environment.extend(env.clone());
     spec.config.extend(codex_overrides_from_env(env));
-    spec.config.retain(|pair| {
-        !pair
-            .split_once('=')
-            .is_some_and(|(key, _)| OWNED_KEYS.contains(&key.trim()))
-    });
-    spec.config.push("approval_policy=\"never\"".to_owned());
-    spec.config
-        .push("sandbox_mode=\"danger-full-access\"".to_owned());
     spec
 }
 
@@ -93,49 +76,5 @@ mod tests {
             ]
         );
         assert!(codex_overrides_from_env(&HashMap::new()).is_empty());
-    }
-
-    #[test]
-    fn native_codex_enforces_full_access_after_account_and_environment_overrides() {
-        let spec = InProcessSpec {
-            agent: "codex".into(),
-            home: Some("/account".into()),
-            config: vec![
-                "model=\"gpt-example\"".into(),
-                "approval_policy=\"on-request\"".into(),
-                "default_permissions=\"custom\"".into(),
-            ],
-            environment: HashMap::new(),
-        };
-        let env = HashMap::from([(
-            "CODEX_CONFIG".to_owned(),
-            r#"{"sandbox_mode":"read-only","model_reasoning_effort":"high"}"#.to_owned(),
-        )]);
-        let resolved = fold_environment(spec.clone(), &env);
-        assert_eq!(resolved.home, spec.home);
-        assert!(
-            resolved
-                .config
-                .contains(&"model=\"gpt-example\"".to_owned())
-        );
-        assert!(
-            resolved
-                .config
-                .contains(&"model_reasoning_effort=\"high\"".to_owned())
-        );
-        assert_eq!(
-            &resolved.config[resolved.config.len() - 2..],
-            &[
-                "approval_policy=\"never\"",
-                "sandbox_mode=\"danger-full-access\""
-            ]
-        );
-        assert!(
-            !resolved
-                .config
-                .iter()
-                .any(|value| value.contains("read-only")
-                    || value.starts_with("default_permissions="))
-        );
     }
 }

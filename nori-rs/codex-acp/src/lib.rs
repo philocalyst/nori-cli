@@ -1,22 +1,17 @@
 //! Codex as an in-process ACP agent for Nori, built on `nori-acp-kit`.
 //!
-//! Nori links Codex's core and runs it in its own process: its ACP client sits on the other end
-//! of an in-memory pipe, so no process is started. The crate's one public entry point is
-//! [`registration`]; the application collects it with the other agents' and hands it to the ACP
-//! host.
+//! Codex runs on Nori's own engine (`nori-engine`) in Nori's process: its ACP client sits on the
+//! other end of an in-memory pipe, so no process is started and no Codex core is linked. What is
+//! Codex's is its sign-in, configuration, model catalog, prompts and tool shapes. The crate's one
+//! public entry point is [`registration`]; the application collects it with the other agents' and
+//! hands it to the ACP host.
 //!
-//! - `load`: the Codex configuration an in-process agent starts with.
 //! - `env`: the environment a custom Codex adapter would have read, folded into overrides.
-//! - `codex_agent`: the [`nori_acp_kit::NativeAgent`] over the Codex thread manager.
-//! - `thread`: one session, and the translation of Codex's events into ACP updates.
-//! - `host_tools`: Nori's host tools as Codex dynamic tools.
+//! - `flavor`: the engine flavor (see its module docs).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
-mod codex_agent;
 mod env;
-mod host_tools;
-mod load;
-mod thread;
+mod flavor;
 
 use nori_acp_kit::Registration;
 
@@ -26,7 +21,19 @@ use nori_acp_kit::Registration;
 /// apart); `config` holds `key=value` overrides as `codex -c` takes them.
 pub fn registration() -> Registration {
     Registration::new("codex", |spec| async move {
-        load::load_agent(spec.home, spec.config).await
+        Ok(nori_engine::EngineAgent::new(
+            flavor::CodexFlavor::launch(spec).await?,
+        ))
     })
     .with_resolver(env::fold_environment)
+    // Who the account is signed in as, read from its stored login without starting the agent.
+    .with_auth_probe(|spec| async move {
+        use nori_engine::Flavor;
+        match flavor::CodexFlavor::launch(spec).await {
+            Ok(codex) => codex.auth_status().await,
+            Err(error) => nori_acp_kit::AuthStatus::unknown(format!(
+                "Codex's stored sign-in could not be read: {error}"
+            )),
+        }
+    })
 }

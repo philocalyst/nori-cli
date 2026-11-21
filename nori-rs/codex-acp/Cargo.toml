@@ -4,7 +4,7 @@ version = "0.16.0"
 edition = "2024"
 authors = ["Zed <hi@zed.dev>"]
 license = "Apache-2.0"
-description = "Codex as an in-process ACP agent for Nori, built on nori-acp-kit"
+description = "Codex as an in-process ACP agent for Nori: Codex's sign-in, configuration and catalog on nori-engine"
 repository = "https://github.com/zed-industries/codex-acp"
 homepage = "https://github.com/zed-industries/codex-acp"
 
@@ -14,42 +14,27 @@ name = "nori_codex_acp"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1"
-# Vendored from openai/codex rust-v0.169.0; see `vendor/codex/README.md`. Path
-# dependencies keep resolvers from having to scan the Codex repository, whose
-# workspace is nested in `codex-rs/`.
-codex-apply-patch = { path = "../../vendor/codex-apply-patch" }
-codex-history = { path = "../../vendor/codex/history" }
-codex-utils-path-uri = { path = "../../vendor/codex/utils/path-uri" }
+# Codex's leaf crates (sign-in, configuration, catalog, prompts), vendored from openai/codex
+# rust-v0.169.0; see `vendor/codex/README.md`. None of them depends on `codex-core`.
 codex-http-client = { path = "../../vendor/codex/http-client" }
-codex-core-api = { path = "../../vendor/codex/core-api" }
 codex-config = { path = "../../vendor/codex/config" }
-codex-features = { path = "../../vendor/codex/features" }
-codex-core = { path = "../../vendor/codex/core" }
 codex-models-manager = { path = "../../vendor/codex/models-manager" }
+codex-model-provider-info = { path = "../../vendor/codex/model-provider-info" }
+codex-prompts = { path = "../../vendor/codex/prompts" }
 codex-protocol = { path = "../../vendor/codex/protocol" }
 codex-login = { path = "../../vendor/codex/login" }
-codex-shell-command = { path = "../../vendor/codex-shell-command" }
-codex-thread-store = { path = "../../vendor/codex/thread-store" }
-codex-utils-approval-presets = { path = "../../vendor/codex/utils/approval-presets" }
-codex-utils-cli = { path = "../../vendor/codex/utils/cli" }
-diffy = { version = "0.5.0", features = ["std"] }
-# The tools Nori hands an agent built into its own process.
 nori-acp-kit = { workspace = true }
-nori-host-tools = { path = "../host-tools" }
-nori-protocol = { path = "../nori-protocol" }
-itertools = "0.14.0"
-serde = { version = "1", features = ["derive"] }
-# codex-cli depends on codex-tui, which enables serde_json/preserve_order; match
-# that behavior here because it affects MCP keychain account hashing.
-serde_json = { version = "1", features = ["preserve_order"] }
-shlex = "1"
+nori-engine = { workspace = true }
+nori-llm = { workspace = true }
+base64 = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
-tokio-util = "0.7"
+chrono = { workspace = true }
 tracing = { version = "0.1", features = ["log"] }
-heck = "0.5.0"
-unicode-segmentation = "1.11.0"
-uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
 let-underscore = "warn"
@@ -58,3 +43,6 @@ unused = "warn"
 
 [dev-dependencies]
 pretty_assertions = "1"
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+base64 = { workspace = true }
