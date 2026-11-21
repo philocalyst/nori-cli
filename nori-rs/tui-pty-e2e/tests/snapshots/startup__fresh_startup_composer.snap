@@ -1,13 +1,10 @@
 ---
 source: tui-pty-e2e/tests/startup.rs
-assertion_line: 110
+assertion_line: 111
 expression: "normalize_for_input_snapshot(session.screen_contents()).lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
 ---
-  › Nori CLI v0.0.0
-
-  System       [TMP_DIR]
-  Agent        Mock ACP
+  › Nori CLI v0.0.0 ·  [TMP_DIR]
 
 › fresh start prompt
 
-  INSERT · git master                         Mock ACP · Mock Default Model · M…
+ INS   Mock ACP · Mock Default Model · Medium                          ⎇ master
