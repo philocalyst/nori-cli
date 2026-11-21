@@ -46,6 +46,7 @@ members = [
     "forge",
     "harness",
     "host-tools",
+    "machines",
     "installed",
     "mock-acp-agent",
     "world",
@@ -106,6 +107,7 @@ mcp-types = { path = "mcp-types" }
 nori-forge = { path = "forge" }
 nori-harness = { path = "harness" }
 nori-host-tools = { path = "host-tools" }
+nori-machines = { path = "machines" }
 nori-exec = { path = "exec" }
 nori-installed = { path = "installed" }
 nori-script = { path = "script" }
