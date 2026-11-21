@@ -291,7 +291,6 @@ impl ChatWidget {
                 cmd,
                 SlashCommand::New
                     | SlashCommand::Resume
-                    | SlashCommand::ResumeViewonly
                     | SlashCommand::Providers
                     | SlashCommand::Close
             )
@@ -315,9 +314,6 @@ impl ChatWidget {
             }
             SlashCommand::Resume => {
                 self.open_resume_session_picker();
-            }
-            SlashCommand::ResumeViewonly => {
-                self.open_viewonly_session_picker();
             }
             SlashCommand::Reference => {
                 self.open_reference_session_picker();
