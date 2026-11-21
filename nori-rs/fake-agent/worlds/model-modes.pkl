@@ -1,0 +1,42 @@
+/// An agent that offers every dial a model has: several models, a reasoning effort listed out of
+/// order on purpose (an agent's own order is not to be trusted), and a service tier with the
+/// modes Nori knows. One slow turn, so the dials can be stepped while it runs.
+///
+///     nori --world fake-agent/worlds/model-modes.pkl
+///
+/// Ctrl+N / Ctrl+P step the model, Ctrl+J / Ctrl+K the effort, Alt+. / Alt+, the model mode.
+amends "nori:World"
+
+name = "model-modes"
+description = "Models, an unordered effort list, and a service tier to step through."
+default_agent = "main"
+clock = "x5"
+
+agents {
+  ["main"] {
+    title = "Fake Claude"
+    models {
+      new Model { id = "fake-opus"; name = "Fake Opus 5"; context_window = 200000 }
+      new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+      new Model { id = "fake-haiku"; name = "Fake Haiku 5"; context_window = 200000 }
+    }
+    efforts { "medium"; "max"; "low"; "xhigh"; "high" }
+    model_modes { "standard"; "priority"; "flex"; "fast" }
+    scenes {
+      new Scene {
+        steps {
+          new Say {
+            text = "Working through it slowly, so the dials can be stepped meanwhile. You said: {{prompt}}\n\n"
+            chunk = new Chunking { size = 2; unit = "words"; every = 400.ms }
+          }
+          new Tool {
+            title = "Read a.txt"
+            tool_kind = "read"
+            locations { new Location { path = "a.txt" } }
+            duration = 300.s
+          }
+        }
+      }
+    }
+  }
+}
