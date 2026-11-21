@@ -1,7 +1,6 @@
 use std::sync::LazyLock;
 
 use super::*;
-use crate::bottom_pane::textarea::VimModeState;
 use nori_config::HotkeyBinding;
 use nori_config::VimEnterBehavior;
 
@@ -16,6 +15,14 @@ impl ChatComposer {
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
         if !self.input_enabled {
             return (InputResult::None, false);
+        }
+        // The editor's search/select prompt owns every key while it is open (Enter runs it,
+        // Esc closes it): nothing is submitted or walked from under it.
+        if self.textarea.mode() == EditorMode::Prompt {
+            if key_event.kind != KeyEventKind::Release {
+                self.editor_input(key_event);
+            }
+            return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Enter
             && key_event.modifiers == KeyModifiers::SHIFT
@@ -37,7 +44,8 @@ impl ChatComposer {
                 redraw,
             );
         }
-        let is_newline_shortcut = !matches!(self.active_popup, ActivePopup::HistorySearch(_))
+        let is_newline_shortcut = self.walk.is_none()
+            && !matches!(self.active_popup, ActivePopup::HistorySearch(_))
             && matches!(
                 key_event,
                 KeyEvent {
@@ -46,13 +54,17 @@ impl ChatComposer {
                     ..
                 }
             );
-        let result = if is_newline_shortcut {
+        // Enter on a walked-back prompt rewinds to it, whatever popup its text opened.
+        let walk_enter = self.walk.is_some()
+            && key_event.code == KeyCode::Enter
+            && matches!(key_event.modifiers, KeyModifiers::NONE | KeyModifiers::ALT);
+        let result = if walk_enter && let Some(result) = self.handle_walk_key(key_event) {
+            result
+        } else if is_newline_shortcut {
             if key_event.kind == KeyEventKind::Release {
                 (InputResult::None, true)
-            } else if self.textarea.is_in_vim_normal_mode() {
-                // A direct edit in Normal mode must also cancel an incomplete
-                // operator such as `d`, just like any other mode transition.
-                self.textarea.enter_vim_normal_mode();
+            } else if self.textarea.mode() != EditorMode::Insert {
+                self.textarea.editor_mut().cancel_pending();
                 self.textarea.insert_str("\n");
                 (InputResult::None, true)
             } else {
@@ -72,6 +84,7 @@ impl ChatComposer {
                 ActivePopup::HistorySearch(_) => {
                     self.handle_key_event_with_history_popup(key_event)
                 }
+                ActivePopup::Palette(_) => self.handle_key_event_with_palette(key_event),
                 ActivePopup::None => self.handle_key_event_without_popup(key_event),
             }
         };
@@ -80,11 +93,17 @@ impl ChatComposer {
             &result.0,
             InputResult::Submitted(_) | InputResult::Command(_)
         ) {
-            self.textarea.enter_vim_normal_mode();
-            if self.textarea.kakoune_mode_enabled() {
-                self.textarea.set_kakoune_mode_enabled(false);
-                self.textarea.set_kakoune_mode_enabled(true);
+            // A recalled entry of an earlier session was sent: the draft the walk began from
+            // comes back.
+            if self.walk.is_some() {
+                // What was attached while walking goes with the recalled prompt; the stashed
+                // draft's attachments come back after the widget took those.
+                let sent = std::mem::take(&mut self.attached_images);
+                self.end_walk_quietly();
+                self.held_images = std::mem::replace(&mut self.attached_images, sent);
             }
+            // The next prompt starts ready to type.
+            self.textarea.enter_insert();
         }
 
         self.sync_selection_popups();
@@ -97,7 +116,7 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        let in_vim_normal = self.textarea.is_in_vim_normal_mode();
+        let in_vim_normal = self.textarea.is_normal_mode();
         if self.should_handle_vim_insert_escape(key_event) {
             return self.handle_input_basic(key_event);
         }
@@ -385,7 +404,8 @@ impl ChatComposer {
                     ActivePopup::None
                     | ActivePopup::Command(_)
                     | ActivePopup::File(_)
-                    | ActivePopup::HistorySearch(_) => None,
+                    | ActivePopup::HistorySearch(_)
+                    | ActivePopup::Palette(_) => None,
                 };
                 if let Some(item) = selected {
                     self.insert_selected_skill(&item.insert_text);
@@ -429,10 +449,7 @@ impl ChatComposer {
         if let Some(pasted) = self.paste_burst.flush_before_modified_input() {
             self.handle_paste(pasted);
         }
-        self.textarea.input(input);
-        let text_after = self.textarea.text();
-        self.pending_pastes
-            .retain(|(placeholder, _)| text_after.contains(placeholder));
+        self.editor_input(input);
         (InputResult::None, true)
     }
 
@@ -676,6 +693,13 @@ impl ChatComposer {
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
+        if let Some(result) = self.handle_walk_key(key_event) {
+            return result;
+        }
+        if self.is_palette_key(&key_event) {
+            self.open_palette();
+            return (InputResult::None, true);
+        }
         if self.should_handle_vim_insert_escape(key_event) {
             return self.handle_input_basic(key_event);
         }
@@ -716,20 +740,31 @@ impl ChatComposer {
         if self.is_vim_operator_pending() {
             return self.handle_input_basic(key_event);
         }
+        // `!` typed on an empty prompt starts a shell command. (With paste-burst detection on,
+        // the burst's flush of a lone `!` does the same.)
+        if self.disable_paste_burst
+            && self.is_empty()
+            && self.textarea.mode() == EditorMode::Insert
+            && key_event.code == KeyCode::Char('!')
+            && key_event.kind == KeyEventKind::Press
+            && key_event.modifiers == KeyModifiers::NONE
+        {
+            self.is_shell_mode = true;
+            return (InputResult::None, true);
+        }
         if self.is_empty()
-            && !self.textarea.kakoune_mode_enabled()
-            && self.textarea.is_in_vim_normal_mode()
+            && self.textarea.is_normal_mode()
             && key_event.kind == KeyEventKind::Press
             && key_event.modifiers == KeyModifiers::NONE
         {
             match key_event.code {
                 KeyCode::Char('/') => {
-                    self.textarea.enter_vim_insert_mode();
+                    self.textarea.enter_insert();
                     self.textarea.insert_str("/");
                     return (InputResult::None, true);
                 }
                 KeyCode::Char('!') => {
-                    self.textarea.enter_vim_insert_mode();
+                    self.textarea.enter_insert();
                     self.is_shell_mode = true;
                     return (InputResult::None, true);
                 }
@@ -808,6 +843,34 @@ impl ChatComposer {
                 ));
                 (InputResult::None, true)
             }
+            // Next and previous model mode (Alt+. / Alt+, by default).
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(
+                        self.textarea
+                            .hotkey_config()
+                            .binding_for(nori_config::HotkeyAction::NextModelMode),
+                        &key_event,
+                    ) =>
+            {
+                self.app_event_tx
+                    .send(AppEvent::CycleModelMode(crate::chatwidget::ModelStep::Next));
+                (InputResult::None, true)
+            }
+            key_event
+                if key_event.kind == KeyEventKind::Press
+                    && matches_binding(
+                        self.textarea
+                            .hotkey_config()
+                            .binding_for(nori_config::HotkeyAction::PreviousModelMode),
+                        &key_event,
+                    ) =>
+            {
+                self.app_event_tx.send(AppEvent::CycleModelMode(
+                    crate::chatwidget::ModelStep::Previous,
+                ));
+                (InputResult::None, true)
+            }
             // Older effort bindings, kept for terminals and habits that still send Shift.
             key_event
                 if key_event.kind == KeyEventKind::Press
@@ -826,39 +889,11 @@ impl ChatComposer {
                 ));
                 (InputResult::None, true)
             }
-            key_event
-                if self.textarea.kakoune_mode_enabled() && key_event.code != KeyCode::Enter =>
-            {
-                self.handle_input_basic(key_event)
-            }
-            // -------------------------------------------------------------
-            // History navigation (Up / Down) – only when the composer is not
-            // empty or when the cursor is at the correct position, to avoid
-            // interfering with normal cursor movement.
-            // -------------------------------------------------------------
-            KeyEvent {
-                code: KeyCode::Up | KeyCode::Down,
-                ..
-            } => {
-                if self
-                    .history
-                    .should_handle_navigation(self.textarea.text(), self.textarea.cursor())
-                {
-                    let replace_text = match key_event.code {
-                        KeyCode::Up => self.history.navigate_up(&self.app_event_tx),
-                        KeyCode::Down => self.history.navigate_down(&self.app_event_tx),
-                        _ => unreachable!(),
-                    };
-                    if let Some(text) = replace_text {
-                        self.set_history_content(text);
-                        return (InputResult::None, true);
-                    }
-                }
-                self.handle_input_basic(key_event)
-            }
+            // `↑`/`↓` past the edges of the text walk the conversation's prompts and the history
+            // (see `prompt_walk`); inside the text they are the editor's.
             key_event
                 if key_event.kind == KeyEventKind::Press
-                    && self.textarea.vim_mode_state_if_enabled() != Some(VimModeState::Normal)
+                    && !self.textarea.is_normal_mode()
                     && matches_binding(
                         self.textarea
                             .hotkey_config()
@@ -877,20 +912,22 @@ impl ChatComposer {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                // Vim enter behavior: route based on mode and configured behavior.
-                if let Some(vim_state) = self.textarea.vim_mode_state_if_enabled() {
-                    match (self.vim_enter_behavior, vim_state) {
-                        // "Enter is Newline": INSERT mode Enter inserts a newline.
-                        (VimEnterBehavior::Newline, VimModeState::Insert) => {
-                            return self.handle_input_basic(key_event);
-                        }
-                        // "Enter is Submit": NORMAL mode Enter inserts a newline.
-                        (VimEnterBehavior::Submit, VimModeState::Normal) => {
+                // Vim's Enter behaviour: route by mode and the configured behaviour.
+                if self.textarea.keymap() == KeymapKind::Vim {
+                    let insert = self.textarea.mode() == EditorMode::Insert;
+                    match (self.vim_enter_behavior, insert) {
+                        // "Enter is Newline": Insert mode Enter inserts a newline.
+                        (VimEnterBehavior::Newline, true) => {
                             self.textarea.insert_str("\n");
                             return (InputResult::None, true);
                         }
-                        (VimEnterBehavior::Newline, VimModeState::Normal)
-                        | (VimEnterBehavior::Submit, VimModeState::Insert)
+                        // "Enter is Submit": Normal mode Enter inserts a newline.
+                        (VimEnterBehavior::Submit, false) => {
+                            self.textarea.insert_str("\n");
+                            return (InputResult::None, true);
+                        }
+                        (VimEnterBehavior::Newline, false)
+                        | (VimEnterBehavior::Submit, true)
                         | (VimEnterBehavior::AlwaysSubmit, _)
                         | (VimEnterBehavior::Off, _) => {} // fall through to submit
                     }
@@ -904,7 +941,6 @@ impl ChatComposer {
                         return (InputResult::None, true);
                     }
                     let text = format!("!{body}");
-                    self.history.record_local_submission(&text);
                     return (InputResult::Submitted(text), true);
                 }
 
@@ -925,6 +961,14 @@ impl ChatComposer {
                     self.textarea.set_text("");
                     return (InputResult::Command(cmd), true);
                 }
+                // A one-line `/name value` that names an action (`/model opus`) runs it.
+                if !self.textarea.text().contains('\n')
+                    && let Some(invocation) = self.actions.parse_command(first_line)
+                    && crate::actions::builtin(&invocation.id).is_some()
+                {
+                    self.textarea.set_text("");
+                    return (InputResult::Action(invocation), true);
+                }
                 // If we're in a paste-like burst capture, treat Enter as part of the burst
                 // and accumulate it rather than submitting or inserting immediately.
                 // Do not treat Enter as paste inside a slash-command context.
@@ -942,18 +986,31 @@ impl ChatComposer {
                         return (InputResult::None, true);
                     }
                 }
-                // If we have pending placeholder pastes, replace them in the textarea text
-                // and continue to the normal submission flow to handle slash commands.
-                if !self.pending_pastes.is_empty() {
-                    let text = self.expand_pending_pastes(self.textarea.text().to_string());
+                // Images go with the prompt only while their chip is in it (a chip deleted and
+                // brought back by undo brings its image back too).
+                let raw_text = self.textarea.text().to_owned();
+                self.attached_images
+                    .retain(|image| raw_text.contains(image.chip.as_char()));
+                // Chips become what they stand for (pastes their text, images their label);
+                // directives are set aside to apply when the prompt is sent.
+                if self
+                    .textarea
+                    .text()
+                    .chars()
+                    .any(|ch| ChipId::from_char(ch).is_some())
+                {
+                    let raw = self.textarea.text().to_string();
+                    self.collect_directives(&raw);
+                    let text = self.expand_pending_pastes(raw);
                     self.textarea.set_text(&text);
                 }
 
                 // During a paste-like burst, treat Enter as a newline instead of submit.
                 let now = Instant::now();
-                if self
-                    .paste_burst
-                    .newline_should_insert_instead_of_submit(now)
+                if !self.disable_paste_burst
+                    && self
+                        .paste_burst
+                        .newline_should_insert_instead_of_submit(now)
                     && !in_slash_context
                 {
                     self.textarea.insert_str("\n");
@@ -1020,9 +1077,6 @@ impl ChatComposer {
 
                 // Strip the agent command prefix so the ACP agent receives the
                 // bare command name (e.g. "/loop 5m" instead of "/claude-code:loop 5m").
-                // Save the pre-stripped text for history so recall + resubmit works
-                // (the prefixed form passes validation and gets stripped again).
-                let history_text = text.clone();
                 if !self.agent_command_prefix.is_empty() {
                     let slash_prefix = format!("/{}:", self.agent_command_prefix);
                     if let Some(rest) = text.strip_prefix(&slash_prefix) {
@@ -1064,9 +1118,6 @@ impl ChatComposer {
                 if text.is_empty() && !has_attachments {
                     return (InputResult::None, true);
                 }
-                if !text.is_empty() {
-                    self.history.record_local_submission(&history_text);
-                }
                 // Do not clear attached_images here; ChatWidget drains them via take_recent_submission_images().
                 (InputResult::Submitted(text), true)
             }
@@ -1085,11 +1136,9 @@ impl ChatComposer {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
 
-        // In vim Normal mode, bypass paste burst detection and send input directly
-        // to the textarea so vim navigation keys (h/j/k/l) work correctly.
-        if self.textarea.kakoune_mode_enabled() || self.textarea.is_in_vim_normal_mode() {
-            self.textarea.input(input);
-            self.sync_placeholder_payloads();
+        // Outside Insert mode keys are commands, not typing: no paste-burst detection.
+        if self.textarea.mode() != EditorMode::Insert {
+            self.editor_input(input);
             return (InputResult::None, true);
         }
 
@@ -1101,12 +1150,14 @@ impl ChatComposer {
             return (InputResult::None, true);
         }
 
-        // Intercept plain Char inputs to optionally accumulate into a burst buffer.
-        if let KeyEvent {
-            code: KeyCode::Char(ch),
-            modifiers,
-            ..
-        } = input
+        // Intercept plain Char inputs to optionally accumulate into a burst buffer (only where
+        // pastes are not bracketed: then fast typing followed by Enter always submits).
+        if !self.disable_paste_burst
+            && let KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } = input
         {
             let has_ctrl_or_alt = has_ctrl_or_alt(modifiers);
             if !has_ctrl_or_alt {
@@ -1157,19 +1208,8 @@ impl ChatComposer {
             }
         }
 
-        // For non-char inputs (or after flushing), handle normally.
-        // Special handling for backspace on placeholders
-        if let KeyEvent {
-            code: KeyCode::Backspace,
-            ..
-        } = input
-            && self.try_remove_any_placeholder_at_cursor()
-        {
-            return (InputResult::None, true);
-        }
-
         // Normal input handling
-        self.textarea.input(input);
+        self.editor_input(input);
 
         // Update paste-burst heuristic for plain Char (no Ctrl/Alt) events.
         let crossterm::event::KeyEvent {
@@ -1191,191 +1231,31 @@ impl ChatComposer {
             }
         }
 
-        self.sync_placeholder_payloads();
         (InputResult::None, true)
     }
 
-    fn sync_placeholder_payloads(&mut self) {
-        let text_after = self.textarea.text();
-
-        // Check if any placeholders were removed and remove their corresponding pending pastes
-        self.pending_pastes
-            .retain(|(placeholder, _)| text_after.contains(placeholder));
-
-        // Keep attached images in proportion to how many matching placeholders exist in the text.
-        // This handles duplicate placeholders that share the same visible label.
-        if !self.attached_images.is_empty() {
-            let mut needed: HashMap<String, usize> = HashMap::new();
-            for img in &self.attached_images {
-                needed
-                    .entry(img.placeholder.clone())
-                    .or_insert_with(|| text_after.matches(&img.placeholder).count());
-            }
-
-            let mut used: HashMap<String, usize> = HashMap::new();
-            let mut kept: Vec<AttachedImage> = Vec::with_capacity(self.attached_images.len());
-            for img in self.attached_images.drain(..) {
-                let total_needed = *needed.get(&img.placeholder).unwrap_or(&0);
-                let used_count = used.entry(img.placeholder.clone()).or_insert(0);
-                if *used_count < total_needed {
-                    kept.push(img);
-                    *used_count += 1;
-                }
-            }
-            self.attached_images = kept;
+    /// The text as sent: each paste chip becomes what was pasted, every other chip its label.
+    pub(super) fn expand_pending_pastes(&mut self, text: String) -> String {
+        if !text.chars().any(|ch| ChipId::from_char(ch).is_some()) {
+            self.pending_pastes.clear();
+            return text;
         }
-    }
-
-    /// Attempts to remove an image or paste placeholder if the cursor is at the end of one.
-    /// Returns true if a placeholder was removed.
-    pub(super) fn try_remove_any_placeholder_at_cursor(&mut self) -> bool {
-        // Clamp the cursor to a valid char boundary to avoid panics when slicing.
-        let text = self.textarea.text();
-        let p = Self::clamp_to_char_boundary(text, self.textarea.cursor());
-
-        // Try image placeholders first
-        let mut out: Option<(usize, String)> = None;
-        // Detect if the cursor is at the end of any image placeholder.
-        // If duplicates exist, remove the specific occurrence's mapping.
-        for (i, img) in self.attached_images.iter().enumerate() {
-            let ph = &img.placeholder;
-            if p < ph.len() {
+        let mut expanded = String::with_capacity(text.len());
+        for ch in text.chars() {
+            let Some(id) = ChipId::from_char(ch) else {
+                expanded.push(ch);
                 continue;
-            }
-            let start = p - ph.len();
-            if text.get(start..p) != Some(ph.as_str()) {
-                continue;
-            }
-
-            // Count the number of occurrences of `ph` before `start`.
-            let mut occ_before = 0usize;
-            let mut search_pos = 0usize;
-            while search_pos < start {
-                let segment = match text.get(search_pos..start) {
-                    Some(s) => s,
-                    None => break,
-                };
-                if let Some(found) = segment.find(ph) {
-                    occ_before += 1;
-                    search_pos += found + ph.len();
-                } else {
-                    break;
-                }
-            }
-
-            // Remove the occ_before-th attached image that shares this placeholder label.
-            out = if let Some((remove_idx, _)) = self
-                .attached_images
-                .iter()
-                .enumerate()
-                .filter(|(_, img2)| img2.placeholder == *ph)
-                .nth(occ_before)
-            {
-                Some((remove_idx, ph.clone()))
-            } else {
-                Some((i, ph.clone()))
             };
-            break;
-        }
-        if let Some((idx, placeholder)) = out {
-            self.textarea.replace_range(p - placeholder.len()..p, "");
-            self.attached_images.remove(idx);
-            return true;
-        }
-
-        // Also handle when the cursor is at the START of an image placeholder.
-        let out: Option<(usize, String)> = 'out: {
-            for (i, img) in self.attached_images.iter().enumerate() {
-                let ph = &img.placeholder;
-                if p + ph.len() > text.len() {
-                    continue;
-                }
-                if text.get(p..p + ph.len()) != Some(ph.as_str()) {
-                    continue;
-                }
-
-                // Count occurrences of `ph` before `p`.
-                let mut occ_before = 0usize;
-                let mut search_pos = 0usize;
-                while search_pos < p {
-                    let segment = match text.get(search_pos..p) {
-                        Some(s) => s,
-                        None => break 'out None,
-                    };
-                    if let Some(found) = segment.find(ph) {
-                        occ_before += 1;
-                        search_pos += found + ph.len();
-                    } else {
-                        break 'out None;
-                    }
-                }
-
-                if let Some((remove_idx, _)) = self
-                    .attached_images
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, img2)| img2.placeholder == *ph)
-                    .nth(occ_before)
-                {
-                    break 'out Some((remove_idx, ph.clone()));
-                } else {
-                    break 'out Some((i, ph.clone()));
-                }
+            if self.is_directive(id) {
+                // Directives are applied, not sent.
+                continue;
             }
-            None
-        };
-
-        if let Some((idx, placeholder)) = out {
-            self.textarea.replace_range(p..p + placeholder.len(), "");
-            self.attached_images.remove(idx);
-            return true;
-        }
-
-        // Then try pasted-content placeholders
-        if let Some(placeholder) = self.pending_pastes.iter().find_map(|(ph, _)| {
-            if p < ph.len() {
-                return None;
-            }
-            let start = p - ph.len();
-            if text.get(start..p) == Some(ph.as_str()) {
-                Some(ph.clone())
-            } else {
-                None
-            }
-        }) {
-            self.textarea.replace_range(p - placeholder.len()..p, "");
-            self.pending_pastes.retain(|(ph, _)| ph != &placeholder);
-            return true;
-        }
-
-        // Also handle when the cursor is at the START of a pasted-content placeholder.
-        if let Some(placeholder) = self.pending_pastes.iter().find_map(|(ph, _)| {
-            if p + ph.len() > text.len() {
-                return None;
-            }
-            if text.get(p..p + ph.len()) == Some(ph.as_str()) {
-                Some(ph.clone())
-            } else {
-                None
-            }
-        }) {
-            self.textarea.replace_range(p..p + placeholder.len(), "");
-            self.pending_pastes.retain(|(ph, _)| ph != &placeholder);
-            return true;
-        }
-
-        false
-    }
-
-    fn expand_pending_pastes(&mut self, mut text: String) -> String {
-        self.pending_pastes
-            .sort_by_key(|(placeholder, _)| std::cmp::Reverse(placeholder.len()));
-        for (placeholder, actual) in &self.pending_pastes {
-            if text.contains(placeholder) {
-                text = text.replace(placeholder, actual);
+            match self.pending_pastes.iter().find(|(chip, _)| *chip == id) {
+                Some((_, pasted)) => expanded.push_str(pasted),
+                None => expanded.push_str(self.textarea.chip_label(id).unwrap_or_default()),
             }
         }
         self.pending_pastes.clear();
-        text
+        expanded
     }
 }

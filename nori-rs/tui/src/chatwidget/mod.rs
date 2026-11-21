@@ -52,6 +52,7 @@ use crate::session_stats::SessionStats;
 use crate::slash_command::SlashCommand;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
+mod actions;
 pub(crate) mod agent;
 mod agent_status;
 mod conflate;

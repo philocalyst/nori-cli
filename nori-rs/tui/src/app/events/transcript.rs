@@ -93,6 +93,18 @@ impl App {
                 self.apply_focus_snapshots(generation, snapshots);
                 tui.frame_requester().schedule_frame();
             }
+            // The composer's walk back through the prompts. Interim: the focus presentation
+            // and the rewind itself are being rebuilt around these events (app/focus.rs).
+            AppEvent::FocusChanged { generation, cell } => {
+                self.on_focus_changed(tui, generation, cell);
+            }
+            AppEvent::ForkWalkedTurn {
+                generation,
+                cell_index,
+            } => self.fork_walked_turn(generation, cell_index),
+            AppEvent::RewindSelection(selection) => {
+                self.on_rewind_selection(tui, selection);
+            }
             AppEvent::RewindFilesRestored {
                 generation,
                 cell_index,

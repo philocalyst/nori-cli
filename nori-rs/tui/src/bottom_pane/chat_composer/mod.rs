@@ -15,7 +15,6 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
-use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
@@ -55,14 +54,16 @@ use nori_harness::custom_prompts::PROMPTS_CMD_PREFIX;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::textarea::TextArea;
-use crate::bottom_pane::textarea::TextAreaState;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_file_search::FileMatch;
+use nori_editor::EditorMode;
+use nori_editor::KeymapKind;
+use nori_editor::chips::ChipId;
+use nori_editor::chips::ChipTone;
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -81,12 +82,15 @@ pub enum InputResult {
     /// Start the oldest queued prompt by interrupting the current turn.
     PromoteQueued,
     Command(SlashCommand),
+    /// An action chosen in the palette or typed as a command.
+    Action(nori_actions::Invocation),
     None,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct AttachedImage {
-    placeholder: String,
+    /// The chip that stands for the image in the text.
+    chip: ChipId,
     path: PathBuf,
 }
 
@@ -118,7 +122,6 @@ pub(crate) struct ChatComposer {
     /// Most recently rendered editable body, used for pointer hit testing.
     rendered_body_area: Cell<Option<Rect>>,
     textarea: TextArea,
-    textarea_state: RefCell<TextAreaState>,
     input_enabled: bool,
     active_popup: ActivePopup,
     app_event_tx: AppEventSender,
@@ -129,7 +132,8 @@ pub(crate) struct ChatComposer {
     dismissed_skill_popup_token: Option<String>,
     dismissed_command_popup_text: Option<String>,
     current_file_query: Option<String>,
-    pending_pastes: Vec<(String, String)>,
+    /// Large pastes, each a chip in the text: what it stands for.
+    pending_pastes: Vec<(ChipId, String)>,
     is_shell_mode: bool,
     status_note: Option<crate::bottom_pane::status_line::StatusNote>,
     /// Every key the TUI answers, for the `?` list.
@@ -160,6 +164,11 @@ pub(crate) struct ChatComposer {
     /// Cloud session id shown in the footer when attached to a cloud session.
     cloud_session: Option<String>,
     vim_enter_behavior: nori_config::VimEnterBehavior,
+    /// `[tui] editor_mode` is Helix (or Kakoune, its old name).
+    helix_keymap: bool,
+    /// When Esc last took the editor out of Insert mode: an Esc soon after does not also
+    /// interrupt a running turn.
+    left_insert_at: Option<Instant>,
     vertical_footer: bool,
     prompt_summary: Option<String>,
     /// Agent-supplied session title, sanitized for single-line display.
@@ -167,8 +176,26 @@ pub(crate) struct ChatComposer {
     footer_segment_config: nori_config::FooterSegmentConfig,
     footer_layout_config: nori_config::FooterLayoutConfig,
     active_subagent_count: i64,
-    monitor_count: i64,
-    rewind_badge: Option<(i64, i64)>,
+    background: super::footer::Background,
+    /// The prompts of the main conversation, for walking back with `↑`.
+    conversation_prompts: prompt_walk::ConversationPrompts,
+    /// The walk back through them, while one is on.
+    walk: Option<prompt_walk::PromptWalk>,
+    /// Attachments of a draft restored after a recalled prompt was sent, held until the widget
+    /// has taken the ones sent with it.
+    held_images: Vec<AttachedImage>,
+    /// Every action (built-in, the agent's, plugins'), for the palette and typed commands.
+    actions: std::sync::Arc<nori_actions::Registry>,
+    /// The dials' values the agent offers now, for the palette.
+    action_choices: super::palette::ActionChoices,
+    /// Directives in the draft: the chip that stands for each and what it does on send.
+    directives: Vec<(ChipId, nori_actions::Invocation)>,
+    /// The actions plugins define (the Pkl runtime's), merged into `actions`.
+    plugin_actions: std::sync::Arc<[nori_actions::Action]>,
+    /// The draft `Ctrl+C` cleared last, which `↓` on an empty composer brings back.
+    cleared_draft: Option<String>,
+    /// The directives of the prompt just sent, until the widget takes them.
+    sent_directives: Vec<(ChipId, nori_actions::Invocation)>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -178,6 +205,7 @@ enum ActivePopup {
     Skill(SkillPopup),
     File(FileSearchPopup),
     HistorySearch(HistorySearchPopup),
+    Palette(Box<super::palette::Palette>),
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
@@ -186,10 +214,17 @@ const FOOTER_SPACING_HEIGHT: u16 = 0;
 const MIN_COMPOSER_HEIGHT: u16 = 3;
 
 mod draft;
+mod editor_events;
+mod palette_handling;
 pub(crate) use draft::ComposerDraft;
+mod inline_walk;
 mod key_handling;
 mod paste_handling;
 mod popup_management;
+mod prompt_walk;
+pub(crate) use prompt_walk::PromptsFingerprint;
+pub(crate) use prompt_walk::RecalledPrompt;
+pub(crate) use prompt_walk::WalkBadge;
 mod rendering;
 
 impl ChatComposer {
@@ -205,7 +240,6 @@ impl ChatComposer {
         let mut this = Self {
             rendered_body_area: Cell::new(None),
             textarea: TextArea::new(),
-            textarea_state: RefCell::new(TextAreaState::default()),
             input_enabled: true,
             active_popup: ActivePopup::None,
             app_event_tx,
@@ -242,14 +276,26 @@ impl ChatComposer {
             model_label: None,
             cloud_session: None,
             vim_enter_behavior: nori_config::VimEnterBehavior::Off,
+            helix_keymap: false,
+            left_insert_at: None,
             vertical_footer: false,
             prompt_summary: None,
             session_title: None,
             footer_segment_config: nori_config::FooterSegmentConfig::default(),
             footer_layout_config: nori_config::FooterLayoutConfig::default(),
             active_subagent_count: 0,
-            monitor_count: 0,
-            rewind_badge: None,
+            background: super::footer::Background::default(),
+            conversation_prompts: prompt_walk::ConversationPrompts::default(),
+            walk: None,
+            held_images: Vec::new(),
+            actions: std::sync::Arc::new(crate::actions::builtin_registry(
+                &nori_config::HotkeyConfig::default(),
+            )),
+            action_choices: super::palette::ActionChoices::default(),
+            directives: Vec::new(),
+            sent_directives: Vec::new(),
+            cleared_draft: None,
+            plugin_actions: std::sync::Arc::from(Vec::new()),
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -265,10 +311,6 @@ impl ChatComposer {
     /// that the composer can navigate cross-session history.
     pub(crate) fn set_history_metadata(&mut self, log_id: u64, entry_count: usize) {
         self.history.set_metadata(log_id, entry_count);
-    }
-
-    pub(crate) fn record_local_history_submission(&mut self, text: &str) {
-        self.history.record_local_submission(text);
     }
 
     pub(crate) fn set_vertical_footer(&mut self, vertical_footer: bool) {
@@ -287,12 +329,8 @@ impl ChatComposer {
         self.active_subagent_count = count;
     }
 
-    pub(crate) fn set_monitor_count(&mut self, count: i64) {
-        self.monitor_count = count;
-    }
-
-    pub(crate) fn set_rewind_badge(&mut self, badge: Option<(i64, i64)>) {
-        self.rewind_badge = badge;
+    pub(crate) fn set_background(&mut self, background: super::footer::Background) {
+        self.background = background;
     }
 
     #[cfg(test)]
@@ -306,24 +344,58 @@ impl ChatComposer {
 
     pub(crate) fn set_hotkey_config(&mut self, config: nori_config::HotkeyConfig) {
         self.textarea.set_hotkey_config(config);
+        self.rebuild_actions();
     }
 
     pub(crate) fn set_vim_mode(&mut self, value: nori_config::VimEnterBehavior) {
         self.vim_enter_behavior = value;
-        self.textarea.set_kakoune_mode_enabled(false);
-        self.textarea.set_vim_mode_enabled(value.is_enabled());
+        self.apply_keymap();
+    }
+
+    /// Choose the Helix keymap (`true`) or the one `vim_mode` gives.
+    pub(crate) fn set_kakoune_mode(&mut self, enabled: bool) {
+        self.helix_keymap = enabled;
+        self.apply_keymap();
+    }
+
+    /// Choose the editor's keymap directly (the palette's "Editor keys").
+    pub(crate) fn set_editor_keymap(&mut self, keymap: KeymapKind) {
+        self.helix_keymap = keymap == KeymapKind::Helix;
+        if keymap == KeymapKind::Vim && !self.vim_enter_behavior.is_enabled() {
+            self.vim_enter_behavior = nori_config::VimEnterBehavior::Submit;
+        }
+        if keymap == KeymapKind::Standard {
+            self.vim_enter_behavior = nori_config::VimEnterBehavior::Off;
+        }
+        self.apply_keymap();
+    }
+
+    fn apply_keymap(&mut self) {
+        let keymap = if self.helix_keymap {
+            KeymapKind::Helix
+        } else if self.vim_enter_behavior.is_enabled() {
+            KeymapKind::Vim
+        } else {
+            KeymapKind::Standard
+        };
+        self.textarea.set_keymap(keymap);
     }
 
     pub(crate) fn cursor_style(&self) -> crossterm::cursor::SetCursorStyle {
-        use crate::bottom_pane::textarea::VimModeState;
         use crossterm::cursor::SetCursorStyle;
+        use nori_editor::CursorShape;
         if !self.input_enabled || self.popup_active() {
             return SetCursorStyle::DefaultUserShape;
         }
-        match self.textarea.vim_mode_state_if_enabled() {
-            Some(VimModeState::Insert) => SetCursorStyle::SteadyBar,
-            Some(VimModeState::Normal) => SetCursorStyle::SteadyBlock,
-            None => SetCursorStyle::DefaultUserShape,
+        match (self.textarea.keymap(), self.textarea.cursor_shape()) {
+            (KeymapKind::Standard, _) => SetCursorStyle::DefaultUserShape,
+            (KeymapKind::Helix | KeymapKind::Vim, CursorShape::Bar) => SetCursorStyle::SteadyBar,
+            (KeymapKind::Helix | KeymapKind::Vim, CursorShape::Block) => {
+                SetCursorStyle::SteadyBlock
+            }
+            (KeymapKind::Helix | KeymapKind::Vim, CursorShape::Underline) => {
+                SetCursorStyle::SteadyUnderScore
+            }
         }
     }
 
@@ -337,32 +409,37 @@ impl ChatComposer {
         if body.intersection(area) != body {
             return false;
         }
-        let state = *self.textarea_state.borrow();
-        self.textarea.place_cursor_at(body, state, column, row)
+        self.textarea.place_cursor_at(column, row)
     }
 
-    /// Select the modalkit Kakoune editing engine for the prompt.
-    pub(crate) fn set_kakoune_mode(&mut self, enabled: bool) {
-        self.textarea.set_kakoune_mode_enabled(enabled);
-    }
-
+    /// Whether the editor has a use for this Esc (leaving Insert mode, closing a menu).
     pub(crate) fn should_handle_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
-        self.textarea.should_handle_vim_insert_escape(key_event)
+        key_event.code == KeyCode::Esc
+            && key_event.modifiers == KeyModifiers::NONE
+            && matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && self.textarea.wants_escape()
     }
 
+    /// Whether Esc during a running turn is the composer's rather than an interrupt: the
+    /// editor or a walk wants it, or it follows an Esc that left Insert mode a moment ago.
     pub(crate) fn should_handle_vim_escape_during_task(&self, key_event: KeyEvent) -> bool {
+        const DOUBLE_ESCAPE: Duration = Duration::from_millis(500);
         self.popup_active()
-            || self
-                .textarea
-                .should_handle_vim_escape_during_task(key_event)
+            || self.walk.is_some()
+            || self.should_handle_vim_insert_escape(key_event)
+            || key_event.code == KeyCode::Esc
+                && (key_event.kind == KeyEventKind::Repeat
+                    || self
+                        .left_insert_at
+                        .is_some_and(|at| at.elapsed() < DOUBLE_ESCAPE))
     }
 
     pub(crate) fn is_vim_operator_pending(&self) -> bool {
-        self.textarea.is_in_vim_normal_mode() && self.textarea.is_vim_operator_pending()
+        self.textarea.is_pending()
     }
 
     pub(crate) fn is_in_vim_normal_mode(&self) -> bool {
-        self.textarea.is_in_vim_normal_mode()
+        self.textarea.is_normal_mode()
     }
 
     /// Set a footer segment's enabled state.
@@ -374,10 +451,10 @@ impl ChatComposer {
         self.footer_segment_config.set_enabled(segment, enabled);
     }
 
-    /// Returns the current vim mode state (for testing).
+    /// The editor's mode (for testing).
     #[cfg(test)]
-    pub(crate) fn vim_mode_state(&self) -> crate::bottom_pane::textarea::VimModeState {
-        self.textarea.vim_mode_state()
+    pub(crate) fn editor_mode(&self) -> EditorMode {
+        self.textarea.mode()
     }
 
     /// Integrate an asynchronous response to an on-demand history lookup. If
@@ -460,7 +537,8 @@ impl ChatComposer {
         let previous = self.current_text();
         self.set_text_content(String::new());
         self.history.reset_navigation();
-        self.history.record_local_submission(&previous);
+        // `↓` on the empty composer brings it back.
+        self.cleared_draft = Some(previous.clone());
         Some(previous)
     }
 
@@ -506,16 +584,14 @@ impl ChatComposer {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".to_string());
-        let placeholder = format!("[{file_label} {width}x{height}]");
-        // Insert as an element to match large paste placeholder behavior:
-        // styled distinctly and treated atomically for cursor/mutations.
-        self.textarea.insert_element(&placeholder);
-        self.attached_images
-            .push(AttachedImage { placeholder, path });
+        let label = format!("[{file_label} {width}x{height}]");
+        let chip = self.textarea.insert_chip(&label, ChipTone::Attachment);
+        self.attached_images.push(AttachedImage { chip, path });
     }
 
     pub fn take_recent_submission_images(&mut self) -> Vec<PathBuf> {
         let images = std::mem::take(&mut self.attached_images);
+        self.attached_images = std::mem::take(&mut self.held_images);
         images.into_iter().map(|img| img.path).collect()
     }
 
@@ -633,14 +709,6 @@ impl ChatComposer {
             popup.set_disabled_builtins(self.disabled_builtin_commands.clone());
         }
     }
-
-    /// Get the token breakdown from transcript location (for status card display).
-    pub(crate) fn transcript_token_breakdown(&self) -> Option<nori_harness::TranscriptTokenUsage> {
-        self.system_info
-            .as_ref()
-            .and_then(|s| s.transcript_location.as_ref())
-            .and_then(|loc| loc.token_breakdown.clone())
-    }
 }
 
 impl ChatComposer {
@@ -653,6 +721,7 @@ impl ChatComposer {
             ActivePopup::Skill(c) => c.calculate_required_height(width),
             ActivePopup::File(c) => c.calculate_required_height(),
             ActivePopup::HistorySearch(c) => c.calculate_required_height(),
+            ActivePopup::Palette(c) => c.calculate_required_height(width),
         };
         let footer_props = self.footer_props();
         let footer_hint_height = self
@@ -664,18 +733,24 @@ impl ChatComposer {
 
 impl Renderable for ChatComposer {
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if !self.input_enabled {
+        // A prompt edited in place has its cursor in the conversation, where the stage puts it.
+        if !self.input_enabled || self.walks_inline() {
             return None;
         }
-        let [_, textarea_rect, _] = self.layout_areas(area);
+        let [_, textarea_rect, popup_rect] = self.layout_areas(area);
+        if let ActivePopup::Palette(palette) = &self.active_popup {
+            return palette.cursor_pos(popup_rect);
+        }
         let textarea_rect = Self::textarea_body_rect(textarea_rect, self.prompt_indicator());
-        let state = *self.textarea_state.borrow();
-        self.textarea.cursor_pos_with_state(textarea_rect, state)
+        self.textarea.cursor_pos(textarea_rect)
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         if !self.input_enabled {
             return 3;
+        }
+        if self.walks_inline() {
+            return self.inline_walk_height();
         }
         let footer_props = self.footer_props();
         let footer_hint_height = self
@@ -700,10 +775,15 @@ impl Renderable for ChatComposer {
                 ActivePopup::Skill(c) => c.calculate_required_height(width),
                 ActivePopup::File(c) => c.calculate_required_height(),
                 ActivePopup::HistorySearch(c) => c.calculate_required_height(),
+                ActivePopup::Palette(c) => c.calculate_required_height(width),
             }
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        if self.input_enabled && self.walks_inline() {
+            self.render_inline_walk(area, buf);
+            return;
+        }
         let [composer_rect, textarea_rect, popup_rect] = self.layout_areas(area);
         if !self.input_enabled {
             // Frozen exit state: no popups, no footer, no cursor — just a dim
@@ -735,6 +815,9 @@ impl Renderable for ChatComposer {
             }
             ActivePopup::HistorySearch(popup) => {
                 popup.render_ref(popup_rect, buf);
+            }
+            ActivePopup::Palette(popup) => {
+                popup.render(popup_rect, buf);
             }
             ActivePopup::None => {
                 let footer_props = self.footer_props();
@@ -777,11 +860,12 @@ impl Renderable for ChatComposer {
         }
         let style = user_message_style();
         Block::default().style(style).render(composer_rect, buf);
-        render_textarea_corner_segments(
-            composer_rect,
-            buf,
-            textarea_corner_segments(&self.footer_props()),
-        );
+        let mut corners = textarea_corner_segments(&self.footer_props());
+        if let Some(badge) = self.walk_badge() {
+            corners.top_left = badge.hint(composer_rect.width.saturating_sub(4));
+            corners.top_right = Line::default();
+        }
+        render_textarea_corner_segments(composer_rect, buf, corners);
         let prompt_indicator = self.prompt_indicator();
         if !textarea_rect.is_empty() {
             let prompt = match prompt_indicator {
@@ -802,9 +886,8 @@ impl Renderable for ChatComposer {
 
         let body_rect = Self::textarea_body_rect(textarea_rect, prompt_indicator);
         self.rendered_body_area.set(Some(body_rect));
-        let mut state = self.textarea_state.borrow_mut();
         self.textarea.set_shell_highlight(self.is_shell_mode);
-        StatefulWidgetRef::render_ref(&(&self.textarea), body_rect, buf, &mut state);
+        self.textarea.render(body_rect, buf);
         if prompt_indicator.hides_textarea_prefix() && !textarea_rect.is_empty() {
             buf.set_string(
                 textarea_rect.x.saturating_sub(1),

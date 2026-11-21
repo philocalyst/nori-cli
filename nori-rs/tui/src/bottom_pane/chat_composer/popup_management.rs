@@ -215,7 +215,10 @@ impl ChatComposer {
     }
 
     pub(super) fn sync_selection_popups(&mut self) {
-        if matches!(self.active_popup, ActivePopup::HistorySearch(_)) {
+        if matches!(
+            self.active_popup,
+            ActivePopup::HistorySearch(_) | ActivePopup::Palette(_)
+        ) {
             return;
         }
 
@@ -228,7 +231,7 @@ impl ChatComposer {
         // file and skill lookup is intentionally Insert-only. This keeps `$`
         // available as Vim's end-of-line motion and prevents Normal-mode edits
         // from mutating picker queries behind the popup.
-        if self.textarea.is_in_vim_normal_mode() {
+        if self.textarea.is_normal_mode() {
             if matches!(
                 self.active_popup,
                 ActivePopup::File(_) | ActivePopup::Skill(_)
@@ -388,6 +391,7 @@ impl ChatComposer {
 
     pub(crate) fn set_custom_prompts(&mut self, prompts: Vec<CustomPrompt>) {
         self.custom_prompts = prompts.clone();
+        self.rebuild_actions();
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_prompts(prompts);
         }
@@ -400,6 +404,7 @@ impl ChatComposer {
     ) {
         self.agent_commands = commands.clone();
         self.agent_command_prefix = prefix.clone();
+        self.rebuild_actions();
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_agent_commands(commands, prefix);
         } else if matches!(self.active_popup, ActivePopup::Skill(_)) {

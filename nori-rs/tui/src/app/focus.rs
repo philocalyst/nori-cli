@@ -1,26 +1,28 @@
-//! Focus-backwards: walking back to an earlier prompt, and rewinding, editing or forking from it.
+//! Walking back to an earlier prompt, and rewinding or forking from it.
 //!
-//! One model for all of it. The focus sits on a prompt of the conversation: the stage draws it as
-//! an amber card with everything after it dimmed (see `stage::focus`), `[` and `]` (or the arrow
-//! keys) move it between prompts, and a key says what to do with the prompt it is on:
+//! The main conversation is walked back from the composer itself: ↑ at its top loads the previous
+//! prompt into the composer's editor, and the composer tells the app where it is
+//! (`AppEvent::FocusChanged`). The focus follows: the stage draws that prompt edited in place,
+//! with the editor's rows and cursor, and everything after it dimmed (see `stage::focus`), so
+//! what sending from there would roll back is visible; the composer has no text box meanwhile. Enter in the composer (`AppEvent::RewindSelection`)
+//! restores the files of the turns it rolls back (Alt+Enter keeps them), forks the conversation
+//! before the prompt and sends the edited text. A running turn is stopped first, never waited
+//! for by the person: the rewind happens as soon as it has stopped.
+//!
+//! A child's journal is walked with keys, its conversation drawn by the child's view; its only
+//! actions are the journal's (rollback and fork):
 //!
 //! | key | what |
 //! |---|---|
-//! | `Enter`, `e` | edit the prompt in place; `Enter` again sends it, restoring the files of the turns it rolls back |
-//! | `r` | rewind to it: restore the files, fork before it, and put it in the composer |
-//! | `R` | the same, keeping the files as they are |
+//! | `[` `]`, `↑` `↓` | move between prompts |
+//! | `Enter`, `e`, `r` | roll back through it |
 //! | `f`, `Space` | fork a subagent from its response |
 //! | `Esc` | leave |
-//!
-//! The same model walks the prompts of a child's journal, where the conversation drawn is the
-//! child's and the only actions are the ones the journal has (rollback and fork).
 
 use std::sync::Arc;
 
-use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
-use crossterm::event::KeyModifiers;
 use nori_config::KeyAction;
 use nori_config::KeyMode;
 use nori_harness::UndoSnapshot;
@@ -28,15 +30,15 @@ use nori_harness::UndoSnapshot;
 use super::App;
 use crate::app_event::AppEvent;
 use crate::app_event::ForkAfter;
+use crate::app_event::RewindFiles;
+use crate::app_event::RewindSelection;
 use crate::app_event::SessionGeneration;
-use crate::bottom_pane::textarea::TextArea;
 use crate::history_cell::AgentMarkdownCell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::UserHistoryCell;
 use crate::pager_overlay::MessageAction;
 use crate::pager_overlay::MessageChoice;
-use crate::stage::EditView;
 use crate::stage::FocusView;
 use crate::subagent_switcher::Target;
 use crate::tui::Tui;
@@ -48,8 +50,6 @@ pub(crate) struct Focus {
     child_cells: Vec<Arc<dyn HistoryCell>>,
     /// Index of the focused prompt in the cells walked.
     selected: usize,
-    /// The prompt, while it is being edited in place.
-    editor: Option<TextArea>,
     /// What the edit journal says restoring would undo, once it answered.
     snapshots: Option<Vec<UndoSnapshot>>,
     /// Opened with `[`: a `t` right after toggles the nearest tool card instead.
@@ -57,8 +57,10 @@ pub(crate) struct Focus {
 }
 
 impl Focus {
-    pub(crate) fn editing(&self) -> bool {
-        self.editor.is_some()
+    /// The focus walks a child's journal, with keys; the main conversation is walked from the
+    /// composer.
+    pub(crate) fn walks_child(&self) -> bool {
+        self.target != Target::Main
     }
 }
 
@@ -112,8 +114,7 @@ impl App {
         }
     }
 
-    /// Focus the last prompt of the conversation shown. For a child, the journal's cells are
-    /// given; the main conversation is the transcript.
+    /// Focus the last prompt of a child's journal, whose cells are given.
     pub(super) fn begin_focus(
         &mut self,
         tui: &mut Tui,
@@ -121,12 +122,7 @@ impl App {
         opened_by_bracket: bool,
     ) {
         let target = self.session_view.focused();
-        let cells: &[Arc<dyn HistoryCell>] = if target == Target::Main {
-            &self.transcript_cells
-        } else {
-            &child_cells
-        };
-        let Some(selected) = cells.iter().rposition(is_prompt) else {
+        let Some(selected) = child_cells.iter().rposition(is_prompt) else {
             self.chat_widget
                 .add_info_message("Nothing has been sent yet to rewind to.".to_owned(), None);
             return;
@@ -135,26 +131,117 @@ impl App {
             target,
             child_cells,
             selected,
-            editor: None,
             snapshots: None,
             opened_by_bracket,
         });
-        if target == Target::Main
-            && let Some(handle) = self.chat_widget.harness_handle()
+        tui.frame_requester().schedule_frame();
+    }
+
+    /// The composer walked back to the prompt at `cell` of the main conversation, or left the
+    /// walk (`None`).
+    pub(super) fn on_focus_changed(
+        &mut self,
+        tui: &mut Tui,
+        generation: SessionGeneration,
+        cell: Option<usize>,
+    ) {
+        if generation != self.chat_widget.session_generation()
+            || self.session_view.focused() != Target::Main
         {
-            let tx = self.app_event_tx.clone();
-            let generation = self.chat_widget.session_generation();
-            tokio::spawn(async move {
-                if let Ok(snapshots) = handle.undo_snapshots().await {
-                    tx.send(AppEvent::FocusSnapshotsLoaded {
-                        generation,
-                        snapshots,
+            return;
+        }
+        let selected = cell.filter(|cell| self.transcript_cells.get(*cell).is_some_and(is_prompt));
+        match (selected, self.focus.as_mut()) {
+            (Some(selected), Some(focus)) if focus.target == Target::Main => {
+                focus.selected = selected;
+            }
+            (Some(selected), _) => {
+                self.focus = Some(Focus {
+                    target: Target::Main,
+                    child_cells: Vec::new(),
+                    selected,
+                    snapshots: None,
+                    opened_by_bracket: false,
+                });
+                // What restoring would undo, for the card's header; it arrives when it arrives.
+                if let Some(handle) = self.chat_widget.harness_handle() {
+                    let tx = self.app_event_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(snapshots) = handle.undo_snapshots().await {
+                            tx.send(AppEvent::FocusSnapshotsLoaded {
+                                generation,
+                                snapshots,
+                            });
+                        }
                     });
                 }
-            });
+            }
+            (None, Some(focus)) if focus.target == Target::Main => self.focus = None,
+            (None, _) => {}
         }
-        self.sync_focus_badge();
         tui.frame_requester().schedule_frame();
+    }
+
+    /// Enter on a prompt the composer walked back to: rewind there and send the edited text. A
+    /// running turn is stopped first and the rewind follows as soon as it has stopped.
+    pub(super) fn on_rewind_selection(&mut self, tui: &mut Tui, selection: RewindSelection) {
+        if selection.generation != self.chat_widget.session_generation() {
+            return;
+        }
+        let still_there = self
+            .transcript_cells
+            .get(selection.cell_index)
+            .is_some_and(is_prompt)
+            && turn_position(&self.transcript_cells, selection.cell_index).0 == selection.turn;
+        if !still_there {
+            self.focus = None;
+            self.chat_widget.add_error_message(
+                "That prompt is no longer in the conversation; nothing was rewound.".to_owned(),
+            );
+            return;
+        }
+        if self.chat_widget.is_task_running() {
+            self.chat_widget
+                .submit_harness_action(crate::app_event::HarnessAction::Cancel);
+            self.chat_widget.add_info_message(
+                "Stopping the running turn; the rewind follows as soon as it has stopped."
+                    .to_owned(),
+                None,
+            );
+            self.pending_rewind = Some(selection);
+            return;
+        }
+        self.rewind_to(tui, selection);
+    }
+
+    fn rewind_to(&mut self, tui: &mut Tui, selection: RewindSelection) {
+        let snapshots = self.focus.take().and_then(|focus| focus.snapshots);
+        self.focus = Some(Focus {
+            target: Target::Main,
+            child_cells: Vec::new(),
+            selected: selection.cell_index,
+            snapshots,
+            opened_by_bracket: false,
+        });
+        self.dispatch_rewind(
+            tui,
+            selection.files == RewindFiles::Restore,
+            ForkAfter::Submit(selection.text),
+        );
+    }
+
+    /// Ctrl+F on a walked prompt: a subagent goes on from the end of that turn's answer.
+    pub(super) fn fork_walked_turn(&mut self, generation: SessionGeneration, cell_index: usize) {
+        if generation != self.chat_widget.session_generation() {
+            return;
+        }
+        match response_for_prompt(&self.transcript_cells, cell_index) {
+            Some(response) => self.fork_subagent_from(response),
+            None => self.chat_widget.add_info_message(
+                "That turn has no answer yet to go on from.".to_owned(),
+                None,
+            ),
+        }
     }
 
     pub(super) fn apply_focus_snapshots(
@@ -171,45 +258,20 @@ impl App {
 
     pub(super) fn close_focus(&mut self, tui: &mut Tui) {
         self.focus = None;
-        self.sync_focus_badge();
         tui.frame_requester().schedule_frame();
     }
 
-    /// Tell the status line which prompt is focused, if any.
-    fn sync_focus_badge(&mut self) {
-        let badge = self
-            .focus
-            .as_ref()
-            .map(|focus| turn_position(self.focus_cells(), focus.selected));
-        self.chat_widget.set_rewind_badge(badge);
-    }
-
-    /// The focused prompt as the stage draws it, for the main conversation.
-    pub(crate) fn focus_view(&self) -> Option<FocusView> {
+    /// The focused prompt as the stage draws it, for the main conversation `width` wide: edited
+    /// in place, with the composer's editor.
+    pub(crate) fn focus_view(&self, width: u16) -> Option<FocusView> {
         let focus = self
             .focus
             .as_ref()
             .filter(|focus| focus.target == Target::Main)?;
-        Some(self.focus_view_of(focus))
-    }
-
-    fn focus_view_of(&self, focus: &Focus) -> FocusView {
-        let cells = self.focus_cells();
-        FocusView {
+        Some(FocusView {
             selected: focus.selected,
-            turn: turn_position(cells, focus.selected),
-            edit: focus.editor.as_ref().map(|editor| EditView {
-                text: editor.text().to_owned(),
-                cursor: editor.cursor(),
-            }),
-            undo_turns: focus.snapshots.as_ref().map(|snapshots| {
-                crate::chatwidget::rewind::turns_to_undo(
-                    snapshots,
-                    &self.prompts_from(focus.selected),
-                )
-            }),
-            has_downstream: focus.selected + 1 < cells.len(),
-        }
+            edit: self.chat_widget.inline_walk(width),
+        })
     }
 
     /// A child's journal as drawn while one of its prompts is focused.
@@ -219,7 +281,10 @@ impl App {
             .as_ref()
             .filter(|focus| focus.target != Target::Main)?;
         Some(crate::stage::render_focused(
-            &self.focus_view_of(focus),
+            &FocusView {
+                selected: focus.selected,
+                edit: None,
+            },
             &focus.child_cells,
             width,
         ))
@@ -237,8 +302,16 @@ impl App {
             .collect()
     }
 
-    /// Keep the focus honest: its prompt must still be one.
+    /// Keep the focus honest: its prompt must still be one. A rewind waiting for a turn to stop
+    /// goes ahead once it has.
     pub(super) fn validate_focus(&mut self, tui: &mut Tui) {
+        if let Some(selection) = self
+            .pending_rewind
+            .take_if(|_| !self.chat_widget.is_task_running())
+        {
+            self.rewind_to(tui, selection);
+            return;
+        }
         let valid = self.focus.as_ref().is_none_or(|focus| {
             focus.target == self.session_view.focused()
                 && self
@@ -259,11 +332,6 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return true;
         }
-        let editing = self.focus.as_ref().is_some_and(Focus::editing);
-        if editing {
-            self.handle_focus_edit_key(tui, key);
-            return true;
-        }
         let opened_by_bracket = self
             .focus
             .as_mut()
@@ -282,8 +350,7 @@ impl App {
             KeyAction::FocusOlder | KeyAction::FocusNewer => {
                 self.move_focus(tui, action == KeyAction::FocusOlder);
             }
-            KeyAction::FocusEdit => self.start_focus_edit(tui),
-            KeyAction::FocusRewind => self.rewind_from_focus(tui, true),
+            KeyAction::FocusEdit | KeyAction::FocusRewind => self.rewind_from_focus(tui, true),
             KeyAction::FocusRewindKeepFiles => self.rewind_from_focus(tui, false),
             KeyAction::FocusFork => self.fork_from_focus(tui),
             KeyAction::FocusToggleTool if opened_by_bracket => {
@@ -311,61 +378,12 @@ impl App {
                 if let Some(focus) = self.focus.as_mut() {
                     focus.selected = next;
                 }
-                self.sync_focus_badge();
                 tui.frame_requester().schedule_frame();
             }
             // Past the newest prompt is the composer again.
             None if !older => self.close_focus(tui),
             None => {}
         }
-    }
-
-    fn start_focus_edit(&mut self, tui: &mut Tui) {
-        let Some(focus) = self.focus.as_ref() else {
-            return;
-        };
-        if focus.target != Target::Main {
-            self.rewind_from_focus(tui, true);
-            return;
-        }
-        let text = self
-            .prompts_from(focus.selected)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let mut editor = TextArea::new();
-        editor.set_hotkey_config(self.hotkey_config.clone());
-        editor.set_text(&text);
-        editor.set_cursor(text.len());
-        if let Some(focus) = self.focus.as_mut() {
-            focus.editor = Some(editor);
-        }
-        tui.frame_requester().schedule_frame();
-    }
-
-    fn handle_focus_edit_key(&mut self, tui: &mut Tui, key: KeyEvent) {
-        let Some(editor) = self.focus.as_mut().and_then(|focus| focus.editor.as_mut()) else {
-            return;
-        };
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                if let Some(focus) = self.focus.as_mut() {
-                    focus.editor = None;
-                }
-            }
-            (KeyCode::Enter, KeyModifiers::NONE) => {
-                let text = editor.text().trim().to_owned();
-                if text.is_empty() {
-                    if let Some(focus) = self.focus.as_mut() {
-                        focus.editor = None;
-                    }
-                } else {
-                    self.dispatch_rewind(tui, true, ForkAfter::Submit(text));
-                }
-            }
-            _ => editor.input(key),
-        }
-        tui.frame_requester().schedule_frame();
     }
 
     fn rewind_from_focus(&mut self, tui: &mut Tui, restore_files: bool) {
@@ -437,13 +455,6 @@ impl App {
         let Some(focus) = self.focus.as_ref() else {
             return;
         };
-        if self.chat_widget.is_task_running() {
-            self.chat_widget.add_info_message(
-                "A turn is running: stop it with Esc before rewinding.".to_owned(),
-                None,
-            );
-            return;
-        }
         let cell_index = focus.selected;
         let prompts = self.prompts_from(cell_index);
         let cached = focus.snapshots.clone();

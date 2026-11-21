@@ -48,16 +48,6 @@ impl ChatWidget {
         self.focused_transcript = None;
     }
 
-    /// Tell the status line which prompt a rewind is focused on, as `(turn, of)`.
-    pub(crate) fn set_rewind_badge(&mut self, turn: Option<(usize, usize)>) {
-        self.bottom_pane.set_rewind_badge(turn.map(|(turn, of)| {
-            (
-                i64::try_from(turn).unwrap_or(i64::MAX),
-                i64::try_from(of).unwrap_or(i64::MAX),
-            )
-        }));
-    }
-
     pub(crate) fn set_focused_subagent_view(
         &mut self,
         key: Option<crate::subagent_switcher::SubagentKey>,
@@ -262,12 +252,12 @@ impl ChatWidget {
 
     /// Update system info in the footer (for background refresh).
     pub(crate) fn apply_system_info_refresh(&mut self, info: crate::system_info::SystemInfo) {
-        if let Some(transcript_location) = &info.transcript_location {
-            for subagent in &transcript_location.subagents_used {
-                self.session_stats.record_subagent(subagent);
-            }
-        }
         self.bottom_pane.set_system_info(info);
+    }
+
+    /// The prompt walked back to, as edited in place in the conversation.
+    pub(crate) fn inline_walk(&self, width: u16) -> Option<crate::stage::InlineEdit> {
+        self.bottom_pane.inline_walk(width)
     }
 
     pub(crate) fn composer_text(&self) -> String {
@@ -330,6 +320,10 @@ impl ChatWidget {
 
     pub(crate) fn has_active_overlay_or_popup(&self) -> bool {
         self.bottom_pane.has_active_overlay_or_popup()
+    }
+
+    pub(crate) fn composer_caret_on_first_row(&self) -> bool {
+        self.bottom_pane.composer_caret_on_first_row()
     }
 
     pub(crate) fn composer_is_empty(&self) -> bool {

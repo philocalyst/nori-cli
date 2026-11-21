@@ -14,7 +14,6 @@ use nori_config::KeyAction;
 use nori_config::KeyMode;
 
 use super::super::App;
-use super::super::focus::is_prompt;
 use super::InputMode;
 use crate::app_event::AppEvent;
 use crate::nori::hotkey_match::matches_binding;
@@ -27,6 +26,21 @@ impl App {
         if self.buffer_key_for_child_history(&key) {
             return;
         }
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Up
+            && key.modifiers == KeyModifiers::NONE
+            && let Target::Subagent(child) = self.session_view.focused()
+            && self.input_mode() == InputMode::Composer
+            && self.chat_widget.is_normal_backtrack_mode()
+            && self.chat_widget.composer_caret_on_first_row()
+        {
+            self.request_child_history(tui, child, true);
+            return;
+        }
+        // The composer walks back through the conversation's prompts on ↑: keep its list current
+        // (nothing to do unless the conversation changed).
+        self.chat_widget
+            .sync_conversation_prompts(&self.transcript_cells);
         if self.input_mode() == InputMode::Focus && self.handle_focus_key(tui, key) {
             return;
         }
@@ -106,9 +120,10 @@ impl App {
         true
     }
 
-    /// The keys that walk back to the prompts of the conversation shown (`Esc` on an empty
-    /// composer while idle; `[` in normal mode), or load a child's journal to do it there.
-    /// Which keys they are is the keymap's; returns whether `key` did.
+    /// The keys that stop running subagents (`Esc` on an empty composer while they run) or load a
+    /// child's journal to walk back through it (`[` in normal mode). The main conversation is
+    /// walked back from the composer itself. Which keys they are is the keymap's; returns
+    /// whether `key` did.
     fn enter_focus_with(&mut self, tui: &mut Tui, key: &KeyEvent) -> bool {
         let Some(action) =
             self.config
@@ -156,11 +171,9 @@ impl App {
             }
             return false;
         }
-        if !self.transcript_cells.iter().any(is_prompt) {
-            return false;
-        }
-        self.begin_focus(tui, Vec::new(), action == KeyAction::EnterFocusBracket);
-        true
+        // The main conversation is walked back from the composer itself (↑ at its top), with the
+        // same editor as any draft: there is no mode to enter.
+        false
     }
 
     /// Esc: stop what is running, or leave where the user is, or walk back to the last prompt.

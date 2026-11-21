@@ -181,6 +181,11 @@ impl App {
             | AppEvent::RemoteControlRequested(..)
             | AppEvent::SessionCloseFailed { .. }
             | AppEvent::SessionClosed => self.handle_session_event(tui, event).await,
+            AppEvent::EditorClipboard { command, text } => {
+                self.chat_widget.paste_clipboard(command, &text);
+                tui.frame_requester().schedule_frame();
+                Ok(true)
+            }
             AppEvent::ConsolidateAgentMessage { .. }
             | AppEvent::DiffResult(..)
             | AppEvent::FinalizeHistoryTools { .. }
@@ -192,6 +197,8 @@ impl App {
             | AppEvent::ResponseRewindFinished { .. }
             | AppEvent::RevealUserQuestion
             | AppEvent::RewindFilesRestored { .. }
+            | AppEvent::RewindSelection(..)
+            | AppEvent::ForkWalkedTurn { .. }
             | AppEvent::ShellComplete { .. }
             | AppEvent::ShellCompleted { .. }
             | AppEvent::ShowToast(..)

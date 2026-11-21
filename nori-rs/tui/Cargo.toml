@@ -59,6 +59,7 @@ codex-rmcp-client = { workspace = true }
 nori-installed = { workspace = true }
 nori-protocol = { workspace = true }
 codex-file-search = { workspace = true }
+nori-actions = { workspace = true }
 nori-editor = { workspace = true }
 nori-tui-components = { workspace = true }
 nucleo-matcher = { workspace = true }

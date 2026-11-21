@@ -205,6 +205,19 @@ pub(crate) enum AppEvent {
         generation: SessionGeneration,
         snapshots: Vec<nori_harness::UndoSnapshot>,
     },
+    /// The composer walked back to a prompt of the main conversation (↑ at its top), or left the
+    /// walk (`None`). `cell` is the prompt's index in the transcript when the walk stepped.
+    FocusChanged {
+        generation: SessionGeneration,
+        cell: Option<usize>,
+    },
+    /// The clipboard's text, read for the composer's `space p` / `space P` / `space R`.
+    EditorClipboard {
+        command: nori_editor::ClipboardCommand,
+        text: String,
+    },
+    /// Enter on a walked-back prompt: rewind the conversation to before it and send `text`.
+    RewindSelection(RewindSelection),
     /// The files of a rewind are restored (or could not be): the conversation forks next.
     RewindFilesRestored {
         generation: SessionGeneration,

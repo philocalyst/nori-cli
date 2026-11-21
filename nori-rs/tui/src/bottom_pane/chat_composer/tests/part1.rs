@@ -1,4 +1,6 @@
 use super::*;
+use crate::app_event::RewindFiles;
+use crate::app_event::RewindSelection;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -37,26 +39,24 @@ fn shortcut_hint_is_placeholder_only_until_shortcut_overlay_opens() {
 }
 
 #[test]
-fn question_mark_is_text_and_does_not_open_shortcut_overlay() {
+fn question_mark_on_an_empty_prompt_opens_and_closes_the_key_list() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
-    let mut composer = ChatComposer::new(true, sender, false, "? for shortcuts".to_string(), false);
+    let mut composer = ChatComposer::new(
+        true,
+        sender,
+        false,
+        "Ask Nori to do anything".to_string(),
+        false,
+    );
+
     type_chars_humanlike(&mut composer, &['?']);
+    assert_eq!(composer.current_text(), "");
+    assert_eq!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 
-    let area = Rect::new(0, 0, 80, 10);
-    let mut buf = Buffer::empty(area);
-    composer.render(area, &mut buf);
-
-    let rendered = (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(composer.current_text(), "?");
-    assert!(rendered.iter().all(|row| !row.contains("newline")));
+    type_chars_humanlike(&mut composer, &['?']);
+    assert_eq!(composer.current_text(), "");
+    assert_ne!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 }
 
 #[test]
@@ -75,14 +75,13 @@ fn clear_for_ctrl_c_records_cleared_draft() {
     assert_eq!(composer.clear_for_ctrl_c(), Some("draft text".to_string()));
     assert!(composer.is_empty());
 
-    assert_eq!(
-        composer.history.navigate_up(&composer.app_event_tx),
-        Some("draft text".to_string())
-    );
+    // `↓` on the empty composer brings the cleared draft back.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(composer.current_text(), "draft text");
 }
 
 #[test]
-fn question_mark_is_literal_at_the_start_and_within_a_draft() {
+fn question_mark_within_a_draft_is_literal() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let mut composer = ChatComposer::new(
         true,
@@ -91,13 +90,13 @@ fn question_mark_is_literal_at_the_start_and_within_a_draft() {
         "Ask Nori to do anything".to_string(),
         false,
     );
-    type_chars_humanlike(&mut composer, &['?', 'h', '?']);
-    assert_eq!(composer.current_text(), "?h?");
+    type_chars_humanlike(&mut composer, &['h', '?', '?']);
+    assert_eq!(composer.current_text(), "h??");
     assert_ne!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 }
 
 #[test]
-fn question_mark_remains_literal_while_task_is_running() {
+fn question_mark_lists_the_keys_while_a_task_is_running() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let mut composer = ChatComposer::new(
         true,
@@ -108,8 +107,8 @@ fn question_mark_remains_literal_while_task_is_running() {
     );
     composer.set_task_running(true);
     type_chars_humanlike(&mut composer, &['?']);
-    assert_eq!(composer.current_text(), "?");
-    assert_ne!(composer.footer_mode(), FooterMode::ShortcutOverlay);
+    assert_eq!(composer.current_text(), "");
+    assert_eq!(composer.footer_mode(), FooterMode::ShortcutOverlay);
 }
 
 #[test]
@@ -363,11 +362,12 @@ fn handle_paste_large_uses_placeholder_and_replaces_on_submit() {
     let large = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
     let needs_redraw = composer.handle_paste(large.clone());
     assert!(needs_redraw);
-    let placeholder = format!("[Pasted Content {} chars]", large.chars().count());
-    assert_eq!(composer.textarea.text(), placeholder);
-    assert_eq!(composer.pending_pastes.len(), 1);
-    assert_eq!(composer.pending_pastes[0].0, placeholder);
-    assert_eq!(composer.pending_pastes[0].1, large);
+    let label = format!("[Pasted Content {} chars]", large.chars().count());
+    let (chip, payload) = composer.pending_pastes[0].clone();
+    assert_eq!(composer.textarea.text(), chip.as_char().to_string());
+    assert_eq!(composer.textarea.chip_label(chip), Some(label.as_str()));
+    assert_eq!(composer.pending_pastes, vec![(chip, large.clone())]);
+    assert_eq!(payload, large);
 
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     match result {
@@ -410,12 +410,19 @@ fn equal_length_large_pastes_expand_in_order_on_submit() {
     );
     let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
     let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
-    let base = format!("[Pasted Content {} chars]", first.chars().count());
 
     composer.handle_paste(first.clone());
     composer.handle_paste(second.clone());
 
-    assert_eq!(composer.current_text(), format!("{base}{base} #2"));
+    // Two chips with the same label are still two distinct characters.
+    let chips: Vec<char> = composer
+        .pending_pastes
+        .iter()
+        .map(|(chip, _)| chip.as_char())
+        .collect();
+    assert_eq!(chips.len(), 2);
+    assert_ne!(chips[0], chips[1]);
+    assert_eq!(composer.current_text(), chips.iter().collect::<String>());
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(result, InputResult::Submitted(format!("{first}{second}")));
 }
@@ -441,27 +448,91 @@ fn equal_length_large_pastes_expand_in_order_in_shell_mode() {
     assert_eq!(result, InputResult::Submitted(format!("!{first}{second}")));
 }
 
+fn prompt(cell_index: usize, text: &str) -> RecalledPrompt {
+    RecalledPrompt {
+        cell_index,
+        text: text.to_string(),
+    }
+}
+
 #[test]
-fn history_recall_places_cursor_at_end_and_keeps_navigating() {
-    let (tx, _rx) = unbounded_channel::<AppEvent>();
-    let sender = AppEventSender::new(tx);
+fn prompt_walk_places_cursor_at_end_and_keeps_walking() {
+    let (tx, mut rx) = unbounded_channel::<AppEvent>();
     let mut composer = ChatComposer::new(
         true,
-        sender,
+        AppEventSender::new(tx),
         false,
         "Ask Nori to do anything".to_string(),
         false,
     );
-    composer.history.record_local_submission("older");
-    composer.history.record_local_submission("newer\nentry");
+    composer.set_conversation_prompts(
+        1,
+        (2, 0),
+        vec![prompt(3, "older"), prompt(7, "newer\nentry")],
+    );
 
     composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(composer.current_text(), "newer\nentry");
     assert_eq!(composer.textarea.cursor(), "newer\nentry".len());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::FocusChanged {
+            generation: 1,
+            cell: Some(7)
+        })
+    ));
 
+    // The caret is on the last row: `↑` moves it within the prompt first.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(composer.current_text(), "newer\nentry");
     composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(composer.current_text(), "older");
     assert_eq!(composer.textarea.cursor(), "older".len());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::FocusChanged {
+            generation: 1,
+            cell: Some(3)
+        })
+    ));
+}
+
+#[test]
+fn prompt_walk_enter_rewinds_to_the_edited_prompt_and_esc_restores_the_draft() {
+    let (tx, mut rx) = unbounded_channel::<AppEvent>();
+    let mut composer = ChatComposer::new(
+        true,
+        AppEventSender::new(tx),
+        false,
+        "Ask Nori to do anything".to_string(),
+        false,
+    );
+    composer.set_conversation_prompts(1, (2, 0), vec![prompt(3, "first"), prompt(7, "second")]);
+    composer.insert_str("my draft");
+
+    // The caret is on the only row of the draft: `↑` starts the walk and stashes it.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(composer.current_text(), "second");
+    composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    // The modeless keymap has no use for `Esc`, so it ends the walk.
+    assert_eq!(composer.current_text(), "my draft");
+
+    composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    composer.insert_str(" edited");
+    while rx.try_recv().is_ok() {}
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(result, InputResult::None);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AppEvent::RewindSelection(RewindSelection {
+            generation: 1,
+            cell_index: 7,
+            turn: 2,
+            files: RewindFiles::Restore,
+            ref text,
+        })) if text == "second edited"
+    ));
+    assert_eq!(composer.current_text(), "my draft");
 }
 
 #[test]
@@ -506,4 +577,91 @@ fn stale_history_response_while_exiting_leaves_composer_untouched() {
 
     assert_eq!(composer.current_text(), "draft");
     assert_eq!(composer.textarea.cursor(), 0);
+}
+
+#[test]
+fn a_walked_prompt_is_edited_in_place_and_the_composer_keeps_only_its_status() {
+    let (tx, _rx) = unbounded_channel::<AppEvent>();
+    let mut composer = ChatComposer::new(
+        true,
+        AppEventSender::new(tx),
+        false,
+        "Ask Nori to do anything".to_string(),
+        false,
+    );
+    composer.set_conversation_prompts(1, (2, 0), vec![prompt(3, "pears and apples")]);
+    let before = composer.desired_height(60);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    let edit = composer
+        .inline_walk(60)
+        .expect("the walked prompt is edited in place");
+    let rows: Vec<String> = edit
+        .body
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
+    assert_eq!(
+        (rows, edit.cursor),
+        (vec!["pears and apples".to_owned()], Some((16, 0)))
+    );
+    // No text box under the conversation: the walk's line and the status line only.
+    assert!(composer.desired_height(60) < before);
+    assert_eq!(
+        composer.cursor_pos(ratatui::layout::Rect::new(0, 0, 60, 10)),
+        None
+    );
+}
+
+#[test]
+fn ctrl_f_on_a_walked_prompt_forks_a_subagent_from_its_turn() {
+    let (tx, mut rx) = unbounded_channel::<AppEvent>();
+    let mut composer = ChatComposer::new(
+        true,
+        AppEventSender::new(tx),
+        false,
+        "Ask Nori to do anything".to_string(),
+        false,
+    );
+    composer.set_conversation_prompts(1, (2, 0), vec![prompt(3, "older"), prompt(7, "newer")]);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+    let events: Vec<AppEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::ForkWalkedTurn {
+                generation: 1,
+                cell_index: 7
+            }
+        )),
+        "{events:?}"
+    );
+    // The walk is over and the draft is back.
+    assert!(composer.walk_badge().is_none());
+}
+
+#[test]
+fn the_walk_hint_drops_whole_keys_on_a_narrow_screen() {
+    let text = |line: ratatui::text::Line<'static>| {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    };
+    let badge = WalkBadge::Turn { turn: 2, total: 2 };
+    assert_eq!(
+        [80, 42, 32, 30, 18].map(|width| text(badge.hint(width))),
+        [
+            "↶ turn 2 of 2 · ⏎ rewind here · ⌥⏎ keep files · ^F fork · esc back".to_owned(),
+            "↶ turn 2 of 2 · ⏎ rewind here · esc back".to_owned(),
+            "↶ 2/2 · ⏎ rewind here · esc back".to_owned(),
+            "↶ turn 2 of 2 · ⏎ rewind here".to_owned(),
+            "↶ turn 2 of 2".to_owned(),
+        ]
+    );
 }

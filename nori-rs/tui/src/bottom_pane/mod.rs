@@ -22,11 +22,13 @@ pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
 mod bottom_pane_view;
 mod chat_composer;
+pub(crate) use chat_composer::RecalledPrompt;
 mod chat_composer_history;
 mod command_popup;
 mod component_overlay_menu_view;
 mod file_search_popup;
 mod footer;
+pub(crate) use footer::Background;
 mod history_search_popup;
 mod list_selection_view;
 mod popup_layout;
@@ -35,6 +37,8 @@ mod status_line;
 #[cfg(test)]
 pub(crate) use list_selection_view::ListSelectionView;
 pub(crate) use list_selection_view::SelectionViewParams;
+mod palette;
+pub(crate) use palette::ActionChoices;
 mod paste_burst;
 pub mod popup_consts;
 mod queued_user_messages;
@@ -298,6 +302,9 @@ impl BottomPane {
                 self.show_ctrl_c_quit_hint();
             }
             event
+        } else if self.composer.end_prompt_walk() {
+            self.request_redraw();
+            CancellationEvent::Handled
         } else if self.composer_is_empty() {
             CancellationEvent::NotHandled
         } else {
@@ -353,6 +360,12 @@ impl BottomPane {
     }
 
     /// Get the current composer text (for tests and programmatic checks).
+    /// The prompt walked back to, as edited in place in the conversation (see
+    /// `chat_composer::inline_walk`).
+    pub(crate) fn inline_walk(&self, width: u16) -> Option<crate::stage::InlineEdit> {
+        self.composer.inline_walk(width)
+    }
+
     pub(crate) fn composer_text(&self) -> String {
         self.composer.current_text()
     }
@@ -506,8 +519,30 @@ impl BottomPane {
         self.composer.set_monitor_count(count);
     }
 
-    pub(crate) fn set_rewind_badge(&mut self, badge: Option<(i64, i64)>) {
-        self.composer.set_rewind_badge(badge);
+    pub(crate) fn paste_clipboard(&mut self, command: nori_editor::ClipboardCommand, text: &str) {
+        self.composer.paste_clipboard(command, text);
+        self.request_redraw();
+    }
+
+    /// See [`ChatComposer::conversation_prompts_current`].
+    pub(crate) fn conversation_prompts_current(
+        &self,
+        generation: crate::app_event::SessionGeneration,
+        fingerprint: chat_composer::PromptsFingerprint,
+    ) -> bool {
+        self.composer
+            .conversation_prompts_current(generation, fingerprint)
+    }
+
+    pub(crate) fn set_conversation_prompts(
+        &mut self,
+        generation: crate::app_event::SessionGeneration,
+        fingerprint: chat_composer::PromptsFingerprint,
+        prompts: Vec<chat_composer::RecalledPrompt>,
+    ) {
+        self.composer
+            .set_conversation_prompts(generation, fingerprint, prompts);
+        self.request_redraw();
     }
 
     pub(crate) fn set_custom_working_messages(&mut self, enabled: bool) {
@@ -742,6 +777,10 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn composer_caret_on_first_row(&self) -> bool {
+        self.composer.caret_on_edge_row(true)
+    }
+
     pub(crate) fn composer_is_empty(&self) -> bool {
         self.composer.is_empty()
     }
@@ -857,10 +896,6 @@ impl BottomPane {
         self.composer.set_history_metadata(log_id, entry_count);
     }
 
-    pub(crate) fn record_local_history_submission(&mut self, text: &str) {
-        self.composer.record_local_history_submission(text);
-    }
-
     pub(crate) fn flush_paste_burst_if_due(&mut self) -> bool {
         self.composer.flush_paste_burst_if_due()
     }
@@ -912,6 +947,31 @@ impl BottomPane {
         self.composer.take_recent_submission_images()
     }
 
+    /// The directives of the prompt just sent.
+    pub(crate) fn take_directives(&mut self) -> Vec<nori_actions::Invocation> {
+        self.composer.take_directives()
+    }
+
+    pub(crate) fn set_plugin_actions(&mut self, actions: std::sync::Arc<[nori_actions::Action]>) {
+        self.composer.set_plugin_actions(actions);
+    }
+
+    pub(crate) fn action_source(
+        &self,
+        id: &nori_actions::ActionId,
+    ) -> Option<nori_actions::Source> {
+        self.composer.action_source(id)
+    }
+
+    pub(crate) fn set_action_choices(&mut self, choices: ActionChoices) {
+        self.composer.set_action_choices(choices);
+    }
+
+    pub(crate) fn set_editor_keymap(&mut self, keymap: nori_editor::KeymapKind) {
+        self.composer.set_editor_keymap(keymap);
+        self.request_redraw();
+    }
+
     fn as_renderable(&'_ self) -> RenderableItem<'_> {
         if let Some(view) = self.active_view() {
             if view.keeps_composer_visible() {
@@ -944,12 +1004,18 @@ impl BottomPane {
 }
 
 impl BottomPane {
-    /// The rows the composer keeps at rest: the prompt and its status line, without a popup, an
-    /// open view, the working indicator or queued messages above it.
-    pub(crate) fn resting_height(&self, width: u16) -> u16 {
-        self.composer
-            .desired_height(width)
-            .saturating_sub(self.composer.popup_rows(width))
+    /// The rows an open view or a popup of the composer takes beyond the prompt at rest: they
+    /// cover the conversation while open, rather than push it into the scrollback.
+    pub(crate) fn view_rows(&self, width: u16) -> u16 {
+        if self.has_active_view() {
+            let resting = self
+                .composer
+                .desired_height(width)
+                .saturating_sub(self.composer.popup_rows(width));
+            self.desired_height(width).saturating_sub(resting)
+        } else {
+            self.composer.popup_rows(width)
+        }
     }
 }
 

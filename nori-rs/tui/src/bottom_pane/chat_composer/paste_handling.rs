@@ -43,9 +43,9 @@ impl ChatComposer {
 
         let char_count = pasted.chars().count();
         if char_count > LARGE_PASTE_CHAR_THRESHOLD {
-            let placeholder = self.next_large_paste_placeholder(char_count);
-            self.textarea.insert_element(&placeholder);
-            self.pending_pastes.push((placeholder, pasted));
+            let label = format!("[Pasted Content {char_count} chars]");
+            let chip = self.textarea.insert_chip(&label, ChipTone::Attachment);
+            self.pending_pastes.push((chip, pasted));
         } else if char_count > 1 && self.handle_paste_image_path(pasted.clone()) {
             self.textarea.insert_str(" ");
         } else {
@@ -55,28 +55,6 @@ impl ChatComposer {
         self.paste_burst.clear_after_explicit_paste();
         self.sync_selection_popups();
         true
-    }
-
-    fn next_large_paste_placeholder(&self, char_count: usize) -> String {
-        let base = format!("[Pasted Content {char_count} chars]");
-        let prefix = format!("{base} #");
-        let mut max_suffix = 0;
-
-        for (placeholder, _) in &self.pending_pastes {
-            if placeholder == &base {
-                max_suffix = max_suffix.max(1);
-            } else if let Some(suffix) = placeholder.strip_prefix(&prefix)
-                && let Ok(value) = suffix.parse::<usize>()
-            {
-                max_suffix = max_suffix.max(value);
-            }
-        }
-
-        if max_suffix == 0 {
-            base
-        } else {
-            format!("{base} #{}", max_suffix + 1)
-        }
     }
 
     pub fn handle_paste_image_path(&mut self, pasted: String) -> bool {

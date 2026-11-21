@@ -1,5 +1,0 @@
----
-source: tui/src/bottom_pane/textarea/tests/mod.rs
-expression: cells
----
-a*b*c*

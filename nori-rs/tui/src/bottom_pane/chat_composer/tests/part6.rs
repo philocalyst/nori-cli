@@ -1,6 +1,6 @@
 #[test]
 fn empty_vim_insert_escape_enters_normal_mode() {
-    use crate::bottom_pane::textarea::VimModeState;
+    use nori_editor::EditorMode;
 
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
@@ -13,11 +13,11 @@ fn empty_vim_insert_escape_enters_normal_mode() {
     );
     composer.set_vim_mode(nori_config::VimEnterBehavior::Submit);
 
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 
     let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
     assert!(composer.textarea.is_empty());
 }
 
@@ -499,18 +499,18 @@ fn shell_mode_renders_bang_prefix() {
 }
 
 #[test]
-fn question_mark_is_rendered_as_input_without_shortcut_help() {
+fn question_mark_in_a_draft_is_rendered_as_input_without_shortcut_help() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(true, sender, false, "? for shortcuts".to_string(), false);
 
-    type_chars_humanlike(&mut composer, &['?']);
+    type_chars_humanlike(&mut composer, &['a', '?']);
 
     let buf = render_composer(&composer);
-    assert_eq!(composer.current_text(), "?");
+    assert_eq!(composer.current_text(), "a?");
     assert_eq!(buf[(0, 1)].symbol(), "›");
     assert!(
-        input_row(&buf).contains('?'),
+        input_row(&buf).contains("a?"),
         "the typed question mark should remain visible: {:?}",
         input_row(&buf)
     );

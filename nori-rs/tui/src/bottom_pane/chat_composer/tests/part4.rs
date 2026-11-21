@@ -308,12 +308,14 @@ fn burst_paste_fast_large_inserts_placeholder_on_flush() {
     let flushed = composer.flush_paste_burst_if_due();
     assert!(flushed, "expected flush after stopping fast input");
 
-    let expected_placeholder = format!("[Pasted Content {count} chars]");
-    assert_eq!(composer.textarea.text(), expected_placeholder);
+    let (chip, payload) = composer.pending_pastes[0].clone();
+    assert_eq!(composer.textarea.text(), chip.as_char().to_string());
+    assert_eq!(
+        composer.textarea.chip_label(chip),
+        Some(format!("[Pasted Content {count} chars]").as_str())
+    );
     assert_eq!(composer.pending_pastes.len(), 1);
-    assert_eq!(composer.pending_pastes[0].0, expected_placeholder);
-    assert_eq!(composer.pending_pastes[0].1.len(), count);
-    assert!(composer.pending_pastes[0].1.chars().all(|c| c == 'x'));
+    assert_eq!(payload, "x".repeat(count));
 }
 
 #[test]
@@ -338,7 +340,7 @@ fn humanlike_typing_1000_chars_appears_live_no_placeholder() {
 
 #[test]
 fn vim_mode_escape_enters_normal_mode_with_content() {
-    use crate::bottom_pane::textarea::VimModeState;
+    use nori_editor::EditorMode;
 
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
@@ -354,7 +356,7 @@ fn vim_mode_escape_enters_normal_mode_with_content() {
     composer.set_vim_mode(nori_config::VimEnterBehavior::Submit);
 
     // Verify we start in Insert mode
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 
     // Type some text
     composer.insert_str("hello");
@@ -365,15 +367,15 @@ fn vim_mode_escape_enters_normal_mode_with_content() {
 
     // Verify we're now in Normal mode
     assert_eq!(
-        composer.vim_mode_state(),
-        VimModeState::Normal,
+        composer.editor_mode(),
+        EditorMode::Normal,
         "Escape should transition from Insert to Normal mode when textarea has content"
     );
 }
 
 #[test]
 fn vim_mode_hjkl_navigation_in_normal_mode() {
-    use crate::bottom_pane::textarea::VimModeState;
+    use nori_editor::EditorMode;
 
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
@@ -390,7 +392,7 @@ fn vim_mode_hjkl_navigation_in_normal_mode() {
 
     // Enter Normal mode
     let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 
     // Get cursor position (should be at end after typing)
     let cursor_before = composer.textarea.cursor();
@@ -411,8 +413,8 @@ fn vim_mode_hjkl_navigation_in_normal_mode() {
     // Press 'i' to return to Insert mode
     let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
     assert_eq!(
-        composer.vim_mode_state(),
-        VimModeState::Insert,
+        composer.editor_mode(),
+        EditorMode::Insert,
         "'i' should return to Insert mode"
     );
 }

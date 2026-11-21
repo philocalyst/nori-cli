@@ -15,7 +15,9 @@ impl ChatComposer {
             return None;
         }
         let [composer_rect, textarea_rect, _] = self.layout_areas(area);
-        if textarea_rect.is_empty() {
+        // A composer squeezed below its height (a tall view over a short screen) lays rows out
+        // past the area it was given; nothing is drawn there.
+        if textarea_rect.is_empty() || textarea_rect.y >= area.bottom() {
             return None;
         }
         let typed = self
@@ -28,7 +30,7 @@ impl ChatComposer {
             })
             .saturating_add(LIVE_PREFIX_COLS);
         let prompt_row = Rect::new(composer_rect.x, textarea_rect.y, composer_rect.width, 1);
-        let rail = (textarea_rect.y > composer_rect.y)
+        let rail = (textarea_rect.y > composer_rect.y && composer_rect.y >= area.y)
             .then(|| Rect::new(composer_rect.x, composer_rect.y, composer_rect.width, 1));
         Some(crate::bottom_pane::activity::ActivitySlots {
             prompt_row: Some((prompt_row, typed)),
@@ -52,6 +54,9 @@ impl ChatComposer {
             }
             ActivePopup::File(popup) => Constraint::Max(popup.calculate_required_height()),
             ActivePopup::HistorySearch(popup) => Constraint::Max(popup.calculate_required_height()),
+            ActivePopup::Palette(popup) => {
+                Constraint::Max(popup.calculate_required_height(area.width))
+            }
             ActivePopup::None => Constraint::Max(footer_total_height),
         };
         let [composer_rect, popup_rect] =
@@ -91,56 +96,24 @@ impl ChatComposer {
             (None, Vec::new(), None, None, None, None, false)
         };
 
-        // Extract token breakdown and agent kind from transcript location
-        let transcript_location = self
-            .system_info
-            .as_ref()
-            .and_then(|s| s.transcript_location.as_ref());
-        let token_breakdown = transcript_location.and_then(|loc| loc.token_breakdown.as_ref());
-        let context_window_size =
-            transcript_location.map(|loc| loc.agent_kind.context_window_size());
-        // Use last_context_tokens (input-side tokens from the most recent
-        // main-chain message) for context window fill display and percentage.
-        // Falls back to cumulative total() when last_context_tokens is not
-        // available (e.g., Gemini).
-        let context_tokens = token_breakdown.and_then(|t| {
-            t.last_context_tokens
-                .or_else(|| Some(t.total()))
-                .filter(|&v| v > 0)
-        });
-        let context_window_percent = self.context_window_percent.or_else(|| {
-            context_window_size.and_then(|window_size| {
-                context_tokens.map(|tokens| {
-                    if window_size > 0 {
-                        ((tokens as f64 / window_size as f64) * 100.0).round() as i64
-                    } else {
-                        0
-                    }
-                })
-            })
-        });
-        let (context_tokens, context_window_percent, context_window_tokens) = if self.child_context
-        {
-            (None, None, None)
-        } else if let Some(session_usage) = &self.session_usage {
-            (
-                Some(session_usage.used_tokens).filter(|&tokens| tokens >= 0),
-                (session_usage.total_tokens > 0).then(|| {
-                    session_usage
-                        .used_tokens
-                        .saturating_mul(100)
-                        .saturating_div(session_usage.total_tokens)
-                        .clamp(0, 100)
-                }),
-                Some(session_usage.total_tokens).filter(|&tokens| tokens > 0),
-            )
-        } else {
-            (
-                context_tokens,
-                context_window_percent,
-                context_window_size.filter(|&tokens| tokens > 0),
-            )
-        };
+        // The context the agent reports is the only measure of it: a turn's tokens are never
+        // guessed from files the agent keeps.
+        let (context_tokens, context_window_percent, context_window_tokens) =
+            match &self.session_usage {
+                Some(session_usage) if !self.child_context => (
+                    Some(session_usage.used_tokens).filter(|&tokens| tokens >= 0),
+                    (session_usage.total_tokens > 0).then(|| {
+                        session_usage
+                            .used_tokens
+                            .saturating_mul(100)
+                            .saturating_div(session_usage.total_tokens)
+                            .clamp(0, 100)
+                    }),
+                    Some(session_usage.total_tokens).filter(|&tokens| tokens > 0),
+                ),
+                Some(_) | None if self.child_context => (None, None, None),
+                Some(_) | None => (None, self.context_window_percent, None),
+            };
 
         FooterProps {
             mode: FooterMode::ContextOnly,
@@ -161,10 +134,14 @@ impl ChatComposer {
                 .as_ref()
                 .map(|s| s.is_worktree)
                 .unwrap_or(false),
-            input_tokens: token_breakdown.map(|t| t.input_tokens),
-            output_tokens: token_breakdown.map(|t| t.output_tokens),
-            cached_tokens: token_breakdown.map(|t| t.cached_tokens),
-            vim_mode_state: self.textarea.vim_mode_state_if_enabled(),
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            editor_mode: self
+                .textarea
+                .keymap()
+                .is_modal()
+                .then(|| self.textarea.mode()),
             prompt_summary: self.prompt_summary.clone(),
             session_title: self.session_title.clone(),
             worktree_name: self
@@ -177,8 +154,11 @@ impl ChatComposer {
             model_label: self.model_label.clone(),
             cloud_session: self.cloud_session.clone(),
             active_subagent_count: self.active_subagent_count,
-            monitor_count: self.monitor_count,
-            rewind_badge: self.rewind_badge,
+            background: self.background,
+            rewind_badge: match self.walk_badge() {
+                Some(WalkBadge::Turn { turn, total }) => Some((turn as i64, total as i64)),
+                Some(WalkBadge::History) | None => None,
+            },
             bash_mode: self.is_shell_mode,
             status_note: self.status_note.clone(),
             key_help: if matches!(self.footer_mode(), FooterMode::ShortcutOverlay) {
@@ -217,7 +197,7 @@ impl ChatComposer {
             active_skillsets: props.active_skillsets,
             nori_version: props.nori_version,
             nori_version_source: props.nori_version_source,
-            token_breakdown: self.transcript_token_breakdown(),
+            token_breakdown: None,
         }
     }
 
@@ -237,23 +217,7 @@ impl ChatComposer {
                 "Agent-reported usage",
             );
         }
-        let transcript = self
-            .system_info
-            .as_ref()
-            .and_then(|info| info.transcript_location.as_ref());
-        (
-            ContextStatus {
-                tokens: transcript
-                    .and_then(|location| location.token_breakdown.as_ref())
-                    .and_then(|usage| usage.last_context_tokens)
-                    .filter(|tokens| *tokens >= 0),
-                window_tokens: transcript
-                    .map(|location| location.agent_kind.context_window_size())
-                    .filter(|tokens| *tokens > 0),
-                percent_used: None,
-            },
-            "Latest transcript input · estimated window",
-        )
+        (ContextStatus::default(), "No usage reported yet")
     }
 
     pub(super) fn footer_mode(&self) -> FooterMode {

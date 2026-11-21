@@ -3,13 +3,13 @@ use crate::app_event::AppEvent;
 use crate::bottom_pane::AppEventSender;
 use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::InputResult;
-use crate::bottom_pane::textarea::VimModeState;
 use crate::slash_command::SlashCommand;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use nori_config::VimEnterBehavior;
+use nori_editor::EditorMode;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -72,7 +72,7 @@ fn always_submit() -> VimEnterBehavior {
 fn enter_normal(composer: &mut ChatComposer) {
     let result = press(composer, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(result, InputResult::None);
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 }
 
 fn rendered_text(composer: &ChatComposer) -> String {
@@ -101,7 +101,8 @@ fn vim_always_submit_submits_from_insert_and_normal() {
             press(&mut composer, KeyCode::Enter, KeyModifiers::NONE),
             InputResult::Submitted("hello".to_string())
         );
-        assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+        // The next prompt starts ready to type, whichever mode the last one was sent from.
+        assert_eq!(composer.editor_mode(), EditorMode::Insert);
     }
 }
 
@@ -117,11 +118,11 @@ fn vim_newline_shortcuts_insert_in_both_modes_and_preserve_mode() {
             if start_normal {
                 enter_normal(&mut composer);
             }
-            let expected_mode = composer.vim_mode_state();
+            let expected_mode = composer.editor_mode();
 
             assert_eq!(press(&mut composer, code, modifiers), InputResult::None);
             assert!(composer.current_text().contains('\n'));
-            assert_eq!(composer.vim_mode_state(), expected_mode);
+            assert_eq!(composer.editor_mode(), expected_mode);
         }
     }
 }
@@ -194,7 +195,7 @@ fn empty_normal_slash_opens_picker_in_insert_mode() {
     );
 
     assert_eq!(composer.current_text(), "/");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
     assert!(composer.popup_active());
 }
 
@@ -209,14 +210,14 @@ fn slash_picker_escape_enters_normal_then_closes() {
         press(&mut composer, KeyCode::Esc, KeyModifiers::NONE),
         InputResult::None
     );
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
     assert!(composer.popup_active());
 
     assert_eq!(
         press(&mut composer, KeyCode::Esc, KeyModifiers::NONE),
         InputResult::None
     );
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
     assert!(!composer.popup_active());
     assert_eq!(composer.current_text(), "/");
 }
@@ -244,7 +245,7 @@ fn slash_picker_normal_i_returns_to_insert_without_closing() {
     let _ = press(&mut composer, KeyCode::Char('/'), KeyModifiers::NONE);
     let _ = press(&mut composer, KeyCode::Esc, KeyModifiers::NONE);
     let _ = press(&mut composer, KeyCode::Char('i'), KeyModifiers::NONE);
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
     assert!(composer.popup_active());
 }
 
@@ -292,15 +293,15 @@ fn empty_normal_bang_enters_insert_and_empty_normal_escape_exits_shell_mode() {
 
     let _ = press(&mut composer, KeyCode::Char('!'), KeyModifiers::NONE);
     assert_eq!(composer.current_text(), "!");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 
     let _ = press(&mut composer, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(composer.current_text(), "!");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 
     let _ = press(&mut composer, KeyCode::Esc, KeyModifiers::NONE);
     assert_eq!(composer.current_text(), "");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 }
 
 #[test]
@@ -314,7 +315,7 @@ fn empty_normal_question_does_not_open_shortcuts_or_enter_insert() {
         InputResult::None
     );
     assert_eq!(composer.current_text(), "");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
     assert!(!rendered_text(&composer).contains("/ for commands"));
 }
 
@@ -332,11 +333,11 @@ fn file_and_skill_pickers_close_in_normal_and_reopen_in_insert() {
         assert!(composer.popup_active());
 
         let _ = press(&mut composer, KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+        assert_eq!(composer.editor_mode(), EditorMode::Normal);
         assert!(!composer.popup_active());
 
         let _ = press(&mut composer, KeyCode::Char('i'), KeyModifiers::NONE);
-        assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+        assert_eq!(composer.editor_mode(), EditorMode::Insert);
         assert!(composer.popup_active());
     }
 }
@@ -372,7 +373,7 @@ fn kakoune_edits_preserve_large_paste_payload() {
 }
 
 #[test]
-fn kakoune_deleting_image_removes_attachment() {
+fn helix_deleting_an_image_chip_leaves_the_image_out_of_the_prompt() {
     let mut composer = make_composer();
     composer.set_kakoune_mode(true);
     composer.attach_image(std::path::PathBuf::from("image.png"), 10, 10, "png");
@@ -380,7 +381,12 @@ fn kakoune_deleting_image_removes_attachment() {
     press(&mut composer, KeyCode::Char('h'), KeyModifiers::NONE);
     press(&mut composer, KeyCode::Char('d'), KeyModifiers::NONE);
     assert_eq!(composer.textarea.text(), "");
-    assert!(composer.attached_images.is_empty());
+    composer.insert_str("text");
+    press(&mut composer, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        composer.take_recent_submission_images(),
+        Vec::<std::path::PathBuf>::new()
+    );
 }
 
 #[test]
@@ -416,7 +422,7 @@ fn selection_editor_enter_submits_and_alt_enter_inserts_newline() {
     press(&mut composer, KeyCode::Enter, KeyModifiers::ALT);
     press(&mut composer, KeyCode::Char('b'), KeyModifiers::NONE);
     assert_eq!(composer.current_text(), "a\nb");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 }
 
 #[test]
@@ -459,7 +465,7 @@ fn tapping_composer_places_modal_cursor_in_rendered_text() {
     assert!(composer.place_cursor_at(body.x + 2, body.y, area));
     press(&mut composer, KeyCode::Char('!'), KeyModifiers::NONE);
     assert_eq!(composer.current_text(), "aé!🙂xy");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
     assert!(!composer.place_cursor_at(area.right(), area.y, area));
 }
 

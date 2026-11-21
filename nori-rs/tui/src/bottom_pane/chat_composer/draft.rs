@@ -8,8 +8,7 @@ use super::*;
 #[must_use]
 pub(crate) struct ComposerDraft {
     textarea: TextArea,
-    textarea_state: TextAreaState,
-    pending_pastes: Vec<(String, String)>,
+    pending_pastes: Vec<(ChipId, String)>,
     attached_images: Vec<AttachedImage>,
     is_shell_mode: bool,
     paste_burst: PasteBurst,
@@ -21,14 +20,9 @@ impl ChatComposer {
     pub(crate) fn take_draft(&mut self) -> ComposerDraft {
         let mut fresh = TextArea::new();
         fresh.set_hotkey_config(self.textarea.hotkey_config().clone());
-        if self.textarea.kakoune_mode_enabled() {
-            fresh.set_kakoune_mode_enabled(true);
-        } else {
-            fresh.set_vim_mode_enabled(self.textarea.vim_mode_state_if_enabled().is_some());
-        }
+        fresh.set_keymap(self.textarea.keymap());
         ComposerDraft {
             textarea: std::mem::replace(&mut self.textarea, fresh),
-            textarea_state: self.textarea_state.take(),
             pending_pastes: std::mem::take(&mut self.pending_pastes),
             attached_images: std::mem::take(&mut self.attached_images),
             is_shell_mode: std::mem::take(&mut self.is_shell_mode),
@@ -40,7 +34,6 @@ impl ChatComposer {
     /// and its original deadline. The next paste tick continues the same burst.
     pub(crate) fn restore_draft(&mut self, draft: ComposerDraft) {
         self.textarea = draft.textarea;
-        self.textarea_state.replace(draft.textarea_state);
         self.pending_pastes = draft.pending_pastes;
         self.attached_images = draft.attached_images;
         self.is_shell_mode = draft.is_shell_mode;

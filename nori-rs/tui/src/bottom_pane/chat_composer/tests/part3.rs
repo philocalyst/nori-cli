@@ -49,7 +49,7 @@ fn attach_image_without_text_submits_empty_text_and_images() {
 }
 
 #[test]
-fn image_placeholder_backspace_behaves_like_text_placeholder() {
+fn an_image_chip_deleted_and_undone_keeps_its_image() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
@@ -60,37 +60,56 @@ fn image_placeholder_backspace_behaves_like_text_placeholder() {
         false,
     );
     let path = PathBuf::from("/tmp/image3.png");
-    composer.attach_image(path.clone(), 20, 10, "PNG");
-    let placeholder = composer.attached_images[0].placeholder.clone();
-
-    // Case 1: backspace at end
-    composer.textarea.move_cursor_to_end_of_line(false);
-    composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-    assert!(!composer.textarea.text().contains(&placeholder));
-    assert!(composer.attached_images.is_empty());
-
-    // Re-add and test backspace in middle: should break the placeholder string
-    // and drop the image mapping (same as text placeholder behavior).
     composer.attach_image(path, 20, 10, "PNG");
-    let placeholder2 = composer.attached_images[0].placeholder.clone();
-    // Move cursor to roughly middle of placeholder
-    if let Some(start_pos) = composer.textarea.text().find(&placeholder2) {
-        let mid_pos = start_pos + (placeholder2.len() / 2);
-        composer.textarea.set_cursor(mid_pos);
-        composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert!(!composer.textarea.text().contains(&placeholder2));
-        assert!(composer.attached_images.is_empty());
-    } else {
-        panic!("Placeholder not found in textarea");
-    }
+    let chip = composer.attached_images[0].chip;
+    assert_eq!(composer.textarea.text(), chip.as_char().to_string());
+    assert_eq!(
+        composer.textarea.chip_label(chip),
+        Some("[image3.png 20x10]")
+    );
+
+    // Backspace at the end removes the whole chip, not one character of a label.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(composer.textarea.text(), "");
+    // Undo brings the chip back, and with it the image.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(composer.textarea.text(), chip.as_char().to_string());
+    composer.insert_str("x");
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        result,
+        InputResult::Submitted("[image3.png 20x10]x".to_owned())
+    );
+    assert_eq!(
+        composer.take_recent_submission_images(),
+        vec![PathBuf::from("/tmp/image3.png")]
+    );
 }
 
 #[test]
-fn backspace_with_multibyte_text_before_placeholder_does_not_panic() {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
+fn an_image_whose_chip_was_deleted_is_not_sent() {
+    let (tx, _rx) = unbounded_channel::<AppEvent>();
+    let sender = AppEventSender::new(tx);
+    let mut composer = ChatComposer::new(
+        true,
+        sender,
+        false,
+        "Ask Nori to do anything".to_string(),
+        false,
+    );
+    composer.attach_image(PathBuf::from("/tmp/gone.png"), 20, 10, "PNG");
+    composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    composer.insert_str("hello");
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(result, InputResult::Submitted("hello".to_owned()));
+    assert_eq!(
+        composer.take_recent_submission_images(),
+        Vec::<PathBuf>::new()
+    );
+}
 
+#[test]
+fn backspace_with_multibyte_text_after_image_chip_does_not_panic() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
@@ -101,27 +120,20 @@ fn backspace_with_multibyte_text_before_placeholder_does_not_panic() {
         false,
     );
 
-    // Insert an image placeholder at the start
     let path = PathBuf::from("/tmp/image_multibyte.png");
-    composer.attach_image(path, 10, 5, "PNG");
-    // Add multibyte text after the placeholder
+    composer.attach_image(path.clone(), 10, 5, "PNG");
     composer.textarea.insert_str("日本語");
 
-    // Cursor is at end; pressing backspace should delete the last character
-    // without panicking and leave the placeholder intact.
+    // Backspace deletes the last character and leaves the chip intact.
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
 
-    assert_eq!(composer.attached_images.len(), 1);
-    assert!(
-        composer
-            .textarea
-            .text()
-            .starts_with("[image_multibyte.png 10x5]")
-    );
+    let chip = composer.attached_images[0].chip;
+    assert_eq!(composer.textarea.text(), format!("{}日本", chip.as_char()));
+    assert_eq!(composer.attached_images, vec![AttachedImage { chip, path }]);
 }
 
 #[test]
-fn deleting_one_of_duplicate_image_placeholders_removes_matching_entry() {
+fn deleting_one_of_duplicate_image_chips_removes_matching_entry() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
     let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
@@ -136,39 +148,25 @@ fn deleting_one_of_duplicate_image_placeholders_removes_matching_entry() {
     let path2 = PathBuf::from("/tmp/image_dup2.png");
 
     composer.attach_image(path1, 10, 5, "PNG");
-    // separate placeholders with a space for clarity
+    // separate the chips with a space for clarity
     composer.handle_paste(" ".into());
     composer.attach_image(path2.clone(), 10, 5, "PNG");
 
-    let placeholder1 = composer.attached_images[0].placeholder.clone();
-    let placeholder2 = composer.attached_images[1].placeholder.clone();
-    let text = composer.textarea.text().to_string();
-    let start1 = text.find(&placeholder1).expect("first placeholder present");
-    let end1 = start1 + placeholder1.len();
-    composer.textarea.set_cursor(end1);
+    let chip1 = composer.attached_images[0].chip;
+    let chip2 = composer.attached_images[1].chip;
+    composer.textarea.set_cursor(chip1.as_char().len_utf8());
 
-    // Backspace should delete the first placeholder and its mapping.
+    // Backspace should delete the first chip and its mapping.
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
 
-    let new_text = composer.textarea.text().to_string();
+    assert_eq!(composer.textarea.text(), format!(" {}", chip2.as_char()));
+    // Only the image whose chip is still in the prompt is sent with it.
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
-        0,
-        new_text.matches(&placeholder1).count(),
-        "first placeholder removed"
+        result,
+        InputResult::Submitted("[image_dup2.png 10x5]".to_owned())
     );
-    assert_eq!(
-        1,
-        new_text.matches(&placeholder2).count(),
-        "second placeholder remains"
-    );
-    assert_eq!(
-        vec![AttachedImage {
-            path: path2,
-            placeholder: "[image_dup2.png 10x5]".to_string()
-        }],
-        composer.attached_images,
-        "one image mapping remains"
-    );
+    assert_eq!(composer.take_recent_submission_images(), vec![path2]);
 }
 
 #[test]
@@ -191,11 +189,11 @@ fn pasting_filepath_attaches_image() {
 
     let needs_redraw = composer.handle_paste(tmp_path.to_string_lossy().to_string());
     assert!(needs_redraw);
-    assert!(
-        composer
-            .textarea
-            .text()
-            .starts_with("[nori_tui_test_paste_image.png 3x2] ")
+    let chip = composer.attached_images[0].chip;
+    assert_eq!(composer.textarea.text(), format!("{} ", chip.as_char()));
+    assert_eq!(
+        composer.textarea.chip_label(chip),
+        Some("[nori_tui_test_paste_image.png 3x2]")
     );
 
     let imgs = composer.take_recent_submission_images();
@@ -346,15 +344,13 @@ fn custom_prompt_with_large_paste_expands_correctly() {
     let large_content = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3000);
     composer.handle_paste(large_content.clone());
 
-    // Verify placeholder was created
-    let placeholder = format!("[Pasted Content {} chars]", large_content.chars().count());
+    // Verify the paste chip was created
+    let chip = composer.pending_pastes[0].0;
     assert_eq!(
         composer.textarea.text(),
-        format!("/prompts:code-review {}", placeholder)
+        format!("/prompts:code-review {}", chip.as_char())
     );
-    assert_eq!(composer.pending_pastes.len(), 1);
-    assert_eq!(composer.pending_pastes[0].0, placeholder);
-    assert_eq!(composer.pending_pastes[0].1, large_content);
+    assert_eq!(composer.pending_pastes, vec![(chip, large_content.clone())]);
 
     // Submit by pressing Enter
     let (result, _needs_redraw) =

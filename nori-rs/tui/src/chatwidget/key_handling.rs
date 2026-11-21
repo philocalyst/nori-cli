@@ -1,7 +1,54 @@
 use super::*;
 
 impl ChatWidget {
+    /// Give the composer the prompts of the main conversation, `cells`, for walking back with
+    /// `↑`. Cheap when nothing changed: the transcript's length and last cell identify it.
+    pub(crate) fn sync_conversation_prompts(
+        &mut self,
+        cells: &[std::sync::Arc<dyn crate::history_cell::HistoryCell>],
+    ) {
+        let last = cells
+            .last()
+            .map_or(0, |cell| std::sync::Arc::as_ptr(cell).cast::<()>() as usize);
+        let fingerprint = (cells.len(), last);
+        let generation = self.session_generation();
+        if self
+            .bottom_pane
+            .conversation_prompts_current(generation, fingerprint)
+        {
+            return;
+        }
+        let prompts = cells
+            .iter()
+            .enumerate()
+            .filter_map(|(cell_index, cell)| {
+                cell.as_any()
+                    .downcast_ref::<crate::history_cell::UserHistoryCell>()
+                    .map(|user| crate::bottom_pane::RecalledPrompt {
+                        cell_index,
+                        text: user.message.clone(),
+                    })
+            })
+            .collect();
+        self.bottom_pane
+            .set_conversation_prompts(generation, fingerprint, prompts);
+    }
+
+    /// The clipboard's text for the composer's editor (`space p` and friends).
+    pub(crate) fn paste_clipboard(&mut self, command: nori_editor::ClipboardCommand, text: &str) {
+        self.bottom_pane.paste_clipboard(command, text);
+    }
+
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+        // The palette shows what each dial value would do, which depends on whether a turn runs.
+        if key_event.kind == KeyEventKind::Press && !self.bottom_pane.has_active_view() {
+            self.refresh_action_choices();
+            // The plugins' actions as the runtime holds them now (a watch: never stale).
+            if let Some(handle) = self.harness_handle() {
+                let actions = handle.plugin_actions().borrow().clone();
+                self.bottom_pane.set_plugin_actions(actions);
+            }
+        }
         // Starting to type a prompt is when delegation may soon be asked for: bring what each
         // agent offers up to date, in the background, for agents not read in a while. Tests
         // must never start the real agents installed on the machine.
@@ -123,6 +170,10 @@ impl ChatWidget {
                 }
             }
             InputResult::Submitted(text) => {
+                // The draft's directives (`⚙ model: opus`) apply before the prompt is sent.
+                for invocation in self.bottom_pane.take_directives() {
+                    self.run_action(invocation);
+                }
                 let user_message = UserMessage {
                     text,
                     image_paths: self.bottom_pane.take_recent_submission_images(),
@@ -191,6 +242,7 @@ impl ChatWidget {
                     self.dispatch_command(cmd);
                 }
             }
+            InputResult::Action(invocation) => self.run_action(invocation),
             InputResult::None => {}
         }
     }

@@ -3,11 +3,11 @@ use crate::app_event::AppEvent;
 use crate::bottom_pane::AppEventSender;
 use crate::bottom_pane::ChatComposer;
 use crate::bottom_pane::InputResult;
-use crate::bottom_pane::textarea::VimModeState;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use nori_config::VimEnterBehavior;
+use nori_editor::EditorMode;
 use tokio::sync::mpsc::unbounded_channel;
 
 fn make_composer() -> ChatComposer {
@@ -27,7 +27,7 @@ fn vim_enter_newline_insert_mode_inserts_newline() {
     let mut composer = make_composer();
     composer.set_vim_mode(VimEnterBehavior::Newline);
 
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 
     composer.insert_str("hello");
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -53,14 +53,15 @@ fn vim_enter_newline_normal_mode_submits() {
 
     // Esc to enter Normal mode
     let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     match result {
         InputResult::Submitted(text) => assert_eq!(text, "hello"),
         other => panic!("NORMAL Enter with Newline behavior should submit, got: {other:?}"),
     }
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    // The next prompt starts ready to type.
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 }
 
 #[test]
@@ -68,7 +69,7 @@ fn vim_enter_submit_insert_mode_submits() {
     let mut composer = make_composer();
     composer.set_vim_mode(VimEnterBehavior::Submit);
 
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 
     composer.insert_str("hello");
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -76,7 +77,8 @@ fn vim_enter_submit_insert_mode_submits() {
         InputResult::Submitted(text) => assert_eq!(text, "hello"),
         other => panic!("INSERT Enter with Submit behavior should submit, got: {other:?}"),
     }
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    // The next prompt starts ready to type.
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
 }
 
 #[test]
@@ -88,7 +90,7 @@ fn vim_enter_submit_normal_mode_inserts_newline() {
 
     // Esc to enter Normal mode
     let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(

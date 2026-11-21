@@ -94,3 +94,13 @@ fn uppercase_exit_submits_literal_text() {
 
     assert_eq!(InputResult::Submitted("Exit".to_string()), result);
 }
+
+#[test]
+fn status_line_counts_monitors_and_background_jobs() {
+    snapshot_composer_state("status_line_monitors_and_jobs", false, |composer| {
+        composer.set_background(crate::bottom_pane::Background {
+            monitors: 2,
+            jobs: 1,
+        });
+    });
+}

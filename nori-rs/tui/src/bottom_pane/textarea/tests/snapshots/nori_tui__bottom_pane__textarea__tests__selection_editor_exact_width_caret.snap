@@ -1,8 +1,0 @@
----
-source: tui/src/bottom_pane/textarea/tests/mod.rs
-assertion_line: 309
-expression: "format!(\"|{}|\\n|{}|\\ncaret=(0, 1)\", rows[0], rows[1])"
----
-|draft survives child switch|
-|                           |
-caret=(0, 1)

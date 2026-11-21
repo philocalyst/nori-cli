@@ -65,15 +65,16 @@ fn handoff_preserves_mid_text_cursor_and_undo() {
     after.restore_draft(before.take_draft());
     after.insert_str(" brave");
     assert_eq!(after.current_text(), "héllo brave world");
-    after.textarea.undo();
+    let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+    after.handle_key_event(ctrl_z);
     assert_eq!(after.current_text(), "héllo world");
-    after.textarea.undo();
+    after.handle_key_event(ctrl_z);
     assert_eq!(after.current_text(), "");
 }
 
 #[test]
 fn handoff_preserves_vim_normal_mode() {
-    use crate::bottom_pane::textarea::VimModeState;
+    use nori_editor::EditorMode;
 
     let mut before = composer();
     before.set_vim_mode(nori_config::VimEnterBehavior::Submit);
@@ -82,7 +83,7 @@ fn handoff_preserves_vim_normal_mode() {
     let mut after = composer();
     after.set_vim_mode(nori_config::VimEnterBehavior::Submit);
     after.restore_draft(before.take_draft());
-    assert_eq!(after.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(after.editor_mode(), EditorMode::Normal);
     after.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
     assert_eq!(after.current_text(), "draf");
     after.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
@@ -119,7 +120,7 @@ fn handoff_preserves_large_paste_payload_and_attached_image() {
 }
 
 #[test]
-fn handoff_preserves_atomic_placeholder_editing() {
+fn handoff_preserves_atomic_chip_editing() {
     let mut before = composer();
     before.handle_paste("a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1));
     let mut after = composer();
@@ -130,19 +131,20 @@ fn handoff_preserves_atomic_placeholder_editing() {
 
 #[test]
 fn new_session_draft_keeps_editor_configuration_and_original_state() {
-    use crate::bottom_pane::textarea::VimModeState;
+    use nori_editor::EditorMode;
     let mut composer = composer();
     composer.set_kakoune_mode(true);
-    composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    type_chars_humanlike(&mut composer, &['a']);
     composer.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
     let old_draft = composer.take_draft();
-    assert!(composer.textarea.kakoune_mode_enabled());
-    assert_eq!(composer.vim_mode_state(), VimModeState::Insert);
-    composer.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(composer.textarea.keymap(), nori_editor::KeymapKind::Helix);
+    assert_eq!(composer.editor_mode(), EditorMode::Insert);
+    type_chars_humanlike(&mut composer, &['b']);
     assert_eq!(composer.current_text(), "b");
     composer.restore_draft(old_draft);
     assert_eq!(composer.current_text(), "a");
-    assert_eq!(composer.vim_mode_state(), VimModeState::Normal);
+    assert_eq!(composer.editor_mode(), EditorMode::Normal);
 }
 
 #[test]

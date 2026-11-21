@@ -2,7 +2,7 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
-fn edit_clears_pending_paste() {
+fn deleting_a_paste_chip_drops_the_paste_from_what_is_sent_and_undo_restores_it() {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
@@ -18,12 +18,20 @@ fn edit_clears_pending_paste() {
         false,
     );
 
-    composer.handle_paste(large);
-    assert_eq!(composer.pending_pastes.len(), 1);
+    composer.handle_paste(large.clone());
+    composer.insert_str(" tail");
+    let chip = composer.pending_pastes[0].0;
+    composer.textarea.set_cursor(chip.as_char().len_utf8());
 
-    // Any edit that removes the placeholder should clear pending_paste
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-    assert!(composer.pending_pastes.is_empty());
+    assert_eq!(composer.textarea.text(), " tail");
+
+    // The payload stays until the prompt is sent, so that undoing brings the paste back whole.
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+    assert_eq!(composer.textarea.text(), format!("{} tail", chip.as_char()));
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(result, InputResult::Submitted(format!("{large} tail")));
+    assert_eq!(composer.pending_pastes, vec![]);
 }
 
 #[test]
@@ -177,31 +185,23 @@ fn slash_popup_model_first_for_mo_logic() {
 }
 
 #[test]
-fn composer_renders_acp_mode_label_above_the_prompt_by_default() {
-    snapshot_composer_state(
-        "composer_acp_mode_textarea_top_right_default",
-        false,
-        |composer| {
-            composer.set_acp_mode_label(Some("Plan".to_string()));
-        },
-    );
+fn composer_status_line_does_not_carry_the_acp_mode_label() {
+    snapshot_composer_state("composer_acp_mode_not_in_status_line", false, |composer| {
+        composer.set_acp_mode_label(Some("Plan".to_string()));
+    });
 }
 
 #[test]
-fn composer_can_move_mode_segment_back_into_the_footer_row() {
-    snapshot_composer_state(
-        "composer_acp_mode_footer_right_override",
-        false,
-        |composer| {
-            composer.set_footer_layout_config(nori_config::FooterLayoutConfig::from_toml(
-                &nori_config::FooterLayoutConfigToml {
-                    footer_right: Some(vec![nori_config::FooterSegment::ModeIndicator.into()]),
-                    ..Default::default()
-                },
-            ));
-            composer.set_acp_mode_label(Some("Plan".to_string()));
-        },
-    );
+fn composer_can_place_the_mode_segment_in_a_prompt_corner() {
+    snapshot_composer_state("composer_acp_mode_prompt_corner", false, |composer| {
+        composer.set_footer_layout_config(nori_config::FooterLayoutConfig::from_toml(
+            &nori_config::FooterLayoutConfigToml {
+                textarea_top_right: Some(vec![nori_config::FooterSegment::ModeIndicator.into()]),
+                ..Default::default()
+            },
+        ));
+        composer.set_acp_mode_label(Some("Plan".to_string()));
+    });
 }
 
 /// Render the composer into an exact `width` x `height` area and return the
@@ -299,7 +299,10 @@ fn slash_init_dispatches_command_and_does_not_submit_literal_text() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch, but composer submitted literal text: {text}")
         }
-        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+        InputResult::None
+        | InputResult::Steer(_)
+        | InputResult::PromoteQueued
+        | InputResult::Action(_) => {
             panic!("expected Command result for '/init'")
         }
     }
@@ -373,7 +376,10 @@ fn slash_tab_then_enter_dispatches_builtin_command() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch after Tab completion, got literal submit: {text}")
         }
-        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+        InputResult::None
+        | InputResult::Steer(_)
+        | InputResult::PromoteQueued
+        | InputResult::Action(_) => {
             panic!("expected Command result for '/diff'")
         }
     }
@@ -408,7 +414,10 @@ fn slash_mention_dispatches_command_and_inserts_at() {
         InputResult::Submitted(text) => {
             panic!("expected command dispatch, but composer submitted literal text: {text}")
         }
-        InputResult::None | InputResult::Steer(_) | InputResult::PromoteQueued => {
+        InputResult::None
+        | InputResult::Steer(_)
+        | InputResult::PromoteQueued
+        | InputResult::Action(_) => {
             panic!("expected Command result for '/mention'")
         }
     }
@@ -433,70 +442,36 @@ fn test_multiple_pastes_submission() {
         false,
     );
 
-    // Define test cases: (paste content, is_large)
-    let test_cases = [
-        ("x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3), true),
-        (" and ".to_string(), false),
-        ("y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7), true),
-    ];
+    let first = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3);
+    let second = "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7);
 
-    // Expected states after each paste
-    let mut expected_text = String::new();
-    let mut expected_pending_count = 0;
+    composer.handle_paste(first.clone());
+    composer.handle_paste(" and ".to_string());
+    composer.handle_paste(second.clone());
 
-    // Apply all pastes and build expected state
-    let states: Vec<_> = test_cases
+    // Each large paste is one chip character; the small one is plain text.
+    let chips: Vec<_> = composer
+        .pending_pastes
         .iter()
-        .map(|(content, is_large)| {
-            composer.handle_paste(content.clone());
-            if *is_large {
-                let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
-                expected_text.push_str(&placeholder);
-                expected_pending_count += 1;
-            } else {
-                expected_text.push_str(content);
-            }
-            (expected_text.clone(), expected_pending_count)
-        })
+        .map(|(chip, _)| chip.as_char())
         .collect();
-
-    // Verify all intermediate states were correct
+    assert_eq!(chips.len(), 2);
     assert_eq!(
-        states,
-        vec![
-            (
-                format!("[Pasted Content {} chars]", test_cases[0].0.chars().count()),
-                1
-            ),
-            (
-                format!(
-                    "[Pasted Content {} chars] and ",
-                    test_cases[0].0.chars().count()
-                ),
-                1
-            ),
-            (
-                format!(
-                    "[Pasted Content {} chars] and [Pasted Content {} chars]",
-                    test_cases[0].0.chars().count(),
-                    test_cases[2].0.chars().count()
-                ),
-                2
-            ),
-        ]
+        composer.textarea.text(),
+        format!("{} and {}", chips[0], chips[1])
     );
 
     // Submit and verify final expansion
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     if let InputResult::Submitted(text) = result {
-        assert_eq!(text, format!("{} and {}", test_cases[0].0, test_cases[2].0));
+        assert_eq!(text, format!("{first} and {second}"));
     } else {
         panic!("expected Submitted");
     }
 }
 
 #[test]
-fn test_placeholder_deletion() {
+fn backspace_deletes_a_paste_chip_as_one_character() {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
@@ -510,112 +485,49 @@ fn test_placeholder_deletion() {
         "Ask Nori to do anything".to_string(),
         false,
     );
-
-    // Define test cases: (content, is_large)
-    let test_cases = [
-        ("a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5), true),
-        (" and ".to_string(), false),
-        ("b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 6), true),
-    ];
-
-    // Apply all pastes
-    let mut current_pos = 0;
-    let states: Vec<_> = test_cases
+    composer.handle_paste("a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5));
+    composer.handle_paste(" and ".to_string());
+    composer.handle_paste("b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 6));
+    let chips: Vec<char> = composer
+        .pending_pastes
         .iter()
-        .map(|(content, is_large)| {
-            composer.handle_paste(content.clone());
-            if *is_large {
-                let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
-                current_pos += placeholder.len();
-            } else {
-                current_pos += content.len();
-            }
-            (
-                composer.textarea.text().to_string(),
-                composer.pending_pastes.len(),
-                current_pos,
-            )
-        })
+        .map(|(chip, _)| chip.as_char())
         .collect();
+    assert_eq!(
+        composer.textarea.text(),
+        format!("{} and {}", chips[0], chips[1])
+    );
 
-    // Delete placeholders one by one and collect states
-    let mut deletion_states = vec![];
-
-    // First deletion
-    composer.textarea.set_cursor(states[0].2);
+    // Backspace right after the first chip deletes it as one character.
+    composer.textarea.set_cursor(chips[0].len_utf8());
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-    deletion_states.push((
-        composer.textarea.text().to_string(),
-        composer.pending_pastes.len(),
-    ));
+    assert_eq!(composer.textarea.text(), format!(" and {}", chips[1]));
 
-    // Second deletion
+    // Backspace at the end deletes the second one.
     composer.textarea.set_cursor(composer.textarea.text().len());
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-    deletion_states.push((
-        composer.textarea.text().to_string(),
-        composer.pending_pastes.len(),
-    ));
-
-    // Verify all states
-    assert_eq!(
-        deletion_states,
-        vec![
-            (" and [Pasted Content 1006 chars]".to_string(), 1),
-            (" and ".to_string(), 0),
-        ]
-    );
+    assert_eq!(composer.textarea.text(), " and ");
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(result, InputResult::Submitted("and".to_string()));
 }
 
 #[test]
-fn test_partial_placeholder_deletion() {
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
-
+fn delete_key_removes_the_chip_after_the_cursor() {
     let (tx, _rx) = unbounded_channel::<AppEvent>();
-    let sender = AppEventSender::new(tx);
     let mut composer = ChatComposer::new(
         true,
-        sender,
+        AppEventSender::new(tx),
         false,
         "Ask Nori to do anything".to_string(),
         false,
     );
-
-    // Define test cases: (cursor_position_from_end, expected_pending_count)
-    let test_cases = [
-        5, // Delete from middle - should clear tracking
-        0, // Delete from end - should clear tracking
-    ];
-
-    let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4);
-    let placeholder = format!("[Pasted Content {} chars]", paste.chars().count());
-
-    let states: Vec<_> = test_cases
-        .into_iter()
-        .map(|pos_from_end| {
-            composer.handle_paste(paste.clone());
-            composer
-                .textarea
-                .set_cursor(placeholder.len() - pos_from_end);
-            composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-            let result = (
-                composer.textarea.text().contains(&placeholder),
-                composer.pending_pastes.len(),
-            );
-            composer.textarea.set_text("");
-            result
-        })
-        .collect();
-
-    assert_eq!(
-        states,
-        vec![
-            (false, 0), // After deleting from middle
-            (false, 0), // After deleting from end
-        ]
-    );
+    composer.handle_paste("x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4));
+    composer.insert_str("tail");
+    composer.textarea.set_cursor(0);
+    composer.handle_key_event(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(composer.textarea.text(), "tail");
+    let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(result, InputResult::Submitted("tail".to_string()));
 }
 
 #[test]
@@ -631,15 +543,15 @@ fn deleting_one_equal_length_paste_keeps_the_other_payload() {
     );
     let first = "a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
     let second = "b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
-    let base = format!("[Pasted Content {} chars]", first.chars().count());
-    let second_placeholder = format!("{base} #2");
 
     composer.handle_paste(first);
     composer.handle_paste(second.clone());
-    composer.textarea.set_cursor(base.len());
+    let remaining = composer.pending_pastes[1].0.as_char();
+    let first_chip_len = composer.pending_pastes[0].0.as_char().len_utf8();
+    composer.textarea.set_cursor(first_chip_len);
     composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
 
-    assert_eq!(composer.current_text(), second_placeholder);
+    assert_eq!(composer.current_text(), remaining.to_string());
     let (result, _) = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(result, InputResult::Submitted(second));
 }
