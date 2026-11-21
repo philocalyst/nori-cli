@@ -31,29 +31,28 @@ const CAPABILITIES_STALE_WAIT: Duration = Duration::from_secs(3);
 #[schemars(crate = "rmcp::schemars")]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DelegateTaskRequest {
-    /// Required. The whole task. The child sees none of your conversation, so include every
-    /// fact, file path, and constraint it needs, and say what its final message must contain.
-    /// Never include secrets.
+    /// Required. The whole task: every fact, file path and constraint the child needs (it sees
+    /// none of your conversation), and what its final message must contain. No secrets.
     task: String,
-    /// The agent to run the child on: an `agent` value from `agent_capabilities`. Defaults to
-    /// your own agent.
+    /// The agent to run the child on: an `agent` value from `agent_capabilities`. Default: yours.
     #[serde(default)]
     agent: Option<String>,
-    /// The child's model: a model value or name its agent offers. Defaults to the agent's own.
+    /// The child's model: a value `agent_capabilities` lists for that agent. Default: the agent's own.
     #[serde(default)]
     model: Option<String>,
     /// A short title shown to the user, such as "Review the parser changes".
     #[serde(default)]
     title: Option<String>,
     /// The kind of work, which frames the child's instructions: `implementation`, `research`,
-    /// `review`, `design`, `test`, or `general`. Tell a research or review child in `task` not to
-    /// change files if it must not.
+    /// `review`, `design`, `test` or `general`. It only frames the child's instructions and
+    /// restricts nothing: tell a research or review child in `task` not to change files if it
+    /// must not.
     #[serde(default)]
     role: Option<Role>,
-    /// `shared` (default): the child works in your working directory. `worktree`: it works in a
-    /// new git worktree at your current commit (uncommitted edits are not in it; it starts on a
-    /// detached HEAD, so ask it to commit or branch and report where), for changes that must not
-    /// collide with yours.
+    /// `shared` (default): the child works in your working directory. `worktree`: a new git
+    /// worktree at your current commit, for changes that must not collide with yours (your
+    /// uncommitted edits are not in it; it starts on a detached HEAD, so ask it to commit or
+    /// branch and report where).
     #[serde(default)]
     isolation: Option<Isolation>,
     /// `background` (default): return at once; the result is delivered to you as a message when
@@ -163,7 +162,7 @@ pub(crate) struct TaskSendRequest {
 #[tool_router(router = task_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "List the agents you can delegate to, with the models and other settings (such as reasoning effort) each offers, plus your delegation depth and the number of tasks running.",
+        description = "List the agents you can delegate to with the models and other settings (such as reasoning effort) each offers, plus your delegation depth and the number of tasks running. Call it before `delegate_task` whenever the user names an agent or model, and pass its `agent`, `model` and `settings` values on; no other tool lists the other providers' models. The first call can take a few seconds while agents are read.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn agent_capabilities(&self) -> Result<CallToolResult, McpError> {
@@ -194,7 +193,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Start a child actor on a task; returns once its session is running, or an error with the cause. The child sees only `task`, not this conversation, and cannot ask questions. Its result arrives as a new message, so don't poll; use `mode: wait` only if you cannot go on without it. Give an `alias` to message it again with `task_send`: an alias that names a live actor sends it the task instead of starting a second child. `isolation: shared` edits your files directly: give parallel children disjoint files, or use `isolation: worktree`. No secrets in `task`.",
+        description = "Start a child actor on a task; returns once its session is running, or an error with the cause (nothing started). The child starts with fresh context: it sees only `task` (plus Nori's standard instructions), never this conversation, and it cannot ask questions, so put everything it needs in `task`. Its result arrives later as a new message: do other work or end your turn, and use `mode: wait` only if you cannot go on without it. Give an `alias` to message it again with `task_send`: an alias that names a live actor sends it the task instead of starting a second child. `isolation: shared` edits your files directly: give parallel children disjoint files, or use `isolation: worktree`. Delegate work that runs beside yours (research, a review, an independent change); do a quick step, or one your next step is blocked on, yourself.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true),
         meta = always_load()
     )]
@@ -222,7 +221,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Read a task (`task-N`), or an actor's latest task of yours: `status`, where its message got (`delivery`: queued = not read yet, delivered, acknowledged), the child's current `activity`, files changed, and its final message once finished. Reading a finished task delivers its result, so it is not also sent as a message. Messages waiting for you arrive in `inbox`. Never poll: results and replies arrive as new messages.",
+        description = "Read a task (`task-N`), or an actor's latest task of yours: `status`, where its message got (`delivery`: `queued` = not read yet, `delivered`, `acknowledged`), the child's current `activity`, files changed, and its final message once finished. Reading a finished task delivers its result, so it is not also sent as a message. Messages waiting for you arrive in `inbox`. Never poll: results and replies arrive as new messages.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
@@ -234,7 +233,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Block until the listed tasks or actors finish, one awaits the user's approval, a message arrives for you, or the timeout passes. Only when you cannot continue without a child's result. It returns at once for a message to a peer (nothing comes back to it): end your turn instead, replies arrive as new messages.",
+        description = "Block until the listed tasks or actors finish, one awaits the user's approval, a message arrives for you, or the timeout passes. Use it only when you cannot continue without a child's result. It returns at once for a message to a peer (nothing comes back to it): end your turn instead, replies arrive as new messages.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false),
         meta = always_load()
     )]
@@ -252,7 +251,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Send a message to any actor: `target` is a `task-N`, an alias, `actor://alias` or a session id. The same actor always gets it, never a new child. An idle actor takes it now, a working one at its next turn boundary (`steer: true` interrupts its turn first), an ended one is revived with its history. To a child you delegated to it is a task and its answer returns to you; to anyone else it is mail and they answer with their own `task_send`. Returns the task with `delivery` (`queued` = not read yet). Do not wait for a reply: end your turn; set `cc_parent` to be told by your parent's mail when an exchange between you and a peer settles.",
+        description = "Send a message to any actor: `target` is a `task-N`, an alias, `actor://alias` or a session id. The same actor always gets it, never a new child. An idle actor takes it now, a working one at its next turn boundary (`steer: true` interrupts its turn first), an ended or failed one is revived with its history. To a child you delegated to it is a task and its answer returns to you; to anyone else it is mail and they answer with their own `task_send`. Returns the task with `delivery` (`queued` = not read yet). Do not wait for a reply: end your turn. Set `cc_parent` to have your parent told when an exchange between you and a peer settles.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
