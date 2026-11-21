@@ -13,9 +13,10 @@ use crate::nori::session_header::AgentStatusHandle;
 use crate::nori::session_header::SkillsetStatus;
 use crate::nori::session_header::StatusViewModel;
 
-/// What the footer's model segment says: the agent, the model with the effort it runs at (what
-/// Ctrl+N, Ctrl+P and Shift+Space change), and any other option the agent has moved off its
-/// default. The mode has its own footer label.
+/// What the footer's model segment says: the agent, the model with the effort it runs at and the
+/// model mode when it is not the standard one (what Ctrl+N / Ctrl+P, Ctrl+J / Ctrl+K and Alt+. /
+/// Alt+, change), and any other option the agent has moved off its default. The permission mode
+/// has its own footer label.
 fn footer_label(agent: &str, config: &AgentConfigState) -> Option<String> {
     use nori_protocol::acp::v1::SessionConfigOptionCategory as Category;
 
@@ -36,10 +37,15 @@ fn footer_label(agent: &str, config: &AgentConfigState) -> Option<String> {
     if let Some(effort) = effort {
         parts.push(effort.display_value());
     }
+    let model_mode = config.mode_option();
+    if let Some(mode) = config.model_mode().filter(|mode| !mode.is_standard()) {
+        parts.push(mode.label().to_owned());
+    }
     for option in config.options() {
         let shown = option.is_category(&Category::Model)
             || option.is_category(&Category::Mode)
-            || effort.is_some_and(|effort| effort.id == option.id);
+            || effort.is_some_and(|effort| effort.id == option.id)
+            || model_mode.is_some_and(|mode| mode.id == option.id);
         let value = option.display_value();
         if !shown && !value.eq_ignore_ascii_case("default") {
             parts.push(value);
@@ -101,6 +107,7 @@ impl ChatWidget {
         self.agent_config = config;
         self.bottom_pane
             .set_model_label(self.current_footer_label());
+        self.refresh_action_choices();
         self.apply_acp_mode_config_snapshot(self.acp_mode_config_generation, mode);
     }
 
@@ -109,6 +116,12 @@ impl ChatWidget {
         &mut self,
         config_options: &[nori_protocol::acp::v1::SessionConfigOption],
     ) {
+        // Presses of the model, effort and mode keys are ahead of what the agent has said so far;
+        // adopting its older announcement would put the footer back and make the next press step
+        // from the wrong place. The agent's answer to the last press settles it.
+        if self.model_cycle.is_settling() {
+            return;
+        }
         self.adopt_agent_config(AgentConfigState::from_options(config_options));
         self.request_redraw();
     }

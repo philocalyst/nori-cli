@@ -117,11 +117,22 @@ pub(crate) fn acp_session_config_value_picker_params(
     };
 
     let is_model = option.category == Some(acp::SessionConfigOptionCategory::Model);
+    // What the keys step through is listed in the order they step: effort from least to most,
+    // modes from slowest to fastest. Models are listed as the agent advertises them.
+    let dial = [nori_protocol::Dial::Effort, nori_protocol::Dial::Mode]
+        .into_iter()
+        .find(|dial| dial.selects(option));
 
     // "Recommended": the values the agent advertises, exactly as reported.
     let mut recommended: Vec<SelectionItem> = Vec::new();
     match &select.options {
         acp::SessionConfigSelectOptions::Ungrouped(options) => {
+            let mut options: Vec<&acp::SessionConfigSelectOption> = options.iter().collect();
+            if let Some(dial) = dial {
+                options.sort_by_key(|value| {
+                    nori_protocol::standing(dial, &value.value.to_string(), &value.name)
+                });
+            }
             for option_value in options {
                 recommended.push(value_item(
                     option,
@@ -280,13 +291,11 @@ fn other_model_item(
         let config_id = option.id.to_string();
         let option_name = option.name.clone();
         let value = model.id.to_string();
-        let value_name = model.label.to_string();
         vec![Box::new(move |tx| {
             tx.send(AppEvent::SetAcpSessionConfigOption {
                 config_id: config_id.clone(),
                 value: value.clone(),
                 option_name: option_name.clone(),
-                value_name: value_name.clone(),
                 is_custom_model: true,
                 origin,
                 route_token: None,
@@ -324,7 +333,6 @@ fn value_item(
     let config_id = option.id.to_string();
     let value = option_value.value.to_string();
     let option_name = option.name.clone();
-    let value_name = option_value.name.clone();
     let group_name = group_name.map(str::to_string);
 
     let actions: Vec<SelectionAction> = if is_current {
@@ -335,7 +343,6 @@ fn value_item(
                 config_id: config_id.clone(),
                 value: value.clone(),
                 option_name: option_name.clone(),
-                value_name: value_name.clone(),
                 is_custom_model: false,
                 origin,
                 route_token: None,
@@ -547,13 +554,11 @@ mod tests {
                 config_id,
                 value,
                 option_name,
-                value_name,
                 is_custom_model,
                 ..
             } if config_id == "model"
                 && value == "mock-model-fast"
                 && option_name == "Model"
-                && value_name == "Mock Fast Model"
                 && !is_custom_model
         ));
         assert!(rx.try_recv().is_err(), "expected a single config event");
@@ -733,13 +738,11 @@ mod tests {
                 config_id,
                 value,
                 option_name,
-                value_name,
                 is_custom_model,
                 ..
             } if config_id == "model"
                 && value == "legacy-a"
                 && option_name == "Model"
-                && value_name == "Legacy A"
                 && is_custom_model
         ));
         assert!(rx.try_recv().is_err(), "expected a single config event");

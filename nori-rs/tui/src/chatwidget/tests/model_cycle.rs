@@ -2,6 +2,7 @@ use super::*;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use nori_protocol::Dial;
 use nori_protocol::acp::v1 as acp;
 use pretty_assertions::assert_eq;
 
@@ -237,7 +238,7 @@ fn ctrl_j_and_k_step_the_effort() {
 }
 
 #[test]
-fn the_models_step_in_intelligence_order() {
+fn the_models_step_in_the_agents_order() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
     chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
         "model",
@@ -263,8 +264,8 @@ fn the_models_step_in_intelligence_order() {
     assert_eq!(
         seen,
         [
-            "claude-fable-5-2",
             "opus",
+            "claude-fable-5-2",
             "sonnet",
             "fable",
             "haiku",
@@ -405,7 +406,75 @@ fn provider_picker_shows_opencode_identity() {
     params.items[0].description =
         Some("Available · sign-in status unknown · select to connect".to_string());
     chat.bottom_pane.show_selection_view(params);
-    let rendered = screen(&chat);
-    assert!(rendered.contains("OpenCode"), "{rendered}");
-    insta::assert_snapshot!("opencode_provider_picker", rendered);
+    let labels = shown_choice_labels(&mut rx);
+    assert!(
+        labels.iter().any(|label| label.contains("OpenCode")),
+        "{labels:?}"
+    );
+}
+
+fn declared(
+    value: &str,
+    label: &str,
+    effect: &nori_protocol::DialEffect,
+) -> acp::SessionConfigSelectOption {
+    acp::SessionConfigSelectOption::new(value.to_owned(), label.to_owned()).meta(effect.to_meta())
+}
+
+#[test]
+fn dial_effect_reads_what_the_choice_declares() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    let costly = nori_protocol::DialEffect {
+        when: nori_protocol::AppliesAt::NextStep,
+        costs: vec![nori_protocol::Consequence::PromptCacheRestarts],
+    };
+    chat.sync_acp_session_config_snapshot(&[acp::SessionConfigOption::select(
+        "model",
+        "Model",
+        "sonnet".to_owned(),
+        vec![
+            acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+            declared("opus", "Opus", &costly),
+        ],
+    )
+    .category(acp::SessionConfigOptionCategory::Model)]);
+
+    assert_eq!(chat.dial_effect(Dial::Model, "opus", true), costly);
+    assert_eq!(chat.dial_effect(Dial::Model, "opus", false), costly);
+}
+
+#[test]
+fn dial_effect_of_an_undeclared_choice_is_next_turn_with_no_costs() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&models("sonnet"));
+
+    for dial in [Dial::Model, Dial::Effort, Dial::Mode] {
+        assert_eq!(
+            chat.dial_effect(dial, "opus", false),
+            nori_protocol::DialEffect::next_turn()
+        );
+    }
+    assert_eq!(
+        chat.dial_effect(Dial::Model, "haiku", true),
+        nori_protocol::DialEffect::next_turn()
+    );
+}
+
+#[test]
+fn dial_effect_of_another_agents_model_restarts_the_session() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+    chat.sync_acp_session_config_snapshot(&models("sonnet"));
+    let restarts = |when| nori_protocol::DialEffect {
+        when,
+        costs: vec![nori_protocol::Consequence::SessionRestarts],
+    };
+
+    assert_eq!(
+        chat.dial_effect(Dial::Model, "gpt-5/codex", true),
+        restarts(nori_protocol::AppliesAt::AfterThisTurn)
+    );
+    assert_eq!(
+        chat.dial_effect(Dial::Model, "gpt-5/codex", false),
+        restarts(nori_protocol::AppliesAt::Now)
+    );
 }

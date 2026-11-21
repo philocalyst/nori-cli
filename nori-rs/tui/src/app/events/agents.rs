@@ -87,7 +87,6 @@ impl App {
                 config_id,
                 value,
                 option_name,
-                value_name,
                 is_custom_model,
                 origin,
                 route_token,
@@ -140,7 +139,6 @@ impl App {
                         config_id,
                         value,
                         option_name,
-                        value_name,
                         is_custom_model,
                         origin,
                         route_token,
@@ -176,13 +174,24 @@ impl App {
                     );
                 }
             }
+            AppEvent::CycleModelMode(step) => {
+                if self.session_view.focused() != crate::subagent_switcher::Target::Main {
+                    tui.show_toast(
+                        "Model controls are unavailable for this child session.".to_owned(),
+                    );
+                } else if !self.chat_widget.cycle_model_mode(step) {
+                    self.chat_widget.add_info_message(
+                        "The agent hasn't listed its options yet.".to_owned(),
+                        None,
+                    );
+                }
+            }
             AppEvent::AcpSessionConfigSetResult {
                 success,
                 agent,
                 config_id,
                 value,
                 option_name,
-                value_name: _,
                 is_custom_model,
                 origin,
                 config_options,
@@ -190,6 +199,12 @@ impl App {
                 route_fallback_eligible,
                 route_token,
             } => {
+                // A value chosen in a picker was shown when it was chosen; the answer confirms it
+                // or puts the old one back.
+                let adopt = origin != crate::nori::session_config_picker::ConfigPickerOrigin::Cycle
+                    && self
+                        .chat_widget
+                        .settle_chosen_option(&config_id, &value, success);
                 if self.stale_model_route_token(route_token) {
                     return Ok(true);
                 }

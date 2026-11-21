@@ -385,6 +385,9 @@ pub(crate) enum AppEvent {
     /// by default).
     CycleEffort(crate::chatwidget::ModelStep),
 
+    /// Step to the next or previous model mode the agent offers (Alt+. / Alt+, by default).
+    CycleModelMode(crate::chatwidget::ModelStep),
+
     /// The independent control plane for a focused subagent, when it has one.
     SubagentControlsReady {
         key: crate::subagent_switcher::SubagentKey,
@@ -428,7 +431,6 @@ pub(crate) enum AppEvent {
         config_id: String,
         value: String,
         option_name: String,
-        value_name: String,
         /// Whether the value came from the free-text custom model input.
         is_custom_model: bool,
         /// Where the choice came from.
@@ -483,6 +485,11 @@ pub(crate) enum AppEvent {
     AddAccount {
         provider: &'static nori_config::ProviderAccounts,
         name: String,
+    },
+    /// A check of whether an account's own login is signed in has landed (its agent's slug); the
+    /// answer is in `nori_acp_host::accounts::status`.
+    AccountChecked {
+        slug: String,
     },
     /// An account was created (its agent's slug), or why not.
     AccountAdded {
@@ -564,9 +571,6 @@ pub(crate) enum AppEvent {
 
     /// Set the TUI pinned plan drawer config setting.
     SetConfigPinnedPlanDrawer(bool),
-
-    /// Set ACP wire JSONL recording for future ACP child subprocesses.
-    SetConfigAcpWireRecording(bool),
 
     /// Set the TUI custom working messages config setting.
     SetConfigCustomWorkingMessages(bool),
@@ -781,6 +785,14 @@ pub(crate) enum AppEvent {
     /// Branch the conversation at its current head via ACP `session/fork`,
     /// swapping the active session to the forked one.
     BranchFromCurrent,
+
+    /// Ctrl+F on a prompt walked back to: continue the conversation through that turn's response
+    /// in a subagent of its own.
+    ForkWalkedTurn {
+        generation: SessionGeneration,
+        /// The walked prompt's index in the transcript.
+        cell_index: usize,
+    },
 
     /// Continue a selected history prefix in a separate child session.
     ForkResponseSubagent {

@@ -93,16 +93,9 @@ impl AgentConfigOption {
     }
 }
 
-/// Whether `option` is the agent's reasoning effort: the option it declares as its thought level,
-/// or, for an agent that declares no category for it, the one named for effort or reasoning.
+/// Whether `option` is the agent's reasoning effort.
 pub(crate) fn is_effort_option(option: &acp::SessionConfigOption) -> bool {
-    match &option.category {
-        Some(category) => *category == acp::SessionConfigOptionCategory::ThoughtLevel,
-        None => {
-            let id = option.id.to_string().to_lowercase();
-            id.contains("effort") || id.contains("thought") || id.contains("reasoning")
-        }
-    }
+    nori_protocol::is_effort_option(option)
 }
 
 /// The agent's advertised session configuration, in advertised order.
@@ -157,6 +150,19 @@ impl AgentConfigState {
         self.options
             .iter()
             .find(|option| is_effort_option(&option.raw))
+    }
+
+    /// The agent's model-mode option (fast, flex, priority), if it has one.
+    pub(crate) fn mode_option(&self) -> Option<&AgentConfigOption> {
+        self.options
+            .iter()
+            .find(|option| nori_protocol::is_mode_option(&option.raw))
+    }
+
+    /// The model mode the session runs in, when the agent offers modes.
+    pub(crate) fn model_mode(&self) -> Option<nori_protocol::ModelMode> {
+        self.mode_option()
+            .and_then(|option| nori_protocol::mode_of(&option.raw))
     }
 
     /// The mode cycle derived from the agent's mode selector, used by the
