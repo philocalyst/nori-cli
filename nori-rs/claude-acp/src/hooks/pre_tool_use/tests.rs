@@ -653,14 +653,26 @@ async fn test_is_plans_directory_path() {
     ));
 
     // Test ~ expansion
-    assert!(is_plans_directory_path("~/.claude/plans/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
+    assert!(is_plans_directory_path(
+        "~/.claude/plans/plan.md",
+        &dirs::home_dir().unwrap().join(".claude/plans")
+    ));
 
     // Test non-plans path
-    assert!(!is_plans_directory_path("/tmp/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
-    assert!(!is_plans_directory_path("~/other/path/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
+    assert!(!is_plans_directory_path(
+        "/tmp/plan.md",
+        &dirs::home_dir().unwrap().join(".claude/plans")
+    ));
+    assert!(!is_plans_directory_path(
+        "~/other/path/plan.md",
+        &dirs::home_dir().unwrap().join(".claude/plans")
+    ));
 
     // Test edge case: similar but not plans directory
-    assert!(!is_plans_directory_path("~/../.claude/plans/plan.md", &dirs::home_dir().unwrap().join(".claude/plans")));
+    assert!(!is_plans_directory_path(
+        "~/../.claude/plans/plan.md",
+        &dirs::home_dir().unwrap().join(".claude/plans")
+    ));
 }
 
 #[tokio::test]
