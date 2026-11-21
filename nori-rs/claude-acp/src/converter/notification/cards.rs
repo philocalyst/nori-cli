@@ -171,9 +171,12 @@ impl NotificationConverter {
             .status(ToolCallStatus::InProgress) // Tool is being executed
             .raw_input(tool_use.input.clone());
 
-        // Nori's own tools say which they are, so the client need not parse the title.
+        // Nori's own tools say which they are, so the client need not parse the title; Claude's
+        // subagent tool says a subagent runs in the turn.
         if let Some(host_tool) = crate::mcp::host_tool_name(&tool_use.name) {
             tool_call = tool_call.meta(nori_host_tools::tool_call_meta(host_tool));
+        } else if matches!(tool_use.name.as_str(), "Agent" | "Task") {
+            tool_call = tool_call.meta(nori_host_tools::subagent_meta());
         }
 
         // Add locations if present
@@ -193,8 +196,25 @@ impl NotificationConverter {
             tool_call = tool_call.locations(acp_locations);
         }
 
-        let notification =
-            SessionNotification::new(session_id.clone(), SessionUpdate::ToolCall(tool_call));
+        // A call already announced (the CLI first shows it with empty input) gets its complete
+        // input as an update: one `tool_call` per id.
+        let update = if self.announced_tool_uses.insert(tool_use.id.clone()) {
+            SessionUpdate::ToolCall(tool_call)
+        } else {
+            let mut fields = ToolCallUpdateFields::new()
+                .title(tool_call.title)
+                .kind(tool_call.kind)
+                .raw_input(tool_call.raw_input);
+            if !tool_call.locations.is_empty() {
+                fields = fields.locations(tool_call.locations);
+            }
+            let mut update = ToolCallUpdate::new(tool_call.tool_call_id, fields);
+            if let Some(meta) = tool_call.meta {
+                update = update.meta(meta);
+            }
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        let notification = SessionNotification::new(session_id.clone(), update);
         self.attach_request_id(notification)
     }
 
@@ -220,6 +240,7 @@ impl NotificationConverter {
             );
             return vec![];
         };
+        self.finish_tool_use(&tool_result.tool_use_id);
 
         tracing::debug!(
             session_id = %session_id.0,

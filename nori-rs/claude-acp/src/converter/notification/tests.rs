@@ -404,3 +404,63 @@ fn test_request_id_with_cwd_default() {
     // Default request_id should be None even with cwd
     assert!(converter.request_id.is_none());
 }
+
+#[test]
+fn a_subagents_messages_show_on_its_card_and_not_in_the_conversation() {
+    let converter = NotificationConverter::new();
+    converter.cache_tool_use(&ToolUseBlock {
+        id: "toolu_agent".to_string(),
+        name: "Agent".to_string(),
+        input: json!({"description": "Survey the parser", "prompt": "…"}),
+    });
+    // The subagent's words stream under the Agent call: none reaches the conversation.
+    let words: Message = serde_json::from_value(json!({
+        "type": "stream_event",
+        "uuid": "u1",
+        "session_id": "abc",
+        "event": {"type": "content_block_delta", "index": 0,
+                  "delta": {"type": "text_delta", "text": "I will read the parser"}},
+        "parent_tool_use_id": "toolu_agent"
+    }))
+    .expect("a stream event");
+    assert!(converter.convert_message(&words, "s").is_empty());
+    // A tool the subagent starts is what its card says it is doing.
+    let read: Message = serde_json::from_value(json!({
+        "type": "assistant",
+        "message": {"model": "claude", "content": [{
+            "type": "tool_use", "id": "toolu_child", "name": "Read",
+            "input": {"file_path": "/repo/src/parser.rs"}
+        }]},
+        "parent_tool_use_id": "toolu_agent",
+        "session_id": "abc"
+    }))
+    .expect("an assistant message");
+    let [notification] = converter
+        .convert_message(&read, "s")
+        .try_into()
+        .expect("one update");
+    let SessionUpdate::ToolCallUpdate(update) = notification.update else {
+        panic!("an update of the Agent call");
+    };
+    assert_eq!(update.tool_call_id.0.as_ref(), "toolu_agent");
+    assert!(
+        update
+            .fields
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with("Survey the parser · ")),
+        "{:?}",
+        update.fields.title
+    );
+    // The subagent's tool results stay its own.
+    let result: Message = serde_json::from_value(json!({
+        "type": "user",
+        "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_child", "content": "fn parse() {}"
+        }]},
+        "parent_tool_use_id": "toolu_agent",
+        "session_id": "abc"
+    }))
+    .expect("a user message");
+    assert!(converter.convert_message(&result, "s").is_empty());
+}

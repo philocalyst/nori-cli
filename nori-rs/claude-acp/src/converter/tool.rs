@@ -237,7 +237,8 @@ pub fn extract_tool_info(name: &str, input: &serde_json::Value, cwd: Option<&Pat
             ToolInfo::new(title, ToolKind::Fetch)
         }
 
-        "Task" => {
+        // The subagent tool: `Agent` in current Claude, `Task` before.
+        "Agent" | "Task" => {
             let desc = input
                 .get("description")
                 .and_then(|v| v.as_str())

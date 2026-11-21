@@ -4,6 +4,7 @@
 //! into ACP session notifications for the client.
 
 mod cards;
+mod subagent;
 
 use std::time::Instant;
 
@@ -102,6 +103,11 @@ fn remove_system_reminders(text: &str) -> String {
 pub struct NotificationConverter {
     /// Cache of tool use entries, keyed by tool_use_id
     tool_use_cache: DashMap<String, ToolUseEntry>,
+    /// The cached tool uses whose result has arrived.
+    finished_tool_uses: dashmap::DashSet<String>,
+    /// The tool uses already announced as a `tool_call`. The CLI shows each one twice, when it
+    /// starts (with empty input) and when its input is complete; the second is an update.
+    announced_tool_uses: dashmap::DashSet<String>,
     /// Current working directory for relative path display
     cwd: Option<std::path::PathBuf>,
     /// Optional request_id for tracking prompt requests
@@ -121,6 +127,8 @@ impl NotificationConverter {
     pub fn new() -> Self {
         Self {
             tool_use_cache: DashMap::new(),
+            finished_tool_uses: dashmap::DashSet::new(),
+            announced_tool_uses: dashmap::DashSet::new(),
             cwd: None,
             request_id: None,
             edit_snapshots: std::sync::Arc::new(EditSnapshots::new(std::path::PathBuf::new())),
@@ -135,6 +143,8 @@ impl NotificationConverter {
     pub fn with_cwd(cwd: std::path::PathBuf) -> Self {
         Self {
             tool_use_cache: DashMap::new(),
+            finished_tool_uses: dashmap::DashSet::new(),
+            announced_tool_uses: dashmap::DashSet::new(),
             edit_snapshots: std::sync::Arc::new(EditSnapshots::new(cwd.clone())),
             cwd: Some(cwd),
             request_id: None,
@@ -203,6 +213,10 @@ impl NotificationConverter {
         };
 
         let sid = SessionId::new(session_id.to_string());
+        // A subagent's own messages are its card's, not the conversation's.
+        if let Some(parent) = subagent::parent_of(message) {
+            return self.convert_child_message(message, parent, &sid);
+        }
         let notifications = match message {
             Message::Assistant(assistant) => self.convert_assistant_message(assistant, &sid),
             Message::StreamEvent(event) => self.convert_stream_event(event, &sid),
@@ -537,9 +551,26 @@ impl NotificationConverter {
         self.tool_use_cache.get(tool_use_id).map(|r| r.clone())
     }
 
+    /// Note that the result of tool use `tool_use_id` arrived.
+    fn finish_tool_use(&self, tool_use_id: &str) {
+        self.finished_tool_uses.insert(tool_use_id.to_owned());
+    }
+
+    /// The tool uses of this turn that started and have no result: what a turn cut short (its
+    /// CLI exited) leaves open, and has to end itself.
+    pub fn unfinished_tool_uses(&self) -> Vec<String> {
+        self.tool_use_cache
+            .iter()
+            .map(|entry| entry.key().clone())
+            .filter(|id| !self.finished_tool_uses.contains(id))
+            .collect()
+    }
+
     /// Clear all cached tool uses
     pub fn clear_cache(&self) {
         self.tool_use_cache.clear();
+        self.finished_tool_uses.clear();
+        self.announced_tool_uses.clear();
         self.edit_snapshots.clear();
     }
 
