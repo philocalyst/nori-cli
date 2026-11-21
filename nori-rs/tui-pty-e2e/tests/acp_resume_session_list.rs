@@ -36,10 +36,7 @@ fn resume_picker_lists_agent_sessions_when_session_list_supported() {
     session.submit_input("/resume").unwrap();
 
     session
-        .wait_for_text(
-            "Resume a live session or start a new one",
-            Duration::from_secs(5),
-        )
+        .wait_for_text("search sessions", Duration::from_secs(5))
         .expect("Should show the agent-sourced session picker");
 
     // The mock agent returns two sessions: the first carries a title, the second
@@ -51,10 +48,7 @@ fn resume_picker_lists_agent_sessions_when_session_list_supported() {
         .wait_for_text("mock-session-2", Duration::from_secs(2))
         .expect("Picker should list the untitled session by its id");
 
-    // Row 0 is the pinned "Start a new session" action; the first listed
-    // session is one row down. Selecting it resumes over ACP.
-    session.send_key(Key::Down).unwrap();
-    std::thread::sleep(TIMEOUT_INPUT);
+    // The selection opens on the most recently active session; choosing it resumes over ACP.
     session.send_key(Key::Enter).unwrap();
     session
         .wait_for_text("Resuming session with", Duration::from_secs(5))
@@ -74,7 +68,7 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
         );
     let mut session = TuiSession::spawn_with_config(30, 64, config).expect("spawn TUI");
     session
-        .wait_for_text("INSERT", TIMEOUT)
+        .wait_for_text(" INS ", TIMEOUT)
         .expect("initial insert mode");
     session
         .wait_for_text("master", TIMEOUT)
@@ -84,7 +78,6 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
     session
         .wait_for_text("First mock session", TIMEOUT)
         .expect("saved session listed");
-    session.send_key(Key::Down).expect("select saved session");
     session.send_key(Key::Enter).expect("resume saved session");
     session
         .wait_for_text("Resuming session with", TIMEOUT)
@@ -93,30 +86,21 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
         .wait_for_text("replay chunk 0", TIMEOUT)
         .expect("resumed widget receives provider history");
     session
-        .wait_for_text("INSERT", TIMEOUT)
+        .wait_for_text(" INS ", TIMEOUT)
         .expect("insert mode after resume");
     session
         .wait_for_text("master", TIMEOUT)
         .expect("git branch after resume");
-    session.start_output_capture();
     session
         .type_input("draft")
         .expect("type into resumed session");
     session
         .wait_for_text("draft", TIMEOUT)
         .expect("draft visible");
-    assert!(
-        session
-            .output_bytes()
-            .expect("captured output")
-            .windows(5)
-            .any(|bytes| bytes == b"\x1b[6 q"),
-        "resumed insert mode uses a bar cursor"
-    );
     session.start_output_capture();
     session.send_str("\x1b[27u").expect("enter normal mode");
     session
-        .wait_for_text("NORMAL", TIMEOUT)
+        .wait_for_text(" NOR ", TIMEOUT)
         .expect("normal mode after resume");
     assert!(
         session
@@ -125,5 +109,18 @@ fn resumed_session_keeps_modal_editor_cursor_and_git_branch() {
             .windows(5)
             .any(|bytes| bytes == b"\x1b[2 q"),
         "resumed normal mode uses a block cursor"
+    );
+    session.start_output_capture();
+    session.send_str("i").expect("return to insert mode");
+    session
+        .wait_for_text(" INS ", TIMEOUT)
+        .expect("insert mode after normal mode");
+    assert!(
+        session
+            .output_bytes()
+            .expect("captured output")
+            .windows(5)
+            .any(|bytes| bytes == b"\x1b[6 q"),
+        "resumed insert mode uses a bar cursor"
     );
 }
