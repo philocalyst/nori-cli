@@ -58,10 +58,11 @@ claude = ["claude@work", "claude-code"]
 ```
 
 The provider key scopes the order, and each value is an agent slug. An active
-route the user chose stays first. Otherwise the listed account order wins among
-that provider's routes, while an account known to be spent still falls behind
-available accounts when `recovery.fallback.prefer_headroom` is enabled. Other
-providers and the explicit fallback `chain` keep their own order.
+named account stays first. The implicit built-in default yields to the configured
+account order. A known-spent account still falls behind available accounts when
+`recovery.fallback.prefer_headroom` is enabled. Other providers and the explicit
+fallback `chain` keep their own order. Nori cannot distinguish an explicit choice
+of the built-in account from that account being the implicit default.
 
 ## Code intelligence: `nudox`
 

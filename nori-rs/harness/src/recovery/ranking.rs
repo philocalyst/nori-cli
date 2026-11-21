@@ -210,15 +210,20 @@ impl RouteRanking {
                 let (route, _) = route(item);
                 let room = headroom.and_then(|headroom| headroom.room_for(&route));
                 let spent = room.as_ref().is_some_and(|room| room.is_spent());
-                // Preserve the person's current account unless its usage is known to be spent.
-                let active = self.active.as_ref() == Some(&route) && !spent;
                 let provider =
                     provider_for(&route.agent, route.model.as_deref().unwrap_or_default());
-                let account_preference = self
-                    .account_preferences
-                    .get(&provider)
+                let accounts = self.account_preferences.get(&provider);
+                let account_preference = accounts
                     .and_then(|accounts| accounts.iter().position(|agent| agent == &route.agent))
                     .unwrap_or(usize::MAX);
+                // A configured account outranks the implicit built-in default. Explicitly
+                // selected non-default accounts remain first unless their usage is spent.
+                let default_yields = accounts.is_some_and(|accounts| {
+                    accounts.iter().any(|agent| agent != &route.agent)
+                        && nori_acp_host::accounts::find(&route.agent)
+                            .is_some_and(|account| account.is_default())
+                });
+                let active = self.active.as_ref() == Some(&route) && !spent && !default_yields;
                 (
                     spent,
                     !active,
@@ -384,14 +389,26 @@ mod tests {
     }
 
     #[test]
-    fn account_preferences_preserve_the_active_route() {
+    fn account_preferences_move_the_implicit_builtin_default_behind_f() {
         let active = RouteRef::new("claude-code", Some("claude-opus-5-5".to_owned()));
         let installed = ["claude-code", "claude@f"].map(str::to_owned).to_vec();
         let ranking =
             claude_f_preference(RouteRanking::new(Some(active), &[], &|_| None, &installed));
         assert_eq!(
             order(&ranking, &["claude@f", "claude-code"], "claude-opus-5-5"),
-            ["claude-code", "claude@f"]
+            ["claude@f", "claude-code"]
+        );
+    }
+
+    #[test]
+    fn account_preferences_preserve_an_active_named_account() {
+        let active = RouteRef::new("claude@work", Some("claude-opus-5-5".to_owned()));
+        let installed = ["claude@work", "claude@f"].map(str::to_owned).to_vec();
+        let ranking =
+            claude_f_preference(RouteRanking::new(Some(active), &[], &|_| None, &installed));
+        assert_eq!(
+            order(&ranking, &["claude@f", "claude@work"], "claude-opus-5-5"),
+            ["claude@work", "claude@f"]
         );
     }
 

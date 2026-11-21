@@ -128,10 +128,12 @@ names the accounts: `account primary → secondary`.
 
 `[account_preferences]` in `config.toml` can put one account first among sibling
 routes for a provider, for example `claude = ["claude@work", "claude-code"]`.
-The active route remains first; a configured account preference comes before
-headroom, except that a known-spent account still falls behind available siblings
-when `prefer_headroom` is on. This affects ranked routes only; the explicit
-fallback `chain` remains in its written order.
+An active named account remains first; the implicit built-in default yields to a
+configured account preference. The preference comes before headroom, except that
+a known-spent account still falls behind available siblings when `prefer_headroom`
+is on. This affects ranked routes only; the explicit fallback `chain` remains in
+its written order. Nori cannot distinguish an explicit choice of the built-in
+account from that account being the implicit default.
 
 ```pkl
 recovery = new Dynamic {

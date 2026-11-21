@@ -71,10 +71,12 @@ changing another provider's route order:
 claude = ["claude@client", "claude-code"]
 ```
 
-The session's active route remains first. When Nori ranks sibling accounts for the same model,
-the configured order comes before headroom; an account known to be spent still goes after available
-accounts when `prefer_headroom` is enabled. Explicit routes in the recovery chain keep their order.
-This is a routing preference, not a replacement for selecting the session's agent with `agent`.
+An active named account remains first, while the implicit built-in default yields to the configured
+order. When Nori ranks sibling accounts for the same model, the configured order comes before
+headroom; an account known to be spent still goes after available accounts when `prefer_headroom` is
+enabled. Explicit routes in the recovery chain keep their order. Nori cannot distinguish an
+explicit choice of the built-in account from that account being the implicit default. This is a
+routing preference, not a replacement for selecting the session's agent with `agent`.
 
 ## How a native account starts
 
