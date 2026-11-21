@@ -65,7 +65,7 @@ pub use provider::Opened;
 pub use provider::Provider;
 pub use provider::ProviderAgent;
 pub use provider::TurnCtx;
-pub use registration::AvailabilityCheck;
+pub use registration::AuthProbe;
 pub use registration::Host;
 pub use registration::InProcessSpec;
 pub use registration::Launcher;

@@ -142,15 +142,15 @@ pub type Launcher = Arc<
 /// client's MCP servers (as the JSON array ACP sends in `session/new`). Returns at once.
 pub type Prewarmer = Arc<dyn Fn(InProcessSpec, PathBuf, serde_json::Value) + Send + Sync>;
 
+/// Says who an agent is signed in as without starting it (from its stored sign-ins), so the host
+/// can show the login before any session of it runs.
+pub type AuthProbe =
+    Arc<dyn Fn(InProcessSpec) -> BoxFuture<'static, crate::auth_status::AuthStatus> + Send + Sync>;
+
 /// Folds the environment a custom adapter would have read into explicit options. The host calls
 /// it with the agent's configured environment, since a process shared with other agents has no
 /// per-agent environment.
 pub type Resolver = fn(InProcessSpec, &HashMap<String, String>) -> InProcessSpec;
-
-/// Says why the agent cannot be used right now, when that is known without starting it. The host
-/// asks on the user's thread whenever it lists agents, so an answer must come from local state
-/// (a file, a process id), never from the network.
-pub type AvailabilityCheck = fn() -> Option<String>;
 
 /// One built-in agent, ready for the host.
 #[derive(Clone)]
@@ -160,7 +160,7 @@ pub struct Registration {
     pub launch: Launcher,
     pub prewarm: Option<Prewarmer>,
     pub resolve: Option<Resolver>,
-    pub availability: Option<AvailabilityCheck>,
+    pub auth_probe: Option<AuthProbe>,
 }
 
 impl std::fmt::Debug for Registration {
@@ -170,7 +170,7 @@ impl std::fmt::Debug for Registration {
             .field("name", &self.name)
             .field("prewarm", &self.prewarm.is_some())
             .field("resolve", &self.resolve.is_some())
-            .field("availability", &self.availability.is_some())
+            .field("auth_probe", &self.auth_probe.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -196,8 +196,18 @@ impl Registration {
             }),
             prewarm: None,
             resolve: None,
-            availability: None,
+            auth_probe: None,
         }
+    }
+
+    /// Let the host ask who the agent is signed in as without starting it.
+    pub fn with_auth_probe<F, Fut>(mut self, probe: F) -> Self
+    where
+        F: Fn(InProcessSpec) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::auth_status::AuthStatus> + Send + 'static,
+    {
+        self.auth_probe = Some(Arc::new(move |spec| Box::pin(probe(spec))));
+        self
     }
 
     /// Let the agent start sessions ahead of time.
@@ -206,12 +216,6 @@ impl Registration {
         prewarm: impl Fn(InProcessSpec, PathBuf, serde_json::Value) + Send + Sync + 'static,
     ) -> Self {
         self.prewarm = Some(Arc::new(prewarm));
-        self
-    }
-
-    /// Let the agent say, from local state, that it cannot be used right now.
-    pub fn with_availability(mut self, availability: AvailabilityCheck) -> Self {
-        self.availability = Some(availability);
         self
     }
 
