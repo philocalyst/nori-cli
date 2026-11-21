@@ -439,8 +439,16 @@ async fn simultaneous_parent_cancel_and_child_completion_retains_verdict() {
     })
     .await;
 
-    // Cancel the parent turn cleanly after/as the child ended. `stop()` marks the finished task
-    // Wake::AfterNextTurn so its verdict is retained instead of fired into cancellation or lost.
+    // The person stops the delegations as the parent's turn ends. Cancelling a turn alone ends
+    // that turn only (delegated actors are independent and their results arrive at the next
+    // boundary, see docs/turn-lifecycle.md); an explicit stop marks the finished task
+    // Wake::AfterNextTurn so its verdict is retained instead of fired into the cancelled turn's
+    // boundary or lost.
+    session
+        .handle
+        .stop_subagents()
+        .await
+        .expect("stop delegations");
     session.handle.cancel().await.expect("cancel parent turn");
     collect_until(&mut session, Duration::from_secs(20), |events| {
         events.last().is_some_and(is_idle)

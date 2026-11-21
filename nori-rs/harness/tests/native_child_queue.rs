@@ -120,6 +120,29 @@ async fn native_child_controls_are_ordered_and_target_the_child() {
         .expect("prompt log")
     }
     wait_for_log(&log, 2).await;
+    // The first turn's replayed answer streams 20 ms after its prompt. Steering cancels the turn,
+    // so the answer must be in the child's history first: the response boundary the test rewinds
+    // to is the end of an answer that follows the retained image.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let history = session
+                .handle
+                .child_history(child.clone())
+                .await
+                .expect("first turn history");
+            let mut after_image = false;
+            if history.iter().any(|event| {
+                let text = serde_json::to_string(event).unwrap();
+                after_image |= text.contains("cmV0YWluZWQ=");
+                after_image && text.contains("historical child answer")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first turn answers after the retained image");
     session
         .handle
         .send_subagent_content(child.clone(), content("queued"))
@@ -686,6 +709,7 @@ async fn transcript_child_is_controllable_without_provider_reannouncement() {
             session_id: acp::v1::SessionId::new("historic-child"),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Set("Historical child".into()),
             description: Patch::Keep,
             state: Patch::Set(SubagentState::Running),
