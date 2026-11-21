@@ -79,10 +79,22 @@ impl ChatWidget {
             } => {
                 if !is_installed {
                     let display_name = agent.display_name();
-                    let npm_package = agent.npm_package();
+                    let command = nori_acp_host::accounts::install_command(agent)
+                        .unwrap_or_else(|| format!("npm install -g {}", agent.npm_package()));
+                    // The Gemini CLI's own sign-in no longer serves personal Google accounts:
+                    // say where they go, and how a key reaches it, with the one thing to install.
+                    let also = if agent == nori_harness::AgentKind::Gemini {
+                        format!(
+                            "\n\n{}. A key goes in {} where Nori starts.",
+                            nori_acp_host::accounts::gemini_cli::PERSONAL_ACCOUNTS,
+                            nori_acp_host::accounts::gemini_cli::KEY_VARIABLE
+                        )
+                    } else {
+                        String::new()
+                    };
                     self.add_login_message(
                         format!(
-                            "{display_name} is not installed. To install, run:\n\n  npm install -g {npm_package}\n\nThen run /login again to authenticate."
+                            "{display_name} is not installed. To install, run:\n\n  {command}\n\nThen run /login again to authenticate.{also}"
                         ),
                         Some("Install the agent first, then authenticate".to_string()),
                     );
@@ -100,6 +112,12 @@ impl ChatWidget {
                         );
 
                         self.start_oauth_login_flow(handler);
+                    }
+                    LoginMethod::NoCommand { instructions } => {
+                        self.add_login_message(
+                            instructions,
+                            Some("it counts as signed in once its login is checked".to_owned()),
+                        );
                     }
                     LoginMethod::ExternalCli { command, args } => {
                         let mut handler = LoginHandler::new();
@@ -389,16 +407,41 @@ impl ChatWidget {
         };
         handler.cancel(); // Clear any handler state
         // The panel goes; what the program last said is the reason a failure is given.
-        let last_words = self
-            .login_terminal
-            .take()
+        let terminal = self.login_terminal.take();
+        let last_words = terminal
+            .as_ref()
             .map(|terminal| terminal.last_words(3))
             .unwrap_or_default();
 
-        // A sign-in run through the agent is said to have worked only once the agent starts.
+        // A sign-in program that makes a token and saves nothing (`claude setup-token`): the
+        // token on its screen is kept where the provider reads it. Either way the sign-in is
+        // said to have worked only once the account's own login says so.
         if success && let Some(target) = self.sign_in_target.clone() {
             self.login_agent_override = None;
             self.login_child_target = None;
+            if let Some(capture) = target.capture {
+                let kept = terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.find_token(capture.prefix))
+                    .ok_or_else(|| "the sign-in printed no token".to_owned())
+                    .and_then(|token| {
+                        nori_acp_host::accounts::store_claude_setting(
+                            &target.agent_name,
+                            capture.variable,
+                            &token,
+                        )
+                        .map_err(|error| format!("{error:#}"))
+                    });
+                if let Err(error) = kept {
+                    self.sign_in_target = None;
+                    self.add_error_message(format!(
+                        "{} sign-in did not finish: {error}",
+                        target.display_name
+                    ));
+                    self.request_redraw();
+                    return;
+                }
+            }
             self.verify_sign_in(target);
             return;
         }

@@ -22,6 +22,12 @@ pub enum LoginMethod {
         /// Arguments to pass (e.g., ["login"])
         args: Vec<String>,
     },
+    /// The agent has no sign-in command to run: it signs in through ACP `authenticate` (offered
+    /// by `/login` when the agent lists a method), an environment variable, or its own screen.
+    NoCommand {
+        /// What to do instead, in words.
+        instructions: String,
+    },
 }
 
 /// State of the login flow
@@ -100,13 +106,20 @@ impl LoginHandler {
                         is_installed: info.is_installed,
                         login_method: LoginMethod::OAuthBrowser,
                     },
-                    // Gemini supports in-app login via external CLI passthrough
+                    // Gemini CLI has no `gemini login`: it signs in through the ACP methods it
+                    // advertises (`authenticate`), `GEMINI_API_KEY`, or Vertex AI variables.
                     AgentKind::Gemini => AgentLoginSupport::Supported {
                         agent: AgentKind::Gemini,
                         is_installed: info.is_installed,
-                        login_method: LoginMethod::ExternalCli {
-                            command: "gemini".to_string(),
-                            args: vec!["login".to_string()],
+                        login_method: LoginMethod::NoCommand {
+                            instructions: format!(
+                                "Gemini CLI has no login command. Nori signs it in through the \
+                                methods it offers over ACP (Login with Google opens your browser); \
+                                none was offered. A Gemini API key goes in {} (or set the Vertex \
+                                AI variables) where Nori starts. {}.",
+                                nori_acp_host::accounts::gemini_cli::KEY_VARIABLE,
+                                nori_acp_host::accounts::gemini_cli::PERSONAL_ACCOUNTS,
+                            ),
                         },
                     },
                     AgentKind::ClaudeCode => AgentLoginSupport::Supported {
@@ -270,8 +283,8 @@ mod tests {
     }
 
     #[test]
-    fn check_agent_support_returns_supported_for_gemini_with_external_cli() {
-        // Gemini supports in-app login via external CLI passthrough
+    fn gemini_has_no_login_command_to_run() {
+        // Gemini CLI has no `gemini login`; running one would only print "unknown command".
         let support = LoginHandler::check_agent_support("gemini");
 
         match support {
@@ -281,13 +294,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(agent, AgentKind::Gemini);
-                match login_method {
-                    LoginMethod::ExternalCli { command, args } => {
-                        assert_eq!(command, "gemini");
-                        assert_eq!(args, vec!["login".to_string()]);
-                    }
-                    _ => panic!("Expected ExternalCli login method for gemini"),
-                }
+                assert!(
+                    matches!(login_method, LoginMethod::NoCommand { .. }),
+                    "{login_method:?}"
+                );
             }
             _ => panic!("Expected Supported variant for gemini"),
         }

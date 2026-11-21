@@ -99,6 +99,21 @@ impl LoginTerminal {
             .find_map(|row| crate::hyperlink::urls_in(row).into_iter().next())
     }
 
+    /// The last token on the program's screen that starts with `prefix` (`claude setup-token`
+    /// prints the long-lived token it makes and saves nothing).
+    pub(crate) fn find_token(&self, prefix: &str) -> Option<String> {
+        self.rows().iter().rev().find_map(|row| {
+            let start = row.rfind(prefix)?;
+            let token: String = row[start..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .collect();
+            (token.len() > prefix.len()).then_some(token)
+        })
+    }
+
     /// What the program last said, oldest first.
     pub(crate) fn last_words(&self, count: usize) -> Vec<String> {
         let mut lines: Vec<String> = self
@@ -487,5 +502,27 @@ fn color(color: vt100::Color) -> Option<Color> {
         vt100::Color::Default => None,
         vt100::Color::Idx(index) => Some(Color::Indexed(index)),
         vt100::Color::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::LoginTerminal;
+
+    #[test]
+    fn finds_setup_token_and_rejects_bare_prefix() {
+        let mut terminal = LoginTerminal::new("Claude Code".to_owned());
+        terminal.feed(b"Finished signing in.\r\nsk-ant-oat01-secret-token\r\n");
+
+        assert_eq!(
+            terminal.find_token("sk-ant-oat").as_deref(),
+            Some("sk-ant-oat01-secret-token")
+        );
+
+        let mut terminal = LoginTerminal::new("Claude Code".to_owned());
+        terminal.feed(b"No token: sk-ant-oat\r\n");
+        assert_eq!(terminal.find_token("sk-ant-oat"), None);
     }
 }
