@@ -350,7 +350,6 @@ opt-level = 0
 incremental = false
 
 [patch.crates-io]
-v8 = { path = "../vendor/rusty-v8" }
 # modalkit is vendored (see ../vendor/modalkit/NORI.md): the prompt editor is built on it.
 modalkit = { path = "../vendor/modalkit/crates/modalkit" }
 keybindings = { path = "../vendor/modalkit/crates/keybindings" }
