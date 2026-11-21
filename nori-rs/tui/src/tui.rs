@@ -79,6 +79,8 @@ fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
 /// Restore the terminal to its original state.
 /// Inverse of `set_modes`.
 pub fn restore() -> Result<()> {
+    // Whatever this process told the terminal it is doing stops being true here.
+    crate::terminal_status::retract_now();
     // Pop may fail on platforms that didn't support the push; ignore errors.
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     execute!(stdout(), DisableBracketedPaste)?;
@@ -121,6 +123,8 @@ pub fn init() -> Result<Terminal> {
     }
     set_modes()?;
     crate::startup_trace::mark("terminal_modes");
+    crate::terminal_status::init();
+    crate::startup_trace::mark("terminal_status");
 
     set_panic_hook();
 
@@ -255,6 +259,13 @@ impl Tui {
             mouse_capture: false,
             cursor_style: None,
             backdrop: Backdrop::default(),
+        }
+    }
+
+    /// Send the terminal status reports that are waiting, when no frame is about to carry them.
+    pub(crate) fn flush_status(&mut self) {
+        if crate::terminal_status::has_pending() {
+            let _ = std::io::Write::flush(self.terminal.backend_mut().writer_mut());
         }
     }
 

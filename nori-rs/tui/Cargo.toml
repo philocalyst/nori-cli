@@ -44,6 +44,8 @@ nori-config = { workspace = true }
 nori-pkl = { workspace = true }
 nori-bash = { workspace = true }
 nori-host-tools = { workspace = true }
+nori-machines = { workspace = true }
+nori-rex = { workspace = true }
 codex-ansi-escape = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-common = { workspace = true, features = [

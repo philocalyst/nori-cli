@@ -86,6 +86,12 @@ impl FrameWriter {
     }
 
     fn commit(&mut self) -> io::Result<()> {
+        // Terminal status reports ride in front of the frame, in the same write, so that they
+        // can never land inside one.
+        let status = crate::terminal_status::take_pending();
+        if !status.is_empty() {
+            self.buffer.splice(0..0, status);
+        }
         if self.buffer.is_empty() {
             return Ok(());
         }

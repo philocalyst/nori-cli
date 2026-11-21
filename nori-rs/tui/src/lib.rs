@@ -90,6 +90,7 @@ mod style;
 mod subagent_switcher;
 mod system_info;
 mod terminal_palette;
+mod terminal_status;
 mod terminal_title;
 mod text_formatting;
 mod transcript_cells;

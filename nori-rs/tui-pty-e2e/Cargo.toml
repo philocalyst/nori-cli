@@ -16,6 +16,7 @@ owo-colors = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+base64 = { workspace = true }
 nori-conversation = { workspace = true }
 tempfile = "3"
 regex = "1"

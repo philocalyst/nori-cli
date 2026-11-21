@@ -331,6 +331,7 @@ impl App {
         chat_widget.maybe_prompt_windows_sandbox_enable();
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        crate::terminal_status::rex_links::follow(app_event_tx.clone());
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
@@ -543,9 +544,12 @@ impl App {
                     app.handle_tui_event_batched(tui, &mut app_event_rx, event).await?
                 }
             }
-        {}
+        {
+            app.sync_program_status(tui);
+        }
 
         app.program_status.clear();
+        tui.flush_status();
         app.cancel_primary_agent_preparation();
         app.prepared_agent_initial_context = None;
         app.discard_candidate();
