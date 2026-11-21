@@ -8,9 +8,13 @@ use nori_workflow::CommitAgent;
 use nori_workflow::CommitBatch;
 use nori_workflow::CommitRules;
 use nori_workflow::CommitStyle;
+use nori_workflow::CompactionOverride;
 use nori_workflow::FallbackOverride;
+use nori_workflow::GoalsOverride;
 use nori_workflow::Hook;
 use nori_workflow::HookEvent;
+use nori_workflow::LoopAction;
+use nori_workflow::LoopOverride;
 use nori_workflow::PrRules;
 use nori_workflow::RecoveryLayer;
 use nori_workflow::RecoveryOverride;
@@ -21,6 +25,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 
 use crate::Error;
+use crate::recovery::DurationValue;
 use crate::recovery::RecoveryLayerBlock;
 
 pub fn global_policy_path(home: &Path) -> PathBuf {
@@ -39,6 +44,9 @@ struct Policy {
     fallback_ranked: Option<bool>,
     fallback_models: Option<Vec<String>>,
     recovery: Option<RecoveryLayerBlock>,
+    compaction: Option<PolicyCompaction>,
+    loops: Option<PolicyLoops>,
+    goals: Option<PolicyGoals>,
     instructions: Option<Vec<String>>,
     hooks: Option<Vec<PolicyHook>>,
     commit: Option<PolicyCommit>,
@@ -63,6 +71,41 @@ struct PolicyTools {
     disabled: Option<Vec<String>>,
     descriptions: Option<std::collections::BTreeMap<String, String>>,
     instructions: Option<Vec<String>>,
+}
+
+/// The `compaction` block: every field optional, so a layer states only what it changes.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PolicyCompaction {
+    auto: Option<bool>,
+    trigger_free_fraction: Option<f64>,
+    trigger_free_tokens: Option<i64>,
+    background_margin_tokens: Option<i64>,
+    shrink_ladder: Option<Vec<f64>>,
+    prefer_native: Option<bool>,
+}
+
+/// The `loops` block: every field optional, so a layer states only what it changes.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PolicyLoops {
+    window: Option<i64>,
+    repeats: Option<i64>,
+    action: Option<String>,
+}
+
+/// The `goals` block: every field optional, so a layer states only what it changes. The agent and
+/// model are nullable, so a layer can set them back to the session's own and the agent's default.
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PolicyGoals {
+    judge: Option<bool>,
+    #[serde(deserialize_with = "deserialize_present_nullable")]
+    judge_agent: Option<Option<String>>,
+    #[serde(deserialize_with = "deserialize_present_nullable")]
+    judge_model: Option<Option<String>>,
+    judge_timeout: Option<DurationValue>,
+    max_disagreements: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +236,62 @@ impl Policy {
                 .to_layer()
                 .map_err(|message| Error::Invalid(format!("recovery: {message}")))?;
             workflow.recovery.apply(layer);
+        }
+        if let Some(compaction) = self.compaction {
+            CompactionOverride {
+                auto: compaction.auto,
+                trigger_free_fraction: compaction.trigger_free_fraction,
+                trigger_free_tokens: compaction.trigger_free_tokens,
+                background_margin_tokens: compaction.background_margin_tokens,
+                shrink_ladder: compaction.shrink_ladder,
+                prefer_native: compaction.prefer_native,
+            }
+            .apply(&mut workflow.compaction);
+            workflow
+                .compaction
+                .validate()
+                .map_err(|message| Error::Invalid(format!("compaction: {message}")))?;
+        }
+        if let Some(loops) = self.loops {
+            let action = loops
+                .action
+                .map(|name| {
+                    LoopAction::parse(&name).ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "loops: unknown action {name:?}, expected nudge_then_stop, nudge, stop or off"
+                        ))
+                    })
+                })
+                .transpose()?;
+            LoopOverride {
+                window: loops.window,
+                repeats: loops.repeats,
+                action,
+            }
+            .apply(&mut workflow.loops);
+            workflow
+                .loops
+                .validate()
+                .map_err(|message| Error::Invalid(format!("loops: {message}")))?;
+        }
+        if let Some(goals) = self.goals {
+            GoalsOverride {
+                judge: goals.judge,
+                judge_agent: goals.judge_agent,
+                judge_model: goals.judge_model,
+                judge_timeout: goals
+                    .judge_timeout
+                    .as_ref()
+                    .map(DurationValue::to_duration)
+                    .transpose()
+                    .map_err(|message| Error::Invalid(format!("goals.judge_timeout: {message}")))?,
+                max_disagreements: goals.max_disagreements,
+            }
+            .apply(&mut workflow.goals);
+            workflow
+                .goals
+                .validate()
+                .map_err(|message| Error::Invalid(format!("goals: {message}")))?;
         }
         if let Some(tools) = self.tools {
             let selection = workflow.tools.get_or_insert_with(Default::default);
@@ -399,6 +498,174 @@ mod tests {
         assert_eq!(cleared.commit_reviewer, None);
     }
     #[test]
+    fn compaction_layers_field_by_field_over_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("init.pkl");
+        let project = dir.path().join("project.pkl");
+        std::fs::write(
+            &global,
+            r#"compaction = new Dynamic {
+          trigger_free_fraction = 0.25
+          shrink_ladder = List(0.9, 0.4)
+          prefer_native = false
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"compaction = new Dynamic { auto = false; trigger_free_tokens = 4000 }"#,
+        )
+        .unwrap();
+        let policy = load_policy(Some(&global), Some(&project)).unwrap();
+        assert_eq!(
+            policy.compaction,
+            nori_workflow::CompactionPolicy {
+                auto: false,
+                trigger_free_fraction: 0.25,
+                trigger_free_tokens: 4000,
+                background_margin_tokens: 12_000,
+                shrink_ladder: vec![0.9, 0.4],
+                prefer_native: false,
+            }
+        );
+        assert_eq!(policy.loops, nori_workflow::LoopPolicy::default());
+    }
+
+    #[test]
+    fn loops_layer_field_by_field_and_validate_the_merged_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("init.pkl");
+        let project = dir.path().join("project.pkl");
+        std::fs::write(
+            &global,
+            r#"loops = new Dynamic { window = 20; action = "nudge" }"#,
+        )
+        .unwrap();
+        std::fs::write(&project, r#"loops = new Dynamic { repeats = 8 }"#).unwrap();
+        let policy = load_policy(Some(&global), Some(&project)).unwrap();
+        assert_eq!(
+            policy.loops,
+            nori_workflow::LoopPolicy {
+                window: 20,
+                repeats: 8,
+                action: LoopAction::Nudge,
+            }
+        );
+
+        // Each layer is fine alone, but the merged result (window 4, repeats 5 from the
+        // defaults... here 5 is still the built-in value) could never find a loop.
+        std::fs::write(&global, "name = \"plain\"").unwrap();
+        std::fs::write(&project, r#"loops = new Dynamic { window = 4 }"#).unwrap();
+        let error = load_policy(Some(&global), Some(&project)).unwrap_err();
+        assert!(error.to_string().contains("repeats"), "{error}");
+    }
+
+    #[test]
+    fn goals_layer_field_by_field_and_null_resets_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("init.pkl");
+        let project = dir.path().join("project.pkl");
+        std::fs::write(
+            &global,
+            r#"goals = new Dynamic {
+          judge_agent = "codex"
+          judge_model = "mini"
+          judge_timeout = 2.min
+          max_disagreements = 5
+        }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"goals = new Dynamic { judge_model = null; judge_timeout = 30 }"#,
+        )
+        .unwrap();
+        let policy = load_policy(Some(&global), Some(&project)).unwrap();
+        assert_eq!(
+            policy.goals,
+            nori_workflow::GoalsPolicy {
+                judge: true,
+                judge_agent: Some("codex".into()),
+                judge_model: None,
+                judge_timeout: std::time::Duration::from_secs(30),
+                max_disagreements: 5,
+            }
+        );
+
+        std::fs::write(&project, r#"goals = new Dynamic { judge = false }"#).unwrap();
+        let policy = load_policy(Some(&global), Some(&project)).unwrap();
+        assert_eq!(
+            policy.goals,
+            nori_workflow::GoalsPolicy {
+                judge: false,
+                judge_agent: Some("codex".into()),
+                judge_model: Some("mini".into()),
+                judge_timeout: std::time::Duration::from_secs(120),
+                max_disagreements: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn bad_goal_values_are_policy_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.pkl");
+        for (source, expected) in [
+            (
+                r#"goals = new Dynamic { max_disagreements = 0 }"#,
+                "max_disagreements",
+            ),
+            (
+                r#"goals = new Dynamic { judge_timeout = 0.s }"#,
+                "judge_timeout",
+            ),
+            (
+                r#"goals = new Dynamic { judge_timeout = 2.h }"#,
+                "judge_timeout",
+            ),
+            (
+                r#"goals = new Dynamic { judge_agent = " " }"#,
+                "judge_agent",
+            ),
+            (r#"goals = new Dynamic { mystery = 1 }"#, "mystery"),
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let error = load_policy(Some(&path), None).unwrap_err().to_string();
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn bad_compaction_and_loop_values_are_policy_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.pkl");
+        for (source, expected) in [
+            (
+                r#"compaction = new Dynamic { trigger_free_fraction = 2.0 }"#,
+                "trigger_free_fraction",
+            ),
+            (
+                r#"compaction = new Dynamic { shrink_ladder = List(0.5, 0.6) }"#,
+                "shrink_ladder",
+            ),
+            (r#"compaction = new Dynamic { mystery = 1 }"#, "mystery"),
+            (
+                r#"loops = new Dynamic { action = "panic" }"#,
+                "unknown action",
+            ),
+            (
+                r#"loops = new Dynamic { window = 3; repeats = 3 }"#,
+                "repeats",
+            ),
+            (r#"loops = new Dynamic { window = 0 }"#, "window"),
+        ] {
+            std::fs::write(&path, source).unwrap();
+            let error = load_policy(Some(&path), None).unwrap_err().to_string();
+            assert!(error.contains(expected), "{source}: {error}");
+        }
+    }
+
+    #[test]
     fn supplied_machine_snapshot_is_available_to_pkl() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("init.pkl");
@@ -448,6 +715,26 @@ mod tests {
         evaluated.recovery.base.retry.max_attempts = -1;
         evaluated.recovery.base.fallback.ranked = false;
         evaluated.recovery.base.fallback.prefer_headroom = false;
+        evaluated.compaction = nori_workflow::CompactionPolicy {
+            auto: false,
+            trigger_free_fraction: 0.5,
+            trigger_free_tokens: 1,
+            background_margin_tokens: 1,
+            shrink_ladder: Vec::new(),
+            prefer_native: false,
+        };
+        evaluated.loops = nori_workflow::LoopPolicy {
+            window: 2,
+            repeats: 1,
+            action: LoopAction::Off,
+        };
+        evaluated.goals = nori_workflow::GoalsPolicy {
+            judge: false,
+            judge_agent: Some("stale".into()),
+            judge_model: Some("stale".into()),
+            judge_timeout: std::time::Duration::from_secs(1),
+            max_disagreements: 99,
+        };
         policy.apply(&mut evaluated).unwrap();
         assert_eq!(builtin_policy(), &evaluated);
         let other = std::thread::spawn(builtin_policy).join().unwrap();

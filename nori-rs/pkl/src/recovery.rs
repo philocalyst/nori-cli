@@ -90,6 +90,12 @@ impl<'de> Deserialize<'de> for RouteBlock {
                 model: Option<String>,
                 #[serde(default)]
                 options: BTreeMap<String, String>,
+                /// The typed spelling of `options["model_mode"]`.
+                #[serde(default)]
+                model_mode: Option<String>,
+                /// The typed spelling of `options["effort"]`.
+                #[serde(default)]
+                effort: Option<String>,
             },
         }
         let route = match Raw::deserialize(deserializer)? {
@@ -108,12 +114,23 @@ impl<'de> Deserialize<'de> for RouteBlock {
             Raw::Fields {
                 agent,
                 model,
-                options,
-            } => Self {
-                agent,
-                model,
-                options,
-            },
+                mut options,
+                model_mode,
+                effort,
+            } => {
+                // The typed settings are the settings `model_mode` and `effort`, which every
+                // agent's own option of that kind answers to.
+                options.extend(
+                    [("model_mode", model_mode), ("effort", effort)]
+                        .into_iter()
+                        .filter_map(|(setting, value)| Some((setting.to_owned(), value?))),
+                );
+                Self {
+                    agent,
+                    model,
+                    options,
+                }
+            }
         };
         if route.agent.is_none() && route.model.is_none() {
             return Err(serde::de::Error::custom(

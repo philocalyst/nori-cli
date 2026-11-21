@@ -50,3 +50,55 @@ recovery = new Dynamic {
   //   retry = new Dynamic { max_attempts = 2 } } }. A role override beats an agent override.
   agents = new Mapping {}
 }
+
+// When a session compacts itself, and how a refused checkpoint is cut down. Layers merge field
+// by field; a list is replaced as a whole.
+compaction = new Dynamic {
+  // Compact before the next prompt once the context nears the window's end. Compaction runs only
+  // between turns, never in the middle of one.
+  auto = true
+  // Compact when the free context is below max(trigger_free_fraction * window, trigger_free_tokens).
+  trigger_free_fraction = 0.15
+  trigger_free_tokens = 16000
+  // Prepare the summary this many tokens of free context before that point, while the provider's
+  // prompt cache is warm, so the switch is instant. 0 prepares nothing early. What happens after
+  // the summary reaches the new session as the checkpoint's verbatim recent context (15,000
+  // tokens), so a margin beyond that mostly prepares summaries that are rewritten.
+  background_margin_tokens = 12000
+  // When the provider refuses a prompt as too long, retry with the checkpoint of earlier
+  // conversation cut to each of these fractions of its size in turn.
+  shrink_ladder = List(0.85, 0.7, 0.5, 0.35)
+  // Use the agent's own /compact when it advertises one.
+  prefer_native = true
+}
+
+// What happens when the agent calls the same tool with the same input over and over.
+// A signature (tool and a hash of its input) is a loop when it fills more than `repeats` of the
+// last `window` tool calls of a turn.
+//   nudge_then_stop: steer the agent once, then cancel the turn if it loops again in the same task
+//   nudge:           steer once per task and otherwise let it go on
+//   stop:            cancel the turn at once, as Esc does
+//   off:             do not look for loops
+loops = new Dynamic {
+  window = 10
+  repeats = 5
+  action = "nudge_then_stop"
+}
+
+// Who checks that a goal is really done. An agent calls `update_goal` with `complete`; with `judge`
+// on, Nori first has a fresh reviewer with no tools read the session's transcript (tool outputs
+// are the evidence; the agent's say-so is not) and decide: done, not yet (the agent is told what
+// is missing and goes on), blocked, or paused. A reviewer that cannot run or does not answer in
+// `judge_timeout` never holds anything up: the agent's word is accepted and marked unverified.
+// Layers merge field by field; `null` sets an agent or model back to the default.
+goals = new Dynamic {
+  judge = true
+  // The agent the reviewer runs on, e.g. "claude-code". null: this session's own agent.
+  judge_agent = null
+  // The reviewer's model, e.g. "haiku". null: that agent's default model.
+  judge_model = null
+  judge_timeout = 120.s
+  // After this many "not yet" verdicts in a row for one goal, the next `complete` pauses the goal
+  // and the person decides, instead of asking the reviewer again.
+  max_disagreements = 3
+}
