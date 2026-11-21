@@ -1,0 +1,245 @@
+/// Jobs: an agent starts background jobs on the world's scripted `processes`, and is woken by what
+/// they print and how they end. Nothing real runs: each process prints its lines and ends on a
+/// script, so a test can ask what Nori does with a job that is ready, never finishes, floods,
+/// dies or does not exist.
+///
+///   * `run ready`: `boot`, ready after a second, exiting 3 a second later. Two wakes.
+///     `read boot` reads its output twice (each line once).
+///   * `run forever`: `forever`, a server that never ends; `stop forever` stops it (`job_stop`),
+///     `list jobs` lists them (`job_list`).
+///   * `run short`: `short`, exits 0 a moment after it starts.
+///   * `run flood`: `flood`, three thousand lines in three seconds; some say ERROR, which wakes the
+///     agent. `read flood` reads two small chunks. `ping` is answered whatever else is going on.
+///   * `run dying`: `crash`, a line on stderr, then exit 1.
+///   * `run nothing`: a command no process of this world matches; the job fails to start.
+///   * `run instant`: `instant`, prints its ready line the moment it starts.
+///
+///     cargo run -p nori-world --example run_world -- fake-agent/worlds/jobs.pkl "run ready"
+amends "nori:World"
+
+name = "jobs"
+description = "Background jobs on scripted processes: ready, never finishing, flooding, dying."
+default_agent = "lead"
+
+local model = new Model { id = "fake-sonnet"; name = "Fake Sonnet 5"; context_window = 200000 }
+
+local noise = new Listing {
+  for (round in IntSeq(1, 20)) {
+    new Line { after = 150.ms; text = "ERROR round \(round) failed" }
+    for (row in IntSeq(1, 149)) {
+      new Line { text = "noise \(round).\(row) some output the agent does not need" }
+    }
+  }
+}
+
+processes {
+  new Process {
+    command = "^boot-service"
+    output {
+      new Line { text = "booting" }
+      new Line { after = 1.s; text = "READY" }
+    }
+    exit = 3
+    linger = 1.s
+  }
+  new Process {
+    command = "^serve-forever"
+    output {
+      new Line { text = "listening on :8080" }
+    }
+    exit = null
+  }
+  new Process {
+    command = "^short-lived"
+    output {
+      new Line { text = "one quick task" }
+    }
+    linger = 1500.ms
+  }
+  new Process {
+    command = "^flood-logs"
+    output = noise
+    exit = 0
+  }
+  new Process {
+    command = "^crashing-service"
+    output {
+      new Line { text = "starting up" }
+      new Line { after = 100.ms; text = "fatal: the database is gone"; stream = "stderr" }
+    }
+    linger = 100.ms
+    exit = 1
+  }
+  new Process {
+    command = "^instant-ready"
+    output {
+      new Line { text = "READY" }
+    }
+    exit = 0
+    linger = 1.s
+  }
+}
+
+agents {
+  ["lead"] {
+    title = "Lead"
+    models { model }
+    scenes {
+      // What a job says reaches the agent as a new turn, whose prompt is the `<monitor_events>`.
+      new Scene {
+        name = "woken"
+        on = new Matching { pattern = "monitor_events" }
+        steps { new Say { text = "A job woke me:\n{{prompt}}\n" } }
+      }
+      new Scene {
+        name = "ping"
+        on = new Matching { pattern = "^ping$" }
+        steps { new Say { text = "pong" } }
+      }
+      new Scene {
+        name = "run ready"
+        on = new Matching { pattern = "^run ready$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Boot the service"
+            arguments = new Dynamic {
+              ["label"] = "boot"
+              ["command"] = "boot-service --port 8080"
+              ["ready"] = "READY"
+            }
+          }
+          new Say { text = "The service is booting in a job; ending my turn.\n" }
+        }
+      }
+      new Scene {
+        name = "read boot"
+        on = new Matching { pattern = "^read boot$" }
+        steps {
+          new HostTool { name = "job_read"; title = "Read the boot output"; arguments = new Dynamic { ["job"] = "boot"; ["from"] = "new" } }
+          new HostTool { name = "job_read"; title = "Read it again"; arguments = new Dynamic { ["job"] = "boot"; ["from"] = "new" } }
+          new Say { text = "Read the job twice.\n" }
+        }
+      }
+      new Scene {
+        name = "run forever"
+        on = new Matching { pattern = "^run forever$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Start the server"
+            arguments = new Dynamic {
+              ["label"] = "forever"
+              ["command"] = "serve-forever"
+            }
+          }
+          new Say { text = "The server runs in a job.\n" }
+        }
+      }
+      new Scene {
+        name = "stop forever"
+        on = new Matching { pattern = "^stop forever$" }
+        steps {
+          new HostTool { name = "job_stop"; title = "Stop the server"; arguments = new Dynamic { ["job"] = "forever" } }
+          new Say { text = "Stopped it.\n" }
+        }
+      }
+      new Scene {
+        name = "list jobs"
+        on = new Matching { pattern = "^list jobs$" }
+        steps {
+          new HostTool { name = "job_list"; title = "List the jobs" }
+          new Say { text = "Listed.\n" }
+        }
+      }
+      new Scene {
+        name = "run short"
+        on = new Matching { pattern = "^run short$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Run the short task"
+            arguments = new Dynamic {
+              ["label"] = "short"
+              ["command"] = "short-lived"
+              ["wake_on_exit"] = false
+            }
+          }
+          new Say { text = "The task runs in a job.\n" }
+        }
+      }
+      new Scene {
+        name = "run flood"
+        on = new Matching { pattern = "^run flood$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Tail the noisy log"
+            arguments = new Dynamic {
+              ["label"] = "flood"
+              ["command"] = "flood-logs"
+              ["wake_on_output"] = "ERROR"
+            }
+          }
+          new Say { text = "Tailing the log; ending my turn.\n" }
+        }
+      }
+      new Scene {
+        name = "read flood"
+        on = new Matching { pattern = "^read flood$" }
+        steps {
+          new HostTool { name = "job_read"; title = "Read a little"; arguments = new Dynamic { ["job"] = "flood"; ["from"] = "start"; ["max_bytes"] = 8192 } }
+          new HostTool { name = "job_read"; title = "Read a little more"; arguments = new Dynamic { ["job"] = "flood"; ["from"] = "new"; ["max_bytes"] = 8192 } }
+          new Say { text = "Read two chunks.\n" }
+        }
+      }
+      new Scene {
+        name = "run dying"
+        on = new Matching { pattern = "^run dying$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Start the service"
+            arguments = new Dynamic {
+              ["label"] = "crash"
+              ["command"] = "crashing-service"
+            }
+          }
+          new Say { text = "Started it; ending my turn.\n" }
+        }
+      }
+      new Scene {
+        name = "run nothing"
+        on = new Matching { pattern = "^run nothing$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Run what this world cannot"
+            arguments = new Dynamic { ["command"] = "unknown-program --flag" }
+            expect_error = true
+          }
+          new Say { text = "It did not start.\n" }
+        }
+      }
+      new Scene {
+        name = "run instant"
+        on = new Matching { pattern = "^run instant$" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Start the quick service"
+            arguments = new Dynamic {
+              ["label"] = "instant"
+              ["command"] = "instant-ready"
+              ["ready"] = "READY"
+            }
+          }
+          new Say { text = "Started it; ending my turn.\n" }
+        }
+      }
+      new Scene {
+        steps { new Say { text = "Nothing to run for that.\n" } }
+      }
+    }
+  }
+}
