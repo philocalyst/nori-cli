@@ -67,10 +67,15 @@ pub(super) fn tool_snapshot_from_tool_call(
     let invocation =
         nori_invocation(tool_call).or_else(|| invocation_from_tool_call(tool_call, &artifacts));
 
+    // Nori's own shell runs commands, whatever kind the agent that called it gave the call.
+    let kind = match nori_host_tools::host_tool_of(tool_call.meta.as_ref()) {
+        Some(HOST_SHELL) => ToolKind::Execute,
+        Some(_) | None => ToolKind::from_acp(tool_call.kind),
+    };
     ToolSnapshot {
         call_id: tool_call.tool_call_id.to_string(),
         title: sanitize_title(&tool_call.title),
-        kind: refine_edit_kind(ToolKind::from_acp(tool_call.kind), &tool_call.raw_input),
+        kind: refine_edit_kind(kind, &tool_call.raw_input),
         phase,
         locations: tool_call
             .locations
@@ -88,11 +93,20 @@ pub(super) fn tool_snapshot_from_tool_call(
     }
 }
 
+/// The host tool that runs shell commands.
+const HOST_SHELL: &str = "bash";
+
 /// A call to one of Nori's own tools: named in its `_meta` by an agent built into Nori, or
 /// recognized from its title when it came through the `nori-client` MCP server.
 pub(super) fn nori_invocation(tool_call: &acp::ToolCall) -> Option<Invocation> {
     let input = tool_call.raw_input.as_ref();
     if let Some(tool) = nori_host_tools::host_tool_of(tool_call.meta.as_ref()) {
+        // Nori's shell: the command it ran, shown the way every command is.
+        if tool == HOST_SHELL {
+            return input
+                .and_then(extract_command)
+                .map(|command| Invocation::Command { command });
+        }
         return DelegationCall::from_tool(tool, input)
             .map(Invocation::Delegation)
             .or_else(|| NativeCall::from_tool(tool, input).map(Invocation::Native));
