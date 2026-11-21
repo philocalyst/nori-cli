@@ -756,6 +756,20 @@ impl AcpBackend {
                 }
             }
         }
+        let policy = workflow.lock().await;
+        session_driver_state.set_policy(policy.loops, policy.compaction.clone());
+        drop(policy);
+        session_driver_state.absorb_setup(
+            initial_setup_events
+                .iter()
+                .chain(&deferred_setup_session_events)
+                .filter_map(|event| match event {
+                    SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
+                        acp::AgentNotification::SessionNotification(notification),
+                    )) => Some(&notification.update),
+                    SessionEvent::Acp(_) | SessionEvent::Nori(_) => None,
+                }),
+        );
         let mut fresh_subagent_events = initial_setup_events
             .iter()
             .chain(&deferred_setup_session_events)

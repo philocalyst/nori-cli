@@ -51,10 +51,14 @@ pub(super) fn inject_default_model(
     }
 }
 
+/// What the agent announced about the session during setup, for the ledger to start with.
+type SetupFacts = Vec<acp::SessionUpdate>;
+
 async fn forward_setup_event(
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     event: crate::connection::ConnectionEvent,
     agent: &str,
+    facts: &mut SetupFacts,
 ) -> Result<bool> {
     match event {
         crate::connection::ConnectionEvent::Acp(event) => {
@@ -62,9 +66,12 @@ async fn forward_setup_event(
             forward_public_acp_event(backend_event_tx, *event).await?;
             Ok(is_response)
         }
-        // The public ACP notification immediately precedes this private
-        // reducer projection. Reducer processing starts after setup.
-        crate::connection::ConnectionEvent::SessionUpdate(_) => Ok(false),
+        // The public ACP notification immediately precedes this private reducer projection.
+        // Reducer processing starts after setup, knowing the session facts announced here.
+        crate::connection::ConnectionEvent::SessionUpdate(update) => {
+            facts.push(update);
+            Ok(false)
+        }
         crate::connection::ConnectionEvent::Subagent(wire) => {
             forward_public_session_events(
                 backend_event_tx,
@@ -103,13 +110,14 @@ async fn forward_setup_events_through_response(
     event_rx: &mut mpsc::Receiver<crate::connection::ConnectionEvent>,
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     agent: &str,
+    facts: &mut SetupFacts,
 ) -> Result<()> {
     loop {
         let event = event_rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("ACP bootstrap event stream closed"))?;
-        if forward_setup_event(backend_event_tx, event, agent).await? {
+        if forward_setup_event(backend_event_tx, event, agent, facts).await? {
             return Ok(());
         }
     }
@@ -119,9 +127,10 @@ async fn forward_available_setup_events(
     event_rx: &mut mpsc::Receiver<crate::connection::ConnectionEvent>,
     backend_event_tx: &mpsc::Sender<BackendEvent>,
     agent: &str,
+    facts: &mut SetupFacts,
 ) -> Result<()> {
     while let Ok(event) = event_rx.try_recv() {
-        forward_setup_event(backend_event_tx, event, agent).await?;
+        forward_setup_event(backend_event_tx, event, agent, facts).await?;
     }
     Ok(())
 }
@@ -223,9 +232,14 @@ impl AcpBackend {
         if let Some(servers) = prewarm_servers {
             prewarm::others(config.agent.clone(), cwd.clone(), &servers);
         }
-        let setup_forward_result =
-            forward_setup_events_through_response(&mut event_rx, &backend_event_tx, &config.agent)
-                .await;
+        let mut setup_facts = SetupFacts::new();
+        let setup_forward_result = forward_setup_events_through_response(
+            &mut event_rx,
+            &backend_event_tx,
+            &config.agent,
+            &mut setup_facts,
+        )
+        .await;
         let session_id = match session_result {
             Ok(id) => {
                 setup_forward_result?;
@@ -245,7 +259,13 @@ impl AcpBackend {
         if let Some(ref default_model) = config.default_model {
             session_defaults::apply_default_model(&connection, &session_id, default_model).await;
         }
-        forward_available_setup_events(&mut event_rx, &backend_event_tx, &config.agent).await?;
+        forward_available_setup_events(
+            &mut event_rx,
+            &backend_event_tx,
+            &config.agent,
+            &mut setup_facts,
+        )
+        .await?;
 
         let capabilities_update = nori_client_mcp::capabilities_update_for_session(
             &connection,
@@ -259,7 +279,12 @@ impl AcpBackend {
 
         let connection = Arc::new(connection);
         let pending_approvals = Arc::new(Mutex::new(Vec::new()));
-        let session_driver = Arc::new(Mutex::new(session_runtime_driver::SessionDriver::new()));
+        let mut session_driver = session_runtime_driver::SessionDriver::new();
+        let policy = workflow.lock().await;
+        session_driver.set_policy(policy.loops, policy.compaction.clone());
+        drop(policy);
+        session_driver.absorb_setup(&setup_facts);
+        let session_driver = Arc::new(Mutex::new(session_driver));
         let (session_event_tx, session_event_rx) = mpsc::channel(128);
         let (prompt_result_tx, prompt_result_rx) = mpsc::channel(128);
         let use_native_notifications =

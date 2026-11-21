@@ -550,9 +550,11 @@ message, within about 15,000 tokens at four characters a token, the newest
 always kept whole, tool outputs cut to 1,250 characters, and the compaction
 exchange itself left out. Fork context and a resume's summary use the same
 block without the recent context. The summary is reprinted in the new
-session's first message, so its headings show what was kept. Compaction runs
-only when the user asks for it: Nori does not yet compact automatically when
-usage nears the context window, nor retry a prompt that overflowed it.
+session's first message, so its headings show what was kept. Automatic compaction
+uses the workflow policy: it prepares a summary while context approaches the
+trigger, then compacts at rest or before the next prompt when the trigger is reached.
+A failed automatic compaction backs off for that session until the user runs `/compact`.
+A prompt refused as too long is retried with progressively shorter checkpoints.
 
 The session-replacement machinery is shared in
 `harness/src/backend/session_swap.rs`. `swap_active_session(SessionSwapMode)`
