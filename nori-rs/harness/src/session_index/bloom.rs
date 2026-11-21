@@ -5,18 +5,30 @@
 //! three or more characters can occur only if every one of its trigrams is present, so a miss
 //! is certain and a hit is verified against the text. Words shorter than a trigram are not
 //! answered by the filter at all (see [`Bloom::may_contain`]).
+//!
+//! A filter grows with its session without being written again: new trigrams set bits, and only
+//! the bytes those bits fall in are patched in the file ([`Bloom::patch_file`]). A filter that
+//! fills up is built again, larger, from the text; each doubling happens after the session
+//! doubled its distinct trigrams, so the cost of building again per appended byte stays constant.
 
 const HASHES: u32 = 2;
 /// Bits allotted per distinct trigram; more bits, fewer false candidates.
 const BITS_PER_TRIGRAM: usize = 12;
 const MIN_LOG2: u8 = 13;
 const MAX_LOG2: u8 = 24;
+/// A filter with more than this share of its bits set (in percent) is built again, larger.
+const CROWDED_PERCENT: usize = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bloom {
     log2: u8,
     bits: Vec<u8>,
+    /// How many bits are set.
+    ones: usize,
 }
+
+/// The bytes of a filter that new text set bits in, with the bits set: what to patch in its file.
+pub(super) type Patch = std::collections::BTreeMap<usize, u8>;
 
 fn trigram_hash(a: char, b: char, c: char) -> u32 {
     let mix = |value: char, rotate: u32, factor: u32| {
@@ -52,11 +64,56 @@ impl Bloom {
         let mut bloom = Self {
             log2,
             bits: vec![0; 1 << (log2 - 3)],
+            ones: 0,
         };
+        let mut unused = Patch::new();
         for hash in distinct {
-            bloom.insert(hash);
+            bloom.insert(hash, &mut unused);
         }
         bloom
+    }
+
+    /// Add the trigrams of `text`, recording in `patch` which bytes changed.
+    pub(super) fn add(&mut self, text: &str, patch: &mut Patch) {
+        for hash in trigrams(text) {
+            self.insert(hash, patch);
+        }
+    }
+
+    /// Whether the filter is too full to answer well and should be built again, larger.
+    pub(super) fn crowded(&self) -> bool {
+        self.log2 < MAX_LOG2 && self.ones * 100 > (1usize << self.log2) * CROWDED_PERCENT
+    }
+
+    /// Bring the filter's file up to date with `patch`, which was recorded while adding to the
+    /// filter this file holds: each changed byte is read, or-ed and written back, so nothing else
+    /// is rewritten.
+    pub(super) fn patch_file(&self, path: &std::path::Path, patch: &Patch) -> std::io::Result<()> {
+        use std::io::Read;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let mut header = [0u8; 1];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut header)?;
+        if header[0] != self.log2 {
+            return Err(std::io::Error::other("bloom file has another size"));
+        }
+        for (&at, &mask) in patch {
+            let offset = u64::try_from(at + 1).map_err(std::io::Error::other)?;
+            let mut byte = [0u8; 1];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut byte)?;
+            byte[0] |= mask;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&byte)?;
+        }
+        Ok(())
     }
 
     fn positions(&self, hash: u32) -> [usize; HASHES as usize] {
@@ -65,9 +122,14 @@ impl Bloom {
         [hash as usize & mask, second as usize & mask]
     }
 
-    fn insert(&mut self, hash: u32) {
+    fn insert(&mut self, hash: u32, patch: &mut Patch) {
         for bit in self.positions(hash) {
-            self.bits[bit >> 3] |= 1 << (bit & 7);
+            let mask = 1 << (bit & 7);
+            if self.bits[bit >> 3] & mask == 0 {
+                self.bits[bit >> 3] |= mask;
+                self.ones += 1;
+                *patch.entry(bit >> 3).or_default() |= mask;
+            }
         }
     }
 
@@ -94,6 +156,10 @@ impl Bloom {
         let (&log2, bits) = bytes.split_first()?;
         ((MIN_LOG2..=MAX_LOG2).contains(&log2) && bits.len() == 1 << (log2 - 3)).then(|| Self {
             log2,
+            ones: bits
+                .iter()
+                .map(|byte| usize::try_from(byte.count_ones()).unwrap_or(0))
+                .sum(),
             bits: bits.to_vec(),
         })
     }

@@ -6,7 +6,6 @@ use super::Catalog;
 use super::CatalogEntry;
 use super::digest::DigestTurn;
 use super::digest::TurnRole;
-use super::digest::digest_path;
 use super::digest::read_digest;
 
 /// Words shorter than this are not searched on disk; the picker's in-memory fields cover them.
@@ -149,8 +148,8 @@ pub(super) fn run(
                     .iter()
                     .filter_map(|entry| {
                         let header = &entry.header;
-                        let path = digest_path(root, &header.project_id, &header.session_id);
-                        let digest = read_digest(&path).ok()?;
+                        let digest =
+                            read_digest(root, &header.project_id, &header.session_id).ok()?;
                         score(
                             &digest.turns,
                             prepared,

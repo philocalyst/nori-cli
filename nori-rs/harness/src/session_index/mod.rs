@@ -2,22 +2,28 @@
 //!
 //! A raw transcript is mostly protocol traffic; the index keeps what a person remembers: what
 //! was asked, what was answered, which tools ran with which commands and files. Per session it
-//! stores a digest (`.nidx`, merged turns) and a trigram bloom filter (`.tri`). A search loads
+//! stores a digest (merged turns and a header; see [`digest`]) and a trigram bloom filter. A search loads
 //! the small filters of all sessions, prunes with them, and reads only the digests that might
 //! match, so the cost follows the candidates, not the size of the history. The same digest
 //! feeds the resume picker's preview, so opening a session's preview never re-parses a raw
 //! transcript of tens of megabytes.
 //!
 //! Nothing here blocks the UI: every entry point is either `async` or meant for
-//! `spawn_blocking`. Updates are incremental: a session is re-digested only when its
-//! transcript's length or modification time differs from the stamp in its digest, which makes
-//! "update on open" cheap and "update on session end" ([`SessionIndex::sync_after_session`])
-//! exact. Digests whose transcript was deleted are removed by [`SessionIndex::sync_all`].
+//! `spawn_blocking`. Updates are incremental: a session's records only grow at the end, and a
+//! cursor beside each digest says how far they were read (see [`cursor`]), so bringing a digest
+//! up to date reads only what was appended since, and writes only what that added: turns that
+//! became final are appended to the digest, the bloom filter is patched where new trigrams set
+//! bits, and the small cursor and header are replaced. The session a person is in is current
+//! after reading what its last turns added, however long it is, and an update on session end
+//! ([`SessionIndex::sync_after_session`]) is a few appended records. Digests whose transcript was
+//! deleted are removed by [`SessionIndex::sync_all`].
 
 mod bloom;
+mod cursor;
 mod digest;
 mod extract;
 mod lineage;
+mod listing;
 mod search;
 
 use std::collections::HashMap;
@@ -37,6 +43,8 @@ pub use digest::SessionDigest;
 pub use digest::SourceStamp;
 pub use digest::TurnRole;
 pub use lineage::Lineage;
+pub use listing::ListedSession;
+pub use listing::SessionListing;
 pub use search::MIN_TERM_CHARS;
 pub use search::SessionHit;
 pub use search::SessionSearch;
@@ -85,17 +93,34 @@ struct Inner {
     nori_home: PathBuf,
     root: PathBuf,
     catalog: RwLock<Option<Catalog>>,
+    /// One gate per session being digested: a second request for a session waits for the first
+    /// and then finds it current, instead of reading the same transcript twice at once.
+    gates: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionIndex {
+    /// The index of `nori_home`. Handles opened while another is alive share its catalog and its
+    /// per-session gates, so a picker opening while an earlier one is still indexing neither
+    /// reads every header again nor digests the same transcript twice.
     pub fn open(nori_home: &Path) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                nori_home: nori_home.to_path_buf(),
-                root: nori_home.join(INDEX_DIR).join(INDEX_VERSION_DIR),
-                catalog: RwLock::new(None),
-            }),
+        static OPEN: std::sync::LazyLock<
+            std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<Inner>>>,
+        > = std::sync::LazyLock::new(std::sync::Mutex::default);
+        let mut open = OPEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(inner) = open.get(nori_home).and_then(std::sync::Weak::upgrade) {
+            return Self { inner };
         }
+        open.retain(|_, inner| inner.strong_count() > 0);
+        let inner = Arc::new(Inner {
+            nori_home: nori_home.to_path_buf(),
+            root: nori_home.join(INDEX_DIR).join(INDEX_VERSION_DIR),
+            catalog: RwLock::new(None),
+            gates: std::sync::Mutex::default(),
+        });
+        open.insert(nori_home.to_path_buf(), Arc::downgrade(&inner));
+        Self { inner }
     }
 
     fn transcripts(&self) -> TranscriptLoader {
@@ -123,7 +148,7 @@ impl SessionIndex {
             };
             for file in files.flatten() {
                 let path = file.path();
-                if path.extension().is_none_or(|extension| extension != "nidx") {
+                if path.extension().is_none_or(|extension| extension != "nhd") {
                     continue;
                 }
                 let loaded = digest::read_header(&path)
@@ -192,53 +217,149 @@ impl SessionIndex {
 
     /// The digest of one session, if it is indexed. Blocking.
     pub fn digest(&self, project_id: &str, session_id: &str) -> Option<SessionDigest> {
-        digest::read_digest(&digest::digest_path(
-            &self.inner.root,
-            project_id,
-            session_id,
-        ))
-        .ok()
+        digest::read_digest(&self.inner.root, project_id, session_id).ok()
     }
 
-    /// Bring one session's digest up to date with its transcript. Returns whether it was
-    /// rebuilt.
+    /// Bring one session's digest up to date with its records, reading only what was appended
+    /// since the last digest. Returns whether the digest changed.
     pub async fn sync_session(&self, project_id: &str, session_id: &str) -> io::Result<bool> {
-        let loader = self.transcripts();
-        let source = source_stamp(&loader, project_id, session_id)?;
+        let gate = Arc::clone(
+            self.inner
+                .gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(session_id.to_owned())
+                .or_default(),
+        );
+        let _one_at_a_time = gate.lock().await;
         let index = self.clone();
         let (project, session) = (project_id.to_owned(), session_id.to_owned());
-        let current = tokio::task::spawn_blocking(move || {
-            index.catalog_entry(&session).is_some_and(|entry| {
-                entry.header.source == source && entry.header.project_id == project
-            })
-        })
-        .await
-        .map_err(io::Error::other)?;
-        if current {
-            return Ok(false);
-        }
-        let transcript = loader.load_transcript(project_id, session_id).await?;
-        let index = self.clone();
-        let project = project_id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let digest = extract::extract(&transcript, &project, source);
-            index.store(&digest)
-        })
-        .await
-        .map_err(io::Error::other)??;
-        Ok(true)
+        tokio::task::spawn_blocking(move || index.sync_blocking(&project, &session))
+            .await
+            .map_err(io::Error::other)?
     }
 
-    fn store(&self, digest: &SessionDigest) -> io::Result<()> {
-        let header = &digest.header;
-        let bloom = Bloom::build(digest.texts());
+    /// [`Self::sync_session`] on the calling thread, which may block.
+    fn sync_blocking(&self, project_id: &str, session_id: &str) -> io::Result<bool> {
+        let transcript = self.transcripts().session_path(project_id, session_id);
+        let (source, file) = cursor::Source::of(&transcript);
+        let metadata = std::fs::metadata(&file).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                io::Error::new(io::ErrorKind::NotFound, "transcript is gone")
+            }
+            _ => error,
+        })?;
+        let len = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+        let root = &self.inner.root;
+        let cursor_path = digest::cursor_path(root, project_id, session_id);
+        let turns_path = digest::digest_path(root, project_id, session_id);
+        let entry = self
+            .catalog_entry(session_id)
+            .filter(|entry| entry.header.project_id == project_id);
+        // The digest's stamp is where its cursor stopped: a digest read to the file's end is
+        // current without reading the cursor.
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.header.source.len == len)
+            && cursor_path.exists()
+        {
+            return Ok(false);
+        }
+        // A cursor continues a digest only when the digest it belongs to is whole: its header
+        // and filter loaded, and its turns file holds what the cursor says.
+        let turns_len = std::fs::metadata(&turns_path).map_or(0, |metadata| {
+            i64::try_from(metadata.len()).unwrap_or(i64::MAX)
+        });
+        let saved = entry
+            .as_ref()
+            .and_then(|_| cursor::Cursor::load(&cursor_path, source, len))
+            .filter(|cursor| cursor.turns_bytes <= turns_len);
+        let mut cursor = saved.unwrap_or_else(|| cursor::Cursor::start(source));
+        let before = cursor.read;
+        cursor.advance(&file)?;
+        if !cursor.restarted
+            && cursor.read == before
+            && entry
+                .as_ref()
+                .is_some_and(|entry| entry.header.source.len == before)
+        {
+            // Nothing complete was appended: a record is still being written.
+            return Ok(false);
+        }
+        let mtime_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0));
+        let stamp = SourceStamp {
+            len: cursor.read,
+            mtime_ms,
+        };
+        // A session whose metadata is not written yet has nothing to show.
+        let Some(header) = cursor.extractor.header(project_id, stamp) else {
+            return Ok(false);
+        };
+        let ready = cursor.extractor.take_ready();
+        let tail = cursor.extractor.tail_turns();
+        let previous = if cursor.restarted {
+            None
+        } else {
+            entry.map(|entry| entry.bloom.clone())
+        };
+
+        // 1. The turns that became final are appended after the ones already there.
+        let keep = if cursor.restarted {
+            0
+        } else {
+            cursor.turns_bytes
+        };
+        cursor.turns_bytes = digest::append_turns(&turns_path, keep, &ready)?;
+        // 2. The filter learns the new text.
+        let new_texts = || {
+            header
+                .branch
+                .iter()
+                .map(String::as_str)
+                .chain(ready.iter().chain(&tail).flat_map(DigestTurn::texts))
+        };
+        let bloom_path = digest::bloom_path(root, project_id, session_id);
+        let bloom = match previous {
+            Some(mut bloom) => {
+                let mut patch = bloom::Patch::new();
+                for text in new_texts() {
+                    bloom.add(text, &mut patch);
+                }
+                if bloom.crowded() {
+                    // Too full to answer well: build it again, larger, from all of the text.
+                    let mut all = digest::read_turns(&turns_path, cursor.turns_bytes)?;
+                    all.extend(tail.iter().cloned());
+                    let bloom = Bloom::build(
+                        header
+                            .branch
+                            .iter()
+                            .map(String::as_str)
+                            .chain(all.iter().flat_map(DigestTurn::texts)),
+                    );
+                    digest::write_atomically(&bloom_path, &bloom.encode())?;
+                    bloom
+                } else {
+                    if bloom.patch_file(&bloom_path, &patch).is_err() {
+                        digest::write_atomically(&bloom_path, &bloom.encode())?;
+                    }
+                    bloom
+                }
+            }
+            None => {
+                let bloom = Bloom::build(new_texts());
+                digest::write_atomically(&bloom_path, &bloom.encode())?;
+                bloom
+            }
+        };
+        // 3. The cursor, then the header, which is what makes the update visible.
+        cursor.save(&cursor_path)?;
         digest::write_atomically(
-            &digest::bloom_path(&self.inner.root, &header.project_id, &header.session_id),
-            &bloom.encode(),
-        )?;
-        digest::write_atomically(
-            &digest::digest_path(&self.inner.root, &header.project_id, &header.session_id),
-            &digest::encode(digest)?,
+            &digest::header_path(root, project_id, session_id),
+            &serde_json::to_vec(&header).map_err(io::Error::other)?,
         )?;
         self.ensure_catalog();
         if let Some(catalog) = self
@@ -250,13 +371,10 @@ impl SessionIndex {
         {
             catalog.entries.insert(
                 header.session_id.clone(),
-                Arc::new(CatalogEntry {
-                    header: header.clone(),
-                    bloom,
-                }),
+                Arc::new(CatalogEntry { header, bloom }),
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Bring every session up to date and drop digests of deleted transcripts: the sessions
@@ -268,12 +386,10 @@ impl SessionIndex {
         first: &[String],
         mut progress: impl FnMut(SyncProgress) + Send,
     ) -> io::Result<()> {
-        let loader = self.transcripts();
-        let mut sessions: Vec<SessionMetadata> = Vec::new();
-        for project in loader.list_projects().await? {
-            sessions.extend(loader.list_session_metadata(&project.id).await?);
-        }
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        // Each session's first record and nothing more: enumerating them reads the same however
+        // long the sessions grew.
+        let mut sessions: Vec<SessionMetadata> =
+            self.transcripts().list_session_heads(None).await?;
         // A stable sort on the position in `first` keeps newest-first within each group.
         sessions.sort_by_key(|session| {
             first
@@ -333,12 +449,22 @@ impl SessionIndex {
     }
 
     fn forget(&self, project_id: &str, session_id: &str) {
+        let _ = std::fs::remove_file(digest::header_path(
+            &self.inner.root,
+            project_id,
+            session_id,
+        ));
         let _ = std::fs::remove_file(digest::digest_path(
             &self.inner.root,
             project_id,
             session_id,
         ));
         let _ = std::fs::remove_file(digest::bloom_path(&self.inner.root, project_id, session_id));
+        let _ = std::fs::remove_file(digest::cursor_path(
+            &self.inner.root,
+            project_id,
+            session_id,
+        ));
         if let Some(catalog) = self
             .inner
             .catalog
@@ -351,9 +477,11 @@ impl SessionIndex {
     }
 
     /// Update the index for the session whose transcript is at `transcript_path`, after the
-    /// session ended. Does nothing when the path is not under a `$NORI_HOME` layout. Spawns
-    /// onto the current runtime; failures are logged, never raised.
-    pub fn sync_after_session(transcript_path: &Path) {
+    /// session ended, and wait for it for at most `budget`: a process that is about to exit
+    /// has no runtime left to finish it in the background, and the next picker should find the
+    /// session titled. Does nothing when the path is not under a `$NORI_HOME` layout. Failures
+    /// are logged, never raised.
+    pub async fn sync_after_session(transcript_path: &Path, budget: std::time::Duration) {
         // <home>/transcripts/by-project/<project>/sessions/<session>.jsonl
         let mut ancestors = transcript_path.ancestors();
         let Some(session_id) = transcript_path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -367,49 +495,18 @@ impl SessionIndex {
         let (Some(project_id), Some(nori_home)) = (project_id, nori_home) else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
         let index = Self::open(nori_home);
-        let (project_id, session_id) = (project_id.to_owned(), session_id.to_owned());
-        runtime.spawn(async move {
-            if let Err(error) = index.sync_session(&project_id, &session_id).await {
+        match tokio::time::timeout(budget, index.sync_session(project_id, session_id)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
                 tracing::warn!(target: "nori_index", %session_id, %error, "could not index ended session");
             }
-        });
+            Err(_) => {
+                tracing::warn!(target: "nori_index", %session_id, "indexing the ended session took too long; the picker will finish it");
+            }
+        }
     }
 }
 
-fn source_stamp(
-    loader: &TranscriptLoader,
-    project_id: &str,
-    session_id: &str,
-) -> io::Result<SourceStamp> {
-    let path = loader.session_path(project_id, session_id);
-    let mut stamp = SourceStamp {
-        len: 0,
-        mtime_ms: 0,
-    };
-    let mut found = false;
-    for candidate in [path.clone(), path.with_extension("pkl")] {
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        found = true;
-        stamp.len += i64::try_from(metadata.len()).unwrap_or(i64::MAX);
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(0));
-        stamp.mtime_ms = stamp.mtime_ms.max(modified);
-    }
-    if found {
-        Ok(stamp)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "transcript is gone",
-        ))
-    }
-}
+#[cfg(test)]
+mod tests;
