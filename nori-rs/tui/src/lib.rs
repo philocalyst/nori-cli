@@ -31,6 +31,7 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 pub use ui_types::TokenUsage;
 
+mod actions;
 mod additional_dirs;
 mod app;
 mod app_event;
