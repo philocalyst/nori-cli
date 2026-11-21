@@ -115,6 +115,9 @@ pub(crate) struct App {
     tool_gesture: tool_gesture::ToolGesture,
     /// Where the cells of the history being replayed start in `transcript_cells`, while it is.
     replay_painted_from: Option<(usize, nori_protocol::ReplaySource)>,
+    /// Entries of the resumed conversation older than the turns read: a resume reads only the
+    /// newest turns of a long conversation.
+    resume_left_out: i64,
 
     pub(crate) enhanced_keys_supported: bool,
 
@@ -330,7 +333,11 @@ impl App {
                         let loader =
                             nori_harness::transcript::TranscriptLoader::new(target.nori_home);
                         let transcript = loader
-                            .load_transcript(&target.project_id, &target.session_id)
+                            .load_transcript_tail(
+                                &target.project_id,
+                                &target.session_id,
+                                nori_harness::transcript::RESUME_TAIL_BYTES,
+                            )
                             .await
                             .map(Box::new)
                             .map_err(|error| error.to_string());
@@ -387,15 +394,16 @@ impl App {
             tool_gesture: Default::default(),
             program_status: Default::default(),
             replay_painted_from: None,
+            resume_left_out: 0,
             focus: None,
-            pending_move: None,
-            move_in_progress: false,
-            recoveries: Vec::new(),
-            pending_handover: None,
             pending_child_focus: None,
             pending_rewind: None,
             child_focus_sequence: 0,
             pending_update_action: None,
+            pending_move: None,
+            move_in_progress: false,
+            recoveries: Vec::new(),
+            pending_handover: None,
             skip_world_writable_scan_once: false,
             prepared_agent: None,
             prepared_agent_initial_context: None,

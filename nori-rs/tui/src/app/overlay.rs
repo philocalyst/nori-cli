@@ -28,10 +28,16 @@ impl App {
                     self.close_transcript_overlay(tui);
                     self.app_event_tx.send(match action {
                         ResumeAction::StartFresh => AppEvent::NewSession,
+                        ResumeAction::Current => {
+                            self.chat_widget
+                                .add_info_message("Already in this session.".to_string(), None);
+                            return Ok(());
+                        }
                         ResumeAction::Local {
                             nori_home,
                             project_id,
                             session_id,
+                            agent: _,
                         } => AppEvent::ResumeSession {
                             nori_home,
                             project_id,
@@ -43,15 +49,6 @@ impl App {
                         } => AppEvent::ResumeAcpSession {
                             acp_session_id,
                             title,
-                        },
-                        ResumeAction::ViewOnly {
-                            nori_home,
-                            project_id,
-                            session_id,
-                        } => AppEvent::LoadViewonlyTranscript {
-                            nori_home,
-                            project_id,
-                            session_id,
                         },
                         ResumeAction::Reference {
                             project_id,

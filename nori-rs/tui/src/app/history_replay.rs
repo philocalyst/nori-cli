@@ -56,12 +56,21 @@ impl App {
                     .len()
                     + 1;
             }
-            if keep > start {
-                let left_out = keep - start;
+            // Entries the resume left on disk count as well: only the newest turns were read.
+            let on_disk = std::mem::take(&mut self.resume_left_out);
+            if keep > start || on_disk > 0 {
+                let left_out = i64::try_from(keep - start)
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(on_disk);
+                let where_they_are = if on_disk > 0 {
+                    " · resumed from its newest turns"
+                } else {
+                    " · Ctrl+T shows the whole transcript"
+                };
                 let note = ratatui::text::Line::from(vec![
                     "↑ ".dim(),
                     format!("{left_out} earlier entries of this conversation").dim(),
-                    " · Ctrl+T shows the whole transcript".dim(),
+                    where_they_are.dim(),
                 ]);
                 let _ = tui.start_stage_at(keep, note);
             }

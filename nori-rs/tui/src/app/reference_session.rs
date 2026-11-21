@@ -14,14 +14,25 @@ impl App {
         let nori_home = self.config.nori_home.clone();
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
-            let loader = nori_harness::transcript::TranscriptLoader::new(nori_home);
-            match loader.load_transcript(&project_id, &session_id).await {
-                Ok(transcript) => {
+            let index = nori_harness::session_index::SessionIndex::open(&nori_home);
+            let loaded = match index.sync_session(&project_id, &session_id).await {
+                Ok(_) => {
+                    let (project, session) = (project_id.clone(), session_id.clone());
+                    tokio::task::spawn_blocking(move || index.digest(&project, &session))
+                        .await
+                        .ok()
+                        .flatten()
+                        .ok_or_else(|| "its digest could not be read".to_owned())
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            match loaded {
+                Ok(digest) => {
                     let text = crate::nori::reference_session_picker::format_reference(
                         &project_id,
                         &session_id,
                         &agent,
-                        &transcript,
+                        &digest.turns,
                     );
                     tx.send(AppEvent::InsertSessionReference { text, target });
                 }
