@@ -9,6 +9,8 @@ use nori_tui_components::HelixItem;
 use nori_tui_components::HelixState;
 use nori_tui_components::Theme;
 use ratatui::style::Style;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::TuiEvent;
 
@@ -58,7 +60,22 @@ pub(crate) fn compact_age(iso: &str) -> String {
     }
 }
 
-/// `text` cut to `max` columns with an ellipsis.
+/// `text` cut to `max` columns, the cut marked with `…`.
 pub(crate) fn clip(text: &str, max: usize) -> String {
-    crate::text_formatting::truncate_text(text, max)
+    if text.width() <= max {
+        return text.to_owned();
+    }
+    let mut clipped = String::new();
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        used += grapheme.width();
+        if used + 1 > max {
+            break;
+        }
+        clipped.push_str(grapheme);
+    }
+    if max > 0 {
+        clipped.push('…');
+    }
+    clipped
 }

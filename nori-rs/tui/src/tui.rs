@@ -514,7 +514,18 @@ impl Tui {
         &mut self,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
-        let height = panel_height(self.terminal.size()?.height);
+        self.draw_overlay_rows(i32::MAX, draw_fn)
+    }
+
+    /// [`Self::draw_overlay`] for a panel that needs only `rows` rows: it takes no more, so a
+    /// short list is not a tall empty box.
+    pub fn draw_overlay_rows(
+        &mut self,
+        rows: i32,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        let panel = panel_height(self.terminal.size()?.height);
+        let height = u16::try_from(rows.clamp(1, i32::from(panel))).unwrap_or(panel);
         let cells = std::mem::take(&mut self.backdrop.cells);
         let result = self.draw_stage(&StageView::new(&cells, None), height, height, draw_fn);
         self.backdrop.cells = cells;
