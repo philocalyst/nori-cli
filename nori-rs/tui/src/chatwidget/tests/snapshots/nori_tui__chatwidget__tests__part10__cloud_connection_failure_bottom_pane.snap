@@ -1,5 +1,9 @@
 ---
 source: tui/src/chatwidget/tests/part10.rs
+assertion_line: 1852
 expression: "render_bottom_pane(&mut chat, 80)"
 ---
+
 › draft while connecting
+
+ INS
