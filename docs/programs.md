@@ -64,7 +64,7 @@ signal through its `RunHandle`. `--json` prints the compiled op graph.
 ## The schema
 
 The schemas are embedded as `nori:*` modules (`nori-rs/conduit/schemas/`): `Program`,
-`Agent`, `Recovery`, `Tool`, `Skill`, `Workspace` and `Run`. A program imports the module a
+`Agent`, `Recovery`, `Tool`, `Toolset`, `Skill` (a program with parameters, see [pkl-runtime.md](pkl-runtime.md#skills)), `Workspace` and `Run`. A program imports the module a
 class comes from (`import "nori:Tool" as Tool`), as any Pkl module does.
 
 | Program field | Meaning |
@@ -73,7 +73,7 @@ class comes from (`import "nori:Tool" as Tool`), as any Pkl module does.
 | `actors` | `Mapping<String, Actor>`; the key is the alias. |
 | `worlds` | `Mapping<String, World>`; scopes steps can run `Within`. |
 | `world` | The world the whole program runs in. |
-| `skills` | `SkillSpec`s actors use by name: instructions and the tools they allow. |
+| `toolsets` | `ToolsetSpec`s (`nori:Toolset`) actors use by name: instructions and the tools they allow. |
 | `tools` | Tools the program calls by name, host or `wasm`. |
 | `recovery` | Program-wide recovery override. |
 | `budget_tokens` | Token budget of the whole run. |
@@ -82,19 +82,19 @@ class comes from (`import "nori:Tool" as Tool`), as any Pkl module does.
 
 An **actor** declares `agent`, `model`, `role` (`implementation`, `research`, `review`,
 `design`, `test`, `general`), `instructions` (delivered ahead of the first message it
-receives), `options` (agent settings by id), `tools`, `skills`, `sandbox`, `recovery`,
+receives), `options` (agent settings by id), `tools`, `toolsets`, `sandbox`, `recovery`,
 `isolation` (`shared`, `worktree`, `sandbox`) and `world`. A `Send` to a declared actor starts it on first use;
 `actor://alias` addresses an actor the program did not start. Aliases resolve through
 the tree-wide actor directory, so a program, the task tools and the TUI address the same
 actor.
 
-### Sandboxes, tools and skills
+### Sandboxes, tools and toolsets
 
 An actor's **sandbox** is the program's outer sandbox, narrowed by the world it lives in
 (`allowed_tools`, `allowed_paths`) and then by the actor's own `sandbox`; a nested scope
 never widens access. On the harness it is enforced where the actor's Nori tools are served:
 
-- `tools` (the actor's own, plus those its skills allow, intersected with the tool names the
+- `tools` (the actor's own, plus those its toolsets allow, intersected with the tool names the
   sandbox allows) selects which Nori host tools exist for the actor, through the same
   per-session tool selection workflow policy uses. A tool outside it is not advertised and
   cannot be called.
@@ -102,7 +102,7 @@ never widens access. On the harness it is enforced where the actor's Nori tools 
   `git`, redirection targets and path literals must lie in `allowed_paths`, dynamic command
   names are refused. The restriction is part of the actor's identity; it survives a revival
   and is inherited, as a sandbox, by anything the actor delegates to.
-- Skill `instructions` are appended to the actor's tool instructions.
+- Toolset `instructions` are appended to the actor's tool instructions.
 
 This is what the removed session-diff sandbox did (it restricted the model's `bash` by tool,
 command and path), now declared per actor or world and also narrowing which tools exist. It
