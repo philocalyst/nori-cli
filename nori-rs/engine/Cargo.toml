@@ -1,0 +1,38 @@
+[package]
+name = "nori-engine"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+description = "Nori's own agent engine: the agent loop, tools, permissions and sessions behind the in-process Codex and OpenCode agents, talking to provider APIs directly"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+globset = "0.4"
+ignore = { workspace = true }
+nori-acp-kit = { workspace = true }
+nori-bash = { workspace = true }
+nori-conversation = { workspace = true }
+nori-host-tools = { workspace = true }
+nori-llm = { workspace = true }
+nori-protocol = { workspace = true }
+nori-tools = { workspace = true }
+regex = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true, features = ["base64", "client", "macros", "schemars", "server", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+shlex = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+wildmatch = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
