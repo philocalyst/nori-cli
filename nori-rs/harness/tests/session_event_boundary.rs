@@ -225,7 +225,7 @@ async fn initialize_error_remains_raw_without_a_nori_failure_mirror() {
 
 #[tokio::test]
 #[serial]
-async fn list_sessions_error_remains_raw_without_a_nori_failure_mirror() {
+async fn list_sessions_error_does_not_stop_the_session_from_starting() {
     // SAFETY: tests that mutate the mock-agent environment run serially.
     unsafe {
         std::env::set_var("MOCK_AGENT_SUPPORT_SESSION_LIST", "1");
@@ -248,18 +248,28 @@ async fn list_sessions_error_remains_raw_without_a_nori_failure_mirror() {
         resume: None,
     });
 
-    let events = collect_until_session_ended(&mut session).await;
+    // A failing `session/list` is a missing catalog, not a failed start (docs/fault-catalog.md,
+    // `list-unreachable`): the session starts, and nothing mirrors the failure as a Nori one.
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        loop {
+            let event = session.events.recv().await.expect("event stream open");
+            let ready = matches!(event, SessionEvent::Nori(NoriEvent::SessionReady(_)));
+            events.push(event);
+            if ready {
+                break events;
+            }
+        }
+    })
+    .await
+    .expect("a session whose agent cannot list sessions still becomes ready");
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            SessionEvent::Acp(AcpEvent::Response {
-                response: Err(error),
-                ..
-            }) if error.message == "broker unreachable"
-        )),
-        "the observed ACP bootstrap error must be the forced session/list failure: {events:?}"
+        events
+            .iter()
+            .all(|event| !matches!(event, SessionEvent::Nori(NoriEvent::RequestFailed(_)))),
+        "a failed session/list must not be mirrored as RequestFailed"
     );
-    assert_acp_bootstrap_error_is_not_mirrored(&events);
+    session.handle.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
