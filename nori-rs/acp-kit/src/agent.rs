@@ -4,6 +4,7 @@ use agent_client_protocol as acp;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::registration::Host;
 use crate::schema::AuthMethod;
 use crate::schema::AuthenticateRequest;
 use crate::schema::AuthenticateResponse;
@@ -120,6 +121,11 @@ pub trait NativeAgent: Send + Sync + 'static {
 
     /// The client's `initialize` request, for an agent that needs the client's capabilities.
     fn on_initialize(&self, _request: &InitializeRequest) {}
+
+    /// Who the client is, once, before any request. Nori's own extensions (such as
+    /// [`crate::announce_auth_status`]) are for [`Host::Nori`] only: another ACP client does not
+    /// know them.
+    fn on_host(&self, _host: Host) {}
 
     async fn authenticate(
         &self,

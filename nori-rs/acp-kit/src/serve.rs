@@ -172,6 +172,7 @@ async fn serve_until<A: NativeAgent>(
     stop: impl std::future::Future<Output = impl Sized>,
 ) -> std::io::Result<()> {
     let agent = Arc::new(agent);
+    agent.on_host(host);
     let mut profile = agent.profile();
     if host == Host::External {
         // Host tool tokens mean nothing outside Nori's own harness.
