@@ -57,6 +57,7 @@ codex-rmcp-client = { workspace = true }
 nori-installed = { workspace = true }
 nori-protocol = { workspace = true }
 codex-file-search = { workspace = true }
+nori-editor = { workspace = true }
 nori-tui-components = { workspace = true }
 nucleo-matcher = { workspace = true }
 # Use the vendored SDK's standalone auth crate. Keeping auth out of the legacy
@@ -75,8 +76,6 @@ itertools = { workspace = true }
 lazy_static = { workspace = true }
 mcp-types = { workspace = true }
 memchr = { workspace = true }
-modalkit = { workspace = true }
-modalkit-ratatui = { workspace = true }
 pathdiff = { workspace = true }
 pulldown-cmark = { workspace = true }
 rand = { workspace = true }

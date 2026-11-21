@@ -37,6 +37,7 @@ members = [
     "sandbox",
     "rmcp-client",
     "stdio-to-uds",
+    "editor",
     "tui",
     "tui-components",
     "utils/git",
@@ -100,6 +101,7 @@ codex-rmcp-client = { path = "rmcp-client" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 nori-protocol = { path = "nori-protocol" }
 nori-actions = { path = "actions" }
+nori-editor = { path = "editor" }
 nori-tui = { path = "tui" }
 nori-tui-components = { path = "tui-components" }
 codex-utils-cache = { path = "utils/cache" }
@@ -178,7 +180,6 @@ lru = "0.18.2"
 maplit = "1.0.2"
 mime_guess = "2.0.5"
 modalkit = "0.0.32"
-modalkit-ratatui = "0.0.32"
 multimap = "0.10.0"
 notify = "8.2.0"
 notify-rust = "4"

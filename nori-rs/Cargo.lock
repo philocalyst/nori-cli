@@ -9869,23 +9869,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "modalkit-ratatui"
-version = "0.0.32"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40ef715586403fb4ff1fccf77ef0742940d39abe24bf5f653a2586376edaefc6"
-dependencies = [
- "crossterm",
- "enum-map",
- "intervaltree",
- "libc",
- "modalkit",
- "ratatui",
- "regex",
- "serde",
- "unicode-width 0.2.1",
-]
-
-[[package]]
 name = "moka"
 version = "0.12.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10312,6 +10295,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nori-editor"
+version = "0.0.0"
+dependencies = [
+ "crossterm",
+ "modalkit",
+ "pretty_assertions",
+ "ratatui",
+ "regex",
+ "unicode-segmentation",
+ "unicode-width 0.2.1",
+]
+
+[[package]]
 name = "nori-engine"
 version = "0.0.0"
 dependencies = [
@@ -10674,11 +10670,10 @@ dependencies = [
  "libc",
  "mcp-types",
  "memchr",
- "modalkit",
- "modalkit-ratatui",
  "nori-acp-host",
  "nori-bash",
  "nori-config",
+ "nori-editor",
  "nori-harness",
  "nori-host-tools",
  "nori-installed",
