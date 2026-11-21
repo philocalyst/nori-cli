@@ -123,5 +123,3 @@ Nothing from the forge, CI, process-cleanup or fork work is committed yet.
     a git repository.
 - **Housekeeping**
   - Decide whether to commit or delete `PERF_PLAN.md` (untracked, repo root).
-  - Commit the work when asked; commit messages end with
-    `Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>`.
