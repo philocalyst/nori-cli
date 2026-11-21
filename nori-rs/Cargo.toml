@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "acp-kit",
+    "actions",
     "fake-agent",
     "antigravity-acp",
     "bash",
@@ -89,6 +90,7 @@ codex-process-hardening = { path = "process-hardening" }
 codex-rmcp-client = { path = "rmcp-client" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }
 nori-protocol = { path = "nori-protocol" }
+nori-actions = { path = "actions" }
 nori-tui = { path = "tui" }
 nori-tui-components = { path = "tui-components" }
 codex-utils-cache = { path = "utils/cache" }
