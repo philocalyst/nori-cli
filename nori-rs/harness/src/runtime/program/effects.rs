@@ -69,8 +69,11 @@ impl HarnessProgramHost {
             .projected_fork_records(self.recorder.session_id(), start, end)
             .await
             .map_err(|error| effect_error("select_context", error))?;
-        crate::transcript::fork_context::context_from_records(records)
-            .map_err(|error| effect_error("select_context", error))
+        crate::transcript::fork_context::context_from_records(
+            records,
+            crate::context_budget::ContextBudget::for_agent(self.backend.agent_name()),
+        )
+        .map_err(|error| effect_error("select_context", error))
     }
 
     pub(super) async fn fork_range(

@@ -549,12 +549,49 @@ The recent context is built from Nori's own transcript of the session
 message, within about 15,000 tokens at four characters a token, the newest
 always kept whole, tool outputs cut to 1,250 characters, and the compaction
 exchange itself left out. Fork context and a resume's summary use the same
-block without the recent context. The summary is reprinted in the new
+block without the recent context.
+
+Every block of conversation history Nori injects into a prompt is bounded, by
+design, in `context_budget.rs` (the one owner of the rule) and not by each
+caller. History may take a quarter of the target model's context window at four
+bytes a token (the window's token count in bytes), within 32 KiB and 1 MiB (a
+tenth of OpenAI's 10 MiB string limit); a model whose window is unknown counts
+as 200,000 tokens. `ContextBudget::for_agent` reads the window from the agent's
+registry entry. Fork, restore, rewind-fork, revival and `select_context`
+history is rendered by `transcript/context_digest.rs` through
+`fork_context::context_from_records(records, budget)`: a history that fits is
+rendered whole; one that does not keeps its newest records (half the budget in
+generous form: long text cut at a size derived from the budget and tool
+payloads cut to an eighth of that; the rest lean, with tool payloads cut to 512
+bytes and session-event noise dropped), cuts every long string in the middle
+with `[… N bytes omitted]`, caps any one record at a quarter of the budget,
+never splits a character, and opens with an `omitted` marker naming how many
+records are left out and pointing at the `conversation_context` tool. Images
+and other typed history ride the wire separately, newest first, within a
+quarter of the budget. The `conversation_context` tool pages by the same
+digest (a page is a quarter of the budget; a read from `start` keeps its oldest
+records and returns `next_start` where the cut fell, a read from the head keeps
+its newest). `compact::checkpoint` is the last guard for any summary text, such
+as a transcript replayed on resume: the whole stays within 1 MiB, keeping the
+newest end and the typed-history block. The completion wake clips a failed
+task's error to 2 KiB, on top of its 16 KiB inline-result limit. A provider that
+refuses a prompt as too long anyway (including OpenAI's "string too long",
+`string_above_max_length` and `LargeStringParam`, which classify as
+`prompt_too_long`) is retried in place, up to twice, with the checkpoint cut to
+a quarter of its size and a notice; a checkpoint that was never accepted is put
+back cut the same way for the next prompt.
+
+A delegated child always starts with fresh context: `delegate_task` and every
+program actor start with their task and Nori's standard instructions only, and
+no parameter inherits the caller's history. Only a history fork (the user's
+`/fork`, a program's `Fork`) or reviving an ended actor with its own earlier
+history carries a conversation prefix, bounded as above. The summary is reprinted in the new
 session's first message, so its headings show what was kept. Automatic compaction
-uses the workflow policy: it prepares a summary while context approaches the
-trigger, then compacts at rest or before the next prompt when the trigger is reached.
-A failed automatic compaction backs off for that session until the user runs `/compact`.
-A prompt refused as too long is retried with progressively shorter checkpoints.
+uses the workflow policy: it prepares a summary while the context is approaching
+the trigger, then compacts at rest or before the next prompt when the trigger is
+reached. A failed automatic compaction backs off for that session until the user
+runs `/compact`. A prompt refused as too long is retried with progressively shorter
+checkpoints from the policy's shrink ladder.
 
 The session-replacement machinery is shared in
 `harness/src/backend/session_swap.rs`. `swap_active_session(SessionSwapMode)`

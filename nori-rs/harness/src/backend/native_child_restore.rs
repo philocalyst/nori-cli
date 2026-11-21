@@ -164,7 +164,10 @@ impl AcpBackend {
                 .context("Managed child journal has no visible history")?
                 .id;
             let source = (binding.session.clone(), start, end);
-            let context = crate::transcript::fork_context::context_from_records(records.clone())?;
+            let context = crate::transcript::fork_context::context_from_records(
+                records.clone(),
+                crate::context_budget::ContextBudget::for_agent(&binding.agent),
+            )?;
             let entries =
                 crate::transcript::fork_context::replay_entries_with_children_from_records(
                     &records, &source.0,
@@ -407,7 +410,10 @@ impl AcpBackend {
                 .context("Child journal has no visible history")?
                 .id;
             let source = (recorder.session_id().to_owned(), start, end);
-            let context = crate::transcript::fork_context::context_from_records(records.clone())?;
+            let context = crate::transcript::fork_context::context_from_records(
+                records.clone(),
+                crate::context_budget::ContextBudget::for_agent(&binding.agent),
+            )?;
             let entries =
                 crate::transcript::fork_context::replay_entries_with_children_from_records(
                     &records, &source.0,

@@ -95,7 +95,10 @@ impl crate::backend::AcpBackend {
             let records = recorder
                 .projected_fork_records(&source.0, source.1, source.2)
                 .await?;
-            let context = crate::transcript::fork_context::context_from_records(records.clone())?;
+            let context = crate::transcript::fork_context::context_from_records(
+                records.clone(),
+                crate::context_budget::ContextBudget::for_agent(self.agent_name()),
+            )?;
             let entries =
                 crate::transcript::fork_context::replay_entries_with_children_from_records(
                     &records, &source.0,

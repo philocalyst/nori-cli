@@ -409,7 +409,10 @@ impl super::AcpBackend {
                 let entries = crate::transcript::fork_context::replay_entries_from_records(
                     &records, &source.0,
                 );
-                let context = crate::transcript::fork_context::context_from_records(records)?;
+                let context = crate::transcript::fork_context::context_from_records(
+                    records,
+                    crate::context_budget::ContextBudget::for_agent(self.agent_name()),
+                )?;
                 let (model, options) = self.native_child_model_and_options(&id).await?;
                 self.orchestrator
                     .fork_native_history(

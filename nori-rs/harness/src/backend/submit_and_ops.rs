@@ -25,7 +25,10 @@ impl AcpBackend {
             let entries =
                 crate::transcript::fork_context::replay_entries_from_records(&records, session_id);
             (
-                crate::transcript::fork_context::context_from_records(records)?,
+                crate::transcript::fork_context::context_from_records(
+                    records,
+                    crate::context_budget::ContextBudget::for_agent(&self.agent_name),
+                )?,
                 entries,
             )
         } else {

@@ -356,13 +356,16 @@ impl Inner {
                     let entries = crate::transcript::fork_context::replay_entries_from_records(
                         &records, &session,
                     );
-                    crate::transcript::fork_context::context_from_records(records)
-                        .ok()
-                        .map(|context| ForkSpec {
-                            context,
-                            source,
-                            entries,
-                        })
+                    crate::transcript::fork_context::context_from_records(
+                        records,
+                        crate::context_budget::ContextBudget::for_agent(&agent),
+                    )
+                    .ok()
+                    .map(|context| ForkSpec {
+                        context,
+                        source,
+                        entries,
+                    })
                 }
                 Ok(_) | Err(_) => None,
             },

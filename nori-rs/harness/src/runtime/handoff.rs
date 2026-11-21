@@ -188,7 +188,14 @@ async fn replace_fenced(
             config: Arc::new(config),
             cli_version: template.cli_version.clone(),
             session_context: template.session_context.clone(),
-            initial_context: context.clone(),
+            // The conversation moves to an agent whose window may be smaller than the last one's.
+            initial_context: context.as_deref().map(|context| {
+                crate::context_budget::fit_summary(
+                    context,
+                    crate::context_budget::ContextBudget::for_agent(&agent).bytes(),
+                )
+                .into_owned()
+            }),
             handoff: template.recorder.clone(),
         });
         if template.seed.is_child() {
