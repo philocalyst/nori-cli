@@ -1339,11 +1339,22 @@ impl AcpBackend {
 
     /// Close (release) the active session via ACP `session/close`.
     ///
-    /// Used by the explicit close action; callers gate on the agent
-    /// advertising `sessionCapabilities.close`. Failures carry the same
+    /// Used by the explicit close action and by catalog probes cleaning up; an agent that
+    /// does not advertise `sessionCapabilities.close` is refused here. Failures carry the same
     /// enhanced structured-code-aware message as spawn/resume errors, so the
     /// agent's error code and `data.detail` reach the user.
     pub async fn close_active_session(&self) -> Result<()> {
+        // An agent that never offered `session/close` is not sent one: it can only answer
+        // "method not found" (catalog probes used to, for every agent they probed).
+        anyhow::ensure!(
+            self.connection
+                .capabilities()
+                .session_capabilities
+                .close
+                .is_some(),
+            "{} does not support closing a session",
+            self.agent_name
+        );
         let session_id = self.session_id.read().await.clone();
         self.connection
             .close_session(&session_id.to_string())
