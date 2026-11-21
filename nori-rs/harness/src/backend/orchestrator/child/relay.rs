@@ -303,6 +303,7 @@ pub(super) async fn relay(
             | NoriEvent::QueueRestored(_)
             | NoriEvent::AgentSilent(_)
             | NoriEvent::AgentHeard
+            | NoriEvent::SessionMoveRequested { .. }
             | NoriEvent::SubscriptionExhausted(_)
             | NoriEvent::RouteChanged(_)
             | NoriEvent::RetryScheduled(_)
@@ -468,6 +469,7 @@ mod tests {
             session_id: raw.clone(),
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Keep,
             state: Patch::Keep,

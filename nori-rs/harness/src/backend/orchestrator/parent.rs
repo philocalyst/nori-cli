@@ -168,6 +168,7 @@ impl AcpBackend {
                     content: vec![nori_protocol::acp::v1::ContentBlock::Text(
                         nori_protocol::acp::v1::TextContent::new(combined),
                     )],
+                    context: Default::default(),
                     display_text: None,
                 },
             )
@@ -237,6 +238,7 @@ impl AcpBackend {
                     content: vec![nori_protocol::acp::v1::ContentBlock::Text(
                         nori_protocol::acp::v1::TextContent::new(leased.wake.text),
                     )],
+                    context: Default::default(),
                     display_text: None,
                 },
             )

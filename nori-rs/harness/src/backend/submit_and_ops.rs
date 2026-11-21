@@ -437,6 +437,7 @@ impl AcpBackend {
                             content: vec![acp::ContentBlock::Text(acp::TextContent::new(
                                 "/compact",
                             ))],
+                            context: Default::default(),
                             display_text: None,
                         },
                     ),

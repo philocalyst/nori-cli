@@ -295,6 +295,8 @@ pub struct AcpBackend {
     pending_compact_summary: Arc<Mutex<Option<String>>>,
     /// The running compaction already reminded the agent of the summary template.
     compact_nudged: Arc<AtomicBool>,
+    /// Compaction the harness starts by itself, and what it has prepared or backed off from.
+    auto_compaction: Arc<auto_compaction::AutoCompaction>,
     /// Persistent goal for this ACP session.
     thread_goal_state: Arc<Mutex<thread_goal::ThreadGoalState>>,
     /// True after the active ACP agent has successfully opened the backend-owned
@@ -305,8 +307,11 @@ pub struct AcpBackend {
     /// Goal extension capability the agent advertised at initialize, parsed
     /// once. `Some` enables driving goals via `_session/goal`.
     goal_ext_capability: Option<goal_ext::GoalExtCapability>,
-    /// Accumulated context from hook `::context::` lines, prepended to next prompt
+    /// Accumulated context from hook `::context::` lines, put before the next prompt that is
+    /// sent (see `prompt_context::session`).
     pending_hook_context: Arc<Mutex<Option<String>>>,
+    /// The session preamble and agent catalog, put before the first prompt that is sent.
+    pending_static_context: Arc<Mutex<prompt_context::StaticContext>>,
     /// Transcript recorder for session persistence.
     ///
     /// Interior-mutable so branch-at-head `/fork` can swap the active recorder
@@ -425,18 +430,22 @@ fn session_context_for_connection(
     }
 }
 
+mod auto_compaction;
 #[cfg(unix)]
 pub mod browser_profile;
 #[cfg(unix)]
 pub mod browser_session;
+mod builtin_modules;
 mod child_control;
 mod ci_watch;
 mod continuation_guard;
 mod forge_tools;
+mod gates;
 mod git_tools;
 mod goal_ext;
 mod goal_judge;
 mod host_tools;
+pub mod jobs;
 #[allow(dead_code)] // Wired by the file tools when they take `machine`.
 mod machine_fs;
 mod monitor;
@@ -447,13 +456,13 @@ mod native_child_sessions;
 mod nori_client_context;
 mod nori_client_mcp;
 mod nudox;
-mod builtin_modules;
 pub(crate) mod orchestrator;
+mod pkl_modules;
+pub mod plugins;
 mod prewarm;
 mod subagent_identity;
 mod workflow;
 pub use nori_client_mcp::set_stdio_bridge;
-mod gates;
 pub use orchestrator::CachedAgentModel;
 pub use orchestrator::cached_agent_models;
 pub use orchestrator::refresh_agent_catalog;
@@ -461,7 +470,7 @@ pub use orchestrator::refresh_agent_catalog_except;
 mod pending_work;
 pub mod prepared;
 pub use pending_work::PendingWork;
-mod prompt_context;
+pub(crate) mod prompt_context;
 mod prompt_lifecycle;
 mod prompt_recovery;
 pub(crate) mod queue_journal;
@@ -472,21 +481,19 @@ mod resume_fallback;
 mod rewind;
 mod route_moves;
 mod session;
-mod pkl_modules;
-pub mod plugins;
 mod session_defaults;
 pub(crate) mod session_reducer;
 mod session_runtime_driver;
 mod session_scope;
 mod session_swap;
+mod session_title;
 mod spawn_and_relay;
 mod submit_and_ops;
 mod thread_goal;
 mod transcript;
-mod turn;
+pub(crate) mod turn;
 mod user_input;
 mod user_question;
-mod session_title;
 mod user_shell;
 pub use transcript::client_events_to_replay_client_events;
 pub(crate) use transcript::transcript_to_child_replay_session_events;
@@ -514,4 +521,3 @@ use hooks::generate_id;
 use hooks::route_hook_results;
 use hooks::run_prompt_summary;
 use hooks::run_session_start_hooks;
-pub mod jobs;

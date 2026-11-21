@@ -353,7 +353,7 @@ impl AcpBackend {
         {
             warn!(%error, "Failed to record initial backend binding");
         }
-        let pending_hook_context = orchestrator
+        let pending_static_context = orchestrator
             .initial_catalog_context(
                 session_context_for_connection(config, &connection),
                 &workflow,
@@ -397,6 +397,7 @@ impl AcpBackend {
             conversation_id: Arc::new(RwLock::new(conversation_id)),
             approval_policy_tx,
             compact_nudged: Arc::new(AtomicBool::new(false)),
+            auto_compaction: Arc::default(),
             pending_compact_summary: Arc::new(Mutex::new(
                 config
                     .initial_context
@@ -407,7 +408,8 @@ impl AcpBackend {
             goal_mcp_connected,
             goal_mcp_http_server,
             goal_ext_capability,
-            pending_hook_context: Arc::new(Mutex::new(pending_hook_context)),
+            pending_hook_context: Arc::new(Mutex::new(None)),
+            pending_static_context: Arc::new(Mutex::new(pending_static_context)),
             transcript_recorder: transcript_recorder_cell,
             session_event_tx: session_event_tx.clone(),
             prompt_result_tx: prompt_result_tx.clone(),
