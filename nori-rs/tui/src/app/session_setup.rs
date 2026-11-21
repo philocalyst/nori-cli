@@ -19,6 +19,8 @@ impl std::error::Error for AgentPreparationTimeout {}
 pub(super) struct ManualModelHandoff {
     pub(super) recorder: std::sync::Arc<nori_harness::transcript::TranscriptRecorder>,
     pub(super) context: String,
+    /// The journal head `context` was read at.
+    pub(super) head: Option<i64>,
     pub(super) source_generation: crate::app_event::SessionGeneration,
     pub(super) effort: Option<String>,
 }
@@ -152,51 +154,39 @@ impl App {
         Ok(Some(agent))
     }
 
-    pub(crate) async fn select_agent_model(
+    /// Move the conversation to `model` on another agent. The conversation the new agent starts
+    /// from is read in the background (it takes as long as the session is long, and nothing
+    /// else on the event loop may wait for it); [`Self::continue_agent_model`] goes on with it.
+    ///
+    /// Chosen while a response is running, the switch is accepted at once and made when the
+    /// response ends, so the response is not cut short; one line says so.
+    pub(crate) fn select_agent_model(
         &mut self,
         agent_name: String,
         display_name: String,
         model: String,
     ) {
-        if self.manual_model_handoff.is_none()
-            && let Some(handle) = self.chat_widget.harness_handle()
-        {
-            if self.chat_widget.is_task_running() {
-                self.model_route_fallback = None;
-                self.app_event_tx.send(AppEvent::ShowToast(
-                    "Wait for the current response before switching models".to_owned(),
-                ));
-                return;
-            }
-            let recorder = match handle.conversation_recorder().await {
-                Ok(Some(recorder)) => recorder,
-                Ok(None) => {
-                    self.model_route_fallback = None;
-                    self.app_event_tx.send(AppEvent::ShowToast(
-                        "Can't switch models without the conversation journal".to_owned(),
-                    ));
-                    return;
-                }
-                Err(error) => {
-                    self.model_route_fallback = None;
-                    self.app_event_tx.send(AppEvent::ShowToast(format!(
-                        "Couldn't prepare model switch: {error}"
-                    )));
-                    return;
-                }
-            };
-            let context = match recorder.visible_context().await {
-                Ok(context) => context,
-                Err(error) => {
-                    self.model_route_fallback = None;
-                    self.app_event_tx.send(AppEvent::ShowToast(format!(
-                        "Couldn't read conversation: {error}"
-                    )));
-                    return;
-                }
-            };
-            let effort = self
-                .chat_widget
+        let (Some(handle), None) = (
+            self.chat_widget.harness_handle(),
+            self.manual_model_handoff.as_ref(),
+        ) else {
+            self.start_agent_model_candidate(agent_name, display_name, model);
+            return;
+        };
+        if self.chat_widget.is_task_running() {
+            self.chat_widget.add_info_message(
+                format!("Switching to {model} on {display_name} when this response ends."),
+                None,
+            );
+            self.deferred_agent_model = Some(DeferredAgentModel {
+                agent_name,
+                display_name,
+                model,
+            });
+            return;
+        }
+        let effort =
+            self.chat_widget
                 .agent_config()
                 .effort_option()
                 .and_then(|option| match &option.raw.kind {
@@ -205,14 +195,86 @@ impl App {
                     }
                     _ => None,
                 });
-            self.manual_model_handoff = Some(ManualModelHandoff {
-                recorder,
-                context,
-                source_generation: self.chat_widget.session_generation(),
+        self.model_handoff_token = self.model_handoff_token.saturating_add(1);
+        let token = self.model_handoff_token;
+        let source_generation = self.chat_widget.session_generation();
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let context = async {
+                let recorder = handle
+                    .conversation_recorder()
+                    .await
+                    .map_err(|error| format!("Couldn't prepare model switch: {error}"))?
+                    .ok_or_else(|| {
+                        "Can't switch models without the conversation journal".to_owned()
+                    })?;
+                let (text, head) = recorder
+                    .visible_context_at_head()
+                    .await
+                    .map_err(|error| format!("Couldn't read conversation: {error}"))?;
+                Ok(crate::app_event::ModelHandoffContext {
+                    recorder,
+                    text,
+                    head,
+                })
+            }
+            .await;
+            tx.send(AppEvent::ModelHandoffContext {
+                token,
+                agent_name,
+                display_name,
+                model,
                 effort,
+                source_generation,
+                context,
             });
+        });
+    }
+
+    /// Make the switch to another agent's model that was chosen during a response, once the
+    /// response has ended. Called after every event; nothing to do is one check.
+    pub(crate) fn run_deferred_agent_model(&mut self) {
+        if self.chat_widget.is_task_running() {
+            return;
         }
+        if let Some(DeferredAgentModel {
+            agent_name,
+            display_name,
+            model,
+        }) = self.deferred_agent_model.take()
+        {
+            self.select_agent_model(agent_name, display_name, model);
+        }
+    }
+
+    /// The conversation for a model switch to another agent is read: start that agent with it.
+    pub(crate) fn continue_agent_model(
+        &mut self,
+        agent_name: String,
+        display_name: String,
+        model: String,
+        effort: Option<String>,
+        source_generation: crate::app_event::SessionGeneration,
+        context: crate::app_event::ModelHandoffContext,
+    ) {
+        self.manual_model_handoff = Some(ManualModelHandoff {
+            recorder: context.recorder,
+            context: context.text,
+            head: context.head,
+            source_generation,
+            effort,
+        });
+        self.start_agent_model_candidate(agent_name, display_name, model);
+    }
+
+    fn start_agent_model_candidate(
+        &mut self,
+        agent_name: String,
+        display_name: String,
+        model: String,
+    ) {
         self.discard_candidate();
+        crate::latency::begin(crate::latency::Interaction::AgentSwitch, false);
         self.pending_candidate_model = Some((agent_name.clone(), model));
         self.start_candidate_preparation(agent_name, display_name);
     }
@@ -282,6 +344,10 @@ impl App {
     }
 
     pub(crate) fn discard_candidate(&mut self) {
+        // Ignore a conversation read that completes after this handoff was cancelled or
+        // superseded by another model choice.
+        self.model_handoff_token = self.model_handoff_token.saturating_add(1);
+        crate::latency::abandon(crate::latency::Interaction::AgentSwitch);
         self.pending_candidate_model = None;
         self.drop_candidate();
         self.chat_widget.set_login_agent_override(None);
@@ -631,4 +697,12 @@ mod tests {
         ));
         assert!(automatic_resume_event(None).is_none());
     }
+}
+
+/// A model on another agent, chosen while a response was running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredAgentModel {
+    pub(crate) agent_name: String,
+    pub(crate) display_name: String,
+    pub(crate) model: String,
 }

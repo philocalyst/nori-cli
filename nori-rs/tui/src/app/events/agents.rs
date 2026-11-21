@@ -21,6 +21,9 @@ impl App {
             AppEvent::SignInVerified { target, result } => {
                 self.chat_widget.on_sign_in_verified(target, result);
             }
+            AppEvent::AccountChecked { slug } => {
+                self.notify_choice(&crate::nori::providers_panel::AccountChecked(slug));
+            }
             AppEvent::AddAccount { provider, name } => {
                 self.chat_widget.add_account(provider, name);
             }
@@ -36,7 +39,34 @@ impl App {
                 value_name,
                 origin,
             } => {
-                self.select_model_routes(routes, value_name, origin).await;
+                self.select_model_routes(routes, value_name, origin);
+            }
+            AppEvent::ModelHandoffContext {
+                token,
+                agent_name,
+                display_name,
+                model,
+                effort,
+                source_generation,
+                context,
+            } => {
+                if token != self.model_handoff_token || self.model_route_fallback.is_none() {
+                    return Ok(true);
+                }
+                match context {
+                    Ok(context) => self.continue_agent_model(
+                        agent_name,
+                        display_name,
+                        model,
+                        effort,
+                        source_generation,
+                        context,
+                    ),
+                    Err(message) => {
+                        self.model_route_fallback = None;
+                        self.app_event_tx.send(AppEvent::ShowToast(message));
+                    }
+                }
             }
             AppEvent::CancelAgentCandidate => {
                 self.discard_candidate();
@@ -210,7 +240,7 @@ impl App {
                 }
                 if self.is_model_session_route(route_token, &config_id, &value) {
                     let why = error.as_deref().unwrap_or("the agent refused it");
-                    if !success && route_fallback_eligible && self.advance_model_route(why).await {
+                    if !success && route_fallback_eligible && self.advance_model_route(why) {
                         return Ok(true);
                     }
                     self.model_route_fallback = None;
@@ -230,34 +260,25 @@ impl App {
                     } else {
                         Err(error.unwrap_or_else(|| "Unknown error".to_string()))
                     });
-                    if success
-                        && let Err(err) = self
-                            .persist_default_model_selection(
-                                &agent,
-                                &config_id,
-                                &value,
-                                config_options.as_deref().unwrap_or_default(),
-                            )
-                            .await
-                    {
-                        tracing::error!(error = %err, "failed to persist default model selection");
-                    }
-                } else if success {
-                    if let Some(config_options) = &config_options {
-                        self.chat_widget
-                            .sync_acp_session_config_snapshot(config_options);
-                    }
-                    if let Err(err) = self
-                        .persist_default_model_selection(
+                    if success {
+                        self.persist_default_model_selection(
                             &agent,
                             &config_id,
                             &value,
                             config_options.as_deref().unwrap_or_default(),
-                        )
-                        .await
-                    {
-                        tracing::error!(error = %err, "failed to persist default model selection");
+                        );
                     }
+                } else if success {
+                    if adopt && let Some(config_options) = &config_options {
+                        self.chat_widget
+                            .sync_acp_session_config_snapshot(config_options);
+                    }
+                    self.persist_default_model_selection(
+                        &agent,
+                        &config_id,
+                        &value,
+                        config_options.as_deref().unwrap_or_default(),
+                    );
                 } else if is_custom_model
                     && nori_harness::get_agent_config(&agent)
                         .map(|config| config.supports_model_injection())
@@ -266,11 +287,7 @@ impl App {
                     // The agent rejected this model from its live picker, but we
                     // can still run it: persist it as the default and restart so
                     // it is forced through the agent's spawn-time channel.
-                    if self.persist_custom_default_model(&agent, &value).await {
-                        self.app_event_tx.send(AppEvent::NewSession);
-                    } else {
-                        tui.show_toast("Couldn't save the model selection".to_owned());
-                    }
+                    self.persist_custom_default_model_and_restart(&agent, &value);
                 } else {
                     let error_msg = error.unwrap_or_else(|| "Unknown error".to_string());
                     tui.show_toast(format!("Couldn't update {option_name}: {error_msg}"));

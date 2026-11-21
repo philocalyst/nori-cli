@@ -406,12 +406,23 @@ pub(crate) enum AppEvent {
         route_token: Option<i64>,
     },
 
+    /// The conversation a model on another agent takes over was read off the event loop (it is
+    /// as long as the session is); the switch goes on with it, or ends with the reason.
+    ModelHandoffContext {
+        token: i64,
+        agent_name: String,
+        display_name: String,
+        model: String,
+        effort: Option<String>,
+        source_generation: SessionGeneration,
+        context: Result<ModelHandoffContext, String>,
+    },
+
     /// Set an ACP session config option value.
     SetAcpSessionConfigOption {
         config_id: String,
         value: String,
         option_name: String,
-        value_name: String,
         /// True when the value came from the free-text "custom model" input
         /// rather than an advertised picker choice. A custom model the agent
         /// rejects can still be run by persisting it and restarting with the
@@ -861,7 +872,6 @@ pub(crate) enum RewindFiles {
     Keep,
 }
 
-
 /// What becomes of the prompt a conversation was forked before.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ForkAfter {
@@ -893,4 +903,13 @@ pub(crate) enum AgentPrepareIntent {
 pub(crate) enum HistoryReplay {
     Started(nori_protocol::ReplaySource),
     Finished,
+}
+
+/// What a model switch to another agent carries over from the conversation so far.
+#[derive(Debug)]
+pub(crate) struct ModelHandoffContext {
+    pub(crate) recorder: std::sync::Arc<nori_harness::transcript::TranscriptRecorder>,
+    pub(crate) text: String,
+    /// The journal head `text` was read at.
+    pub(crate) head: Option<i64>,
 }

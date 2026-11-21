@@ -63,7 +63,7 @@ impl App {
         })
     }
 
-    pub(super) async fn select_model_routes(
+    pub(super) fn select_model_routes(
         &mut self,
         routes: Vec<ModelRoute>,
         name: String,
@@ -72,6 +72,8 @@ impl App {
         if self.model_route_fallback.is_some() || self.manual_model_handoff.is_some() {
             self.discard_candidate();
         }
+        // A newer choice replaces one still waiting for a response to end.
+        self.deferred_agent_model = None;
         self.manual_model_handoff = None;
         let mut remaining = VecDeque::from(routes);
         let Some(current) = remaining.pop_front() else {
@@ -89,10 +91,10 @@ impl App {
             origin,
             token: self.next_model_route_token,
         });
-        self.apply_model_route().await;
+        self.apply_model_route();
     }
 
-    async fn apply_model_route(&mut self) {
+    fn apply_model_route(&mut self) {
         let Some(fallback) = self.model_route_fallback.as_ref() else {
             return;
         };
@@ -107,7 +109,6 @@ impl App {
                     config_id: config_id.clone(),
                     value: value.clone(),
                     option_name: option_name.clone(),
-                    value_name: fallback.name.clone(),
                     is_custom_model: false,
                     origin: fallback.origin,
                     route_token: Some(fallback.token),
@@ -120,7 +121,7 @@ impl App {
             } => {
                 let (agent, display, model) =
                     (agent_name.clone(), display_name.clone(), model.clone());
-                self.select_agent_model(agent, display, model).await;
+                self.select_agent_model(agent, display, model);
             }
         }
     }
@@ -128,7 +129,7 @@ impl App {
     /// The route the model choice is on failed because of `why`: say so in the transcript and
     /// try the next route, or, when none is left, end the choice with the reason. `true` when
     /// another route is being tried; `false` also when no model choice was in progress.
-    pub(super) async fn advance_model_route(&mut self, why: &str) -> bool {
+    pub(super) fn advance_model_route(&mut self, why: &str) -> bool {
         let Some(fallback) = self.model_route_fallback.as_mut() else {
             return false;
         };
@@ -143,7 +144,7 @@ impl App {
             format!("{failed} couldn't run {name}: {why}"),
             Some(format!("trying {next}")),
         );
-        self.apply_model_route().await;
+        self.apply_model_route();
         true
     }
 

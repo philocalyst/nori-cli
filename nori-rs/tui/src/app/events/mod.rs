@@ -63,7 +63,7 @@ fn classify_candidate_activation_event(
     }
 }
 
-fn candidate_model_config(
+pub(super) fn candidate_model_config(
     options: &[nori_protocol::acp::v1::SessionConfigOption],
     model: &str,
 ) -> Option<String> {
@@ -246,6 +246,15 @@ impl App {
             | AppEvent::SystemInfoRefreshed(..)
             | AppEvent::UndoSnapshotsLoaded(..) => self.handle_workspace_event(tui, event).await,
             AppEvent::SessionEvent { .. } => self.handle_stream_event(tui, event).await,
+            AppEvent::CandidateCommitted {
+                generation,
+                started,
+                outcome,
+            } => {
+                self.finish_candidate_commit(tui, generation, *started, outcome)
+                    .await;
+                Ok(true)
+            }
             AppEvent::ActivatePreparedResume { .. } | AppEvent::AgentPrepared { .. } => {
                 self.handle_prepared_event(tui, event).await
             }
@@ -271,6 +280,7 @@ impl App {
             | AppEvent::CancelAgentCandidate
             | AppEvent::CycleEffort(..)
             | AppEvent::CycleModel(..)
+            | AppEvent::CycleModelMode(..)
             | AppEvent::ExternalCliLoginComplete { .. }
             | AppEvent::ExternalCliLoginOutput { .. }
             | AppEvent::LoginCancelled
@@ -281,7 +291,9 @@ impl App {
             | AppEvent::SignInVerified { .. }
             | AppEvent::AddAccount { .. }
             | AppEvent::AccountAdded { .. }
+            | AppEvent::AccountChecked { .. }
             | AppEvent::LoginStarted { .. }
+            | AppEvent::ModelHandoffContext { .. }
             | AppEvent::OpenAcpModelPickerUnsupported
             | AppEvent::OpenAcpSessionConfigPicker { .. }
             | AppEvent::OpenAcpSessionConfigValuePicker { .. }
