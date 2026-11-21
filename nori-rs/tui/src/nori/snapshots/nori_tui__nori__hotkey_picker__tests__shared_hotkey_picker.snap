@@ -1,5 +1,6 @@
 ---
 source: tui/src/nori/hotkey_picker.rs
+assertion_line: 528
 expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
 ---
 
@@ -29,4 +30,6 @@ expression: "text.lines().map(str::trim_end).collect::<Vec<_>>().join(\"\\n\")"
      Next Effort Level               ctrl + j
      Previous Effort Level           ctrl + k
      Commit Changes                  alt + g
+     Switch Subagent                 ctrl + space
+     Next Model Mode                 alt + .
   ↑↓/j/k move  enter rebind  r reset  esc close
