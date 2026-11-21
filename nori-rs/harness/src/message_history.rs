@@ -24,8 +24,6 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs;
-use tokio::io::AsyncReadExt;
 
 use crate::config::HistoryPersistence;
 use uuid::Uuid;
@@ -218,32 +216,30 @@ async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
 }
 
 async fn history_metadata_for_file(path: &Path) -> (u64, usize) {
-    let log_id = match fs::metadata(path).await {
-        Ok(metadata) => history_log_id(&metadata).unwrap_or(0),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
-        Err(_) => return (0, 0),
-    };
-
-    // Open the file.
-    let mut file = match fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return (log_id, 0),
-    };
-
-    // Count newline bytes.
-    let mut buf = [0u8; 8192];
-    let mut count = 0usize;
-    loop {
-        match file.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+    // One blocking read with a large buffer: through async file reads each 8 KB chunk was a
+    // round trip to a blocking thread, which made a session wait on the history file's length.
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return (0, 0);
+        };
+        let log_id = history_log_id(&metadata).unwrap_or(0);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return (log_id, 0);
+        };
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut count = 0usize;
+        loop {
+            match std::io::Read::read(&mut file, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => count += memchr::memchr_iter(b'\n', &buf[..n]).count(),
+                Err(_) => return (log_id, 0),
             }
-            Err(_) => return (log_id, 0),
         }
-    }
-
-    (log_id, count)
+        (log_id, count)
+    })
+    .await
+    .unwrap_or((0, 0))
 }
 
 #[cfg(any(unix, windows))]
