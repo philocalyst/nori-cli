@@ -1,8 +1,9 @@
-//! Brief, unobtrusive messages in the top right of the screen.
+//! Brief, unobtrusive messages at the right end of the status line.
 //!
-//! A toast is a few cells drawn into the frame over the right end of the topmost rows of the
-//! region. It is drawn again by every frame while it lives, and when it ends the next frame no
-//! longer draws it, which erases it. Nothing is added to the conversation.
+//! A toast is a few cells drawn into the frame over the right end of a row of the bottom block,
+//! never over the conversation, which is the terminal's. It slides in from the right edge, stays,
+//! and slides out again; every frame draws it as far as it has come, and when it ends the next
+//! frame no longer draws it, which erases it. Nothing is added to the conversation.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -21,6 +22,12 @@ const MAX_TOASTS: usize = 3;
 
 /// The most of a message that is shown, in columns.
 const MAX_TEXT_COLUMNS: usize = 44;
+
+/// How long a toast takes to slide in from the right edge, and out again.
+const SLIDE: Duration = Duration::from_millis(180);
+
+/// How often a sliding toast is drawn again.
+const SLIDE_FRAME: Duration = Duration::from_millis(16);
 
 /// Small marks to put in front, picked by the text so one message always gets the same one.
 const SPARKLES: [&str; 5] = ["✦", "✧", "❀", "♪", "☾"];
@@ -58,7 +65,8 @@ impl Toasts {
         self.items.len() != before
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 }
@@ -80,10 +88,38 @@ fn label(text: &str) -> String {
     format!(" {sparkle} {shown} ")
 }
 
-/// Draw every toast into `buffer`, newest last, from `first_row` of it down over up to `rows`
-/// rows, flush against the right edge.
-pub(crate) fn draw(buffer: &mut Buffer, toasts: &Toasts, first_row: u16, rows: u16) {
+/// How much of a toast shows `age` into its life, from 0 to 1: it slides in, stays, slides out.
+fn shown(age: Duration) -> f64 {
+    let leaving = TOAST_LIFETIME.saturating_sub(age);
+    let edge = age.min(leaving).min(SLIDE);
+    let fraction = edge.as_secs_f64() / SLIDE.as_secs_f64();
+    // Fast at first, settling as it arrives.
+    1.0 - (1.0 - fraction).powi(3)
+}
+
+/// When a toast `age` into its life must be drawn again: soon while it slides, else when it
+/// starts to slide out.
+fn next_draw(age: Duration) -> Duration {
+    let leave_at = TOAST_LIFETIME.saturating_sub(SLIDE);
+    if age < SLIDE || age >= leave_at {
+        SLIDE_FRAME
+    } else {
+        leave_at - age
+    }
+}
+
+/// Draw every toast into `buffer` as it is at `now`, newest last, from `first_row` of it down
+/// over up to `rows` rows, flush against the right edge. Says when the next frame must draw them
+/// again, while any is on screen.
+pub(crate) fn draw(
+    buffer: &mut Buffer,
+    toasts: &Toasts,
+    first_row: u16,
+    rows: u16,
+    now: Instant,
+) -> Option<Duration> {
     let area = buffer.area;
+    let mut next: Option<Duration> = None;
     for (index, toast) in toasts
         .items
         .iter()
@@ -95,18 +131,42 @@ pub(crate) fn draw(buffer: &mut Buffer, toasts: &Toasts, first_row: u16, rows: u
         if y >= area.bottom() {
             break;
         }
+        let age = now.saturating_duration_since(toast.shown_at);
+        next = Some(next.map_or(next_draw(age), |next| next.min(next_draw(age))));
+        // As far as it has slid in: its first columns, against the right edge.
         let text = label(&toast.text);
-        let columns = u16::try_from(UnicodeWidthStr::width(text.as_str())).unwrap_or(area.width);
+        let full = UnicodeWidthStr::width(text.as_str());
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let wanted = (full as f64 * shown(age)).round() as usize;
+        let mut visible = String::new();
+        let mut columns = 0;
+        for c in text.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if columns + width > wanted {
+                break;
+            }
+            visible.push(c);
+            columns += width;
+        }
+        if visible.is_empty() {
+            continue;
+        }
+        let columns = u16::try_from(columns).unwrap_or(area.width);
         let x = area.right().saturating_sub(columns.saturating_add(1));
         buffer.set_string(
             x,
             y,
-            text,
+            visible,
             Style::new()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::REVERSED),
         );
     }
+    next
 }
 
 #[cfg(test)]
@@ -156,26 +216,28 @@ mod tests {
     #[test]
     fn drawing_goes_to_the_right_edge() {
         let mut toasts = Toasts::default();
-        toasts.push("hi".into(), Instant::now());
+        let start = Instant::now();
+        toasts.push("hi".into(), start);
         let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 6));
-        draw(&mut buffer, &toasts, 4, 2);
-        let row: String = (0..80)
+        draw(&mut buffer, &toasts, 4, 2, start + Duration::from_secs(1));
+        let row: String = (73..80)
             .map(|x| buffer[(x, 4)].symbol().to_owned())
             .collect();
-        // " ✦ hi " is six columns; flush right leaves one column of margin.
-        assert_eq!(row.trim_end().chars().count(), 79);
-        assert!(row.contains("hi"));
+        // The six columns of the label, flush right with one column of margin.
+        assert_eq!(row, format!("{} ", label("hi")));
+        assert_eq!(buffer[(72, 4)].symbol(), " ");
     }
 
     #[test]
     fn nothing_is_drawn_without_toasts_or_rows() {
         let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 3));
         let blank = buffer.clone();
-        draw(&mut buffer, &Toasts::default(), 0, 3);
+        let now = Instant::now();
+        draw(&mut buffer, &Toasts::default(), 0, 3, now);
         assert_eq!(buffer, blank);
         let mut toasts = Toasts::default();
-        toasts.push("x".into(), Instant::now());
-        draw(&mut buffer, &toasts, 0, 0);
+        toasts.push("x".into(), now);
+        draw(&mut buffer, &toasts, 0, 0, now + Duration::from_secs(1));
         assert_eq!(buffer, blank);
     }
 }

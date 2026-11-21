@@ -198,29 +198,39 @@ impl VT100Backend {
     /// the rows at the top that the cursor would be pushed off by go into the scrollback; when it
     /// gets taller rows come back from the scrollback at the top (the cursor moves down with
     /// them), and any other row is blank. With `pull` false the terminal never pulls rows back:
-    /// a taller screen only adds blank rows at the bottom. Rows are cut to the new width, never
-    /// re-wrapped, which is what Nori's rows (they are never soft-wrapped) get from a reflowing
-    /// terminal too.
-    pub fn resize(&mut self, cols: u16, rows: u16, pull: bool) {
+    /// a taller screen only adds blank rows at the bottom.
+    ///
+    /// With `reflow` a new width wraps every line on the screen again, as tmux, Ghostty, kitty,
+    /// iTerm2, WezTerm and Terminal.app do (see [`Self::rewrap`]); without it rows are cut to the
+    /// new width and stay one row each, as xterm does.
+    pub fn resize(&mut self, cols: u16, rows: u16, pull: bool, reflow: bool) {
+        if reflow && cols != self.vt100().screen().size().1 {
+            self.rewrap(cols);
+        }
         let (old_rows, old_cols) = self.vt100().screen().size();
         let (cursor_row, cursor_col) = self.vt100().screen().cursor_position();
         let keep = old_cols.min(cols);
         let mut lines: Vec<Vec<u8>> = self.vt100().screen().rows_formatted(0, keep).collect();
         let mut texts: Vec<String> = self.vt100().screen().rows(0, keep).collect();
+        // Which rows continue on the next one: kept, so a later width joins them again.
+        let mut wrapped: Vec<bool> = (0..old_rows)
+            .map(|row| self.vt100().screen().row_wrapped(row))
+            .collect();
         let mut cursor_row = usize::from(cursor_row);
         let rows_wanted = usize::from(rows);
-        if rows < old_rows {
+        if usize::from(rows) < lines.len() {
             let shift = (cursor_row + 1).saturating_sub(rows_wanted);
             let pushed: Vec<Vec<u8>> = lines.drain(..shift.min(texts.len())).collect();
             let pushed_texts = texts.drain(..shift.min(texts.len()));
+            wrapped.drain(..shift.min(wrapped.len()));
             if let Some(scrollback) = self.scrollback.as_mut() {
                 for (text, bytes) in pushed_texts.zip(pushed) {
                     scrollback.rows.push((text, bytes));
                 }
             }
             cursor_row -= shift;
-        } else if rows > old_rows && pull {
-            let pull = usize::from(rows - old_rows).min(
+        } else if usize::from(rows) > lines.len() && pull {
+            let pull = (usize::from(rows) - lines.len()).min(
                 self.scrollback
                     .as_ref()
                     .map_or(0, |scrollback| scrollback.rows.len()),
@@ -231,13 +241,17 @@ impl VT100Backend {
                     scrollback.rows.drain(at..).unzip();
                 texts.splice(0..0, pulled_texts);
                 lines.splice(0..0, pulled);
+                wrapped.splice(0..0, std::iter::repeat_n(false, pull));
             }
             cursor_row += pull;
         }
         lines.truncate(rows_wanted);
         let mut parser = vt100::Parser::new(rows, cols, 0);
         for (row, bytes) in lines.iter().enumerate() {
-            parser.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            // A row that continues the one above is written right after it, so it wraps there.
+            if !(row > 0 && wrapped.get(row - 1).copied().unwrap_or(false)) {
+                parser.process(format!("\x1b[{};1H", row + 1).as_bytes());
+            }
             parser.process(bytes);
         }
         let cursor_col = cursor_col.min(cols.saturating_sub(1));
@@ -249,6 +263,110 @@ impl VT100Backend {
             )
             .as_bytes(),
         );
+        *self.vt100_mut() = parser;
+    }
+
+    /// Wrap the lines on the screen again at `cols` columns, as a reflowing terminal does: rows
+    /// it joined by wrapping are one line again, a line runs through its last glyph (or to the end
+    /// of its last row when that ends on a colored background), and it takes as many rows as it
+    /// needs at the new width. The screen grows to hold them; [`Self::resize`] then pushes what
+    /// does not fit into the scrollback. The cursor stays on the glyph it was on.
+    fn rewrap(&mut self, cols: u16) {
+        let width = usize::from(cols.max(1));
+        let screen = self.vt100().screen();
+        let (old_rows, old_cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        // Each line as its glyphs (the bytes that draw one, and its width) and the column of it,
+        // counted from the line's start, the cursor is on.
+        let mut lines: Vec<(Vec<(Vec<u8>, usize)>, Option<usize>)> = Vec::new();
+        let mut glyphs = Vec::new();
+        let mut columns = 0;
+        let mut cursor = None;
+        for row in 0..old_rows {
+            let cells: Vec<&vt100::Cell> = (0..old_cols)
+                .filter_map(|col| screen.cell(row, col))
+                .collect();
+            let wraps = screen.row_wrapped(row);
+            let extent = if wraps {
+                cells.len()
+            } else {
+                cells
+                    .iter()
+                    .rposition(|cell| {
+                        cell.has_contents() || cell.bgcolor() != vt100::Color::Default
+                    })
+                    .map_or(0, |last| last + if cells[last].is_wide() { 2 } else { 1 })
+                    .min(cells.len())
+            };
+            if row == cursor_row {
+                cursor = Some(columns + usize::from(cursor_col));
+            }
+            for cell in &cells[..extent] {
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let glyph = if cell.is_wide() { 2 } else { 1 };
+                glyphs.push((cell_bytes(cell), glyph));
+                columns += glyph;
+            }
+            if !wraps {
+                lines.push((std::mem::take(&mut glyphs), cursor.take()));
+                columns = 0;
+            }
+        }
+        if !glyphs.is_empty() || cursor.is_some() {
+            lines.push((glyphs, cursor));
+        }
+        // Where every glyph goes at the new width, a wide one never split across two rows.
+        let mut placed: Vec<Vec<(usize, usize)>> = Vec::with_capacity(lines.len());
+        let mut heights = Vec::with_capacity(lines.len());
+        for (glyphs, _) in &lines {
+            let (mut row, mut column) = (0, 0);
+            let mut at = Vec::with_capacity(glyphs.len());
+            for (_, glyph) in glyphs {
+                if column + glyph > width {
+                    row += 1;
+                    column = 0;
+                }
+                at.push((row, column));
+                column += glyph;
+            }
+            placed.push(at);
+            heights.push(row + 1);
+        }
+        let total: usize = heights.iter().sum();
+        let height = u16::try_from(total.max(usize::from(old_rows)).max(1)).unwrap_or(u16::MAX);
+        let mut parser = vt100::Parser::new(height, cols, 0);
+        let mut first_row = 0;
+        let mut new_cursor = (0, 0);
+        for (((glyphs, cursor), at), rows) in lines.iter().zip(&placed).zip(&heights) {
+            parser.process(format!("\x1b[{};1H", first_row + 1).as_bytes());
+            for (bytes, _) in glyphs {
+                parser.process(bytes);
+            }
+            if let Some(cursor) = cursor {
+                // The glyph the cursor was on, or as far past the line's end as it was.
+                let mut columns = 0;
+                let mut spot = None;
+                for ((_, glyph), &(row, column)) in glyphs.iter().zip(at) {
+                    if columns + glyph > *cursor {
+                        spot = Some((row, column));
+                        break;
+                    }
+                    columns += glyph;
+                }
+                let (row, column) = spot.unwrap_or_else(|| {
+                    let (row, column) = at
+                        .last()
+                        .zip(glyphs.last())
+                        .map_or((0, 0), |(&(row, column), (_, glyph))| (row, column + glyph));
+                    (row, (column + cursor - columns).min(width - 1))
+                });
+                new_cursor = (first_row + row.min(rows - 1), column);
+            }
+            first_row += rows;
+        }
+        parser.process(format!("\x1b[{};{}H", new_cursor.0 + 1, new_cursor.1 + 1).as_bytes());
         *self.vt100_mut() = parser;
     }
 
@@ -390,4 +508,35 @@ impl Backend for VT100Backend {
     ) -> io::Result<()> {
         self.crossterm_backend.scroll_region_down(region, scroll_by)
     }
+}
+
+/// The bytes that draw `cell` with its colors and attributes, from a reset.
+fn cell_bytes(cell: &vt100::Cell) -> Vec<u8> {
+    let mut sgr = vec!["0".to_owned()];
+    for (on, code) in [
+        (cell.bold(), "1"),
+        (cell.dim(), "2"),
+        (cell.italic(), "3"),
+        (cell.underline(), "4"),
+        (cell.inverse(), "7"),
+    ] {
+        if on {
+            sgr.push(code.to_owned());
+        }
+    }
+    for (color, base) in [(cell.fgcolor(), 38), (cell.bgcolor(), 48)] {
+        match color {
+            vt100::Color::Default => {}
+            vt100::Color::Idx(index) => sgr.push(format!("{base};5;{index}")),
+            vt100::Color::Rgb(red, green, blue) => {
+                sgr.push(format!("{base};2;{red};{green};{blue}"));
+            }
+        }
+    }
+    let contents = if cell.has_contents() {
+        cell.contents()
+    } else {
+        " "
+    };
+    format!("\x1b[{}m{contents}", sgr.join(";")).into_bytes()
 }

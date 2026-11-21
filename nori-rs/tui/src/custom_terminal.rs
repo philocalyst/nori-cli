@@ -43,6 +43,7 @@ use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
+use ratatui::text::Line;
 use ratatui::widgets::WidgetRef;
 
 pub(crate) const fn crossterm_color(color: Color) -> CrosstermColor {
@@ -211,6 +212,11 @@ where
         &mut self.buffers[1 - self.current]
     }
 
+    /// The cells of the last frame drawn, which the screen shows unless something moved it.
+    pub(crate) fn last_frame(&self) -> &Buffer {
+        &self.buffers[1 - self.current]
+    }
+
     /// Gets the backend
     pub const fn backend(&self) -> &B {
         &self.backend
@@ -292,6 +298,7 @@ where
     where
         F: FnOnce(&mut Frame),
     {
+        self.autoresize()?;
         self.draw_in(self.viewport_area, None, render_callback)
     }
 
@@ -301,7 +308,8 @@ where
     ///
     /// The render callback should fully render the entire viewport when called, including areas
     /// that are unchanged from the previous frame, because each frame is compared with the
-    /// previous one and only the differences are written.
+    /// previous one and only the differences are written. The caller decides the screen the frame
+    /// is for ([`Self::resize`]): a resize while it is drawn is the next frame's to find.
     pub fn draw_in<F>(
         &mut self,
         area: Rect,
@@ -311,10 +319,6 @@ where
     where
         F: FnOnce(&mut Frame),
     {
-        // Autoresize - otherwise we get glitches if shrinking or potential desync between widgets
-        // and the terminal (if growing), which may OOB.
-        self.autoresize()?;
-
         crate::hyperlink::begin_frame();
         let mut frame = self.get_frame();
         frame.viewport_area = area;
@@ -426,6 +430,33 @@ where
         }
     }
 
+    /// The viewport grows up over rows already on screen and is now `area`: the rows it had are
+    /// its last `area.height - seeds.len()`, and `seeds` says what the screen shows on each row
+    /// it grew over, so the next frame writes only what differs. A row it cannot say (`None`)
+    /// makes the next frame write every row.
+    pub(crate) fn reclaim_viewport(&mut self, area: Rect, seeds: &[Option<&Line<'static>>]) {
+        let width = usize::from(self.viewport_area.width);
+        let old_height = usize::from(self.viewport_area.height);
+        let previous = std::mem::take(&mut self.previous_buffer_mut().content);
+        let repaint_all = self.repaint_all;
+        self.set_viewport_area(area);
+        self.repaint_all = repaint_all;
+        let added = seeds.len();
+        if width != usize::from(area.width) || seeds.iter().any(Option::is_none) {
+            self.repaint_all = true;
+            return;
+        }
+        let kept = old_height.min(usize::from(area.height).saturating_sub(added));
+        let target = self.previous_buffer_mut();
+        target.content[added * width..(added + kept) * width]
+            .clone_from_slice(&previous[..kept * width]);
+        for (row, line) in seeds.iter().flatten().enumerate() {
+            let y = area.y + u16::try_from(row).unwrap_or(u16::MAX);
+            target.set_style(Rect::new(area.x, y, area.width, 1), line.style);
+            target.set_line(area.x, y, line, area.width);
+        }
+    }
+
     /// Clears the inactive buffer and swaps it with the current buffer
     pub fn swap_buffers(&mut self) {
         self.previous_buffer_mut().reset();
@@ -491,8 +522,6 @@ fn diff_buffers(
         // Scan the row to find the rightmost column that still matters: any non-space glyph,
         // any cell whose bg differs from the row’s trailing bg, or any cell with modifiers.
         // Multi-width glyphs extend that region through their full displayed width.
-        // After that point the rest of the row can be cleared with a single ClearToEnd, a perf win
-        // versus emitting multiple space Put commands.
         let mut last_nonblank_column = 0usize;
         let mut column = 0usize;
         while column < row.len() {
@@ -504,8 +533,13 @@ fn diff_buffers(
             column += cell_width.max(1); // treat zero-width symbols as width 1
         }
 
-        if last_nonblank_column + 1 < row.len() {
-            let (x, y) = a.pos_of(row_start + last_nonblank_column + 1);
+        // A row with room left at its end is erased whole and its cells are written again. A
+        // terminal remembers how far a row ever reached: one erased only from its middle keeps
+        // that length, and on a narrower screen its reflow wraps the erased blanks onto a row of
+        // their own, so every row of the scrollback would come back double spaced.
+        let erased = last_nonblank_column + 1 < row.len();
+        if erased {
+            let (x, y) = a.pos_of(row_start);
             sink.link(None)?;
             sink.clear_to_end(x, y, bg)?;
         }
@@ -517,8 +551,14 @@ fn diff_buffers(
         // their place (the skipped cells should be blank anyway), or due to per-cell-skipping:
         let mut to_skip: usize = 0;
         for (column, (current, previous)) in row.iter().zip(previous_row.iter()).enumerate() {
+            let changed = if erased {
+                // The erase left blanks of the row's trailing background.
+                current.symbol() != " " || current.bg != bg || !current.modifier.is_empty()
+            } else {
+                repaint_all || current != previous || invalidated > 0
+            };
             if !matches!(current.diff_option, CellDiffOption::Skip)
-                && (repaint_all || current != previous || invalidated > 0)
+                && changed
                 && to_skip == 0
                 && column <= last_nonblank_column
             {
@@ -634,7 +674,10 @@ impl<W: Write> DiffSink for TerminalSink<'_, W> {
         queue!(
             self.writer,
             Clear(crossterm::terminal::ClearType::UntilNewLine)
-        )
+        )?;
+        // An erase leaves the cursor where it began, as if the cell before it had been written.
+        self.last_pos = x.checked_sub(1).map(|x| Position { x, y });
+        Ok(())
     }
 }
 
@@ -772,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_buffers_clear_to_end_starts_after_wide_char() {
+    fn a_shortened_row_is_erased_whole_and_written_again() {
         let area = Rect::new(0, 0, 10, 1);
         let mut previous = Buffer::empty(area);
         let mut next = Buffer::empty(area);
@@ -781,11 +824,15 @@ mod tests {
         next.set_string(0, 0, "中", Style::default());
 
         let commands = diff_commands(&previous, &next, false);
-        assert!(
-            commands
-                .iter()
-                .any(|command| matches!(command, DrawCommand::ClearToEnd { x: 2, y: 0, .. })),
-            "expected clear-to-end to start after the remaining wide char; commands: {commands:?}"
+        assert_eq!(
+            format!("{commands:?}"),
+            format!(
+                "{:?}",
+                [
+                    DrawCommand::ClearToEnd { x: 0, y: 0 },
+                    DrawCommand::Put { x: 0, y: 0 }
+                ]
+            ),
         );
     }
 }
@@ -836,9 +883,8 @@ mod row_skip_tests {
         let mut next = previous.clone();
         next.set_string(0, 2, "after!", Style::default());
 
-        // Five cells of the changed row differ (the sixth, `r`, is the same) and its trailing
-        // clear; the other rows cost nothing.
-        assert_eq!(diff(&previous, &next, false), (5, 1));
+        // The changed row is erased and its six cells written again; the other rows cost nothing.
+        assert_eq!(diff(&previous, &next, false), (6, 1));
     }
 
     #[test]
@@ -851,10 +897,20 @@ mod row_skip_tests {
     }
 
     #[test]
-    fn repaint_all_writes_interior_blanks_over_unknown_terminal_contents() {
+    fn repaint_all_erases_unknown_terminal_contents_before_writing() {
         let area = Rect::new(0, 0, 4, 1);
         let mut frame = Buffer::empty(area);
         frame.set_string(0, 0, "a b", Style::default());
-        assert_eq!(diff(&frame, &frame, true), (3, 1));
+        assert_eq!(diff(&frame, &frame, true), (2, 1));
+    }
+
+    #[test]
+    fn a_full_width_row_writes_only_its_changed_cells() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut previous = Buffer::empty(area);
+        previous.set_string(0, 0, "abcd", Style::default());
+        let mut next = previous.clone();
+        next.set_string(1, 0, "x", Style::default());
+        assert_eq!(diff(&previous, &next, false), (1, 0));
     }
 }

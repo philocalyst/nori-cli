@@ -38,6 +38,41 @@ pub(crate) fn scroll_screen_up(
     Ok(())
 }
 
+/// Hand `rows` to the scrollback, in order and once each, by scrolling the screen: `lift` rows
+/// above them leave first as they are, then one line feed per row. The row that leaves is the one
+/// at the top of the screen, so a row the top does not show (`shown(index)` is false: it is
+/// clipped, covered, or changed since it was drawn) is written there just before its line feed.
+/// Every row that stays on screen is moved by the terminal and never drawn again, so what the
+/// person is reading, or has selected, keeps its place.
+pub(crate) fn scroll_rows_off(
+    writer: &mut impl Write,
+    screen_height: u16,
+    width: u16,
+    lift: u16,
+    rows: &[Line<'_>],
+    shown: impl Fn(usize) -> bool,
+) -> io::Result<()> {
+    scroll_screen_up(writer, screen_height, lift)?;
+    if rows.is_empty() || screen_height == 0 {
+        return Ok(());
+    }
+    let texts: Vec<_> = rows.iter().map(|row| row_text(row, width)).collect();
+    let mut at_bottom = lift > 0;
+    for (index, row) in rows.iter().enumerate() {
+        if !shown(index) {
+            queue!(writer, MoveTo(0, 0))?;
+            write_row(writer, row, &crate::hyperlink::line_links(&texts, index))?;
+            at_bottom = false;
+        }
+        if !at_bottom {
+            queue!(writer, MoveTo(0, screen_height - 1))?;
+            at_bottom = true;
+        }
+        queue!(writer, Print("\n"))?;
+    }
+    Ok(())
+}
+
 /// Erase the rows `from..to` one at a time. Erasing "from the cursor down" at the top of the
 /// screen is read by some terminals (tmux) as clearing the screen, and they push everything on it
 /// into the scrollback first.

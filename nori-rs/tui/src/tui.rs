@@ -44,6 +44,7 @@ use crate::tui::job_control::SuspendContext;
 #[cfg(unix)]
 mod job_control;
 pub(crate) mod present;
+pub(crate) mod reflow;
 mod repaint;
 mod toast;
 
@@ -162,6 +163,8 @@ pub struct Tui {
     presenter: present::Presenter,
     /// Any resize can damage terminal contents, even if a burst ends at the original size.
     resize_signal: Arc<present::ResizeSignal>,
+    /// Since when frames have waited for the resize event of a screen that changed size.
+    resize_wait: Option<Instant>,
     /// Whether a frame was drawn yet, for the startup trace.
     first_frame_drawn: bool,
     #[cfg(unix)]
@@ -302,7 +305,8 @@ impl Tui {
             let palette_refresh = tokio::time::sleep(crate::terminal_palette::REFRESH_DELAY);
             tokio::pin!(palette_refresh);
             let mut palette_refreshed = false;
-            let mut cursor_reports = true;
+            // Unanswered cursor queries in a row; a terminal that never answers is not asked again.
+            let mut unanswered = 0;
             loop {
                 select! {
                     () = &mut palette_refresh, if !palette_refreshed => {
@@ -326,14 +330,15 @@ impl Tui {
                             Event::Resize(_, _) => {
                                 // The scheduler coalesces bursts; draw reads the latest PTY size.
                                 // Where the terminal left the cursor says how it moved the screen;
-                                // it can only be asked here, between reads of the input. A terminal
-                                // that does not answer is not asked again.
-                                let report = if cursor_reports {
+                                // it can only be asked here, between reads of the input. One slow
+                                // answer in a burst of resizes is no reason to stop asking; three
+                                // in a row are.
+                                let report = if unanswered < 3 {
                                     present::CursorReport::query()
                                 } else {
                                     None
                                 };
-                                cursor_reports = report.is_some();
+                                unanswered = if report.is_some() { 0 } else { unanswered + 1 };
                                 resize_signal.note(report);
                                 resize_frame.schedule_frame();
                             }
@@ -463,9 +468,12 @@ impl Tui {
         self.frame_requester().schedule_frame();
     }
 
-    /// The expandable card (a tool, a peer message) nearest the composer on screen.
-    pub(crate) fn last_card(&self) -> Option<usize> {
-        self.presenter.stage.last_card()
+    /// The expandable card (a tool, a peer message) of `cells` nearest the composer on screen.
+    pub(crate) fn last_card(
+        &self,
+        cells: &[Arc<dyn crate::history_cell::HistoryCell>],
+    ) -> Option<usize> {
+        self.presenter.stage.last_card(&StageView::new(cells, None))
     }
 
     /// The expandable card drawn at `row` of the screen.
@@ -508,6 +516,27 @@ impl Tui {
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
         let (resize_event, cursor_report) = self.resize_signal.take();
+        // A screen that changed size is found again from where the terminal says the cursor went
+        // after its last resize. A frame that comes before that answer (the terminal resized but
+        // the event has not been read, or a later resize is still to be answered) would have to
+        // guess, and a wrong guess draws again rows the terminal already pushed into the
+        // scrollback. It waits for the answer instead, briefly: a terminal that does not answer
+        // gets the guess.
+        let screen = self.terminal.size()?;
+        let moved = resize_event || screen != self.terminal.last_known_screen_size;
+        let answered = cursor_report.is_some_and(|report| report.screen == screen);
+        if moved && !answered {
+            let waited = self.resize_wait.get_or_insert_with(Instant::now).elapsed();
+            if waited < RESIZE_ANSWER_WAIT {
+                if resize_event {
+                    self.resize_signal.note(cursor_report);
+                }
+                self.frame_requester()
+                    .schedule_frame_in(RESIZE_ANSWER_WAIT - waited);
+                return Ok(());
+            }
+        }
+        self.resize_wait = None;
         // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
         // in the synchronized update.
         #[cfg(unix)]
@@ -561,6 +590,9 @@ impl Tui {
         }
         self.presenter
             .present(&mut self.terminal, view, height, popup_rows, draw_fn)?;
+        if let Some(next) = self.presenter.toast_frame() {
+            self.frame_requester().schedule_frame_in(next);
+        }
         #[cfg(unix)]
         self.suspend_context.set_cursor_y(
             self.presenter
@@ -581,6 +613,9 @@ impl Tui {
         result
     }
 }
+
+/// How long frames wait for the cursor report of a resize before guessing where the screen went.
+const RESIZE_ANSWER_WAIT: Duration = Duration::from_millis(250);
 
 /// The shortest time between two draws. Requests inside the window are deferred to its end,
 /// never dropped, so a burst of events costs one frame instead of one per event.

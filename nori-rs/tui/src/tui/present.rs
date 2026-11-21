@@ -72,34 +72,45 @@ impl ResizeSignal {
 pub(crate) struct Presenter {
     /// What the screen shows of the conversation, and what has left it for the scrollback.
     pub(crate) stage: Stage,
-    /// Toasts on screen, and whether the last frame drew them (so the next must not scroll them).
+    /// Toasts, drawn on the status line: never over the conversation, which is the terminal's.
     pub(crate) toasts: toast::Toasts,
-    toasts_drawn: bool,
+    /// When the toasts on screen must be drawn again (they slide), if any are.
+    pub(super) toast_frame: Option<std::time::Duration>,
     /// The next frame erases the region and draws every row of it.
     pub(crate) full_repaint: bool,
     /// The row the last frame left the cursor on: after a resize, how far the cursor has moved
     /// says how far the terminal moved the screen.
-    parked_row: u16,
+    pub(super) parked_row: u16,
     /// The first row of the bottom block as the last frame drew it.
-    block_top: u16,
+    pub(super) block_top: u16,
+    /// What the terminal does to its rows when its width changes.
+    pub(crate) width_change: super::reflow::WidthChange,
 }
 
 impl Presenter {
     /// Find the conversation again after a resize.
     ///
     /// The terminal moves the screen by itself: a shorter screen pushes the top rows into the
-    /// scrollback so the cursor stays on screen, a taller one may pull rows back. How the cursor
-    /// row moved says by how many rows (`report` is where the cursor is now; the last frame left
-    /// it on `parked_row`). Rows of the tail that were pushed are in the scrollback now, so the
-    /// stage marks them committed; the rest of the region (and a pulled-back shift of it) is
-    /// erased where it stands, from the first row of the region down, and the tail is drawn again
-    /// at the new width from there. Rows above the region, the scrollback and the rows the
-    /// terminal reflows are never touched.
+    /// scrollback so the cursor stays on screen, a taller one may pull rows back, and a new width
+    /// re-wraps every row, the region's included (one row of the tail may become three). Where
+    /// the cursor is now (`report`) and how many rows lie between the region's first row and the
+    /// cursor once re-wrapped ([`super::reflow`], from the cells of the last frame) say exactly
+    /// where the region's first row went. Everything from there down is erased and drawn again at
+    /// the new width, so no re-wrapped copy of the tail is left behind. Rows of the tail the
+    /// terminal pushed past the top are in the scrollback now, so the stage marks them committed.
+    /// Rows above the region and the scrollback are never touched.
     ///
-    /// Without a report (the terminal did not answer) the shift is assumed to be the push a
-    /// shorter screen needs, or the pull a taller one allows, and nothing is marked committed: a
-    /// row may then be in the scrollback and on screen at once, or an old row stay above the
-    /// redrawn tail, which is better than a screen that lost its context.
+    /// Without a report (the terminal did not answer) a region that began on the first row still
+    /// does; otherwise the shift is assumed to be the push a shorter screen needs, or the pull a
+    /// taller one allows, less the rows the region grew by.
+    ///
+    /// A bottom block that sat on the last row stays there (the stage keeps it anchored): rows a
+    /// taller screen adds are left empty right above it.
+    ///
+    /// The printed rows above the region were re-wrapped too, a glyph at a time. Every cell of
+    /// them still wholly on screen is taken back and laid out again at the new width (words
+    /// wrapped, the full width used), so after a resize the screen reads as if it had been drawn
+    /// for its size, and those rows can be reclaimed by a view again.
     pub(crate) fn recover_from_resize<B>(
         &mut self,
         terminal: &mut Terminal<B>,
@@ -112,25 +123,85 @@ impl Presenter {
         if old.is_empty() {
             return;
         }
+        let old_screen = terminal.last_known_screen_size;
         let parked = i32::from(self.parked_row);
         let report = report.filter(|report| report.screen == screen);
-        // Rows the screen moved up (negative: down) under the region.
-        let shift = match &report {
-            Some(report) => parked - i32::from(report.row),
-            None if screen.height > old.bottom() => {
-                i32::from(old.bottom()) - i32::from(screen.height)
+        let cursor = Position::new(terminal.last_known_cursor_pos.x, self.parked_row);
+        let rewrapped = super::reflow::Rewrapped::of(
+            terminal.last_frame(),
+            cursor,
+            screen.width,
+            self.width_change,
+        );
+        let above = i32::try_from(rewrapped.above_cursor()).unwrap_or(i32::MAX);
+        let top = match &report {
+            Some(report) => i32::from(report.row) - above,
+            None if old.y == 0 => 0,
+            None => {
+                // Rows the screen moved up (negative: down) under the region, as a guess.
+                let shift = if screen.height > old.bottom() {
+                    i32::from(old.bottom()) - i32::from(screen.height)
+                } else {
+                    (parked - i32::from(screen.height.saturating_sub(1))).max(0)
+                };
+                let grown = above - (parked - i32::from(old.y));
+                i32::from(old.y) - shift - grown.max(0)
             }
-            None => (parked - i32::from(screen.height.saturating_sub(1))).max(0),
         };
-        let top = (i32::from(old.y) - shift).clamp(0, i32::from(screen.height.saturating_sub(1)));
-        if report.is_some() {
-            // The shell's rows above the region went first; what is left of the push came off the
-            // tail. Rows of a view (a focused prompt) cannot be matched to the conversation.
-            let pushed = usize::try_from(shift - i32::from(old.y)).unwrap_or(0);
-            self.stage
-                .note_lost_rows(pushed.min(self.stage.displayed().len()));
+        // The printed rows above the region: with the cursor's answer, how the terminal re-wrapped
+        // them says which cells are still wholly on screen, and those are taken back to be laid
+        // out again at the new width; without it, or when the region itself was pushed past the
+        // top, they are the terminal's alone.
+        // Taller, as wide, and the cursor stayed on its row: the terminal pulled nothing back
+        // (Terminal.app does not), so the rows it added are empty ones at the bottom.
+        if let Some(report) = &report
+            && screen.width == old_screen.width
+            && screen.height > old_screen.height
+            && i32::from(report.row) == parked
+        {
+            self.stage.unanchor_after_bare_grow();
         }
-        let top = u16::try_from(top).unwrap_or(0);
+        let top = if report.is_some() && top >= 0 {
+            let taken = self.stage.reown_after_resize(
+                u16::try_from(top).unwrap_or(u16::MAX),
+                screen.width,
+                self.width_change,
+            );
+            tracing::debug!(top, taken, "took back the cells still on screen");
+            top - i32::from(taken)
+        } else {
+            self.stage.forget_printed();
+            top
+        };
+        if report.is_some() && top < 0 {
+            // The first rows of the region went past the top into the scrollback. Rows of the
+            // tail that went whole are committed there; one cut in two is drawn again whole.
+            // Rows of a view (a focused prompt) cannot be matched to the conversation.
+            let pushed = usize::try_from(-top).unwrap_or(0);
+            let mut covered = 0;
+            let gone = rewrapped
+                .rows
+                .iter()
+                .take_while(|rows| {
+                    covered += **rows;
+                    covered <= pushed
+                })
+                .count();
+            self.stage
+                .note_lost_rows(gone.min(self.stage.displayed().len()));
+        }
+        tracing::debug!(
+            ?screen,
+            ?old,
+            ?report,
+            parked,
+            above,
+            top,
+            displayed = self.stage.displayed().len(),
+            "recovering the region after a resize"
+        );
+        let top =
+            u16::try_from(top.clamp(0, i32::from(screen.height.saturating_sub(1)))).unwrap_or(0);
         let _ = crate::stage::write::erase_rows(terminal.backend_mut(), top, screen.height);
         self.stage.forget_screen();
         terminal.set_viewport_area(ratatui::layout::Rect::new(
@@ -177,33 +248,55 @@ impl Presenter {
             terminal.clear()?;
             self.stage.forget_screen();
         }
-        // Toasts are drawn over the first rows of the region: rows with a toast on them must be
-        // typed, not scrolled, or the toast would end up in the scrollback.
-        let toasts_expired = self.toasts.expire(Instant::now());
-        if self.toasts_drawn || toasts_expired {
-            self.stage.forget_screen();
-        }
+        let now = Instant::now();
+        self.toasts.expire(now);
 
         let screen = terminal.size()?;
         let top = terminal.viewport_area.y;
         let plan = self.stage.plan(view, screen, top, height, popup_rows);
         self.stage.commit(terminal, &plan)?;
+        // The frame is drawn for this screen; one that changed meanwhile is found again next.
+        terminal.resize(screen)?;
 
         let Self { stage, toasts, .. } = self;
         let block = plan.block();
-        let caret = plan.caret();
+        let mut toast_frame = None;
         terminal.draw_in(block, Some(Position::new(0, block.y)), |frame| {
             stage.draw(&plan, frame.buffer);
             draw_fn(frame);
-            if let Some(caret) = caret {
-                frame.set_cursor_position(caret);
+            // A prompt edited where it is in the conversation has the cursor there.
+            if let Some((x, y)) = plan.focus_cursor(frame.buffer.area) {
+                frame.set_cursor_position(Position::new(x, y));
             }
-            toast::draw(frame.buffer, toasts, 0, 3);
+            // The newest toast, at the right end of the block's last row (the status line).
+            let status = block
+                .bottom()
+                .saturating_sub(1)
+                .saturating_sub(frame.buffer.area.y);
+            toast_frame = toast::draw(frame.buffer, toasts, status, 1, now);
         })?;
-        self.toasts_drawn = !self.toasts.is_empty();
+        self.toast_frame = toast_frame;
+        // The rows of settled cells the frame drew are the terminal's from now on: the region
+        // starts below them, and they are never drawn again.
+        let printed = u16::try_from(self.stage.settle(&plan)).unwrap_or(0);
+        if printed > 0 {
+            let area = terminal.viewport_area;
+            let rest = ratatui::layout::Rect::new(
+                area.x,
+                area.y + printed,
+                area.width,
+                area.height.saturating_sub(printed),
+            );
+            terminal.scroll_viewport(rest, printed);
+        }
         self.parked_row = terminal.last_known_cursor_pos.y;
         self.block_top = block.y;
         Ok(())
+    }
+
+    /// When the last frame's toasts must be drawn again, if it drew any.
+    pub(crate) fn toast_frame(&self) -> Option<std::time::Duration> {
+        self.toast_frame
     }
 
     /// Where the bottom block began in the last frame.

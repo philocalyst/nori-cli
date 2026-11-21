@@ -36,6 +36,7 @@ use crate::history_cell::UserHistoryCell;
 use crate::test_backend::VT100Backend;
 use crate::tui::present::CursorReport;
 use crate::tui::present::Presenter;
+use crate::tui::reflow::WidthChange;
 
 pub(crate) struct StageSim {
     terminal: Terminal<VT100Backend>,
@@ -64,6 +65,9 @@ pub(crate) struct TerminalBehavior {
     /// The terminal answers the cursor-position query after a resize. A shorter screen pushes
     /// rows into the scrollback whatever it does.
     pub(crate) answers_cursor_query: bool,
+    /// A new width wraps the lines on the screen again (most terminals), instead of cutting each
+    /// row (xterm).
+    pub(crate) reflows: bool,
 }
 
 impl Default for TerminalBehavior {
@@ -71,6 +75,7 @@ impl Default for TerminalBehavior {
         Self {
             pulls_on_grow: true,
             answers_cursor_query: true,
+            reflows: true,
         }
     }
 }
@@ -159,17 +164,19 @@ impl StageSim {
                 .iter()
                 .rposition(|cell| cell.as_any().is::<UserHistoryCell>())
         {
-            let total = self
-                .cells
-                .iter()
-                .filter(|cell| cell.as_any().is::<UserHistoryCell>())
-                .count();
+            // The prompt is edited where it is, as the composer's walk does.
+            let text = self.cells[selected]
+                .as_any()
+                .downcast_ref::<UserHistoryCell>()
+                .map(|cell| cell.message.clone())
+                .unwrap_or_default();
+            let column = u16::try_from(text.len()).unwrap_or(0);
             self.focus = Some(FocusView {
                 selected,
-                turn: (total, total),
-                edit: None,
-                undo_turns: None,
-                has_downstream: selected + 1 < self.cells.len(),
+                edit: Some(crate::stage::InlineEdit {
+                    body: vec![ratatui::text::Line::from(text)],
+                    cursor: Some((column, 0)),
+                }),
             });
         }
         self.frame();
@@ -201,9 +208,12 @@ impl StageSim {
 
     /// Resize the terminal as a window drag would, and draw the frame that follows.
     pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
-        self.terminal
-            .backend_mut()
-            .resize(cols, rows, self.behavior.pulls_on_grow);
+        self.terminal.backend_mut().resize(
+            cols,
+            rows,
+            self.behavior.pulls_on_grow,
+            self.behavior.reflows,
+        );
         self.report = self.behavior.answers_cursor_query.then(|| CursorReport {
             screen: Size::new(cols, rows),
             row: self.cursor().0,
@@ -214,6 +224,11 @@ impl StageSim {
     /// Change how the terminal behaves from the next resize on.
     pub(crate) fn behave(&mut self, behavior: TerminalBehavior) {
         self.behavior = behavior;
+        self.presenter.width_change = if behavior.reflows {
+            WidthChange::Rewraps
+        } else {
+            WidthChange::Cuts
+        };
     }
 
     /// Draw one frame.
@@ -226,10 +241,14 @@ impl StageSim {
         let draft = self.draft.clone();
         let live_tail = self.live_tail.clone();
         let picker = self.picker;
+        let focused = self.focus.is_some();
         let popup = self.popup_rows;
         let live = u16::try_from(live_tail.len()).unwrap_or(u16::MAX);
         let block = if picker {
             u16::MAX
+        } else if self.focus.is_some() {
+            // A walk has no text box: the walk's line and the status line.
+            2
         } else {
             (live + 3 + popup).min(screen.height)
         };
@@ -247,6 +266,12 @@ impl StageSim {
                             Style::default(),
                         );
                     }
+                    return;
+                }
+                if focused {
+                    // The walk's line and the status line; the cursor is the stage's.
+                    buf.set_string(area.x, area.y, "  ↶ turn · ⏎ rewind here", Style::default());
+                    buf.set_string(area.x, area.y + 1, " INS  Sim · model", Style::default());
                     return;
                 }
                 let mut y = area.y;
@@ -437,11 +462,62 @@ mod tests {
     }
 
     #[test]
+    fn focusing_a_prompt_draws_over_its_rows_without_moving_them() {
+        let mut sim = StageSim::after_shell(60, 24, &["~ ❯ nori"]);
+        fill(&mut sim, 3);
+        check(&sim, 3, "3 turns, room to spare");
+        sim.escape();
+        check(&sim, 3, "focused");
+        sim.escape();
+        check(&sim, 3, "unfocused");
+    }
+
+    #[test]
+    fn a_terminal_that_cuts_rows_loses_nothing() {
+        let mut sim = StageSim::after_shell(60, 16, &["~ ❯ nori"]);
+        sim.behave(TerminalBehavior {
+            reflows: false,
+            ..TerminalBehavior::default()
+        });
+        fill(&mut sim, 10);
+        for (cols, rows) in RESIZES {
+            sim.resize(cols, rows);
+            let label = format!("cut rows, resized to {cols}x{rows}");
+            check(&sim, 10, &label);
+            assert_tail_visible(&sim, "MARK10", &label);
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_cuts_rows_while_streaming_focused_and_in_a_picker() {
+        let mut sim = StageSim::new(60, 14);
+        sim.behave(TerminalBehavior {
+            reflows: false,
+            ..TerminalBehavior::default()
+        });
+        fill(&mut sim, 6);
+        sim.stream(&["streaming 1", "streaming 2", "streaming 3"]);
+        sim.resize(40, 10);
+        sim.resize(70, 18);
+        sim.finish_stream();
+        check(&sim, 6, "cut rows, streamed");
+        sim.escape();
+        sim.resize(50, 12);
+        check(&sim, 6, "cut rows, focused, resized");
+        sim.escape();
+        sim.open_picker();
+        sim.resize(40, 10);
+        sim.close_picker();
+        check(&sim, 6, "cut rows, after picker");
+    }
+
+    #[test]
     fn a_terminal_that_never_pulls_rows_back_loses_nothing() {
         let mut sim = StageSim::new(60, 16);
         sim.behave(TerminalBehavior {
             pulls_on_grow: false,
             answers_cursor_query: true,
+            reflows: true,
         });
         fill(&mut sim, 10);
         for (cols, rows) in RESIZES {
@@ -458,6 +534,7 @@ mod tests {
         sim.behave(TerminalBehavior {
             pulls_on_grow: true,
             answers_cursor_query: false,
+            reflows: true,
         });
         fill(&mut sim, 10);
         for (cols, rows) in RESIZES {
