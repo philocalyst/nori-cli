@@ -464,11 +464,17 @@ fn default_selection_uses_a_surface_and_pointer_without_edge_rails() {
 
     let selected = find_ascii_text(&buffer, "Keep session").expect("selected label");
     let pointer = find_symbol_on_row(&buffer, selected.1, "›").expect("selection pointer");
-    assert_eq!(buffer[pointer].fg, Color::Green);
+    assert_eq!(
+        buffer[pointer].fg,
+        theme.accent_mint.fg.expect("mint foreground")
+    );
     assert_eq!(buffer[selected].fg, Color::Reset);
     let description =
         find_ascii_text(&buffer, "Supporting copy for Keep session").expect("description");
-    assert_eq!(buffer[description].fg, Color::DarkGray);
+    assert_eq!(
+        buffer[description].fg,
+        theme.muted.fg.expect("muted foreground")
+    );
     for row in selected.1..=description.1 {
         assert_eq!(find_symbol_on_row(&buffer, row, "▏"), None);
         assert_eq!(find_symbol_on_row(&buffer, row, "▕"), None);
@@ -499,8 +505,14 @@ fn fullscreen_selection_rails_are_explicit_and_replace_the_pointer() {
     for row in selected.1..=description.1 {
         let left = find_symbol_on_row(&buffer, row, "▏").expect("left selection rail");
         let right = find_symbol_on_row(&buffer, row, "▕").expect("right selection rail");
-        assert_eq!(buffer[left].fg, Color::Green);
-        assert_eq!(buffer[right].fg, Color::Green);
+        assert_eq!(
+            buffer[left].fg,
+            theme.accent_mint.fg.expect("mint foreground")
+        );
+        assert_eq!(
+            buffer[right].fg,
+            theme.accent_mint.fg.expect("mint foreground")
+        );
         assert_eq!(find_symbol_on_row(&buffer, row, "›"), None);
     }
 }
@@ -601,10 +613,16 @@ fn shortcut_columns_align_numbers_and_bold_unselected_mnemonics() {
     assert_eq!(buffer[(resume.0 - 3, resume.1)].symbol(), "1");
     assert_eq!(buffer[(inspect.0 - 3, inspect.1)].symbol(), " ");
     assert_eq!(buffer[(share.0 - 3, share.1)].symbol(), "3");
-    assert_eq!(buffer[(resume.0 - 3, resume.1)].fg, Color::Green);
+    assert_eq!(
+        buffer[(resume.0 - 3, resume.1)].fg,
+        theme.accent_mint.fg.expect("mint foreground")
+    );
     assert_eq!(buffer[resume].fg, Color::Reset);
     assert_eq!(buffer[(resume.0 + 1, resume.1)].fg, Color::Reset);
-    assert_eq!(buffer[(share.0 - 3, share.1)].fg, Color::Green);
+    assert_eq!(
+        buffer[(share.0 - 3, share.1)].fg,
+        theme.accent_mint.fg.expect("mint foreground")
+    );
     assert!(buffer[resume].modifier.contains(Modifier::BOLD));
     assert!(buffer[inspect].modifier.contains(Modifier::BOLD));
     assert!(!buffer[share].modifier.contains(Modifier::BOLD));

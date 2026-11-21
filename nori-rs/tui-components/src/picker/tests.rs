@@ -251,13 +251,22 @@ fn picker_applies_density_surfaces_search_input_and_selection() {
         assert_eq!(buffer[(x, selected.1)].bg, Color::Rgb(43, 43, 43));
     }
     assert_eq!(buffer[pointer].symbol(), "›");
-    assert_eq!(buffer[pointer].fg, Color::Green);
+    assert_eq!(
+        buffer[pointer].fg,
+        theme.accent_mint.fg.expect("mint foreground")
+    );
     assert_eq!(buffer[selected].fg, Color::Reset);
-    assert_eq!(buffer[description].fg, Color::DarkGray);
+    assert_eq!(
+        buffer[description].fg,
+        theme.muted.fg.expect("muted foreground")
+    );
     assert_eq!(buffer[(3, selected.1 + 2)].bg, Color::Reset);
     assert_eq!(buffer[(3, selected.1 + 4)].bg, Color::Reset);
     assert_eq!(buffer[(2, 4)].symbol(), "⌕");
-    assert_eq!(buffer[(2, 4)].fg, Color::Green);
+    assert_eq!(
+        buffer[(2, 4)].fg,
+        theme.accent_mint.fg.expect("mint foreground")
+    );
     assert_eq!(buffer[(2, 4)].bg, Color::Reset);
     assert_eq!(buffer[(4, 4)].bg, Color::Rgb(38, 38, 38));
     assert_eq!(buffer[(3, 5)].bg, Color::Reset);
