@@ -39,64 +39,61 @@ use serde_json::Value;
 /// `mcp__nori__git_status`.
 pub const SERVER_NAME: &str = "nori";
 
-/// Guidance for the Nori-owned cross-provider task catalog.
+/// Guidance for the Nori-owned cross-provider task catalog: when to delegate and how replies
+/// come back. Each tool's own description holds its contract.
 pub const DELEGATION_INSTRUCTIONS: &str = "Nori runs a tree of agents called actors: you, the children you delegate to, their children, \
 and peers. An actor has a stable address: an alias such as `reviewer` (also written `actor://reviewer`), \
 or its session id (`actor://<session-id>`). A task (`task-N`) is one turn of work you gave an actor; it \
 is not a new agent.
-- `agent_capabilities` lists the agents and models you can delegate to. When the user names a provider \
-or model, call it, then `delegate_task` with those values; another agent's own spawn tool lists only \
-its own models, so do not tell the user a provider is unavailable because that tool omits it.
-- `delegate_task` starts a child and returns once its session is running, or says exactly why it could \
-not start. The child sees none of this conversation: give it the whole task. Give it an `alias` if \
-anyone will message it again; an alias that already names a live actor reuses that actor and sends it \
-the task.
-- `task_send` messages any actor by `task-N`, alias, `actor://alias` or session id: the same actor \
-every time, never a new child. It reads the message at its next turn boundary (now if idle; \
-`steer: true` interrupts its current turn first). An ended or failed actor is revived with its \
-history. A message to a child you delegated to is a task: its answer to that turn comes back to you. \
-A message to anyone else is mail: they answer with their own `task_send`, and nothing returns \
-automatically.
-- Results and replies arrive as new messages in a new turn. Never poll and never hold your turn \
-waiting: after delegating or sending, continue other work or end your turn. `queued` means the \
-actor has not read the message yet; only `delivered` or `acknowledged` mean it has. Use `task_wait` \
-only when you truly cannot go on without a child's result, and never to wait for a peer. Repeating \
-`task_status` unchanged achieves nothing.
-- Children run independently: the user interrupting your turn does not stop them, and their results still arrive as new messages. They end with this session, or when you or the user stop them (`task_cancel`).";
+- Delegate work that can run beside yours and whose result you do not need for your very next step: \
+research, a review, an independent change. Do it yourself when it is quick or your next step is blocked \
+on it. `delegate_task` starts a child with fresh context: it sees none of this conversation, so give it \
+the whole task, and give parallel children disjoint files.
+- When the user names a provider or model, call `agent_capabilities`, then `delegate_task` with those \
+values; another agent's own spawn tool lists only its own models, so do not tell the user a provider \
+is unavailable because that tool omits it.
+- `task_send` messages an actor that already exists (never a new child). To a child you delegated to \
+it is a task and its answer comes back to you; to anyone else it is mail: they answer with their own \
+`task_send`, and nothing returns automatically.
+- Results and replies arrive as new messages in a new turn. After delegating or sending, do other work \
+or end your turn; never poll, and never hold your turn waiting. `queued` means the actor has not read \
+the message yet; only `delivered` or `acknowledged` mean it has. Use `task_wait` only when you truly \
+cannot go on without a child's result, never for a peer; repeating `task_status` unchanged achieves nothing.
+- Children run independently: the user interrupting your turn does not stop them, and their results \
+still arrive as new messages. They end with this session, or when you or the user stop them \
+(`task_cancel`).";
 
 /// Guidance for monitors: background watchers whose events wake the agent, instead of polling.
-pub const MONITOR_INSTRUCTIONS: &str = "Monitors are how you wait. Arm a background watcher with `monitor_start`, then do other work or end \
-your turn. Never poll, `sleep` or hold a turn open for a build, a test run, CI, a dev server, a log, a \
-file, a URL or a peer: every event the watcher produces reaches you as a new `<monitor_events>` \
+/// `monitor_start` holds the source fields and examples.
+pub const MONITOR_INSTRUCTIONS: &str = "Monitors are how you wait for what happens outside your turn: a build, a test run, CI, a dev server, \
+a log, a file, a URL, a peer, a clock. Arm one with `monitor_start`, then do other work or end your \
+turn. Never poll, `sleep` or hold a turn open: every event reaches you as a new `<monitor_events>` \
 message, even after your turn ended.
-- `source`: `command` (a shell command; each stdout line is an event, `stderr: true` adds stderr; when \
-it exits its exit code is the final event and non-zero is a failure), `file` (tail a file; `from_start` \
-replays it first), `watch` (`paths`: created, modified and deleted entries, debounced), `actor` (a \
-peer's state changes, results and replies; children you delegated to already wake you with \
-their results), `ci` (the checks on a commit; ends with the verdict and \
-the log of each failed job), `http_poll` (an event only when the value picked by `json_path` or \
-`regex` changes; no credentials: use `command` with curl for those).
-- Cover failure, not only success: silence is not success. `fail_on` is a list of regexes that always \
-emit and mark the event FAILED, even when `filter` would drop the line: \
-`[\"Traceback\", \"panicked\", \"FAILED\", \"error\\\\[\", \"Killed\", \"OOM\", \"exit [1-9]\"]`. `filter` \
-keeps only matching lines; `until` ends the monitor once a line matches (that line is emitted first). \
-Filter with `filter`, not by piping the command through `grep`: a pipeline reports grep's exit \
-status, not the command's (if you must pipe, start with `set -o pipefail`).
-- A monitor ends when its source exits, at `timeout_seconds` (default 1800; you are told it expired and \
-how many events it saw, which is not success), at `until`, at `max_events` (a monitor that floods \
-stops and says so: narrow `filter` or raise `batch_ms`), on `monitor_stop`, or with this session. It \
-survives your turn ending. After a restart it is dormant: `monitor_rearm` starts it again.
-- `wake`: `immediate` (default) wakes you when you are idle as soon as events arrive; `digest` gathers \
-events for `digest_seconds` (default 30) into one wake; `boundary` never wakes an idle you, events \
-come after your next turn. A failure, or a monitor ending in failure, always wakes you.
-- Give each a short `label`. At most 8 run at once. A short command you need now is not a monitor: \
-run it with `bash`. `monitor_list` shows what is armed and hands you events you have not read; \
-`monitor_stop` ends one (or `all`); `monitor_rearm` restarts an ended or dormant monitor and extends a \
-running one.
-Examples: tests: {\"label\":\"tests\",\"source\":\"command\",\"command\":\"cargo test 2>&1\",\"filter\":\"test result|FAILED|panicked|error\",\"fail_on\":[\"FAILED\",\"panicked\",\"error\\\\[E\"],\"timeout_seconds\":900}. \
-CI on the branch: {\"label\":\"ci\",\"source\":\"ci\"}. Dev server: {\"label\":\"dev\",\"source\":\"file\",\"path\":\"/tmp/dev.log\",\"filter\":\"ERROR|WARN\",\"fail_on\":[\"Traceback\",\"panicked\",\"Killed\",\"OOM\"],\"wake\":\"digest\"}. \
-A peer: {\"label\":\"review\",\"source\":\"actor\",\"actor\":\"reviewer\"}. Source changes: {\"label\":\"src\",\"source\":\"watch\",\"paths\":[\"src\"],\"kinds\":[\"modified\"],\"filter\":\"\\\\.rs$\"}. \
-A deploy: {\"label\":\"deploy\",\"source\":\"http_poll\",\"url\":\"https://example.com/status\",\"json_path\":\"$.state\",\"interval_seconds\":20,\"until\":\"live|failed\"}.";
+- Cover failure, not only success: silence is not success. Put failure signatures in `fail_on` \
+(`[\"Traceback\", \"panicked\", \"FAILED\", \"error\\\\[\", \"Killed\", \"OOM\", \"exit [1-9]\"]`): such a line always \
+emits, marked FAILED, even when `filter` would drop it, and always wakes you. Narrow noise with \
+`filter`, not by piping the command through `grep`: a pipeline reports grep's exit status, not the \
+command's (if you must pipe, start with `set -o pipefail`).
+- A monitor ends when its source exits, at `timeout_seconds` (you are told it expired and how many \
+events it saw, which is not success), at `until`, at `max_events` (a flood stops it and says so: \
+narrow `filter` or raise `batch_ms`), on `monitor_stop`, or with this session. It survives your turn \
+ending; after a restart it is dormant and `monitor_rearm` starts it again.
+- Give each a short `label`; at most 8 run at once. A short command you need now is not a monitor: run \
+it with `bash`; a process that should outlive the turn is a job (`job_start`).";
+
+/// Guidance for background jobs: processes that outlive a turn and wake the agent instead of being
+/// polled. `job_start` holds the fields and examples.
+pub const JOB_INSTRUCTIONS: &str = "Jobs run what outlives a turn: a dev server, a watcher, a long build or test run. `job_start` returns at \
+once; the job keeps running after your turn, the session and Nori end, and wakes you with a new \
+`<monitor_events>` message when it is ready (`ready`), prints a line matching `wake_on_output`, or \
+exits (`wake_on_exit`, default on). Do other work or end your turn: never poll, `sleep` or loop on \
+`job_read` for it.
+- A non-zero exit, a kill or a lost job always wakes you; a non-zero exit carries the last stderr lines.
+- Set `wake_on_output` to what matters (`error|panic|FAILED`), not to everything. Give each a short \
+`label`; at most 16 run at once.
+- `job_read` returns each output line once (`from: new`): use it to look at output after a wake, not \
+to wait. `job_stop` ends one, and that end does not wake you.
+- A command you need the result of now is not a job: run it with `bash`.";
 
 /// The `_meta` key under which everything here lives.
 const META_KEY: &str = "nori";
@@ -106,6 +103,8 @@ const SESSION_TOKEN_KEY: &str = "hostTools";
 const ADVERTISE_KEY: &str = "hostTools";
 /// In a tool call's `_meta.nori`: which host tool it is.
 const TOOL_CALL_KEY: &str = "hostTool";
+/// In a tool call's `_meta.nori`: that it runs a subagent.
+const SUBAGENT_KEY: &str = "subagent";
 
 /// One tool, in the shape an MCP `tools/list` entry has.
 #[derive(Debug, Clone, PartialEq)]
@@ -327,6 +326,20 @@ pub fn advertised(meta: Option<&Map<String, Value>>) -> bool {
 /// the call without parsing its title.
 pub fn tool_call_meta(name: &str) -> Map<String, Value> {
     nori_meta(TOOL_CALL_KEY, Value::String(name.to_owned()))
+}
+
+/// The `_meta` an agent puts on the ACP tool call of its own subagent tool (Claude's `Agent`), so
+/// the host knows a subagent runs inside the turn: cancelling the turn would end it.
+pub fn subagent_meta() -> Map<String, Value> {
+    nori_meta(SUBAGENT_KEY, Value::Bool(true))
+}
+
+/// Whether an ACP tool call's `_meta` says it runs a subagent.
+pub fn is_subagent(meta: Option<&Map<String, Value>>) -> bool {
+    meta.and_then(|meta| meta.get(META_KEY))
+        .and_then(|nori| nori.get(SUBAGENT_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The host tool an ACP tool call's `_meta` names.

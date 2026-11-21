@@ -72,6 +72,9 @@ impl SelectedTools {
         if specs.iter().any(|spec| spec.name == "monitor_start") {
             lines.push(crate::MONITOR_INSTRUCTIONS.to_owned());
         }
+        if specs.iter().any(|spec| spec.name == "job_start") {
+            lines.push(crate::JOB_INSTRUCTIONS.to_owned());
+        }
         lines.extend(selection.instructions.iter().cloned());
         Self {
             inner,
