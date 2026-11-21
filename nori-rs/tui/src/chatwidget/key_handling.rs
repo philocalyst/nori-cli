@@ -263,6 +263,7 @@ impl ChatWidget {
     }
 
     pub(super) fn dispatch_command(&mut self, cmd: SlashCommand) {
+        crate::latency::begin(crate::latency::Interaction::Command, true);
         // Once exit begins, the session is over: ignore repeated quit
         // commands and refuse everything else instead of racing teardown.
         if self.exiting {

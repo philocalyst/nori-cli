@@ -13,6 +13,9 @@ impl ChatWidget {
             }
             nori_protocol::NoriEvent::SessionStarted(started) => {
                 self.on_session_started(started);
+                // A new or resumed session is on screen, its replayed history with it.
+                crate::latency::settle(crate::latency::Interaction::SessionStart);
+                crate::latency::settle(crate::latency::Interaction::Resume);
             }
             nori_protocol::NoriEvent::SessionPhaseChanged(phase) => {
                 if self.resume_can_fall_back
