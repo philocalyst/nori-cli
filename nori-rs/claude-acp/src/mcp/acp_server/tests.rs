@@ -138,6 +138,44 @@ async fn test_handle_message_tools_call_bash_fallback() {
 }
 
 #[tokio::test]
+async fn background_bash_is_reachable_through_bash_output() {
+    let server = AcpMcpServer::new("test", "1.0.0");
+    server.set_cwd(std::env::temp_dir());
+    server.set_session_id("test-session");
+    server.set_background_processes(Arc::new(BackgroundProcessManager::new()));
+    let started = server
+        .execute_tool(
+            "Bash",
+            serde_json::json!({
+                "command": "printf 'background-marker\\n'", "run_in_background": true
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!started.is_error, "{}", started.content);
+    let id = started.metadata.as_ref().unwrap()["shell_id"]
+        .as_str()
+        .unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = server
+                .execute_tool("BashOutput", serde_json::json!({"bash_id": id}), None)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{}", result.content);
+            if result.content.contains("background-marker") {
+                break result.content;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background output");
+    assert!(output.contains("background-marker"));
+}
+
+#[tokio::test]
 async fn test_handle_message_tools_call_with_tool_use_id() {
     // Test that tool_use_id is extracted from _meta
     let server = AcpMcpServer::new("test-server", "1.0.0");

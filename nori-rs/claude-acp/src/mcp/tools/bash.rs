@@ -172,7 +172,7 @@ impl Tool for BashTool {
 
         // Fall back to direct process execution
         if params.run_in_background.unwrap_or(false) {
-            return self.execute_background(&params, context);
+            return start_background(&params.command, params.description.as_deref(), context);
         }
 
         self.execute_foreground(&params, context).await
@@ -318,132 +318,6 @@ impl BashTool {
                 "exec_duration_ms": exec_duration.as_millis()
             }))
         }
-    }
-
-    /// Execute command in background (non-blocking)
-    fn execute_background(&self, params: &BashInput, context: &ToolContext) -> ToolResult {
-        // Get background process manager
-        let manager = match context.background_processes() {
-            Some(m) => m.clone(),
-            None => {
-                return ToolResult::error("Background process manager not available");
-            }
-        };
-
-        // Build the command with process-wrap for process group support
-        let mut cmd = CommandWrap::with_new("bash", |c| {
-            c.arg("-c")
-                .arg(&params.command)
-                .current_dir(&context.cwd)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        });
-
-        // Add platform-specific wrapper for process group management
-        #[cfg(unix)]
-        cmd.wrap(ProcessGroup::leader());
-
-        #[cfg(windows)]
-        cmd.wrap(JobObject::new());
-
-        // Spawn the process
-        let mut wrapped_child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to spawn command: {e}")),
-        };
-
-        // Extract stdout and stderr BEFORE wrapping (ChildWrapper doesn't expose them)
-        let stdout = wrapped_child.stdout().take();
-        let stderr = wrapped_child.stderr().take();
-
-        // Generate shell ID
-        let shell_id = format!("shell-{}", Uuid::new_v4().simple());
-
-        // Create wrapped child handle (stdout/stderr not stored in handle)
-        let child_handle = ChildHandle::Wrapped {
-            child: Arc::new(tokio::sync::Mutex::new(WrappedChild::new(wrapped_child))),
-        };
-
-        // Create background terminal
-        let terminal = BackgroundTerminal::new_running(child_handle);
-
-        // Get reference to output buffer for the read task
-        let output_buffer = match &terminal {
-            BackgroundTerminal::Running { output_buffer, .. } => output_buffer.clone(),
-            BackgroundTerminal::Finished { .. } => unreachable!(),
-        };
-
-        // Register with manager
-        let shell_id_clone = shell_id.clone();
-        manager.register(shell_id.clone(), terminal);
-
-        // Spawn task to read output
-        let manager_clone = manager;
-        let description = params.description.clone();
-        tokio::spawn(async move {
-            let mut combined_output = String::new();
-
-            // Read stdout
-            if let Some(stdout) = stdout {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    combined_output.push_str(&line);
-                    combined_output.push('\n');
-                    let mut buffer = output_buffer.lock().await;
-                    buffer.push_str(&line);
-                    buffer.push('\n');
-                }
-            }
-
-            // Read stderr
-            if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if !combined_output.is_empty() && !combined_output.ends_with('\n') {
-                        combined_output.push('\n');
-                    }
-                    combined_output.push_str(&line);
-                    combined_output.push('\n');
-                    let mut buffer = output_buffer.lock().await;
-                    buffer.push_str(&line);
-                    buffer.push('\n');
-                }
-            }
-
-            // Wait for process to finish and update terminal state
-            // Use get() instead of get_mut() because BackgroundTerminal contains ChildHandle
-            // We only need a shared reference to clone the ChildHandle
-            if let Some(terminal_ref) = manager_clone.get(&shell_id_clone)
-                && let BackgroundTerminal::Running { child, .. } = &*terminal_ref
-            {
-                // Clone the ChildHandle to hold it across await points
-                let mut child_handle = child.clone();
-                drop(terminal_ref); // Release DashMap read lock before await
-
-                // ChildHandle::wait() handles locking internally
-                if let Ok(status) = child_handle.wait().await {
-                    let exit_code = status.code().unwrap_or(-1);
-                    manager_clone
-                        .finish_terminal(&shell_id_clone, TerminalExitStatus::Exited(exit_code))
-                        .await;
-                } else {
-                    manager_clone
-                        .finish_terminal(&shell_id_clone, TerminalExitStatus::Aborted)
-                        .await;
-                }
-            }
-        });
-
-        // Return immediately with shell ID
-        ToolResult::success(format!(
-            "Command started in background.\n\nShell ID: {shell_id}\n\nUse BashOutput to check status and retrieve output."
-        )).with_metadata(json!({
-            "shell_id": shell_id,
-            "status": "running",
-            "description": description
-        }))
     }
 
     /// Execute command using Terminal API in foreground (blocking)
@@ -601,6 +475,138 @@ impl BashTool {
             "terminal_api": true
         }))
     }
+}
+
+/// Run `command` as a background shell this session owns: registered with the session's background
+/// processes, so `BashOutput` and `KillShell` reach it by the shell id this returns, whichever Bash
+/// tool started it.
+pub(crate) fn start_background(
+    command: &str,
+    description: Option<&str>,
+    context: &ToolContext,
+) -> ToolResult {
+    // Get background process manager
+    let manager = match context.background_processes() {
+        Some(m) => m.clone(),
+        None => {
+            return ToolResult::error("Background process manager not available");
+        }
+    };
+
+    // Build the command with process-wrap for process group support
+    let mut cmd = CommandWrap::with_new("bash", |c| {
+        c.arg("-c")
+            .arg(command)
+            .current_dir(&context.cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    });
+
+    // Add platform-specific wrapper for process group management
+    #[cfg(unix)]
+    cmd.wrap(ProcessGroup::leader());
+
+    #[cfg(windows)]
+    cmd.wrap(JobObject::new());
+
+    // Spawn the process
+    let mut wrapped_child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(format!("Failed to spawn command: {e}")),
+    };
+
+    // Extract stdout and stderr BEFORE wrapping (ChildWrapper doesn't expose them)
+    let stdout = wrapped_child.stdout().take();
+    let stderr = wrapped_child.stderr().take();
+
+    // Generate shell ID
+    let shell_id = format!("shell-{}", Uuid::new_v4().simple());
+
+    // Create wrapped child handle (stdout/stderr not stored in handle)
+    let child_handle = ChildHandle::Wrapped {
+        child: Arc::new(tokio::sync::Mutex::new(WrappedChild::new(wrapped_child))),
+    };
+
+    // Create background terminal
+    let terminal = BackgroundTerminal::new_running(child_handle);
+
+    // Get reference to output buffer for the read task
+    let output_buffer = match &terminal {
+        BackgroundTerminal::Running { output_buffer, .. } => output_buffer.clone(),
+        BackgroundTerminal::Finished { .. } => unreachable!(),
+    };
+
+    // Register with manager
+    let shell_id_clone = shell_id.clone();
+    manager.register(shell_id.clone(), terminal);
+
+    // Spawn task to read output
+    let manager_clone = manager;
+    let description = description.map(str::to_owned);
+    tokio::spawn(async move {
+        let mut combined_output = String::new();
+
+        // Read stdout
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                combined_output.push_str(&line);
+                combined_output.push('\n');
+                let mut buffer = output_buffer.lock().await;
+                buffer.push_str(&line);
+                buffer.push('\n');
+            }
+        }
+
+        // Read stderr
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !combined_output.is_empty() && !combined_output.ends_with('\n') {
+                    combined_output.push('\n');
+                }
+                combined_output.push_str(&line);
+                combined_output.push('\n');
+                let mut buffer = output_buffer.lock().await;
+                buffer.push_str(&line);
+                buffer.push('\n');
+            }
+        }
+
+        // Wait for process to finish and update terminal state
+        // Use get() instead of get_mut() because BackgroundTerminal contains ChildHandle
+        // We only need a shared reference to clone the ChildHandle
+        if let Some(terminal_ref) = manager_clone.get(&shell_id_clone)
+            && let BackgroundTerminal::Running { child, .. } = &*terminal_ref
+        {
+            // Clone the ChildHandle to hold it across await points
+            let mut child_handle = child.clone();
+            drop(terminal_ref); // Release DashMap read lock before await
+
+            // ChildHandle::wait() handles locking internally
+            if let Ok(status) = child_handle.wait().await {
+                let exit_code = status.code().unwrap_or(-1);
+                manager_clone
+                    .finish_terminal(&shell_id_clone, TerminalExitStatus::Exited(exit_code))
+                    .await;
+            } else {
+                manager_clone
+                    .finish_terminal(&shell_id_clone, TerminalExitStatus::Aborted)
+                    .await;
+            }
+        }
+    });
+
+    // Return immediately with shell ID
+    ToolResult::success(format!(
+        "Command started in background.\n\nShell ID: {shell_id}\n\nUse BashOutput to check status and retrieve output."
+    )).with_metadata(json!({
+        "shell_id": shell_id,
+        "status": "running",
+        "description": description
+    }))
 }
 
 #[cfg(test)]

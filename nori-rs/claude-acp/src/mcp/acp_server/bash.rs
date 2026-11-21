@@ -52,6 +52,17 @@ impl AcpMcpServer {
             .unwrap_or(120_000)
             .min(600_000); // Max 10 minutes
 
+        // A background command is a shell the session owns, which `BashOutput` and `KillShell`
+        // reach through the session's background processes. It is never the client's terminal:
+        // a client need not have terminals at all.
+        if run_in_background {
+            return Ok(crate::mcp::tools::bash::start_background(
+                &command,
+                description.as_deref(),
+                context,
+            ));
+        }
+
         // Generate unique terminal ID for tracking
         let terminal_id = uuid::Uuid::new_v4().to_string();
 
@@ -62,7 +73,6 @@ impl AcpMcpServer {
             command = %command,
             description = ?description,
             terminal_id = %terminal_id,
-            run_in_background = run_in_background,
             timeout_ms = timeout_ms,
             cwd = ?context.cwd,
             "Executing Bash command with streaming output"
@@ -111,7 +121,6 @@ impl AcpMcpServer {
                 &terminal_id,
                 context,
                 timeout_ms,
-                run_in_background,
                 cx_clone.as_ref(),
                 session_id_clone.as_deref(),
                 tool_use_id_clone.as_deref(),
@@ -170,7 +179,6 @@ impl AcpMcpServer {
         terminal_id: &str,
         context: &ToolContext,
         timeout_ms: u64,
-        run_in_background: bool,
         cx: Option<&Cx>,
         session_id: Option<&str>,
         tool_use_id: Option<&str>,
@@ -189,15 +197,6 @@ impl AcpMcpServer {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| format!("Failed to spawn command: {e}"))?;
-
-        // Handle background execution
-        if run_in_background {
-            let shell_id = format!("term-{terminal_id}");
-            tracing::info!(shell_id = %shell_id, "Command started in background");
-            return Ok(ToolResult::success(format!(
-                "Command started in background.\n\nShell ID: {shell_id}\n\nUse BashOutput to check status."
-            )));
-        }
 
         // Collect output
         let mut output = String::new();
