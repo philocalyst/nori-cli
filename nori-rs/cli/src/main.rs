@@ -357,30 +357,6 @@ fn pre_main_hardening() {
 }
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(feature = "native-codex")]
-    {
-        let mut args = std::env::args();
-        let _ = args.next();
-        match args.next().as_deref() {
-            Some("--codex-ui-plugin-process") => {
-                return codex_code_mode_runtime::run_ui_sandbox().map_err(Into::into);
-            }
-            Some("--nori-code-mode-host") => {
-                let args: Vec<_> = args.collect();
-                let listen = match args.as_slice() {
-                    [] => codex_code_mode_host::DEFAULT_LISTEN_URL,
-                    [flag, url] if flag == "--listen" => url.as_str(),
-                    _ => anyhow::bail!("invalid code-mode host arguments"),
-                };
-                return tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(codex_code_mode_host::run_main(listen));
-            }
-            _ => {}
-        }
-        codex_install_context::set_code_mode_host_program(std::env::current_exe()?);
-    }
     nori_tui::startup_trace::mark("main");
     arg0_dispatch_or_else(|codex_linux_sandbox_exe| async move {
         cli_main(codex_linux_sandbox_exe).await?;

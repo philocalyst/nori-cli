@@ -17,9 +17,9 @@ workspace = true
 
 [features]
 default = ["native-codex", "native-claude", "native-opencode"]
-# Run Codex inside Nori's own process instead of through an adapter. It links all of codex-core,
-# including V8, so a build without it is much smaller and faster to compile.
-native-codex = ["dep:nori-codex-acp", "dep:codex-code-mode-host", "dep:codex-code-mode-runtime", "dep:codex-install-context"]
+# Run Codex inside Nori's own process, on Nori's engine (`nori-engine`) with Codex's sign-in,
+# config and catalog: no Codex program and no vendored Codex core.
+native-codex = ["dep:nori-codex-acp"]
 # Run Claude Code through the in-process Rust driver instead of the TypeScript adapter. It still
 # starts Claude Code's own CLI; there is no adapter process.
 native-claude = ["dep:nori-claude-acp"]
@@ -50,9 +50,6 @@ codex-stdio-to-uds = { workspace = true }
 nori-tui = { workspace = true }
 ctor = { workspace = true }
 nori-codex-acp = { path = "../codex-acp", optional = true }
-codex-code-mode-host = { path = "../../vendor/codex/code-mode-host", optional = true }
-codex-code-mode-runtime = { path = "../../vendor/codex/code-mode-runtime", optional = true }
-codex-install-context = { path = "../../vendor/codex/install-context", optional = true }
 nori-claude-acp = { path = "../claude-acp", optional = true }
 nori-opencode-acp = { path = "../opencode-acp", optional = true }
 nori-gemini-acp = { path = "../gemini-acp", optional = true }
@@ -77,9 +74,6 @@ which = { workspace = true }
 codex_windows_sandbox = { package = "codex-windows-sandbox", path = "../windows-sandbox-rs" }
 
 [dev-dependencies]
-codex-code-mode = { path = "../../vendor/codex/code-mode" }
-codex-core = { path = "../../vendor/codex/core" }
-codex-protocol = { path = "../../vendor/codex/protocol" }
 tokio-util = { workspace = true, features = ["rt"] }
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
