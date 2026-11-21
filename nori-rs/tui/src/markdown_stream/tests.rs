@@ -27,8 +27,8 @@ async fn e2e_stream_blockquote_simple_is_green() {
     let l = &out[0];
     assert_eq!(
         l.style.fg,
-        Some(Color::Green),
-        "expected blockquote line fg green, got {:?}",
+        Some(Color::DarkGray),
+        "expected blockquote line fg dark gray (muted), got {:?}",
         l.style.fg
     );
 }
@@ -52,16 +52,16 @@ async fn e2e_stream_blockquote_nested_is_green() {
         })
         .collect();
     assert_eq!(non_blank.len(), 2);
-    assert_eq!(non_blank[0].style.fg, Some(Color::Green));
-    assert_eq!(non_blank[1].style.fg, Some(Color::Green));
+    assert_eq!(non_blank[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(non_blank[1].style.fg, Some(Color::DarkGray));
 }
 
 #[tokio::test]
 async fn e2e_stream_blockquote_with_list_items_is_green() {
     let out = super::simulate_stream_markdown_for_tests(&["> - item 1\n> - item 2\n"], true);
     assert_eq!(out.len(), 2);
-    assert_eq!(out[0].style.fg, Some(Color::Green));
-    assert_eq!(out[1].style.fg, Some(Color::Green));
+    assert_eq!(out[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(out[1].style.fg, Some(Color::DarkGray));
 }
 
 #[tokio::test]
@@ -84,14 +84,14 @@ async fn e2e_stream_nested_mixed_lists_ordered_marker_is_light_blue() {
     });
     let idx = find_idx.expect("expected third-level ordered line");
     let line = &out[idx];
-    // Expect at least one span on this line to be styled light blue
+    // Expect at least one span on this line to be styled dark gray (muted)
     let has_light_blue = line
         .spans
         .iter()
-        .any(|s| s.style.fg == Some(ratatui::style::Color::LightBlue));
+        .any(|s| s.style.fg == Some(ratatui::style::Color::DarkGray));
     assert!(
         has_light_blue,
-        "expected an ordered-list marker span with light blue fg on: {line:?}"
+        "expected an ordered-list marker span with dark gray fg on: {line:?}"
     );
 }
 
@@ -121,8 +121,8 @@ async fn e2e_stream_blockquote_wrap_preserves_green_style() {
     for (i, l) in non_blank.iter().enumerate() {
         assert_eq!(
             l.spans[0].style.fg,
-            Some(Color::Green),
-            "wrapped line {} should preserve green style, got {:?}",
+            Some(Color::DarkGray),
+            "wrapped line {} should preserve muted style, got {:?}",
             i,
             l.spans[0].style.fg
         );
@@ -324,7 +324,7 @@ async fn e2e_stream_deep_nested_third_level_marker_is_light_blue() {
     });
 
     // The marker (including indent and "1.") is expected to be in the first span
-    // and colored LightBlue; following content should be default color.
+    // and muted (dark gray); following content should be default color.
     assert!(
         !line.spans.is_empty(),
         "expected non-empty spans for the third-level line"
@@ -332,8 +332,8 @@ async fn e2e_stream_deep_nested_third_level_marker_is_light_blue() {
     let marker_span = &line.spans[0];
     assert_eq!(
         marker_span.style.fg,
-        Some(Color::LightBlue),
-        "expected LightBlue 3rd-level ordered marker, got {:?}",
+        Some(Color::DarkGray),
+        "expected muted (DarkGray) 3rd-level ordered marker, got {:?}",
         marker_span.style.fg
     );
     // Find the first non-empty non-space content span and verify it is default color.

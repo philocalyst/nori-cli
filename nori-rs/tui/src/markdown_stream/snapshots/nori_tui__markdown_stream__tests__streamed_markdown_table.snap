@@ -1,5 +1,6 @@
 ---
-source: tui/src/markdown_stream.rs
+source: tui/src/markdown_stream/tests.rs
+assertion_line: 627
 expression: transcript
 ---
 Here is a table:
