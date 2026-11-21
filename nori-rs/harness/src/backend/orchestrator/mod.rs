@@ -113,6 +113,8 @@ pub(crate) struct Tree {
     journal: persistence::Journal,
     /// What programs hand their actors' recovery engines and what those engines report back.
     program: program::ProgramState,
+    /// The session's compiled gates, which the whole tree is consulted through.
+    pub(crate) gates: super::gates::GateCell,
 }
 
 /// What a session needs to delegate: the configuration its children start from and where it sits
@@ -145,6 +147,7 @@ impl Seed {
                 directory: Directory::default(),
                 journal: persistence::Journal::default(),
                 program: program::ProgramState::default(),
+                gates: super::gates::GateCell::default(),
             }),
             record_transcript: true,
             actor_view: None,

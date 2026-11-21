@@ -450,6 +450,7 @@ async fn run_event_loop(state: Arc<Mutex<HostShared>>, mut events: mpsc::Receive
                 | NoriEvent::QueueRestored(_)
                 | NoriEvent::AgentSilent(_)
                 | NoriEvent::AgentHeard
+                | NoriEvent::SessionMoveRequested { .. }
             | NoriEvent::ConversationResponseBoundary(_),
             )
             // A remote controller sees the root session only.
@@ -637,6 +638,24 @@ impl HostedAgent for HarnessRemoteHost {
             .forwarded_requests
             .retain(|id| id != &request_id);
         Ok(())
+    }
+
+    async fn ext_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, acp::Error> {
+        let handle = self
+            .state
+            .lock()
+            .await
+            .session
+            .as_ref()
+            .map(|session| session.handle.clone())
+            .ok_or_else(unknown_session)?;
+        crate::backend::plugins::remote::answer(&handle, method, params)
+            .await
+            .unwrap_or_else(|| Err(acp::Error::method_not_found()))
     }
 
     async fn subscribe(&self) -> HostedSubscription {

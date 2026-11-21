@@ -252,8 +252,33 @@ impl ServerHandler for NoriClientService {
     ) -> Result<CallToolResult, McpError> {
         let caller = caller::session_from_meta(&context.meta)?;
         let service = self.for_caller(caller, request.name.as_ref()).await?;
+        // The same gates as for a built-in agent's call (`host_tools::dispatch`).
+        let mut request = request;
+        let arguments = serde_json::Value::Object(request.arguments.take().unwrap_or_default());
+        let gated = match super::gates::gate_host_call(
+            service.orchestrator(),
+            request.name.as_ref(),
+            arguments,
+        )
+        .await
+        {
+            Ok(gated) => gated,
+            Err(reason) => return Ok(tool_error(reason)),
+        };
+        request.arguments = match gated.arguments {
+            serde_json::Value::Object(arguments) => Some(arguments),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Array(_) => None,
+        };
         let call = rmcp::handler::server::tool::ToolCallContext::new(&service, request, context);
-        service.tool_router.call(call).await
+        let mut result = service.tool_router.call(call).await?;
+        if let Some(note) = gated.rewritten {
+            result.content.push(Content::text(note));
+        }
+        Ok(result)
     }
 
     fn get_info(&self) -> ServerInfo {

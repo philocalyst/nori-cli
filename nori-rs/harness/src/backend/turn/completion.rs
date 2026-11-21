@@ -19,7 +19,9 @@ impl AcpBackend {
             | QueuedPromptKind::GoalContinuation
             | QueuedPromptKind::TaskResults
             | QueuedPromptKind::MonitorEvents
-            | QueuedPromptKind::WorkflowHook => {
+            | QueuedPromptKind::WorkflowHook
+            | QueuedPromptKind::LoopNudge
+            | QueuedPromptKind::GateContinue => {
                 if let Some(last_agent_message) = &completed_turn.last_agent_message
                     && !last_agent_message.is_empty()
                     && !self.post_agent_response_hooks.is_empty()
@@ -107,7 +109,9 @@ impl AcpBackend {
                     }
                 }
 
-                // The workflow's follow-up comes first; the goal continues once it is done.
+                // A gate's say comes first: it is the person's own rule. Then the workflow's
+                // follow-up, and the goal continues once that is done.
+                self.gate_stop(completed_turn, generation).await;
                 self.maybe_submit_workflow_hook(completed_turn, generation)
                     .await;
                 self.maybe_submit_goal_continuation(completed_turn, generation)
@@ -236,6 +240,7 @@ impl AcpBackend {
                 prompt_meta: None,
                 original_content: Vec::new(),
                 content: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt_text))],
+                context: Default::default(),
                 display_text: None,
             },
         )

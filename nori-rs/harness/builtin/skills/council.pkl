@@ -1,0 +1,157 @@
+/// A council: several independent members review or answer the same request in parallel, each in
+/// a fresh session that has seen nothing else, and a chair reconciles what they said into agreements,
+/// disagreements and a recommendation. Nori ships it built in; a `council.pkl` in
+/// `$NORI_HOME/skills/` or a trusted project's `.nori/skills/` replaces it.
+///
+/// What Theo's version does (Theo Browne, t3.gg; MIT; the `council` skill of
+/// https://github.com/t3dotgg/tstack, read at commit 7de017b3fc9d,
+/// https://github.com/t3dotgg/tstack/tree/7de017b3fc9d50c03cf3ecb98fb71e0ca65a78bd/skills/council):
+/// it is a prompt, not code, that fires when the user says "council". The agent brings in
+/// three delegates, one strong model from each of three providers at high reasoning effort
+/// (Claude Opus, GPT, Gemini Pro as the example), or the members the user names; it starts them
+/// in parallel (`delegate_task` in T3 Code, the harness's subagent tools elsewhere), gives each the
+/// request and the relevant context, and keeps their work read-only when the job is a review. If
+/// three providers cannot be reached, or a named member is unavailable, it reports that instead of
+/// substituting another model. It then summarizes the useful findings, the disagreements and the
+/// recommended next steps. For a code review each delegate also gives a score out of 10; one full
+/// review pass is a round, and a fresh review after fixes starts a new round. When the work ends in
+/// a pull request, a "Council review" section (a table of delegate by round, `no score` when a
+/// delegate gave none, never an invented one) goes into the PR description, edited in place and not
+/// posted as a comment. If the agent agrees with the recommendations it makes the changes and asks
+/// for a fresh review, until every delegate is satisfied, and it fights scope creep while doing so.
+///
+/// What this skill does of that: the members run in parallel as Nori actors (fresh sessions, high
+/// effort, read-only by instruction), one provider each by default; a member that cannot start
+/// fails the run with its reason and nothing is substituted (recovery fallbacks are switched off);
+/// the chair reconciles, and for a review asks every member's score and whether it is satisfied.
+/// The loop is the calling agent's, as in Theo's: it applies the recommendations and runs the
+/// skill again with `round` and `previous` set, and the chair's table row carries the round. The
+/// PR description is the agent's to edit (Nori does not touch it). What it adds: the members, their
+/// number, the reasoning effort and the chair's prompt are parameters.
+///
+/// Parameters (all text; `skill` passes them as `arguments`):
+///
+/// - `request`: what the council reviews or answers, with the context the members need: they
+///   start with none, so name the files, the diff or the question in full.
+/// - `members`: who sits, as `agent` or `agent:model`, comma separated. Default
+///   `claude-code:opus,codex,gemini:pro`: one strong model from each of three providers.
+/// - `count`: how many of `members` sit (the first ones). Default: all of them. Asking for more
+///   than are named fails and says so.
+/// - `effort`: the reasoning effort for members, as the agent offers it. Default `high`. An agent
+///   with no effort setting refuses it and fails the run; `default` leaves every member's own.
+/// - `chair`: who reconciles, `agent` or `agent:model`. Default `claude-code:sonnet`.
+/// - `synthesis`: the chair's brief; replace it to change what the council reports.
+/// - `round`, `previous`: for a second pass after fixes; `previous` says what changed and what the
+///   members objected to last time.
+///
+/// Dry run: `cargo run -p nori-conduit --example program_check -- harness/builtin/skills/council.pkl
+/// --run --arg request="Review this diff" --arg count=2`.
+amends "nori:Skill"
+
+import "nori:Recovery" as Recovery
+
+local defaultMembers = "claude-code:opus,codex,gemini:pro"
+local defaultChair = "claude-code:sonnet"
+local defaultEffort = "high"
+local defaultSynthesis = """
+  You chair a council. You add no view of your own: you reconcile what the members said. Report, in order:
+  1. Agreements: what every member (or all but one) said, stated once.
+  2. Disagreements: each point where members differ, who said what, and which side the evidence in their answers supports and why.
+  3. Findings worth acting on, most important first, each with the member(s) who raised it.
+  4. Recommended next steps, in order, and what to leave alone: do not let the council's list grow the scope of the work.
+  5. For a code review: a table row for this round, `| Member | Round N |` with each member's score out of 10 exactly as given (`no score` when it gave none; never invent one) and whether it is satisfied.
+  Be concise. Do not repeat the members' answers.
+  """
+
+local function argument(name: String, fallback: String): String =
+  let (value = read?("prop:skill.\(name)")) if (value == null || value.trim().isEmpty) fallback else value.trim()
+
+/// `agent` or `agent:model`.
+local class Seat {
+  agent: String
+  model: String?
+}
+local function seat(text: String): Seat =
+  let (parts = text.trim().split(":"))
+    new Seat { agent = parts[0].trim(); model = if (parts.length > 1) parts.drop(1).join(":").trim() else null }
+
+local named: List<String> = argument("members", defaultMembers).split(",").map((member) -> member.trim()).filter((member) -> !member.isEmpty)
+local wanted: Int = argument("count", named.length.toString()).toInt()
+local members: List<Seat> = named.take(wanted).map((text) -> seat(text))
+/// What is wrong with the council asked for, if anything. It is raised from `name` below: an
+/// error inside a `local` reaches the person as a misleading "Cannot find property".
+local problem: String? =
+  if (wanted > named.length) "the council was asked for \(wanted) members but names \(named.length) (\(named.join(", "))); name more members or lower count; a member is never substituted"
+  else if (wanted < 1) "a council needs at least one member"
+  else null
+local chair: Seat = seat(argument("chair", defaultChair))
+local effort: String = argument("effort", defaultEffort)
+local synthesis: String = argument("synthesis", defaultSynthesis)
+
+/// A member never falls back to another route: an unavailable member is reported, not replaced.
+local noSubstitution = new Recovery.Block { fallback { ranked = false; chain = new Listing {} } }
+
+local readOnly = "Keep your work read-only: read, search and run non-mutating commands, but do not edit files, commit, push or change any state."
+local brief = """
+  You are one member of a council: several independent reviewers answer the same request, each alone, with fresh context and without seeing the others. Answer on your own merits. Be concrete and cite what you rely on (files, lines, commands, sources). Say how sure you are and what would change your mind; do not hedge to agree with anyone.
+  \(readOnly)
+  If the request is a code review, end with two lines: `Score: N/10` (a whole number) and `Satisfied: yes` or `Satisfied: no` (yes only if you would approve it as it stands). If it is not a review, give no score. Never invent one.
+  """
+
+name = if (problem != null) throw(problem) else "council"
+summary = "Several independent models answer the same request in parallel with fresh context; a chair reports their agreements, disagreements and a recommendation (with scores for a review)."
+parameters {
+  ["request"] { description = "What the council reviews or answers, with all the context the members need: they start with none" }
+  ["members"] { description = "Who sits, as agent or agent:model, comma separated"; default = defaultMembers }
+  ["count"] { description = "How many of the members sit (the first ones); all of them when empty"; required = false }
+  ["effort"] { description = "The members' reasoning effort; default leaves each agent's own"; default = defaultEffort }
+  ["chair"] { description = "Who reconciles, as agent or agent:model"; default = defaultChair }
+  ["synthesis"] { description = "The chair's brief: what the report contains"; default = defaultSynthesis }
+  ["round"] { description = "Which review pass this is; 1 for the first, 2 after fixes"; default = "1" }
+  ["previous"] { description = "For a later round: what changed since, and what the members objected to before"; required = false }
+}
+
+actors {
+  for (index, member in members) {
+    ["member_\(index + 1)"] {
+      agent = member.agent
+      model = member.model
+      role = "review"
+      options { when (effort != "default") { ["effort"] = effort } }
+      instructions = brief
+      recovery = noSubstitution
+    }
+  }
+  ["chair"] {
+    agent = chair.agent
+    model = chair.model
+    role = "design"
+    instructions = "\(readOnly) You chair the council; you do not review the work yourself."
+    recovery = noSubstitution
+  }
+}
+
+local function label(index: Int, member: Seat): String = "Member \(index + 1) (\(member.agent)\(if (member.model != null) ":" + member.model else ""))"
+
+steps {
+  new Par {
+    id = "answers"
+    branches {
+      for (index, member in members) {
+        new Send {
+          id = "member_\(index + 1)"
+          to = "member_\(index + 1)"
+          message = "Round {{round}}.\n\n{{request}}\n\n{{previous}}"
+          bind = "answer_\(index + 1)"
+        }
+      }
+    }
+  }
+  new Send {
+    id = "synthesis"
+    to = "chair"
+    message = "\(synthesis)\n\nRound {{round}}. The request:\n\n{{request}}\n\n\(members.mapIndexed((index, member) -> "### \(label(index, member))\n\n{{answer_\(index + 1)}}").join("\n\n"))"
+    bind = "report"
+  }
+}
+result = "report"

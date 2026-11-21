@@ -47,9 +47,11 @@ nori-host-tools = { workspace = true }
 nori-machines = { workspace = true }
 nori-workflow = { workspace = true }
 nori-pkl = { workspace = true }
+nori-actions = { workspace = true }
 nori-conduit = { workspace = true }
 nori-bash = { workspace = true }
 notify-rust = { workspace = true }
+globset = "0.4"
 regex = { workspace = true }
 reqwest = { workspace = true }
 shlex = { workspace = true }

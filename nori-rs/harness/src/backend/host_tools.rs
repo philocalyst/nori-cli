@@ -216,9 +216,23 @@ fn specs_from(mut tools: Vec<rmcp::model::Tool>) -> Vec<HostToolSpec> {
         .collect()
 }
 
-/// Call the tool `name` as the MCP server would. Every tool the router lists has an arm here;
-/// a test holds the two together.
+/// Call the tool `name` as the MCP server would, once the session's `host_tool` gates have had
+/// their say: a refused call is the tool's error, and a rewritten one says so in its result.
 async fn dispatch(
+    service: &NoriClientService,
+    name: &str,
+    arguments: Value,
+) -> Result<CallToolResult, String> {
+    let call = super::gates::gate_host_call(service.orchestrator(), name, arguments).await?;
+    let mut result = run_tool(service, name, call.arguments).await?;
+    if let Some(note) = call.rewritten {
+        result.content.push(rmcp::model::Content::text(note));
+    }
+    Ok(result)
+}
+
+/// Every tool the router lists has an arm here; a test holds the two together.
+async fn run_tool(
     service: &NoriClientService,
     name: &str,
     arguments: Value,
@@ -226,6 +240,7 @@ async fn dispatch(
     let result = match name {
         "bash" => service.bash(parameters(arguments)?).await,
         "conversation" => service.conversation(parameters(arguments)?).await,
+        "skill" => service.skill(parameters(arguments)?).await,
         "conversation_context" => service.conversation_context(parameters(arguments)?).await,
         "get_goal" => {
             no_arguments(name, &arguments)?;

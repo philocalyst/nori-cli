@@ -7,6 +7,7 @@
 
 use super::super::*;
 
+use super::super::gates::Gated;
 use super::super::session_reducer::InboundEvent;
 
 impl AcpBackend {
@@ -69,24 +70,27 @@ impl AcpBackend {
             request_id: pending_request.request.request_id.clone(),
             request: pending_request.request.request.clone(),
         });
-        let auto_outcome = (current_policy == AskForApproval::Never).then(|| {
-            permission
-                .options
-                .iter()
-                .find(|option| {
-                    matches!(
-                        option.kind,
-                        acp::PermissionOptionKind::AllowOnce
-                            | acp::PermissionOptionKind::AllowAlways
-                    )
-                })
-                .map(|option| {
-                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(
-                        option.option_id.clone(),
-                    ))
-                })
-                .unwrap_or(acp::RequestPermissionOutcome::Cancelled)
-        });
+        // Nori never asks permission: a tool the agent wants to run runs. A gate is the person's
+        // own standing rule and still speaks first; a request the agent marks as a question for
+        // the person (`_meta.nori.question`, such as Claude's plan review) is the only kind shown.
+        let question = permission
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("nori"))
+            .and_then(|nori| nori.get("question"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        let gated = self.gate_permission(permission, current_policy, None).await;
+        let mut answer_meta = None;
+        let auto_outcome = match gated {
+            Gated::Answer { outcome, meta } => {
+                answer_meta = meta;
+                Some(outcome)
+            }
+            Gated::Ask => None,
+            Gated::Unmatched if question => None,
+            Gated::Unmatched => Some(allow(permission)),
+        };
 
         // Register first so the ledger's own cancellation finds the request where it must.
         self.pending_approvals.lock().await.push(*pending_request);
@@ -165,20 +169,30 @@ impl AcpBackend {
     }
 
     /// Answer a request as cancelled because the ledger's turn was cancelled or the connection
-    /// died. A permission gets the explicit outcome; a question's responder is dropped.
+    /// died. A permission gets the explicit outcome; a question's responder is dropped. Either
+    /// way the request is withdrawn from the client, so nothing goes on offering the user a
+    /// question the agent was already told is cancelled.
     pub(super) async fn resolve_cancelled_permission(&self, request_id: &str) {
-        if let Some(pending) = self.take_pending_request(request_id).await
-            && matches!(
-                pending.request.request,
-                acp::AgentRequest::RequestPermissionRequest(_)
-            )
-        {
+        let Some(pending) = self.take_pending_request(request_id).await else {
+            return;
+        };
+        let wire_request_id = pending.request.request_id.clone();
+        if matches!(
+            pending.request.request,
+            acp::AgentRequest::RequestPermissionRequest(_)
+        ) {
             let _ = pending.request.response_tx.send(Ok(
                 acp::ClientResponse::RequestPermissionResponse(
                     acp::RequestPermissionResponse::new(acp::RequestPermissionOutcome::Cancelled),
                 ),
             ));
         }
+        let _ = self
+            .backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(
+                nori_protocol::NoriEvent::RequestWithdrawn(wire_request_id),
+            )))
+            .await;
     }
 
     /// Every request the agent is still waiting on, by wire request ID.
@@ -189,5 +203,22 @@ impl AcpBackend {
             .iter()
             .map(|pending| pending.request.request_id.to_string())
             .collect()
+    }
+}
+
+/// The answer that lets a tool run: allowing it this once where the agent offers that (so no
+/// agent writes a standing rule of its own), else always; a request that offers no way to allow
+/// is cancelled.
+fn allow(permission: &acp::RequestPermissionRequest) -> acp::RequestPermissionOutcome {
+    let pick = |kind: acp::PermissionOptionKind| {
+        permission.options.iter().find(|option| option.kind == kind)
+    };
+    match pick(acp::PermissionOptionKind::AllowOnce)
+        .or_else(|| pick(acp::PermissionOptionKind::AllowAlways))
+    {
+        Some(option) => acp::RequestPermissionOutcome::Selected(
+            acp::SelectedPermissionOutcome::new(option.option_id.clone()),
+        ),
+        None => acp::RequestPermissionOutcome::Cancelled,
     }
 }

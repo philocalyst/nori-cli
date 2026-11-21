@@ -102,6 +102,8 @@ enum HarnessCommand {
     ExecuteConversationProgram {
         source: String,
         path: Option<PathBuf>,
+        /// A skill's arguments; empty for a program.
+        arguments: std::collections::BTreeMap<String, String>,
         response_tx: oneshot::Sender<anyhow::Result<ConversationProgramResult>>,
     },
     /// Submit one ACP prompt and return its transport request ID.
@@ -300,12 +302,50 @@ enum HarnessCommand {
     FlushTranscript {
         response_tx: oneshot::Sender<anyhow::Result<()>>,
     },
+    /// The session's skills (`nori:Skill` modules), for the person's command list.
+    Skills {
+        response_tx: oneshot::Sender<anyhow::Result<Vec<SkillInfo>>>,
+    },
+    /// The session's plugins (`nori:Plugin` modules) and their commands.
+    Plugins {
+        response_tx: oneshot::Sender<Vec<crate::backend::plugins::PluginInfo>>,
+    },
+    /// Run a command of one of the session's plugins.
+    RunPlugin {
+        plugin: String,
+        command: String,
+        arguments: std::collections::BTreeMap<String, String>,
+        response_tx: oneshot::Sender<
+            Result<crate::backend::plugins::PluginRun, crate::backend::plugins::PluginError>,
+        >,
+    },
+}
+
+/// A skill the session can run: what the person's command list shows and what `run_skill` needs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub summary: String,
+    /// The slash command that runs it, without the slash.
+    pub command: String,
+    /// Parameters in name order: name, description, and whether it must be given.
+    pub parameters: Vec<SkillParameterInfo>,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SkillParameterInfo {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
 }
 
 /// Typed handle for controlling one Nori harness session.
 #[derive(Clone)]
 pub struct HarnessHandle {
     command_tx: mpsc::UnboundedSender<HarnessCommand>,
+    /// The session's plugin commands as actions, kept current as its modules load.
+    plugin_actions: crate::backend::plugins::PluginActionsFeed,
     first_prompt_started: Option<Arc<FirstPromptStarted>>,
     context_timeline: Arc<tokio::sync::RwLock<crate::context_timeline::ContextTimelineState>>,
 }
@@ -338,6 +378,7 @@ impl HarnessHandle {
         self.request(|response_tx| HarnessCommand::ExecuteConversationProgram {
             source,
             path: None,
+            arguments: std::collections::BTreeMap::new(),
             response_tx,
         })
         .await
@@ -353,6 +394,95 @@ impl HarnessHandle {
         self.request(|response_tx| HarnessCommand::ExecuteConversationProgram {
             source,
             path: Some(path),
+            arguments: std::collections::BTreeMap::new(),
+            response_tx,
+        })
+        .await
+    }
+
+    /// The session's skills, as their modules declare them.
+    pub async fn skills(&self) -> anyhow::Result<Vec<SkillInfo>> {
+        self.request(|response_tx| HarnessCommand::Skills { response_tx })
+            .await
+    }
+
+    /// The session's plugins, as their modules declare them.
+    pub async fn plugins(&self) -> anyhow::Result<Vec<crate::backend::plugins::PluginInfo>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(HarnessCommand::Plugins { response_tx })
+            .map_err(|_| anyhow::anyhow!("ACP agent command channel closed"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP agent did not respond"))
+    }
+
+    /// The session's plugin commands as actions, for a frontend's palette and `/name`: all
+    /// plugins', replaced whenever the modules load again (empty until they first have).
+    pub fn plugin_actions(
+        &self,
+    ) -> tokio::sync::watch::Receiver<std::sync::Arc<[nori_actions::Action]>> {
+        self.plugin_actions.subscribe()
+    }
+
+    /// Run the plugin command an action stands for. The invocation's argument becomes the
+    /// command's arguments (one parameter takes it whole, several take `name=value` pairs and a
+    /// bare value fills the first required one); then this is `run_plugin`. An id that names no
+    /// plugin command, or an argument the command cannot take, is an error that says so.
+    pub async fn run_plugin_action(
+        &self,
+        invocation: nori_actions::Invocation,
+    ) -> Result<crate::backend::plugins::PluginRun, crate::backend::plugins::PluginError> {
+        let plugins = self
+            .plugins()
+            .await
+            .map_err(|_| crate::backend::plugins::PluginError::SessionClosed)?;
+        let (plugin, command, arguments) = crate::backend::plugins::resolve(&plugins, &invocation)?;
+        self.run_plugin(&plugin, &command, arguments).await
+    }
+
+    /// Run command `command` of the session's plugin `plugin` with `arguments`. Every operation
+    /// is something Nori already does (see `docs/pkl-runtime.md#plugins`); the first to fail
+    /// stops the command, and the error names it. The run is journaled as one `plugin` command.
+    pub async fn run_plugin(
+        &self,
+        plugin: &str,
+        command: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> Result<crate::backend::plugins::PluginRun, crate::backend::plugins::PluginError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(HarnessCommand::RunPlugin {
+                plugin: plugin.to_owned(),
+                command: command.to_owned(),
+                arguments,
+                response_tx,
+            })
+            .map_err(|_| crate::backend::plugins::PluginError::SessionClosed)?;
+        response_rx
+            .await
+            .map_err(|_| crate::backend::plugins::PluginError::SessionClosed)?
+    }
+
+    /// Run the skill `name` (a `nori:Skill` module of the session's) with `arguments`: the
+    /// person's `/name ...`. The agent runs skills with the `skill` tool.
+    pub async fn run_skill(
+        &self,
+        name: &str,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<ConversationProgramResult> {
+        let path = self
+            .skills()
+            .await?
+            .into_iter()
+            .find(|skill| skill.name == name)
+            .map(|skill| skill.path)
+            .ok_or_else(|| anyhow::anyhow!("there is no skill named {name}"))?;
+        let source = tokio::fs::read_to_string(&path).await?;
+        self.request(|response_tx| HarnessCommand::ExecuteConversationProgram {
+            source,
+            path: Some(path),
+            arguments,
             response_tx,
         })
         .await
@@ -1063,8 +1193,10 @@ pub fn refresh_prepared_agent(
 }
 
 fn build_backend_config(spec: AgentPrepareSpec) -> AcpBackendConfig {
+    let plugin_actions = crate::backend::plugins::PluginActionsFeed::default();
     let AgentPrepareSpec {
         config,
+        plugin_actions: plugin_actions.clone(),
         cli_version,
         session_context,
         initial_context,
@@ -1257,6 +1389,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
             result.map_err(|error| (failure_label, error))
         };
 
+        plugin_actions.follow(&backend);
         // Race backend init against shutdown requests and a timeout.
         // This ensures the user can always exit even if the backend hangs.
         let mut connect = std::pin::pin!(connect);
@@ -1406,6 +1539,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                             if let Some(request) = request {
                                 handoff::run(
                                     handoff::Live {
+                                        plugin_actions: &plugin_actions,
                                         backend: &mut backend_for_agent,
                                         prompt_queue: &mut prompt_queue,
                                         requests: &handoff_tx,
@@ -1435,9 +1569,9 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     ),
                     HarnessCommand::ChildConfigOptions { session_id, .. } => ("child-config-options", serde_json::json!({"session_id":session_id}).to_string()),
                     HarnessCommand::SetChildConfigOption { session_id, config_id, value, .. } => ("set-child-config-option", serde_json::json!({"session_id":session_id, "config_id":config_id, "value":value}).to_string()),
-                    HarnessCommand::ExecuteConversationProgram { source, path, .. } => (
+                    HarnessCommand::ExecuteConversationProgram { source, path, arguments, .. } => (
                         "execute-conversation-program",
-                        serde_json::json!({"source": source, "path": path}).to_string(),
+                        serde_json::json!({"source": source, "path": path, "arguments": arguments}).to_string(),
                     ),
                     HarnessCommand::Prompt { content, meta, .. } => (
                         "prompt",
@@ -1563,6 +1697,22 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     HarnessCommand::CloseSession { .. } => ("close-session", "{}".to_owned()),
                     HarnessCommand::SubscribeEvents { .. } => ("subscribe-events", "{}".to_owned()),
                     HarnessCommand::FlushTranscript { .. } => ("flush-transcript", "{}".to_owned()),
+                    HarnessCommand::Skills { .. } => ("skills", "{}".to_owned()),
+                    HarnessCommand::Plugins { .. } => ("plugins", "{}".to_owned()),
+                    HarnessCommand::RunPlugin {
+                        plugin,
+                        command,
+                        arguments,
+                        ..
+                    } => (
+                        "plugin",
+                        serde_json::json!({
+                            "plugin": plugin,
+                            "command": command,
+                            "arguments": arguments,
+                        })
+                        .to_string(),
+                    ),
                 };
                 if command_recording_enabled.load(std::sync::atomic::Ordering::Acquire)
                     && !matches!(
@@ -1570,6 +1720,8 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         HarnessCommand::RetireHandoff { .. }
                             | HarnessCommand::RecordHandoffAttempt { .. }
                             | HarnessCommand::CurrentSessionId { .. }
+                            | HarnessCommand::Skills { .. }
+                            | HarnessCommand::Plugins { .. }
                     )
                     && let Some(recorder) =
                         current_cell(&command_recorder_cell).read().await.clone()
@@ -1620,13 +1772,16 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                     HarnessCommand::ExecuteConversationProgram {
                         source,
                         path,
+                        arguments,
                         response_tx,
                     } => {
                         let backend = Arc::clone(&backend_for_agent);
                         let recorder = current_cell(&command_recorder_cell);
                         tokio::spawn(async move {
-                            let result =
-                                program::execute_source(&source, path, &backend, &recorder).await;
+                            let result = program::execute_source(
+                                &source, path, &arguments, &backend, &recorder,
+                            )
+                            .await;
                             let _ = response_tx.send(result);
                         });
                     }
@@ -1646,6 +1801,7 @@ fn launch_session_from(source: SessionAgentSource, start: SessionStart) -> Launc
                         {
                             handoff::run(
                                 handoff::Live {
+                                    plugin_actions: &plugin_actions,
                                     backend: &mut backend_for_agent,
                                     prompt_queue: &mut prompt_queue,
                                     requests: &handoff_tx,
@@ -2154,6 +2310,7 @@ mod tests {
         });
         let handle = HarnessHandle {
             command_tx,
+            plugin_actions: Default::default(),
             first_prompt_started: None,
             context_timeline: Arc::default(),
         };

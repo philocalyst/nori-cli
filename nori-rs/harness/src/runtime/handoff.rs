@@ -42,6 +42,8 @@ const FENCE_WAIT: Duration = Duration::from_secs(30);
 
 /// Everything the command loop owns that a replacement touches.
 pub(super) struct Live<'a> {
+    /// Follows the running backend's modules; pointed at a replacement when there is one.
+    pub(super) plugin_actions: &'a crate::backend::plugins::PluginActionsFeed,
     pub(super) backend: &'a mut Arc<AcpBackend>,
     pub(super) prompt_queue: &'a mut PromptQueue,
     pub(super) requests: &'a mpsc::UnboundedSender<HandoffRequest>,
@@ -353,6 +355,8 @@ async fn replace(live: Live<'_>, request: HandoffRequest, mut cancel: watch::Rec
     match outcome {
         Outcome::Replaced(new, queued) => {
             *live.backend = new;
+            live.plugin_actions.follow(live.backend);
+            live.backend.publish_events_to_monitors(live.fanout.clone());
             *live.prompt_queue = PromptQueue::start(Arc::clone(live.backend));
             // The user cancelled after the new agent took over: the prompt is not sent again.
             let cancelled_late = *cancel.borrow();

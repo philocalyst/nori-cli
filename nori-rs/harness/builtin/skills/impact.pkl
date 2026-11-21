@@ -1,0 +1,117 @@
+/// An impact assessment: what a change affects, with nudox as the evidence. Nori ships it built in
+/// (a `impact.pkl` in `$NORI_HOME/skills/` or a trusted project's `.nori/skills/` replaces it), and
+/// tells every agent to run it before it changes a public declaration.
+///
+/// Run with no arguments it assesses the working tree's changes (staged, unstaged and untracked
+/// against `HEAD`); with `declarations` it assesses those names instead, with nothing changed.
+/// It reports, concisely: the declarations that changed; their direct and then transitive users,
+/// bounded; the tests that reach them; and risk notes. Every item cites the nudox call that
+/// proves it (a declaration coordinate and the source span of a use), so a reader can check it, and
+/// anything nudox could not show is said to be unproven, not guessed.
+///
+/// nudox is the code graph of the project, local and versioned (`nudox` on the command line; its MCP
+/// server is in every Nori session while `nudox` is installed). If the project has not been indexed
+/// the assessment says so. Running the skill is the agent's request for an impact assessment, and
+/// that is consent to index this one project (`index` = `yes`, the default); it never indexes any
+/// other path. With `index` = `no` it only reports that the project is not indexed and offers to
+/// index it.
+///
+/// Parameters (text):
+///
+/// - `declarations`: names or addresses to assess, comma or newline separated, such as
+///   `AcpBackend::skills` or `nori_pkl::catalog::load`. Empty: the working tree's changes.
+/// - `depth`: how many hops of users to follow beyond the direct ones. Default `2`.
+/// - `limit`: how many rows to read per declaration and hop. Default `25`; what is cut off is counted.
+/// - `index`: `yes` (default) indexes this project when it is not indexed; `no` only reports it.
+/// - `agent`, `model`: which agent runs the analysis. Default `claude-code` and `sonnet` (another agent runs its own default model).
+///
+/// Dry run: `cargo run -p nori-conduit --example program_check -- harness/builtin/skills/impact.pkl --run`.
+amends "nori:Skill"
+
+local function argument(name: String, fallback: String): String =
+  let (value = read?("prop:skill.\(name)")) if (value == null || value.trim().isEmpty) fallback else value.trim()
+
+local agentName: String = argument("agent", "claude-code")
+/// Sonnet when Claude runs it; any other agent runs its own default model unless one is named.
+local modelName: String = argument("model", if (agentName == "claude-code") "sonnet" else "")
+
+local protocol = """
+  You assess the impact of a change on the project in your working directory, read-only: never edit, commit, stage or stash anything. Your evidence is nudox, the project's code graph. Its MCP tools are `backend_packages`, `backend_status`, `backend_index`, `backend_index_progress`, `backend_resolve`, `backend_search`, `backend_outline`, `backend_references`, `backend_graph`, `backend_source` and `backend_document`. If they are not available to you, use the same commands of the `nudox` command line through bash (`nudox packages`, `nudox resolve <name>`, `nudox references <coordinate>`, `nudox graph <coordinate>`, `nudox show <coordinate>`; add `--project <dir>` and `--format json` when useful). A coordinate is the exact declaration address nudox returned; copy it verbatim, never invent one.
+
+  Evidence rule: every declaration, user, test and risk you report cites its proof in square brackets: the nudox call and coordinate it came from and, for a use, the file and lines of the source span nudox gave, for example `[references rust:nori_pkl::catalog::load → harness/src/backend/pkl_modules.rs:51-54]`. Something you inferred without nudox (from the diff, say) is marked `[diff]` or `[unproven]`, never presented as established. Be concise: lists, no prose padding.
+  """
+
+local scope = """
+  Phase 1 of 2: scope. Do these in order and stop after them.
+  1. Find the project root (`git rev-parse --show-toplevel`, else the working directory). Ask nudox whether it is indexed (`backend_packages`, then `backend_status` if the answer is unclear): the root must be listed as a ready package.
+  2. If it is not indexed and the index argument is `{{index}}`: when it is `yes`, the person's request for this assessment is consent to index this project and only this project. Index its root (`backend_index` with the absolute path, then follow `index_poll.call` with `backend_index_progress` until its terminal receipt; or `nudox add <root> --wait`), and record in your answer that you indexed it. When it is `no`, do not index; reply that the project is not indexed and that you can index it on request. Never index any other path, and never index a dependency or a parent directory.
+  3. Establish the declarations to assess. Declarations named by the person: `{{declarations}}`. If that is empty, the working tree's changes: run `git status --porcelain`, `git diff HEAD --stat` and `git diff HEAD -U0`, and read untracked files that matter. Map every changed hunk to the declaration (function, method, type, trait, field, constant, config key, protocol message) that contains it, and say whether the change is to its signature or visibility (breaking for users) or only to its body. Resolve each name with `backend_resolve` (or `backend_search`) to its coordinate; report names that are ambiguous or that nudox does not know instead of guessing. Skip pure formatting, comments and test-only edits, but keep them listed under "not assessed".
+  4. If any changed file is newer than the index (the change is not in the indexed revision), say that nudox shows the project as it was indexed, and which of your findings come from the diff alone.
+  Your answer's first line is exactly one of `STATE: ready`, `STATE: not-indexed` or `STATE: nothing-to-assess`. After it, give: the index status (and whether you indexed it); the declarations to assess, each as `name | kind | signature or body | coordinate | evidence`; and what is not assessed and why.
+  """
+
+local walk = """
+  Phase 2 of 2: assess, using the declarations you listed. Follow at most {{depth}} hops of users beyond the direct ones, and read at most {{limit}} rows per declaration and hop; say how many rows were cut off.
+  1. Direct users: for each declaration, `backend_references` on its coordinate (and `backend_graph` for callers, implementations and overriders where the declaration is a function, trait or type). List each user with its file and lines, and the relation kind (call, implementation, reference, import).
+  2. Transitive users: for the direct users that are themselves public or widely used, follow them outward the same way, up to the hop limit. Merge duplicates; mark each user with the hop it was found at. Stop at the limit and say so.
+  3. Affected tests: every user in a test module, test file or test directory, plus tests that call a user within the hop limit. Name each test with its file and the declaration it reaches.
+  4. Risk notes, most serious first: breaking changes to a signature, visibility, behavior others rely on, or a serialized/protocol/config shape; users outside this repository you cannot see (published or exported items); declarations with many users or no tests; generated code, macros, reflection or dynamic dispatch nudox cannot follow. For each, say what to check or run.
+  Write the final report in this form, and nothing before it:
+  ## Impact
+  One line: the verdict (what is affected and how risky, low/medium/high) and the index state.
+  ### Changed declarations
+  ### Direct users
+  ### Transitive users (hops 2 to {{depth}}, bounded)
+  ### Affected tests
+  ### Risks
+  ### Not proven
+  Every item cites its evidence as the protocol says. Leave out a section only when it is empty, and then say `none found [<the call>]`.
+  """
+
+local report = """
+  Phase 2 of 2 did not run because phase 1 answered something other than `STATE: ready`. Write the final report from your phase 1 answer in this form:
+  ## Impact
+  One line: why no assessment was made (not indexed, or nothing to assess).
+  Then what the person can do: when the project is not indexed, say so plainly and offer to index it (`nudox add <root> --wait`, or run this skill again with index=yes); when nothing changed, say what to name in `declarations`.
+  """
+
+name = "impact"
+summary = "What a change affects, with nudox evidence: the changed declarations, their direct and transitive users, the tests that reach them and the risks. No arguments means the working tree's changes."
+parameters {
+  ["declarations"] { description = "Declarations to assess, comma or newline separated; empty means the working tree's changes"; required = false }
+  ["depth"] { description = "How many hops of users to follow beyond the direct ones"; default = "2" }
+  ["limit"] { description = "Rows to read per declaration and hop"; default = "25" }
+  ["index"] { description = "yes indexes this project when it is not indexed (asking for an impact is consent); no only reports it"; default = "yes" }
+  ["agent"] { description = "The agent that runs the analysis"; default = "claude-code" }
+  ["model"] { description = "Its model; sonnet for claude-code, else the agent's own default"; required = false }
+}
+
+actors {
+  ["analyst"] {
+    agent = agentName
+    model = if (modelName.isEmpty) null else modelName
+    role = "research"
+    instructions = protocol
+  }
+}
+
+steps {
+  new Send {
+    id = "scope"
+    to = "analyst"
+    message = scope
+    bind = "scope"
+  }
+  new When {
+    id = "assess"
+    bind = "report"
+    check = new Check { value = "scope"; contains = "STATE: ready" }
+    steps {
+      new Send { id = "walk"; to = "analyst"; message = walk }
+    }
+    otherwise {
+      new Send { id = "explain"; to = "analyst"; message = report }
+    }
+  }
+}
+result = "report"
