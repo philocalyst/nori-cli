@@ -161,7 +161,10 @@ In the composer, Enter submits to this queue. Shift+Enter steers the active turn
 cancels that turn and starts the steering message as soon as it ends, ahead of other
 queued messages. If no turn is open, the message starts immediately. Enter with an empty
 composer promotes the oldest queued message by cancelling the active turn and starting
-that message next. Alt+Enter inserts a newline. Queued and steering messages retain their
+that message next. A turn with a subagent running (a tool call whose `_meta.nori.subagent` is
+true, such as Claude's `Agent`) is not cancelled by steering or promotion, since that would end
+the subagent's work: the message waits first in line and starts as the turn ends, and one line
+says so. Esc still interrupts everything. Alt+Enter inserts a newline. Queued and steering messages retain their
 attached images and resources.
 
 Cancelling marks the turn as cancelling, answers its outstanding requests as cancelled,
@@ -205,22 +208,10 @@ response boundaries are scoped to that child, including typed content and tool
 updates. A child rewind stages a separate agent connection and tool context from
 the selected visible prefix, then keeps the same public child identity after
 commit. The parent and sibling sessions keep their own histories and connections.
-OpenCode child sessions are controllable as soon as they are announced: follow-up
-prompts, cancellation, and configuration use the child's own session and do not
-require a preceding `session/load`. Its model options are published on the child
-session; loading remains a separate replay operation. OpenCode announces each
-child on its immediate parent's session and sends its text, tool, and config
-updates on the child's own session. A tool completing does not finish the child;
-only the child's execution lifecycle changes its state.
+An engine agent (OpenCode) has no provider-owned children of its own: it delegates through
+Nori's host tools (`delegate_task`), so its subagents are Nori's actors.
 
-For the OpenCode v2 engine, Nori enables agent delegation and sets its
-nesting depth to 9,007,199,254,740,991 when those settings have no explicit
-configuration. This is the engine's finite JavaScript integer ceiling; Nori
-adds no separate nesting budget. Explicit depth and delegation rules are kept.
-The adapter reads the engine's resolved configuration and, when defaults are
-needed, restarts the background engine with an in-memory configuration overlay.
-
-When a Codex or OpenCode agent asks a question, Nori presents it on the originating
+When a Codex agent asks a question, Nori presents it on the originating
 session, including child sessions, and returns the selected or typed answers to
 the agent. Dismissing the question cancels its pending interaction. Automatic
 permission approval does not answer interactive questions.
@@ -228,6 +219,31 @@ permission approval does not answer interactive questions.
 `session/load` opens a `Replay` turn that owns replay updates until its response arrives. A
 load request received while a turn is open is rejected with a warning. Loading history is not
 reported as a completed prompt turn.
+
+### What Nori says along with a prompt
+
+Nori puts blocks of its own in front of a prompt. They reach the agent as assistant-only
+text blocks, and the person's own blocks are an ordered, byte-exact subsequence of what is
+sent. One function assembles the wire prompt (`PromptContext::assemble`,
+`harness/src/backend/prompt_context/`); nothing else concatenates injected text. The order is
+fixed so that a provider's prompt cache, which matches exact prefixes, can reuse the start of
+every session that begins alike:
+
+1. **Static block** (one block): the session preamble, the cached agent catalog, the active
+   workflow's rules.
+2. **Dynamic blocks**: the checkpoint a compaction, fork or resume left (then the typed
+   history that came with it), then the output of hooks (`::context::` lines).
+3. **The person's content**, unchanged.
+4. **Goal context**, after the words it is about.
+
+Admitting a prompt records only what is its own: the workflow rules text. Everything the
+session owes whichever prompt goes out next (preamble, catalog, hook output, checkpoint, goal
+context, whether the workflow rules were told) is taken when the prompt is sent, so a prompt
+that is refused as busy, dropped from the queue or never started takes nothing with it. A
+prompt whose send fails before the agent has it gives back what it took: the parts return to
+the session (a checkpoint made meanwhile is kept, hook output keeps its order, the goal and
+the workflow rules count as not yet told), and the next prompt carries them. Compaction
+prompts take none of it.
 
 ## Compaction, rewind, fork, and resume
 
@@ -244,7 +260,8 @@ work (delegated results, mail, CI) that was refused meanwhile.
   session exactly as it was and says why: the summary turn failed or was cancelled, the agent
   did not write the template (it is reminded once, ahead of the queue), the agent started working
   again so a swap would orphan its turn and the requests it waits on, or no new session could be
-  started. The checkpoint is applied when a prompt is sent, not when it is submitted, so the
+  started. The checkpoint is applied when a prompt is sent, not when it is submitted (see
+  [What Nori says along with a prompt](#what-nori-says-along-with-a-prompt)), so the
   first prompt to reach the new session carries it whether it was typed before or after the
   swap. A prompt that fails before the agent takes it gives the checkpoint back. Native compact
   is an ordinary turn; its divider appears only if the agent finished.
@@ -285,6 +302,44 @@ and the user is told once. Permission requests the retired session still held at
 declined with one notice. Only retired sessions are refused: the first updates of the new
 session may arrive before the swap has installed its ID.
 
+## Undo
+
+`/undo` and the undo picker restore files, never conversation state: the agent is not told, and
+the transcript keeps the turn. Every turn the edit journal opens (`EditJournal::begin_turn`, one
+per prompt the harness sends) records two things:
+
+- the **turn snapshot**: the tree of the project's files captured before the turn's prompt is sent,
+  so nothing the agent does can race into it (`harness/src/undo/tree.rs`);
+- the file edits the agent reported as ACP diffs (the diff journal).
+
+A snapshot is a git tree object in a shadow repository under
+`$NORI_HOME/snapshots/<hash of the project root>/`, never inside the project. Every git command
+runs as a `tokio` process with `GIT_DIR` set to the shadow repository, `GIT_WORK_TREE` the project's
+git root and its own index; nothing touches the real repository's index or refs. The project's
+`.gitignore` files and the real repository's `info/exclude` apply, so ignored files are neither
+captured nor restored. To keep the wait before a prompt short the shadow index stays warm: one
+capture when the session starts and one when each turn ends, both in the background, so the capture
+at a turn's start only re-stats files. Each capture's duration is logged at `debug`; one over
+250 ms before a prompt is logged at `warn`. A prompt never waits more than 400 ms for its snapshot:
+a capture that takes longer (the first, cold one on a large tree) runs on in the background and
+warms the index, and that turn's undo falls back to the diff journal.
+
+Undoing turn N, and `undo_to` for older ones, restores the working tree to the tree captured at
+the start of the oldest turn undone: paths that differ from a fresh capture are written back from
+the snapshot, and files the turns created are removed. This covers what commands did (`sed`,
+`rm`, a formatter) as well as what edits reported. Whatever undo overwrites or removes is first
+copied to `$NORI_HOME/undo-trash`, and a path whose copy fails is left alone. The result says how
+many files came from the snapshot and how many from the diff journal. A turn the snapshot saw
+nothing change in is not offered.
+
+Snapshots apply only where they are safe and cheap: the session's directory is inside a git work
+tree, `git` exists, and the tree is not absurdly large. If the first capture takes over 10 seconds
+or the index passes 200,000 entries, snapshots are off for the session and one notice says so. A
+turn whose capture failed, or any turn without a snapshot, undoes through the diff journal alone,
+which reverses only edits the agent reported as diffs and says so when the turn ran commands.
+Shadow objects older than 7 days are pruned by a background `git gc`, at most once a day per
+shadow repository.
+
 ## Recording and replay
 
 The append-only Pkl journal is the canonical conversation history. The harness
@@ -311,20 +366,11 @@ binding by itself.
 
 ## Terminal program status
 
-The interactive Nori ACP client reports its active conversation through the
-[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
-(OSC 7501). It reports the root turn and each announced child session as separate
-records, retaining the parent-child hierarchy. Terminals that do not implement the
-protocol ignore the reports. Permission and sign-in requests are reported as
-blocked; cancellation returns to idle. Permission requests use `kind=permission`,
-and sign-in flows use `kind=auth`. Interactive questions transported by
-`_nori/request_user_input` use `kind=question` on the originating root or child
-record. Answering or withdrawing the exact request clears its blocked state;
-tool names and text alone never imply a question.
-Nori clears a child record and its descendants when the agent reports that the
-child session closed; cancellation of a turn instead leaves the child idle. It
-clears all records when the root session closes or the client exits. Reports do
-not contain percentage estimates.
+The interactive client reports the root turn and each announced child session to the terminal
+through the Program Status Protocol (OSC 7501), as separate, nested records: idle, working (the
+current tool or phase), blocked (a permission, a question, a sign-in), done (a one-line summary),
+error. What is said, when it is withdrawn, and how the terminal is asked whether it understands
+the protocol are in [terminal-integration.md](terminal-integration.md).
 
 Prompt results and cancellation watchdogs retain the ACP wire request ID that owns them. A
 late response or timeout from an earlier turn cannot complete the current turn or abort its
