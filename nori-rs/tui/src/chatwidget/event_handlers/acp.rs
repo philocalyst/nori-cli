@@ -22,6 +22,13 @@ impl ChatWidget {
                 } else {
                     self.note_replayed_update(&notification.update);
                 }
+                // A fresh call can reuse an id from a previous turn. Updates for settled calls
+                // still target history, but a new announcement starts a new card.
+                if let nori_protocol::acp::v1::SessionUpdate::ToolCall(call) = &notification.update
+                {
+                    self.settled_client_tool_calls
+                        .remove(&call.tool_call_id.to_string());
+                }
                 let events = self
                     .client_event_normalizer
                     .push_session_update(&notification.update);
