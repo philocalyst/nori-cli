@@ -14,6 +14,9 @@ use serde::Serialize;
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum DelegationCall {
     Delegate {
+        /// What the new actor is called, when the call names it.
+        #[serde(default)]
+        alias: Option<String>,
         agent: Option<String>,
         model: Option<String>,
         title: String,
@@ -65,6 +68,7 @@ impl DelegationCall {
         };
         Some(match tool {
             "delegate_task" => Self::Delegate {
+                alias: text("alias").filter(|alias| !alias.trim().is_empty()),
                 agent: text("agent"),
                 model: text("model"),
                 title: text("title")
@@ -110,14 +114,23 @@ impl DelegationCall {
     pub(crate) fn header(&self, active: bool) -> String {
         let (now, done) = match self {
             Self::Delegate {
+                alias,
                 agent,
                 model,
                 title,
             } => {
-                let target = match (agent, model) {
-                    (Some(agent), Some(model)) => format!(" to {agent} · {model}"),
-                    (Some(agent), None) => format!(" to {agent}"),
-                    (None, Some(model)) => format!(" to {model}"),
+                let route = match (agent, model) {
+                    (Some(agent), Some(model)) => Some(format!("{agent} · {model}")),
+                    (Some(agent), None) => Some(agent.clone()),
+                    (None, Some(model)) => Some(model.clone()),
+                    (None, None) => None,
+                };
+                // The actor is named the way every other view names it: by its alias, with what
+                // runs it beside.
+                let target = match (alias, route) {
+                    (Some(alias), Some(route)) => format!(" to {alias} ({route})"),
+                    (Some(alias), None) => format!(" to {alias}"),
+                    (None, Some(route)) => format!(" to {route}"),
                     (None, None) => String::new(),
                 };
                 let what = if title.is_empty() {
@@ -232,6 +245,7 @@ mod tests {
             assert_eq!(
                 DelegationCall::recognize(title, Some(&input)),
                 Some(DelegationCall::Delegate {
+                    alias: None,
                     agent: Some("codex".to_owned()),
                     model: None,
                     title: "Read a.txt".to_owned(),
@@ -252,6 +266,7 @@ mod tests {
     #[test]
     fn headers_and_outcomes_read_as_sentences() {
         let call = DelegationCall::Delegate {
+            alias: None,
             agent: Some("codex".to_owned()),
             model: Some("gpt-5.1".to_owned()),
             title: "Read a.txt".to_owned(),
