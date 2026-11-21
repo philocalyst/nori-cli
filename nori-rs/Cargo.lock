@@ -7949,6 +7949,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helix-lsp"
+version = "25.7.1"
+dependencies = [
+ "anyhow",
+ "helix-lsp-types",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "helix-lsp-types"
+version = "0.95.1"
+dependencies = [
+ "bitflags 2.13.1",
+ "helix-stdx",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "helix-stdx"
+version = "25.7.1"
+dependencies = [
+ "percent-encoding",
+ "serde",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10439,6 +10471,22 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "nori-lsp"
+version = "0.0.0"
+dependencies = [
+ "helix-lsp",
+ "parking_lot",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "which 6.0.3",
 ]
 
 [[package]]

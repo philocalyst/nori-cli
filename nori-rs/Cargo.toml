@@ -30,6 +30,7 @@ members = [
     "process-hardening",
     "acp-host",
     "nori-config",
+    "lsp",
     "opencode-acp",
     "sandbox",
     "rmcp-client",
@@ -87,6 +88,7 @@ nori-fake-agent = { path = "fake-agent" }
 nori-world = { path = "world" }
 nori-config = { path = "nori-config" }
 nori-conversation = { path = "conversation" }
+nori-lsp = { path = "lsp" }
 codex-login = { path = "login" }
 codex-process-hardening = { path = "process-hardening" }
 codex-rmcp-client = { path = "rmcp-client" }

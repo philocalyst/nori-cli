@@ -1,0 +1,17 @@
+nori-lsp
+========
+
+nori-lsp is Nori's own code (Apache-2.0, see the repository LICENSE). It links the Helix LSP client
+vendored under vendor/helix (helix-lsp and helix-stdx: Mozilla Public License 2.0; helix-lsp-types:
+MIT). See vendor/helix/NORI.md for what was kept and changed, and vendor/helix/LICENSE and
+vendor/helix/helix-lsp-types/LICENSE for the license texts.
+
+Tool descriptions (src/tools/specs.rs)
+--------------------------------------
+The descriptions of the lsp_* tools were written for Nori. No text from another project was copied.
+Behaviour of other agents' LSP tooling (Crush's post-edit diagnostics wait of "first publish within
+about a second, then a short quiet window" and its tool split; Zed's diagnostics, definition,
+references, rename and code-action tools) was read as a specification of what such tools should do.
+Zed's agent crate is GPL-3.0 and Crush is FSL-1.1; neither's code or prose is used here. The
+permissively licensed descriptions (OpenCode, Codex, Gemini CLI, Cline, Roo Code, Goose) contain no
+LSP tools to adapt.

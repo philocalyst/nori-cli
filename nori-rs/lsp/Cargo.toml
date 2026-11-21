@@ -1,0 +1,24 @@
+[package]
+name = "nori-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Helix's async LSP client, vendored without the editor (see ../../vendor/helix/NORI.md).
+helix-lsp = { path = "../../vendor/helix/helix-lsp" }
+parking_lot = "0.12"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tracing = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "test-util", "time"] }
