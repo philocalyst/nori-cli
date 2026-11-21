@@ -50,6 +50,8 @@ impl UsageSample {
 /// A provider's name as the user reads it.
 pub fn provider_title(provider: &str) -> String {
     match provider {
+        "opencode-go" => "OpenCode Go".to_owned(),
+        "opencode" => "OpenCode Models".to_owned(),
         "claude" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
         "gemini" => "Gemini".to_owned(),
@@ -80,6 +82,12 @@ pub fn provider_for(agent: &str, model: &str) -> String {
     ];
     let model = model.to_ascii_lowercase();
     let agent = agent.to_ascii_lowercase();
+    if model.starts_with("opencode-go/") {
+        return "opencode-go".to_owned();
+    }
+    if model.starts_with("opencode/") {
+        return "opencode".to_owned();
+    }
     for subject in [&model, &agent] {
         for (provider, needles) in FAMILIES {
             let hit = needles.iter().any(|needle| {
@@ -98,5 +106,27 @@ pub fn provider_for(agent: &str, model: &str) -> String {
         "other".to_owned()
     } else {
         agent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::provider_for;
+    use super::provider_title;
+
+    #[test]
+    fn opencode_go_and_models_keep_separate_provider_attribution() {
+        assert_eq!(
+            provider_for("opencode", "opencode-go/deepseek-v4.1-flash"),
+            "opencode-go"
+        );
+        assert_eq!(
+            provider_for("opencode", "opencode/deepseek-v4.1-flash"),
+            "opencode"
+        );
+        assert_eq!(provider_title("opencode-go"), "OpenCode Go");
+        assert_eq!(provider_title("opencode"), "OpenCode Models");
     }
 }

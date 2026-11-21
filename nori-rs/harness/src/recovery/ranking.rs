@@ -41,6 +41,7 @@ pub fn is_gateway(agent: &str) -> bool {
 pub struct RouteKey {
     not_active: bool,
     preference: usize,
+    not_preferred_provider: bool,
     not_native: bool,
     agent: usize,
 }
@@ -166,6 +167,10 @@ impl RouteRanking {
         RouteKey {
             not_active: self.active.as_ref() != Some(route),
             preference,
+            not_preferred_provider: !route
+                .model
+                .as_deref()
+                .is_some_and(|model| model.starts_with("opencode-go/")),
             not_native: !family.is_some_and(|family| family.is_native(&route.agent)),
             agent: self
                 .agent_order
@@ -374,6 +379,30 @@ mod tests {
         assert_eq!(
             order(&ranking, &["opencode", "codex"], "gpt-6"),
             ["codex", "opencode"]
+        );
+    }
+
+    #[test]
+    fn open_code_go_precedes_open_code_models_for_the_same_model() {
+        let installed = vec!["opencode".to_owned()];
+        let ranking = RouteRanking::new(None, &[], &|_| None, &installed);
+        let mut routes = vec![
+            RouteRef::new("opencode", Some("opencode/deepseek-v4.1-flash".to_owned())),
+            RouteRef::new(
+                "opencode",
+                Some("opencode-go/deepseek-v4.1-flash".to_owned()),
+            ),
+        ];
+        ranking.sort_same_model(&mut routes, |route| (route.clone(), None));
+        assert_eq!(
+            routes
+                .iter()
+                .filter_map(|route| route.model.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                "opencode-go/deepseek-v4.1-flash",
+                "opencode/deepseek-v4.1-flash"
+            ]
         );
     }
 

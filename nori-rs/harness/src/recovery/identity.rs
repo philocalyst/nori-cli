@@ -69,7 +69,11 @@ impl ModelIdentity {
     pub fn of(name: &str, value: &str) -> Self {
         let label = model_label(value, name, None);
         let label = label.as_str();
-        let selected = if label.chars().any(|ch| ch.is_ascii_digit()) {
+        let selected = if let Some((provider, model)) = value.split_once('/')
+            && matches!(provider, "opencode" | "opencode-go")
+        {
+            model
+        } else if label.chars().any(|ch| ch.is_ascii_digit()) {
             label
         } else {
             value.rsplit_once('/').map_or(value, |(_, suffix)| suffix)
@@ -294,6 +298,10 @@ mod tests {
                     ("Claude Haiku 5.5", "opencode/claude-haiku-5-5"),
                 ),
                 same(
+                    ("DeepSeek V4.1 Flash", "opencode-go/deepseek-v4.1-flash"),
+                    ("DeepSeek V4.1 Flash 1017", "opencode/deepseek-v4.1-flash"),
+                ),
+                same(
                     ("GPT-6.1 Terra", "gpt-6.1-terra"),
                     ("GPT-6.1 Terra", "openai/gpt-6.1-terra")
                 ),
@@ -309,7 +317,7 @@ mod tests {
                 same(("Haiku", "haiku"), ("Sonnet", "sonnet")),
                 same(("Claude Opus 5.5", "opus"), ("Claude Opus 5", "opus")),
             ],
-            [true, true, true, true, false, false, false, false]
+            [true, true, true, true, true, false, false, false, false]
         );
     }
 }

@@ -334,7 +334,7 @@ mod tests {
                     300
                 ),
                 (
-                    "deepseek".to_owned(),
+                    "opencode-go".to_owned(),
                     "via opencode".to_owned(),
                     Some("opencode".to_owned()),
                     100

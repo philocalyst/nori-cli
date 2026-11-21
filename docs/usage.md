@@ -52,10 +52,12 @@ account is, best source first:
    `secondary`, `claude3` `tertiary` (the number in the slug). Two slugs that would both be
    `primary` keep their slug in the name.
 
-A **gateway** (`opencode`, `openrouter`) is billed by the provider of the model it routed to, so
-`anthropic/claude-opus-5-5` through `opencode` is an account of Claude named `via opencode`, and
-`opencode-go/deepseek-v4` one of DeepSeek. It never merges with a direct account of that
-provider. When a gateway and a native agent report the same tokens (same root session, same
+A **gateway** (`opencode`, `openrouter`) routes to another provider. OpenCode keeps its two billing
+providers distinct: `opencode-go/deepseek-v4.1-flash` is OpenCode Go, while
+`opencode/deepseek-v4.1-flash` is OpenCode Models paid from Console credits. Other gateways are
+grouped by the model provider; `anthropic/claude-opus-5-5` through `opencode` is an account of
+Claude named `via opencode`. A gateway account never merges with a direct account of that provider.
+When a gateway and a native agent report the same tokens (same root session, same
 provider, identical totals within ten seconds) the gateway's copy is dropped, so a delegated
 child is not counted twice.
 
