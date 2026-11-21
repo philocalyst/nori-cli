@@ -3,6 +3,12 @@
 ///   * `build`: a `command` monitor on a script that prints progress and then fails. The agent
 ///     ends its turn; the failure wakes it.
 ///   * `peer`: an `actor` monitor on a peer that is working on a task of its own.
+///   * `tick`: a `timer` that fires every second, twice.
+///   * `tell`: a monitor whose action tells the person (`notify`) instead of waking the agent.
+///   * `guard`: a `session` monitor that wakes the agent with its own words when a request fails
+///     (`break it` fails one).
+///   * `job`: a background job (`run the job`) that is ready, then exits 3; each wakes the agent.
+///     `read the job output` reads it with `job_read`, twice.
 ///
 ///     cargo run -p nori-world --example run_world -- fake-agent/worlds/monitors.pkl "build it"
 ///     cargo run -p nori-world --example run_world -- fake-agent/worlds/monitors.pkl "watch the peer"
@@ -119,6 +125,97 @@ agents {
             bind = "monitor"
           }
           new Say { text = "Watching the worker; ending my turn.\n" }
+        }
+      }
+      // A clock: fires every second; the second firing ends it (`max_events`).
+      new Scene {
+        name = "tick"
+        on = new Matching { pattern = "(?i)tick" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Every second"
+            arguments = new Dynamic {
+              ["label"] = "clock"
+              ["source"] = "timer"
+              ["every_seconds"] = 1
+              ["max_events"] = 2
+              ["batch_ms"] = 0
+            }
+          }
+          new Say { text = "Armed a clock.\n" }
+        }
+      }
+      // A monitor that tells the person and never wakes the agent.
+      new Scene {
+        name = "tell"
+        on = new Matching { pattern = "(?i)tell" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Tell me when it is done"
+            arguments = new Dynamic {
+              ["label"] = "done"
+              ["source"] = "command"
+              ["command"] = "echo all green"
+              ["actions"] = new Listing {
+                new Dynamic { ["kind"] = "notify"; ["title"] = "Build"; ["body"] = "{{event}}" }
+              }
+            }
+          }
+          new Say { text = "I'll let you know.\n" }
+        }
+      }
+      // The session itself: a failed request wakes the agent with its own words.
+      new Scene {
+        name = "guard"
+        on = new Matching { pattern = "(?i)guard" }
+        steps {
+          new HostTool {
+            name = "monitor_start"
+            title = "Watch for failures"
+            arguments = new Dynamic {
+              ["label"] = "failures"
+              ["source"] = "session"
+              ["events"] = new Listing { "turn_failed" }
+              ["actions"] = new Listing {
+                new Dynamic { ["kind"] = "wake"; ["message"] = "A request failed; look into it:\n{{event}}" }
+              }
+            }
+          }
+          new Say { text = "Watching for failures.\n" }
+        }
+      }
+      new Scene {
+        name = "break"
+        on = new Matching { pattern = "(?i)break it" }
+        steps { new Fail { failure = "internal"; detail = "the tool server fell over" } }
+      }
+      // A background job: ready after a moment, then it exits 3. The job wakes the agent twice
+      // (ready, exit); `read the job output` reads what was not read, twice.
+      new Scene {
+        name = "read job"
+        on = new Matching { pattern = "(?i)read the job" }
+        steps {
+          new HostTool { name = "job_read"; title = "Read the boot output"; arguments = new Dynamic { ["job"] = "boot" } }
+          new HostTool { name = "job_read"; title = "Read it again"; arguments = new Dynamic { ["job"] = "boot" } }
+          new Say { text = "Read the job twice.\n" }
+        }
+      }
+      new Scene {
+        name = "job"
+        on = new Matching { pattern = "(?i)run the job" }
+        steps {
+          new HostTool {
+            name = "job_start"
+            title = "Boot the service"
+            arguments = new Dynamic {
+              ["label"] = "boot"
+              ["command"] = "echo booting; sleep 0.3; echo READY; sleep 0.3; exit 3"
+              ["ready"] = "READY"
+            }
+          }
+          new Say { text = "The service is booting in a job; ending my turn.\n" }
         }
       }
       new Scene {
