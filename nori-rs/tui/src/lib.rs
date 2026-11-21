@@ -66,6 +66,7 @@ mod markdown;
 mod markdown_render;
 mod markdown_stream;
 mod nori;
+mod nori_link;
 mod overlay_menu;
 mod pager_overlay;
 mod pinned_plan_drawer;
