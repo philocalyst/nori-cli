@@ -55,9 +55,8 @@ impl CustomModelInputView {
         }
         self.app_event_tx.send(AppEvent::SetAcpSessionConfigOption {
             config_id: self.config_id.clone(),
-            value: value.clone(),
+            value,
             option_name: self.option_name.clone(),
-            value_name: value,
             is_custom_model: true,
             origin: self.origin,
             route_token: None,
@@ -189,13 +188,11 @@ mod tests {
                 config_id,
                 value,
                 option_name,
-                value_name,
                 is_custom_model,
                 ..
             } if config_id == "model"
                 && value == "claude-opus-4-8"
                 && option_name == "Model"
-                && value_name == "claude-opus-4-8"
                 && is_custom_model
         ));
     }

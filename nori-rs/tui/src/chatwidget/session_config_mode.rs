@@ -73,7 +73,6 @@ impl ChatWidget {
             let next_mode = mode.advanced();
             let config_id = mode.config_id;
             let value = mode.next_value;
-            let value_name = mode.next_label;
             self.apply_acp_mode_config_snapshot(generation, Some(next_mode));
             tokio::spawn(async move {
                 let config_id_for_result = config_id.clone();
@@ -92,7 +91,6 @@ impl ChatWidget {
                             config_id: config_id_for_result,
                             value: value_for_result,
                             option_name: "Mode".to_string(),
-                            value_name,
                             is_custom_model: false,
                             origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                             config_options: Some(config_options),
@@ -108,7 +106,6 @@ impl ChatWidget {
                             config_id: config_id_for_result,
                             value: value_for_result,
                             option_name: "Mode".to_string(),
-                            value_name: value_name.clone(),
                             is_custom_model: false,
                             origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                             config_options: None,
@@ -150,7 +147,6 @@ impl ChatWidget {
                 .await
             {
                 Ok(config_options) => {
-                    let value_name = mode.next_label.clone();
                     app_event_tx.send(AppEvent::AcpModeConfigSnapshot {
                         generation,
                         mode: crate::nori::session_config_mode::acp_mode_config_from_options(
@@ -163,7 +159,6 @@ impl ChatWidget {
                         config_id: mode.config_id,
                         value: mode.next_value,
                         option_name: "Mode".to_string(),
-                        value_name,
                         is_custom_model: false,
                         origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                         config_options: Some(config_options),
@@ -179,7 +174,6 @@ impl ChatWidget {
                         config_id: mode.config_id,
                         value: mode.next_value,
                         option_name: "Mode".to_string(),
-                        value_name: mode.next_label,
                         is_custom_model: false,
                         origin: crate::nori::session_config_picker::ConfigPickerOrigin::Direct,
                         config_options: None,
