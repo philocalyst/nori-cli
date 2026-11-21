@@ -42,3 +42,8 @@ test *args:
 # Run `cargo install cargo-nextest` if you don't have it installed.
 nextest:
     {{cargo}} nextest run --no-fail-fast
+
+# The ACP fault catalog (docs/fault-catalog.md): every failure mode the fake agent can play,
+# driven through the real harness on a virtual clock. No network, no real agent, no usage.
+faults *args:
+    {{cargo}} test -p nori-world --tests "$@"
