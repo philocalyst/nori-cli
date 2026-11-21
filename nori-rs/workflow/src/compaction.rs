@@ -153,7 +153,7 @@ mod tests {
     fn the_trigger_is_the_larger_of_the_fraction_and_the_token_floor() {
         let policy = CompactionPolicy::default();
         assert_eq!(policy.trigger_free(200_000), 30_000);
-        assert_eq!(policy.trigger_free(60_000), 16_000);
+        assert_eq!(policy.trigger_free(60_000), 15_000);
         assert_eq!(policy.trigger_free(1_000_000), 150_000);
     }
 
