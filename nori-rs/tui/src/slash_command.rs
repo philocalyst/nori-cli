@@ -34,7 +34,6 @@ pub enum SlashCommand {
     Goal,
     New,
     Resume,
-    ResumeViewonly,
     Reference,
     Close,
     Init,
@@ -68,7 +67,6 @@ impl SlashCommand {
             SlashCommand::Providers => "connect model providers",
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Resume => "resume a previous session",
-            SlashCommand::ResumeViewonly => "view a previous session transcript (read-only)",
             SlashCommand::Reference => "search past chats and reference one in your draft",
             SlashCommand::Close => "close (release) the current session and start a fresh chat",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Nori",
@@ -113,7 +111,6 @@ impl SlashCommand {
             SlashCommand::Providers
             | SlashCommand::New
             | SlashCommand::Resume
-            | SlashCommand::ResumeViewonly
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Undo
@@ -167,7 +164,6 @@ impl SlashCommand {
             | SlashCommand::Goal
             | SlashCommand::New
             | SlashCommand::Resume
-            | SlashCommand::ResumeViewonly
             | SlashCommand::Reference
             | SlashCommand::Init
             | SlashCommand::Compact

@@ -322,7 +322,8 @@ impl App {
         let automatic_resume =
             super::session_setup::automatic_resume_event(agent.automatic_session_id());
         let sessions = match agent.catalog() {
-            nori_harness::runtime::SessionCatalog::Unsupported => Vec::new(),
+            nori_harness::runtime::SessionCatalog::Unsupported
+            | nori_harness::runtime::SessionCatalog::Unavailable { .. } => Vec::new(),
             nori_harness::runtime::SessionCatalog::Listed(sessions) => sessions.clone(),
         };
         if let Some(event) = automatic_resume {
@@ -332,8 +333,7 @@ impl App {
             // asking about a list with one row.
             self.app_event_tx.send(AppEvent::NewSession);
         } else {
-            self.chat_widget
-                .show_acp_resume_session_picker(sessions, true);
+            self.chat_widget.show_agent_session_picker(sessions, true);
         }
     }
 
@@ -405,73 +405,6 @@ impl App {
 
     pub(crate) fn shutdown_current_conversation(&mut self) {
         self.chat_widget.shutdown_harness_session();
-    }
-
-    /// Display a loaded transcript in the history view.
-    pub(super) fn display_viewonly_transcript(
-        &mut self,
-        entries: Vec<crate::viewonly_transcript::ViewonlyEntry>,
-    ) {
-        use crate::history_cell::AgentMarkdownCell;
-        use crate::history_cell::AgentMessageCell;
-        use crate::markdown::append_markdown;
-        use crate::viewonly_transcript::ViewonlyEntry;
-
-        // Add a header
-        self.chat_widget.add_info_message(
-            "────────── Viewing Previous Session ──────────".to_string(),
-            None,
-        );
-
-        let mut is_first_entry = true;
-        for entry in entries {
-            // Add a blank line separator between entries (except before the first)
-            if !is_first_entry {
-                self.chat_widget
-                    .add_plain_history_lines(vec![Line::from("")]);
-            }
-            is_first_entry = false;
-
-            match entry {
-                ViewonlyEntry::User { content } => {
-                    // Add user messages with a user prefix to distinguish them
-                    self.chat_widget.add_boxed_history(Box::new(
-                        crate::history_cell::UserHistoryCell { message: content },
-                    ));
-                }
-                ViewonlyEntry::Assistant { content } => {
-                    let cell = AgentMarkdownCell::new(content, &self.config.cwd);
-                    self.chat_widget.add_boxed_history(Box::new(cell));
-                }
-                ViewonlyEntry::Thinking { content } => {
-                    // Add thinking block with dimmed style (same pattern as reasoning display)
-                    let mut lines = Vec::new();
-                    append_markdown(&content, None, &mut lines);
-                    // Dim all spans in the lines to indicate this is thinking content
-                    let dimmed_lines: Vec<Line<'static>> = lines
-                        .into_iter()
-                        .map(|line| {
-                            Line::from(
-                                line.spans
-                                    .into_iter()
-                                    .map(ratatui::prelude::Stylize::dim)
-                                    .collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect();
-                    let cell = AgentMessageCell::new(dimmed_lines, true);
-                    self.chat_widget.add_boxed_history(Box::new(cell));
-                }
-                ViewonlyEntry::Info { content } => {
-                    // Add as an info message
-                    self.chat_widget
-                        .add_info_message(content, Some("transcript".to_string()));
-                }
-            }
-        }
-
-        self.chat_widget
-            .add_info_message("────────── End of Transcript ──────────".to_string(), None);
     }
 
     pub(super) fn open_external_editor(&mut self, tui: &mut tui::Tui) {

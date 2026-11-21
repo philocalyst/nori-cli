@@ -1362,7 +1362,7 @@ updates `conversation_id`, records `forked_from`, and says so in a notice that
 carries the copy-pasteable `nori resume <previous>` hint, so the previous (now
 frozen) conversation stays resumable.
 
-#### Transcripts and view-only mode
+#### Replay of a resumed conversation
 
 Between `ReplayStarted` and `ReplayFinished`, replayed updates go through the
 same handlers as live ones (`chatwidget/replay.rs`), so a resumed session
@@ -1375,9 +1375,8 @@ replay ends the last. The cells of a replay go into the transcript only, and
 when it ends the newest of them are painted at once with the reflow's bounds
 (`app/history_replay.rs`): a long session costs its replay's last 1,000 cells
 and 10,000 rows in output rather than every row it ever wrote.
-View-only rendering recovers initialization identity and replay source from the
-stored lifecycle events, then runs raw session-information notifications
-through the same private normalizer and renderer as the live TUI.
+There is no read-only view of a past session: every resume, including the one that
+continues a conversation the agent no longer has, ends in a live session you can type into.
 
 Transcript schema v3 contains lifecycle events even before
 a prompt, so session pickers determine whether a transcript is empty by its

@@ -243,15 +243,17 @@ impl App {
                 if let Some(agent) = &self.prepared_agent {
                     let can_resume_catalog = agent.capabilities().load_session
                         || agent.capabilities().session_capabilities.resume.is_some();
-                    match agent.catalog() {
+                    let listed = match agent.catalog() {
                         nori_harness::runtime::SessionCatalog::Listed(sessions)
                             if can_resume_catalog =>
                         {
-                            self.chat_widget
-                                .show_acp_resume_session_picker(sessions.clone(), false);
+                            sessions.clone()
                         }
-                        _ => self.chat_widget.open_local_resume_session_picker(),
-                    }
+                        nori_harness::runtime::SessionCatalog::Listed(_)
+                        | nori_harness::runtime::SessionCatalog::Unsupported
+                        | nori_harness::runtime::SessionCatalog::Unavailable { .. } => Vec::new(),
+                    };
+                    self.chat_widget.show_resume_picker(listed);
                 } else {
                     self.begin_agent_preparation(
                         crate::app_event::AgentPrepareIntent::ResumePicker,

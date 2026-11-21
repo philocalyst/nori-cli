@@ -137,7 +137,8 @@ impl App {
                         let can_resume_catalog = agent.capabilities().load_session
                             || agent.capabilities().session_capabilities.resume.is_some();
                         let sessions = match agent.catalog() {
-                            nori_harness::runtime::SessionCatalog::Unsupported => None,
+                            nori_harness::runtime::SessionCatalog::Unsupported
+                            | nori_harness::runtime::SessionCatalog::Unavailable { .. } => None,
                             nori_harness::runtime::SessionCatalog::Listed(sessions) => {
                                 Some(sessions.clone())
                             }
@@ -186,23 +187,20 @@ impl App {
                                 crate::app_event::AgentPrepareIntent::Picker {
                                     fallback_to_spawn,
                                 } => match sessions {
-                                    Some(sessions) => self
-                                        .chat_widget
-                                        .show_acp_resume_session_picker(sessions, false),
+                                    Some(sessions) => {
+                                        self.chat_widget.show_agent_session_picker(sessions, false)
+                                    }
                                     None if fallback_to_spawn => {
                                         self.app_event_tx.send(AppEvent::NewSession)
                                     }
                                     None => self
                                         .chat_widget
-                                        .show_acp_resume_session_picker(Vec::new(), false),
+                                        .show_agent_session_picker(Vec::new(), false),
                                 },
                                 crate::app_event::AgentPrepareIntent::ResumePicker => {
-                                    if can_resume_catalog && let Some(sessions) = sessions {
-                                        self.chat_widget
-                                            .show_acp_resume_session_picker(sessions, false);
-                                    } else {
-                                        self.chat_widget.open_local_resume_session_picker();
-                                    }
+                                    let listed = sessions.filter(|_| can_resume_catalog);
+                                    self.chat_widget
+                                        .show_resume_picker(listed.unwrap_or_default());
                                 }
                                 crate::app_event::AgentPrepareIntent::Candidate { .. } => {
                                     unreachable!("candidate handled above")

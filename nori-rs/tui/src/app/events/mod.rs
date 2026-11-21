@@ -341,24 +341,19 @@ impl App {
             | AppEvent::SkillsetPickerDismissed
             | AppEvent::SkillsetSwitchResult { .. }
             | AppEvent::SwitchSkillset { .. } => self.handle_extensions_event(tui, event).await,
-            AppEvent::DisplayViewonlyTranscript { .. }
-            | AppEvent::InsertSessionReference { .. }
+            AppEvent::InsertSessionReference { .. }
             | AppEvent::LoadSessionReference { .. }
-            | AppEvent::LoadViewonlyTranscript { .. }
             | AppEvent::OpenForkPicker
             | AppEvent::OpenUsage
             | AppEvent::ShowChoicePicker(..)
-            | AppEvent::ShowReferenceSessionPicker { .. }
-            | AppEvent::ShowViewonlySessionPicker { .. } => {
+            | AppEvent::ShowReferenceSessionPicker { .. } => {
                 self.handle_panels_event(tui, event).await
             }
             AppEvent::ResumeAcpSession { .. }
             | AppEvent::ResumeSession { .. }
             | AppEvent::ResumeTranscriptLoaded { .. }
-            | AppEvent::ShowHelixAcpResumePicker { .. }
-            | AppEvent::ShowResumeSessionPicker { .. } => {
-                self.handle_resume_event(tui, event).await
-            }
+            | AppEvent::ShowResumeSessionPicker(..)
+            | AppEvent::ResumePickerAgentSessions(..) => self.handle_resume_event(tui, event).await,
         }
     }
 }
