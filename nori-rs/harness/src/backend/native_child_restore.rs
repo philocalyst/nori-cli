@@ -17,10 +17,22 @@ pub(super) struct RestoredChild {
 /// The import record is consumed once delegation recovery succeeds on this machine.
 const DELEGATION_RESTORED: &str = "delegation-restored-after-move";
 
-fn needs_move_restore(commands: &[(String, String)]) -> bool {
-    commands
-        .last()
-        .is_some_and(|(name, _)| name == crate::portable::MOVED_IN)
+fn needs_move_restore(commands: &[(String, String)], hostname: &str) -> bool {
+    let Some((name, payload)) = commands.last() else {
+        return false;
+    };
+    if name != crate::portable::MOVED_IN || hostname == "unknown" {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|origin| origin != "unknown" && origin != hostname)
 }
 
 impl AcpBackend {
@@ -32,7 +44,14 @@ impl AcpBackend {
             .journaled_commands_of(&[crate::portable::MOVED_IN, DELEGATION_RESTORED])
             .await
         {
-            Ok(commands) => needs_move_restore(&commands),
+            Ok(commands)
+                if commands
+                    .last()
+                    .is_some_and(|(name, _)| name == crate::portable::MOVED_IN) =>
+            {
+                needs_move_restore(&commands, &crate::portable::hostname())
+            }
+            Ok(_) => false,
             Err(error) => {
                 tracing::warn!(%error, "could not check whether delegation recovery is needed");
                 false
@@ -448,11 +467,24 @@ mod move_restore_tests {
 
     #[test]
     fn only_a_new_unrestored_import_needs_delegation_recovery() {
-        let moved = (crate::portable::MOVED_IN.to_owned(), String::new());
+        let moved = (
+            crate::portable::MOVED_IN.to_owned(),
+            r#"{"from":"old-host"}"#.to_owned(),
+        );
         let restored = (DELEGATION_RESTORED.to_owned(), String::new());
-        assert!(!needs_move_restore(&[]));
-        assert!(needs_move_restore(std::slice::from_ref(&moved)));
-        assert!(!needs_move_restore(&[moved.clone(), restored.clone()]));
-        assert!(needs_move_restore(&[moved.clone(), restored, moved]));
+        assert!(!needs_move_restore(&[], "new-host"));
+        assert!(needs_move_restore(std::slice::from_ref(&moved), "new-host"));
+        assert!(!needs_move_restore(
+            std::slice::from_ref(&moved),
+            "old-host"
+        ));
+        assert!(!needs_move_restore(
+            &[moved.clone(), restored.clone()],
+            "new-host"
+        ));
+        assert!(needs_move_restore(
+            &[moved.clone(), restored, moved],
+            "new-host"
+        ));
     }
 }
