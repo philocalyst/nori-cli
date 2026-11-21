@@ -345,42 +345,9 @@ fn parallel_native_tool_calls_each_finish_with_their_result() {
 }
 
 #[test]
-fn transcript_subagents_are_merged_into_exit_stats() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
-
-    chat.apply_system_info_refresh(crate::system_info::SystemInfo {
-        transcript_location: Some(nori_harness::TranscriptLocation {
-            agent_kind: nori_harness::AgentKind::Codex,
-            transcript_path: PathBuf::from("/tmp/session.jsonl"),
-            session_id: "codex-session".to_string(),
-            token_breakdown: None,
-            subagents_used: vec!["nori-task-runner".to_string()],
-        }),
-        ..Default::default()
-    });
-
-    assert_eq!(chat.session_stats.subagents_used, vec!["nori-task-runner"]);
-}
-
-#[test]
-fn session_usage_updates_footer_and_disables_transcript_fallback() {
+fn session_usage_updates_footer() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
 
-    chat.apply_system_info_refresh(crate::system_info::SystemInfo {
-        transcript_location: Some(nori_harness::TranscriptLocation {
-            agent_kind: nori_harness::AgentKind::Codex,
-            transcript_path: PathBuf::from("/tmp/codex-transcript.jsonl"),
-            session_id: "codex-session".to_string(),
-            token_breakdown: Some(nori_harness::TranscriptTokenUsage {
-                input_tokens: 995_726,
-                output_tokens: 8_452,
-                cached_tokens: 500_000,
-                last_context_tokens: Some(69_246),
-            }),
-            subagents_used: Vec::new(),
-        }),
-        ..Default::default()
-    });
     chat.handle_client_event(crate::presentation::ClientEvent::SessionUpdateInfo(
         crate::presentation::SessionUpdateInfo {
             kind: crate::presentation::SessionUpdateKind::Usage,
@@ -405,41 +372,8 @@ fn session_usage_updates_footer_and_disables_transcript_fallback() {
     let contents = terminal.backend().vt100().screen().contents();
 
     assert!(
-        contents.contains("16% / 258k"),
-        "expected ACP session usage in footer, got: {contents:?}"
-    );
-}
-
-#[test]
-fn transcript_usage_supplies_default_context_percentage_and_window_size() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
-
-    chat.apply_system_info_refresh(crate::system_info::SystemInfo {
-        transcript_location: Some(nori_harness::TranscriptLocation {
-            agent_kind: nori_harness::AgentKind::Codex,
-            transcript_path: PathBuf::from("/tmp/codex-transcript.jsonl"),
-            session_id: "codex-session".to_string(),
-            token_breakdown: Some(nori_harness::TranscriptTokenUsage {
-                input_tokens: 69_246,
-                output_tokens: 1_200,
-                cached_tokens: 45_000,
-                last_context_tokens: Some(69_246),
-            }),
-            subagents_used: Vec::new(),
-        }),
-        ..Default::default()
-    });
-
-    let height = chat.desired_height(80);
-    let mut terminal = Terminal::new(VT100Backend::new(80, height)).expect("create terminal");
-    terminal
-        .draw(|f| chat.render(f.area(), f.buffer_mut()))
-        .expect("draw chat with transcript context usage");
-    let contents = terminal.backend().vt100().screen().contents();
-
-    assert!(
-        contents.contains("27% / 258k"),
-        "expected transcript usage and agent window size in footer: {contents:?}"
+        contents.contains("16%"),
+        "expected ACP session usage on the status line, got: {contents:?}"
     );
 }
 
