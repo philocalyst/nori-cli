@@ -281,13 +281,24 @@ impl ChatWidget {
         self.forked_from =
             nori_harness::ConversationId::from_string(&forked.previous_conversation_id).ok();
 
-        let hint = self.forked_from.as_ref().map(|previous| {
-            format!(
-                "resume the original with {}",
-                crate::resume_command_for_conversation(previous)
-            )
-        });
-        self.push_notice_with_hint(NoticeKind::Info, "Session forked".to_owned(), hint);
+        let command = self
+            .forked_from
+            .as_ref()
+            .map(crate::resume_command_for_conversation);
+        match command {
+            Some(command) => {
+                self.push_notice_with_hint(
+                    NoticeKind::Info,
+                    "Session forked".to_owned(),
+                    Some("resume the original with".to_owned()),
+                );
+                // The command has a row of its own, so a narrow terminal never breaks it across lines.
+                self.push_notice_with_hint(NoticeKind::Info, command, None);
+            }
+            None => {
+                self.push_notice_with_hint(NoticeKind::Info, "Session forked".to_owned(), None);
+            }
+        }
     }
 
     pub(super) fn on_session_started(&mut self, event: nori_protocol::SessionStarted) {

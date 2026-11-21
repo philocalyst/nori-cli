@@ -2195,12 +2195,12 @@ fn session_forked_shows_resume_hint_for_previous_conversation() {
 
     let rendered = history_text(&mut rx);
     assert!(
-        rendered.contains("Session forked. To resume previous:"),
+        rendered.contains("Session forked · resume the original with\n"),
         "fork should add the resume-hint cell, got:\n{rendered}"
     );
     assert!(
-        rendered.contains("nori resume 11111111-1111-1111-1111-111111111111"),
-        "fork hint should offer a copy-pasteable resume command for the previous conversation, got:\n{rendered}"
+        rendered.contains("\n◇ nori resume 11111111-1111-1111-1111-111111111111\n"),
+        "fork hint should put the copy-pasteable resume command on a row of its own, got:\n{rendered}"
     );
 }
 
