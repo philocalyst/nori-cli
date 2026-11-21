@@ -115,15 +115,15 @@ fn successful_claude_cli_login_does_not_restart_a_different_active_agent() {
 
 #[test]
 fn model_popup_without_a_session_asks_for_one() {
-    let (mut chat, _rx, _unused_rx) = make_chatwidget_manual();
+    let (mut chat, mut rx, _unused_rx) = make_chatwidget_manual();
     chat.bottom_pane
         .set_composer_placeholder_for_test("! for shell commands");
 
     chat.open_model_popup();
 
-    insta::assert_snapshot!(
-        "model_popup_without_session",
-        render_bottom_pane(&mut chat, 80)
+    assert_eq!(
+        shown_choice_labels(&mut rx),
+        vec!["No models available yet".to_string()]
     );
 }
 
@@ -252,7 +252,12 @@ fn follow_only_attachment_keeps_messages_in_the_composer_but_allows_agent_switch
     chat.set_composer_text("/model".to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    assert!(chat.bottom_pane.has_active_overlay_or_popup());
+    // The agent picker is an overlay the app draws, so the chat asks for it as an event.
+    assert!(
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|event| matches!(event, AppEvent::ShowChoicePicker(_))),
+        "/model must still open the agent picker in follow-only mode"
+    );
 }
 
 #[test]
