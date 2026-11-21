@@ -53,23 +53,34 @@ pub fn installed_agents(active_agent: Option<&str>) -> Vec<crate::registry::AcpA
         .collect()
 }
 
-/// Installed agents with their last advertised models, in display order.
+/// Installed agents with their last advertised models, in display order. An agent that last said
+/// it is signed out runs none of them: they are listed, with that reason, but never offered.
 pub fn route_catalog(home: &Path, active_agent: Option<&str>) -> Vec<CatalogAgent> {
     installed_agents(active_agent)
         .into_iter()
-        .map(|info| CatalogAgent {
-            gateway: is_gateway(&info.agent_name),
-            models: crate::backend::orchestrator::offered_models(home, &info.agent_name)
-                .into_iter()
-                .map(|model| CatalogModel {
-                    identity: ModelIdentity::of(&model.name, &model.value),
-                    value: model.value,
-                    name: model.name,
-                    availability: model.availability,
-                })
-                .collect(),
-            agent: info.agent_name,
-            display_name: info.display_name,
+        .map(|info| {
+            let signed_out = nori_acp_host::accounts::identity_of(&info.agent_name)
+                .is_some_and(|identity| identity.kind == "none");
+            CatalogAgent {
+                gateway: is_gateway(&info.agent_name),
+                models: crate::backend::orchestrator::offered_models(home, &info.agent_name)
+                    .into_iter()
+                    .map(|model| CatalogModel {
+                        identity: ModelIdentity::of(&model.name, &model.value),
+                        value: model.value,
+                        name: model.name,
+                        availability: if signed_out {
+                            Availability::Unavailable {
+                                reason: format!("{} is not signed in", info.display_name),
+                            }
+                        } else {
+                            model.availability
+                        },
+                    })
+                    .collect(),
+                agent: info.agent_name,
+                display_name: info.display_name,
+            }
         })
         .collect()
 }
