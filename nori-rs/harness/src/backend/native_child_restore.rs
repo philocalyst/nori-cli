@@ -103,7 +103,15 @@ impl AcpBackend {
         }
         Ok(
             crate::transcript::fork_context::child_bindings_from_records(
-                &recorder.visible_records().await?,
+                &recorder
+                    .visible_records_where(|kind, name| {
+                        kind == nori_conversation::Kind::Command
+                            && name.is_some_and(|name| {
+                                name.starts_with("native-child-journal:")
+                                    || name.starts_with("managed-child-journal:")
+                            })
+                    })
+                    .await?,
             )
             .into_iter()
             .filter_map(|(name, _)| {
@@ -126,7 +134,13 @@ impl AcpBackend {
             return Ok(Vec::new());
         }
         let mut bindings = std::collections::BTreeMap::new();
-        for record in parent_recorder.visible_records().await? {
+        let commands = parent_recorder
+            .visible_records_where(|kind, name| {
+                kind == nori_conversation::Kind::Command
+                    && name.is_some_and(|name| name.starts_with("managed-child-journal:"))
+            })
+            .await?;
+        for record in commands {
             if let Event::Command { name, payload } = record.event
                 && let Some(id) = name.strip_prefix("managed-child-journal:")
             {
@@ -146,12 +160,12 @@ impl AcpBackend {
         for (public_id, binding) in bindings {
             let id = acp::SessionId::new(public_id);
             let loader = crate::transcript::TranscriptLoader::new(self.nori_home.clone());
-            let transcript = loader
-                .load_transcript(&binding.project, &binding.session)
+            let meta = loader
+                .load_session_meta(&binding.project, &binding.session)
                 .await?;
             let source_recorder = crate::transcript::TranscriptRecorder::continue_session(
                 loader.session_path(&binding.project, &binding.session),
-                &transcript.meta,
+                &meta,
             )
             .await?;
             let records = source_recorder.visible_records().await?;
@@ -245,7 +259,6 @@ impl AcpBackend {
         use nori_protocol::NoriEvent;
         use nori_protocol::Patch;
         use nori_protocol::SessionEvent;
-        use nori_protocol::SubagentState;
         use nori_protocol::SubagentUpdate;
         use nori_protocol::SubagentWire;
         let recorder = self
@@ -254,7 +267,15 @@ impl AcpBackend {
             .await
             .clone()
             .context("Staged child has no journal")?;
-        let records = recorder.visible_records().await?;
+        let records = recorder
+            .visible_records_where(|kind, name| {
+                kind == nori_conversation::Kind::Command
+                    && name.is_some_and(|name| {
+                        name.starts_with("native-child-journal:")
+                            || name.starts_with("managed-child-journal:")
+                    })
+            })
+            .await?;
         let bindings = crate::transcript::fork_context::child_bindings_from_records(&records);
         let all_ids: std::collections::HashSet<_> = bindings
             .iter()
@@ -317,6 +338,7 @@ impl AcpBackend {
                 session_id: id.clone(),
                 agent: Patch::Keep,
                 model: Patch::Keep,
+                name: Patch::Keep,
                 title: Patch::Keep,
                 description: Patch::Keep,
                 state: Patch::Keep,

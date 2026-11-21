@@ -53,11 +53,10 @@ impl crate::backend::AcpBackend {
     ) -> anyhow::Result<()> {
         let _child_gate = self.native_children.control_gate(&session_id).await;
         let recorder = self.native_children.history(&session_id).await?;
-        let records = recorder.visible_records().await?;
-        let (Some(first), Some(last)) = (records.first(), records.last()) else {
+        let Some((first, last)) = recorder.visible_span().await? else {
             anyhow::bail!("no history was recorded for it");
         };
-        let source = (recorder.session_id().to_owned(), first.id, last.id);
+        let source = (recorder.session_id().to_owned(), first, last);
         self.rebind_native_child(session_id, source).await
     }
 

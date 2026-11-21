@@ -79,13 +79,10 @@ impl NativeHistory {
                 .as_str()
                 .context("Invalid child journal identity")?;
             let loader = TranscriptLoader::new(self.home.clone());
-            let transcript = loader.load_transcript(project, session).await?;
+            let meta = loader.load_session_meta(project, session).await?;
             Arc::new(
-                TranscriptRecorder::continue_session(
-                    loader.session_path(project, session),
-                    &transcript.meta,
-                )
-                .await?,
+                TranscriptRecorder::continue_session(loader.session_path(project, session), &meta)
+                    .await?,
             )
         } else {
             let recorder = Arc::new(
@@ -229,7 +226,7 @@ impl NativeHistory {
             }
             SubagentWire::Update(update) => {
                 let outcome = match &update.state {
-                    Patch::Set(SubagentState::Idle) => Some(Ok(acp::StopReason::EndTurn)),
+                    Patch::Set(SubagentState::Idle { .. }) => Some(Ok(acp::StopReason::EndTurn)),
                     Patch::Set(SubagentState::Ended(
                         nori_protocol::SubagentOutcome::Completed { stop_reason },
                     )) => Some(Ok(match stop_reason.as_deref() {

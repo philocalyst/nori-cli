@@ -40,7 +40,10 @@ impl AcpBackend {
             .await
             .clone()
             .context("The parent conversation journal is unavailable")?;
-        let events = recorder.replay_child_session_events().await?;
+        // Only the parent's records about this child are read: its updates name it.
+        let events = recorder
+            .visible_session_events_mentioning(&id.to_string())
+            .await?;
         let original_parent = events.iter().rev().find_map(|event| match event {
             SessionEvent::Nori(NoriEvent::Subagent(SubagentWire::Update(update)))
                 if update.session_id == id =>
@@ -55,36 +58,19 @@ impl AcpBackend {
             Some(parent) if known_bindings.contains(&parent.to_string()) => parent,
             Some(_) | None => self.session_id().await,
         };
-        // Validate and retain the independent history before making its archived view visible.
-        let loader = crate::transcript::TranscriptLoader::new(self.nori_home.clone());
-        let transcript = loader
-            .load_transcript(&reference.project, &reference.session)
-            .await
-            .context("Could not load the uninitialized child's archived history")?;
         // Configuration is journaled before its parent binding is upgraded. A shutdown
-        // between those writes is recoverable from the actual advertised snapshot.
-        let configuration = transcript
-            .entries
-            .iter()
-            .rev()
-            .find_map(|line| {
-                let crate::transcript::TranscriptEntry::SessionEvent(entry) = &line.entry else {
-                    return None;
-                };
-                let SessionEvent::Acp(nori_protocol::AcpEvent::Notification(
-                    acp::AgentNotification::SessionNotification(notification),
-                )) = &entry.event
-                else {
-                    return None;
-                };
-                let acp::SessionUpdate::ConfigOptionUpdate(update) = &notification.update else {
-                    return None;
-                };
-                Some(update.config_options.clone())
-            })
-            .map(super::child_control::child_model_and_options)
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
+        // between those writes is recoverable from the actual advertised snapshot, the newest in
+        // the child's own history, which must exist.
+        let path = crate::transcript::TranscriptLoader::new(self.nori_home.clone())
+            .session_path(&reference.project, &reference.session);
+        let configuration = tokio::task::spawn_blocking(move || {
+            crate::transcript::newest_config_option_update(&path)
+        })
+        .await?
+        .context("Could not load the uninitialized child's archived history")?
+        .map(super::child_control::child_model_and_options)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
         if let Some((model, options)) = configuration {
             let binding = super::native_child_history::ReboundBinding {
                 project: reference.project,
@@ -111,6 +97,7 @@ impl AcpBackend {
             session_id: id,
             agent: Patch::Keep,
             model: Patch::Keep,
+            name: Patch::Keep,
             title: Patch::Keep,
             description: Patch::Set(UNAVAILABLE.into()),
             state: Patch::Set(SubagentState::Ended(nori_protocol::SubagentOutcome::Closed)),

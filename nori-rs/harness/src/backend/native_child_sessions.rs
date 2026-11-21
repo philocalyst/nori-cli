@@ -84,7 +84,7 @@ impl NativeChildren {
         }
         let (running, ended) = match &update.state {
             Patch::Set(SubagentState::Running) => (Some(true), None),
-            Patch::Set(SubagentState::Idle) => (Some(false), None),
+            Patch::Set(SubagentState::Idle { .. }) => (Some(false), None),
             Patch::Set(SubagentState::Ended(outcome)) => (None, Some(outcome.clone())),
             Patch::Keep | Patch::Clear => (None, None),
         };
@@ -209,7 +209,7 @@ impl NativeChildren {
             Patch::Set(SubagentState::Running) => {
                 let _ = tx.send(Command::State(true));
             }
-            Patch::Set(SubagentState::Idle | SubagentState::Ended(_)) => {
+            Patch::Set(SubagentState::Idle { .. } | SubagentState::Ended(_)) => {
                 let _ = tx.send(Command::State(false));
             }
             Patch::Clear | Patch::Keep => {}
@@ -233,7 +233,7 @@ impl NativeChildren {
         }
         let mut update = update.clone();
         if matches!(&update.state, Patch::Set(SubagentState::Running)) {
-            update.state = Patch::Set(SubagentState::Idle);
+            update.state = Patch::Set(SubagentState::Idle { interrupted: true });
         }
         let _ = self
             .observe(connection, events, root, &SubagentWire::Update(update))
@@ -793,6 +793,7 @@ async fn run(actor: NativeActor, mut rx: mpsc::UnboundedReceiver<Command>) {
                         session_id: id.clone(),
                         agent: Patch::Keep,
                         model: Patch::Keep,
+                        name: Patch::Keep,
                         title: Patch::Keep,
                         description: Patch::Keep,
                         state: Patch::Set(SubagentState::Ended(
