@@ -44,8 +44,32 @@ pub(super) fn wake_text(lease: &Lease) -> String {
             monitor.source,
             escape(&monitor.status)
         ));
-        for event in shown.iter().filter(|event| event.monitor == monitor.id) {
-            text.push_str(&render(event));
+        let events: String = shown
+            .iter()
+            .filter(|event| event.monitor == monitor.id)
+            .map(|event| render(event))
+            .collect();
+        // A `wake` message leads the events; one that places `{{event}}` itself gets them there.
+        match &monitor.message {
+            Some(message) if message.contains("{{event}}") => {
+                text.push_str(
+                    &message
+                        .replace("{{label}}", &monitor.label)
+                        .replace("{{monitor}}", &monitor.id)
+                        .replace("{{event}}", events.trim_end()),
+                );
+                text.push('\n');
+            }
+            Some(message) => {
+                text.push_str(
+                    &message
+                        .replace("{{label}}", &monitor.label)
+                        .replace("{{monitor}}", &monitor.id),
+                );
+                text.push('\n');
+                text.push_str(&events);
+            }
+            None => text.push_str(&events),
         }
         if monitor.rearmable {
             text.push_str("It is not running. `monitor_rearm` starts it again.\n");

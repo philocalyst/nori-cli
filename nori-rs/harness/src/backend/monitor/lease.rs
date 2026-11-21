@@ -36,6 +36,8 @@ pub(crate) struct LeasedMonitor {
     pub(crate) source: &'static str,
     pub(crate) status: String,
     pub(crate) rearmable: bool,
+    /// What the monitor's `wake` action says ahead of its events.
+    pub(crate) message: Option<String>,
 }
 
 impl Monitors {
@@ -83,6 +85,7 @@ impl Monitors {
                     source: entry.spec.source.kind(),
                     status: State::status_of(entry),
                     rearmable: !matches!(entry.phase, Phase::Running { .. }),
+                    message: entry.spec.wake_message().map(str::to_owned),
                 });
             }
         }
@@ -125,14 +128,24 @@ impl Monitors {
     }
 
     /// When the delivery loop next needs to look at the queue by itself: the earliest event that
-    /// becomes ready later (a digest filling up).
+    /// becomes ready later (a digest filling up, or a storm's wait ending).
     pub(crate) fn next_ready(&self) -> Option<Instant> {
         let state = self.lock();
         let now = Instant::now();
+        let storm = state
+            .wakes
+            .iter()
+            .filter(|woke| now.duration_since(**woke) <= STORM_WINDOW)
+            .count()
+            >= STORM_WAKES;
         state
             .queue
             .iter()
-            .filter_map(|queued| queued.ready)
+            .filter_map(|queued| match (queued.event.class, queued.ready) {
+                (Class::Immediate, Some(_)) if storm => Some(queued.at + STORM_DIGEST),
+                (Class::Immediate | Class::Digest, Some(ready)) => Some(ready),
+                (Class::Urgent | Class::Immediate | Class::Digest | Class::Boundary, _) => None,
+            })
             .filter(|ready| *ready > now)
             .min()
     }

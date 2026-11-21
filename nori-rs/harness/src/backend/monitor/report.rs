@@ -9,11 +9,13 @@ use super::event::Event;
 use super::event::EventLine;
 use super::journal::Record;
 use super::registry::Burst;
+use super::registry::Effect;
 use super::registry::Entry;
 use super::registry::Monitors;
 use super::registry::Phase;
 use super::registry::Queued;
 use super::registry::seconds;
+use super::spec::Action;
 use super::spec::WakeMode;
 
 impl Monitors {
@@ -67,6 +69,44 @@ impl Monitors {
             ending,
         })
         .await;
+        self.notify();
+    }
+
+    /// Deliver what an action of monitor `id` produced (a skill's result) to the agent as one more
+    /// event of that monitor, even after the monitor ended: it wakes the agent whatever the
+    /// monitor's actions are, and performs none of them again.
+    pub(crate) async fn post_outcome(&self, id: &str, text: String, failure: bool) {
+        let event = {
+            let mut state = self.lock();
+            state.next_seq += 1;
+            let seq = state.next_seq;
+            let Some(entry) = state.entry(id) else { return };
+            Event {
+                seq,
+                monitor: entry.id.clone(),
+                label: entry.spec.label.clone(),
+                age_seconds: i64::try_from(entry.started.elapsed().as_secs()).unwrap_or(i64::MAX),
+                lines: vec![EventLine { text, failure }],
+                omitted: 0,
+                failure,
+                ending: None,
+                class: if failure {
+                    Class::Urgent
+                } else {
+                    Class::Immediate
+                },
+            }
+        };
+        self.write(&Record::Event {
+            event: event.clone(),
+        })
+        .await;
+        let now = Instant::now();
+        self.lock().insert(Queued {
+            event,
+            at: now,
+            ready: Some(now),
+        });
         self.notify();
     }
 
@@ -127,51 +167,76 @@ impl Monitors {
         })
     }
 
-    /// Journal an event, then queue it. An event is never queued before it is journaled.
+    /// Journal an event, perform the monitor's actions, then queue it for a wake when one of
+    /// them is a wake. An event is never queued before it is journaled.
     async fn enqueue(&self, id: &str, run: i64, event: Event, must_be_running: bool) -> bool {
         self.write(&Record::Event {
             event: event.clone(),
         })
         .await;
-        let digest = {
-            let state = self.lock();
-            state
-                .entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .map_or(30, |entry| entry.spec.limits.digest_seconds)
-        };
-        let stale = {
+        let (digest, spec, current) = {
             let mut state = self.lock();
-            let current = state
-                .entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .is_some_and(|entry| {
-                    entry.run == run
-                        && (!must_be_running || matches!(entry.phase, Phase::Running { .. }))
-                });
+            let entry = state.entries.iter().find(|entry| entry.id == id);
+            let digest = entry.map_or(30, |entry| entry.spec.limits.digest_seconds);
+            let spec = entry.map(|entry| std::sync::Arc::clone(&entry.spec));
+            let current = entry.is_some_and(|entry| {
+                entry.run == run
+                    && (!must_be_running || matches!(entry.phase, Phase::Running { .. }))
+            });
             if current {
-                let now = Instant::now();
-                let ready = match event.class {
-                    Class::Urgent | Class::Immediate => Some(now),
-                    Class::Digest => Some(now + seconds(digest)),
-                    Class::Boundary => None,
-                };
-                state.insert(Queued {
-                    event: event.clone(),
-                    at: now,
-                    ready,
-                });
+                if let Some(spec) = &spec {
+                    let text = event
+                        .lines
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    for action in &spec.actions {
+                        match action {
+                            Action::Wake { .. } => {}
+                            Action::Prompt { .. }
+                            | Action::Notify { .. }
+                            | Action::RunJob { .. }
+                            | Action::StopJob { .. }
+                            | Action::RunSkill { .. } => self.perform(Effect {
+                                monitor: event.monitor.clone(),
+                                label: event.label.clone(),
+                                action: action.clone(),
+                                event: text.clone(),
+                                failure: event.failure,
+                            }),
+                        }
+                    }
+                    if spec.wakes() {
+                        let now = Instant::now();
+                        let ready = match event.class {
+                            Class::Urgent | Class::Immediate => Some(now),
+                            Class::Digest => Some(now + seconds(digest)),
+                            Class::Boundary => None,
+                        };
+                        state.insert(Queued {
+                            event: event.clone(),
+                            at: now,
+                            ready,
+                        });
+                    }
+                }
             }
-            !current
+            (digest, spec, current)
         };
-        if stale {
+        if !current {
             self.write(&Record::Taken {
                 seqs: vec![event.seq],
             })
             .await;
             return false;
+        }
+        if spec.is_some_and(|spec| !spec.wakes()) {
+            // Acted on, and nobody is to be woken: the event is consumed here.
+            self.write(&Record::Taken {
+                seqs: vec![event.seq],
+            })
+            .await;
         }
         self.notify();
         true

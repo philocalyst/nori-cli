@@ -497,3 +497,4 @@ use hooks::generate_id;
 use hooks::route_hook_results;
 use hooks::run_prompt_summary;
 use hooks::run_session_start_hooks;
+pub mod jobs;

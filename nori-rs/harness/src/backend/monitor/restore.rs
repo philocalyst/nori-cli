@@ -11,6 +11,7 @@ use super::registry::Entry;
 use super::registry::Monitors;
 use super::registry::Phase;
 use super::registry::Queued;
+use super::spec::Source;
 
 impl Monitors {
     // ---- restoring -------------------------------------------------------------------------
@@ -54,6 +55,8 @@ impl Monitors {
             .entries
             .iter()
             .filter(|entry| matches!(entry.phase, Phase::Dormant))
+            // A job's wake is started again by the jobs restore, which says what became of the job.
+            .filter(|entry| !matches!(entry.spec.source, Source::Job { .. }))
             .map(|entry| {
                 (
                     entry.id.clone(),

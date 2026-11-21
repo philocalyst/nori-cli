@@ -14,6 +14,8 @@ use nori_protocol::acp::v1 as acp;
 
 use super::journal;
 use super::journal::Record;
+use super::registry::Effect;
+use super::spec::Action;
 use super::text;
 use crate::backend::AcpBackend;
 use crate::backend::BackendEvent;
@@ -27,6 +29,16 @@ impl AcpBackend {
         let backend = self.clone();
         let monitors = self.orchestrator.monitors().clone();
         monitors.attach_journal(self.transcript_recorder_cell());
+        let jobs = self.orchestrator.jobs().clone();
+        jobs.attach_journal(self.transcript_recorder_cell());
+        let (effects_tx, mut effects) = tokio::sync::mpsc::unbounded_channel::<Effect>();
+        monitors.attach_effects(effects_tx);
+        let performer = self.clone();
+        tokio::spawn(async move {
+            while let Some(effect) = effects.recv().await {
+                performer.perform_monitor_action(effect).await;
+            }
+        });
         tokio::spawn(async move {
             let mut published = nori_protocol::MonitorsState::default();
             loop {
@@ -40,7 +52,9 @@ impl AcpBackend {
                     () = monitors.changed() => {}
                     () = due => {}
                 }
-                let state = monitors.summary();
+                let mut state = monitors.summary();
+                let counts = jobs.summary();
+                state.jobs = counts.running + counts.unreachable;
                 if state != published {
                     published = state.clone();
                     let _ = backend
@@ -56,6 +70,153 @@ impl AcpBackend {
                 backend.deliver_monitor_events_if_idle(false).await;
             }
         });
+    }
+
+    /// Tell the person: one transcript line and an OS notification. The line is headed by `title`,
+    /// or by `label` when there is none, and the notification can block, so it is never sent from
+    /// the event loop. A monitor's `notify` action and a plugin's `notify` operation both do this.
+    /// Returns the headline.
+    pub(crate) async fn tell_person(
+        &self,
+        label: &str,
+        title: Option<String>,
+        body: String,
+        failure: bool,
+    ) -> String {
+        let headline = title.as_deref().unwrap_or(label).to_owned();
+        let message = match (failure, body.is_empty()) {
+            (true, _) => format!("◉ {headline} FAILED: {body}"),
+            (false, true) => format!("◉ {headline}"),
+            (false, false) => format!("◉ {headline}: {body}"),
+        };
+        let _ = self
+            .backend_event_tx
+            .send(BackendEvent::Public(SessionEvent::Nori(NoriEvent::Notice(
+                nori_protocol::Notice { message },
+            ))))
+            .await;
+        let notifier = self.user_notifier.clone();
+        let notification = crate::UserNotification::Monitor {
+            label: label.to_owned(),
+            title,
+            body,
+        };
+        tokio::task::spawn_blocking(move || notifier.notify(&notification));
+        headline
+    }
+
+    /// Do what a monitor's action asks, other than a wake (which goes through the queue).
+    async fn perform_monitor_action(&self, effect: Effect) {
+        match &effect.action {
+            Action::Wake { .. } => {}
+            Action::Notify { title, body } => {
+                let body = effect.render(body.as_deref().unwrap_or("{{event}}"));
+                let title = title.as_deref().map(|title| effect.render(title));
+                self.tell_person(&effect.label, title, body, effect.failure)
+                    .await;
+            }
+            Action::RunJob { job } => {
+                let backend = self.clone();
+                let job = job.clone();
+                tokio::spawn(async move {
+                    let jobs = backend.orchestrator.jobs();
+                    // A job of that name already running is what the action asks for.
+                    if matches!(
+                        jobs.follow(&job),
+                        Ok(crate::backend::jobs::Followed::Live { .. })
+                    ) {
+                        return;
+                    }
+                    let modules = backend.orchestrator.modules().await;
+                    let started = match crate::backend::jobs::JobStartRequest::module(&job)
+                        .into_start(&modules, &backend.cwd)
+                    {
+                        Ok(start) => jobs.start(start).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = started {
+                        backend
+                            .notice(&format!(
+                                "◉ {}: could not run job `{job}`: {error}",
+                                effect.label
+                            ))
+                            .await;
+                    }
+                });
+            }
+            Action::StopJob { job } => {
+                let backend = self.clone();
+                let job = job.clone();
+                tokio::spawn(async move {
+                    // A job that is not running is already what the action asks for.
+                    if let Err(error) = backend
+                        .orchestrator
+                        .jobs()
+                        .stop(&job, None, std::time::Duration::from_secs(5))
+                        .await
+                    {
+                        tracing::debug!(monitor = %effect.monitor, %job, %error, "a monitor's stop_job found nothing to stop");
+                    }
+                });
+            }
+            Action::RunSkill { skill, arguments } => {
+                let backend = self.clone();
+                let skill = skill.clone();
+                let arguments = arguments
+                    .iter()
+                    .map(|(name, value)| (name.clone(), effect.render(value)))
+                    .collect();
+                tokio::spawn(async move {
+                    let (text, failure) =
+                        match backend.orchestrator.execute_skill(&skill, arguments).await {
+                            Ok(result) => (
+                                format!(
+                                    "skill {skill} finished: {} (journal: {})",
+                                    match &result.value {
+                                        serde_json::Value::String(text) => text.clone(),
+                                        other => other.to_string(),
+                                    },
+                                    result.journal
+                                ),
+                                false,
+                            ),
+                            Err(error) => (format!("skill {skill} failed: {error:#}"), true),
+                        };
+                    backend
+                        .orchestrator
+                        .monitors()
+                        .post_outcome(&effect.monitor, text, failure)
+                        .await;
+                });
+            }
+            Action::Prompt { text } => {
+                let text = effect.render(text);
+                let backend = self.clone();
+                // Admission can wait for a running turn; the next action must not wait with it.
+                tokio::spawn(async move {
+                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                    backend
+                        .submit_prompt(
+                            vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
+                            None,
+                            crate::backend::PromptAdmission::Queue,
+                            response_tx,
+                        )
+                        .await;
+                    if let Ok(Err(error)) = response_rx.await {
+                        tracing::warn!(monitor = %effect.monitor, %error, "a monitor's prompt was not queued");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Let this session's `session` monitors read its public events from now on.
+    pub(crate) fn publish_events_to_monitors(
+        &self,
+        events: crate::session_event_fanout::SessionEventFanout,
+    ) {
+        self.orchestrator.monitors().attach_events(events);
     }
 
     /// A turn of any owner ended: events that were waiting for a boundary may come now.
@@ -98,6 +259,7 @@ impl AcpBackend {
                     prompt_meta: None,
                     original_content: Vec::new(),
                     content: vec![acp::ContentBlock::Text(acp::TextContent::new(body))],
+                    context: Default::default(),
                     display_text: None,
                 },
             )
@@ -123,8 +285,14 @@ impl AcpBackend {
     }
 
     /// Take back what the journal says: monitors armed before the last run come back dormant,
-    /// and events nobody had been handed are queued again.
+    /// events nobody had been handed are queued again, and the jobs that were running are adopted
+    /// (after the monitors: a job's wake is the dormant monitor restored here).
     pub(in crate::backend) async fn restore_monitors(&self) {
+        self.restore_monitor_records().await;
+        self.restore_jobs().await;
+    }
+
+    async fn restore_monitor_records(&self) {
         let Some(recorder) = self.transcript_recorder.read().await.clone() else {
             return;
         };
@@ -142,7 +310,7 @@ impl AcpBackend {
             return;
         }
         let texts = recorder
-            .visible_records()
+            .visible_records_where(|kind, _| kind == nori_conversation::Kind::Message)
             .await
             .unwrap_or_default()
             .into_iter()

@@ -18,7 +18,7 @@ const ARMED: &str = "Armed. Its events arrive as new messages, even after your t
 #[tool_router(router = monitor_tool_router, vis = "pub(crate)")]
 impl NoriClientService {
     #[tool(
-        description = "Arm a background monitor and return at once; its events arrive later as new messages, so you can end your turn. Sources: `command` (shell command; each stdout line is an event; its exit code is the last event, non-zero is a failure), `file` (tail), `watch` (created/modified/deleted under paths), `actor` (a peer's state, results, replies), `ci` (checks on a commit, ends with the verdict), `http_poll` (event when the value you pick changes). Cover failure: put failure signatures (`Traceback`, `panicked`, `FAILED`, `error\\[`, `Killed`, `OOM`) in `fail_on`; silence is not success. `filter` keeps matching lines, `until` ends the monitor at a matching line, `timeout_seconds` bounds it (expiry is reported, not success), `wake` chooses `immediate`, `digest` or `boundary`.",
+        description = "Watch something in the background and return at once; its events arrive later as new messages, so you end your turn instead of polling or sleeping. `source` picks what: `command` (each stdout line is an event; its exit code is the last event, non-zero is a failure), `file` (tail), `watch` (created/modified/deleted under paths), `actor` (a peer's state, results, replies), `ci` (checks on a commit; ends with the verdict), `http_poll` (an event when the value you pick changes), `timer` (`every_seconds`, `at` or `cron`: wake yourself later instead of sleeping), `session` (this session's `turn_failed`, `route_changed`, `subagent_ended`, ... or `idle_seconds`). Each source reads only its own fields; one that belongs to another is rejected and the error says so. `fail_on`, `filter`, `until`, `timeout_seconds` and `wake` shape what arrives (see the fields); `actions` can tell the person (`notify`, no wake) or act for you (`run_job`, `stop_job`, `run_skill`). Returns the monitor id, label and limits; an error means nothing was armed. Not for a short command you need now (use `bash`) nor to run a process that outlives the turn (use `job_start`). Examples: `{\"label\":\"tests\",\"source\":\"command\",\"command\":\"cargo test 2>&1\",\"filter\":\"test result|FAILED|panicked\",\"fail_on\":[\"FAILED\",\"panicked\"],\"timeout_seconds\":900}`; `{\"label\":\"ci\",\"source\":\"ci\"}`; to be woken in ten minutes: `{\"label\":\"later\",\"source\":\"timer\",\"every_seconds\":600,\"max_events\":1}`.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true),
         meta = super::super::orchestrator::always_load()
     )]
@@ -51,7 +51,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "List your monitors: each one's id, label, source, state (`running`, `dormant` after a restart, or `ended: ...` with how), events seen, failures, and how long until it expires. Also returns, once, the events you have not been given yet. Not a way to wait: events arrive as messages by themselves.",
+        description = "List your monitors: each one's id, label, source, state (`running`, `dormant` after a restart, or `ended: ...` with how), events seen, failures, and time left. Also returns, once, the events you have not been given yet. Not a way to wait: events arrive as messages by themselves.",
         annotations(
             read_only_hint = false,
             idempotent_hint = false,
@@ -102,7 +102,7 @@ impl NoriClientService {
     }
 
     #[tool(
-        description = "Start an ended, expired or dormant monitor again with a fresh timeout and event budget (same source and rules), or extend a running monitor's timeout. Optionally change `timeout_seconds`, `max_events`, `wake`.",
+        description = "Start an ended, expired or dormant monitor again with a fresh timeout and event budget (same source and rules), or extend a running monitor's timeout. Optionally change `timeout_seconds` (seconds), `max_events` or `wake`.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -150,7 +150,7 @@ impl NoriClientService {
 impl NoriClientService {
     /// Where a monitor's relative paths and commands start: the directory of the caller's own
     /// shell when it has one, else the session's.
-    async fn monitor_cwd(&self) -> PathBuf {
+    pub(super) async fn monitor_cwd(&self) -> PathBuf {
         let session = self
             .shared
             .bash_sessions

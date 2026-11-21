@@ -8,7 +8,10 @@ mod ci;
 mod command;
 mod file;
 mod http;
+mod job;
 mod jsonpath;
+mod schedule;
+mod session;
 mod watch;
 
 use std::path::Path;
@@ -22,6 +25,8 @@ use crate::backend::orchestrator::ActorWatch;
 use crate::backend::orchestrator::Orchestrator;
 
 pub(super) use ci::CiTarget;
+pub(crate) use job::NOTE_PATTERN as JOB_NOTE_PATTERN;
+pub(crate) use schedule::Schedule;
 
 /// What a source tells its monitor.
 pub(super) enum Item {
@@ -44,9 +49,25 @@ pub(super) enum Item {
 pub(crate) struct SourceEnv {
     actor: Option<ActorWatch>,
     ci: Option<CiTarget>,
+    schedule: Option<schedule::Compiled>,
+    /// The session's events, for a `session` source.
+    events: Option<tokio::sync::mpsc::Receiver<nori_protocol::SessionEvent>>,
+    /// The job a `job` source follows.
+    job: Option<job::Prepared>,
 }
 
 impl SourceEnv {
+    /// A `job` source following `followed`; `ready` is checked now.
+    pub(crate) fn job(
+        followed: crate::backend::jobs::Followed,
+        ready: Option<&str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            job: Some(job::Prepared::new(followed, ready)?),
+            ..Self::default()
+        })
+    }
+
     /// Check `source` against the actor's sandbox and the world, and resolve what it names.
     pub(crate) async fn prepare(
         source: &Source,
@@ -100,6 +121,28 @@ impl SourceEnv {
                 env.ci = Some(CiTarget::resolve(cwd, sha.as_deref(), branch.as_deref()).await?);
             }
             Source::HttpPoll { url, .. } => http::check(url)?,
+            Source::Timer { schedule } => {
+                env.schedule = Some(schedule.compile(chrono::Local::now())?);
+            }
+            Source::Session {
+                events,
+                idle_seconds,
+            } => {
+                if events.is_empty() && idle_seconds.is_none() {
+                    return Err(
+                        "a `session` monitor needs `events`, `idle_seconds`, or both".to_owned(),
+                    );
+                }
+                if idle_seconds.is_some_and(|seconds| seconds < 1) {
+                    return Err("`idle_seconds` must be at least 1".to_owned());
+                }
+                env.events = Some(orchestrator.monitors().subscribe_events().ok_or(
+                    "this session does not publish its events to monitors (a headless child)",
+                )?);
+            }
+            Source::Job { job, ready, .. } => {
+                return Self::job(orchestrator.jobs().follow(job)?, ready.as_deref());
+            }
         }
         Ok(env)
     }
@@ -108,7 +151,13 @@ impl SourceEnv {
 /// Run `source` until it ends, reporting to `tx`. The end is always the last item sent; a source
 /// that cannot say how it ended is reported by the pipeline as failed.
 pub(super) async fn run(source: Source, env: SourceEnv, tx: Sender<Item>) {
-    let SourceEnv { actor, ci } = env;
+    let SourceEnv {
+        actor,
+        ci,
+        schedule,
+        events,
+        job,
+    } = env;
     let ending = match source {
         Source::Command {
             command,
@@ -130,6 +179,25 @@ pub(super) async fn run(source: Source, env: SourceEnv, tx: Sender<Item>) {
             interval_seconds,
             extract,
         } => http::run(&url, interval_seconds, &extract, &tx).await,
+        Source::Timer { .. } => match schedule {
+            Some(schedule) => schedule::run(schedule, &tx).await,
+            None => Some(missing("timer")),
+        },
+        Source::Session {
+            events: triggers,
+            idle_seconds,
+        } => match events {
+            Some(events) => {
+                let idle = idle_seconds
+                    .map(|seconds| std::time::Duration::from_secs(seconds.max(1).unsigned_abs()));
+                session::run(events, &triggers, idle, &tx).await
+            }
+            None => Some(missing("session")),
+        },
+        Source::Job { lines, .. } => match job {
+            Some(job) => job::run(job, lines, &tx).await,
+            None => Some(missing("job")),
+        },
     };
     if let Some(ending) = ending {
         let _ = tx.send(Item::Done(ending)).await;

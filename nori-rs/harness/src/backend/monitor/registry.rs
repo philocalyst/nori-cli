@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::event::Ending;
 use super::event::Event;
@@ -22,11 +23,15 @@ use super::event::EventLine;
 use super::journal::Record;
 use super::pipeline;
 use super::source::SourceEnv;
+use super::spec::Action;
 use super::spec::MAX_RUNNING;
+use super::spec::Origin;
 use super::spec::Spec;
 use super::spec::WakeMode;
 use super::view::Stopped;
 use super::view::unknown;
+use crate::session_event_fanout::SessionEventFanout;
+use crate::session_event_fanout::WeakSessionEventFanout;
 use crate::transcript::TranscriptRecorder;
 
 /// Ended monitors kept in the list.
@@ -53,6 +58,54 @@ pub(super) struct Shared {
     /// Something changed that the delivery loop may need to act on.
     pub(super) changed: Notify,
     pub(super) journal: Mutex<Option<Journal>>,
+    /// The session's public events, for `session` monitors.
+    /// Held weakly: the monitors live as long as the backend, which must not keep the event
+    /// stream open after the session has ended.
+    pub(super) events: Mutex<Option<WeakSessionEventFanout>>,
+    /// Where actions other than a wake go: the backend performs them.
+    pub(super) effects: Mutex<Option<UnboundedSender<Effect>>>,
+}
+
+/// An action a monitor's event asks the backend to perform, with what it fired on.
+#[derive(Debug, Clone)]
+pub(crate) struct Effect {
+    pub(crate) monitor: String,
+    pub(crate) label: String,
+    pub(crate) action: Action,
+    /// The event's lines, for `{{event}}`.
+    pub(crate) event: String,
+    pub(crate) failure: bool,
+}
+
+impl Effect {
+    /// `template` with `{{event}}`, `{{label}}` and `{{monitor}}` filled in.
+    pub(crate) fn render(&self, template: &str) -> String {
+        let mut rendered = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find("{{") {
+            rendered.push_str(&rest[..open]);
+            rest = &rest[open..];
+            let Some(close) = rest.find("}}") else {
+                rendered.push_str(rest);
+                return rendered;
+            };
+            let token = &rest[2..close];
+            let replacement = match token {
+                "event" => Some(self.event.as_str()),
+                "label" => Some(self.label.as_str()),
+                "monitor" => Some(self.monitor.as_str()),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                rendered.push_str(replacement);
+            } else {
+                rendered.push_str(&rest[..close + 2]);
+            }
+            rest = &rest[close + 2..];
+        }
+        rendered.push_str(rest);
+        rendered
+    }
 }
 
 #[derive(Default)]
@@ -199,6 +252,8 @@ impl Monitors {
                 state: Mutex::new(State::default()),
                 changed: Notify::new(),
                 journal: Mutex::new(None),
+                events: Mutex::new(None),
+                effects: Mutex::new(None),
             }),
         }
     }
@@ -217,6 +272,56 @@ impl Monitors {
             .journal
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(journal);
+    }
+
+    /// Let `session` monitors read the session's events from now on.
+    pub(crate) fn attach_events(&self, events: SessionEventFanout) {
+        *self
+            .shared
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(events.downgrade());
+    }
+
+    /// A subscription to the session's events, when the session publishes them.
+    pub(crate) fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<nori_protocol::SessionEvent>> {
+        self.shared
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(WeakSessionEventFanout::upgrade)
+            .as_ref()
+            .map(SessionEventFanout::subscribe)
+    }
+
+    /// Hand actions other than a wake to the backend from now on.
+    pub(crate) fn attach_effects(&self, effects: UnboundedSender<Effect>) {
+        *self
+            .shared
+            .effects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(effects);
+    }
+
+    /// Ask the backend to perform `effect`. Without a backend (a test) it is logged and dropped.
+    pub(super) fn perform(&self, effect: Effect) {
+        let effects = self
+            .shared
+            .effects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match effects {
+            Some(effects) => {
+                let _ = effects.send(effect);
+            }
+            None => {
+                tracing::warn!(monitor = %effect.monitor, "a monitor action has no backend to run it")
+            }
+        }
     }
 
     pub(super) async fn write(&self, record: &Record) {
@@ -265,6 +370,7 @@ impl Monitors {
         env: SourceEnv,
         replace: bool,
     ) -> Result<Armed, String> {
+        spec.validate_actions()?;
         let rules = spec.rules.compile()?;
         let spec = Arc::new(spec);
         let mut superseded = None;
@@ -291,11 +397,15 @@ impl Monitors {
                 }
                 None => {}
             }
+            // Standing monitors (a module's) do not take the agent's places.
             let running: Vec<String> = state
                 .running()
+                .filter(|entry| entry.spec.origin == Origin::Agent)
                 .map(|entry| format!("{} ({})", entry.id, entry.spec.label))
                 .collect();
-            if i64::try_from(running.len()).unwrap_or(i64::MAX) >= MAX_RUNNING {
+            if spec.origin == Origin::Agent
+                && i64::try_from(running.len()).unwrap_or(i64::MAX) >= MAX_RUNNING
+            {
                 return Err(format!(
                     "{MAX_RUNNING} monitors are already running: {}. `monitor_stop` one first.",
                     running.join(", ")
@@ -411,6 +521,7 @@ impl Monitors {
             if let Some(wake) = overrides.wake {
                 spec.wake = wake;
             }
+            spec.validate_actions()?;
             let armed = Armed {
                 monitor: entry.id.clone(),
                 label: spec.label.clone(),
@@ -464,19 +575,20 @@ impl Monitors {
         let stopped = {
             let mut state = self.lock();
             let ids: Vec<String> = if which == "all" {
+                // Everything the agent armed; a module's monitors are stopped by name only.
                 state
                     .entries
                     .iter()
-                    .filter(|entry| !matches!(entry.phase, Phase::Ended(_)))
+                    .filter(|entry| {
+                        !matches!(entry.phase, Phase::Ended(_))
+                            && entry.spec.origin == Origin::Agent
+                    })
                     .map(|entry| entry.id.clone())
                     .collect()
             } else {
-                match state
-                    .entries
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.id == which || entry.spec.label == which)
-                {
+                match state.entries.iter().rev().find(|entry| {
+                    stop_matches(&entry.id, &entry.spec.label, &entry.spec.origin, which)
+                }) {
                     Some(entry) => vec![entry.id.clone()],
                     None => return Err(unknown(&state, which)),
                 }
@@ -529,6 +641,48 @@ impl Monitors {
     }
 }
 
+/// The agent can address its own monitors by id or label. A module's standing monitors have a
+/// stable label; their generated ids are internal to that module's session.
+fn stop_matches(id: &str, label: &str, origin: &Origin, which: &str) -> bool {
+    label == which || (origin == &Origin::Agent && id == which)
+}
+
 pub(super) fn seconds(seconds: i64) -> Duration {
     Duration::from_secs(u64::try_from(seconds.max(0)).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn a_standing_monitor_can_be_stopped_by_label_but_not_its_internal_id() {
+        let module = Origin::Module {
+            path: PathBuf::from("monitor.pkl"),
+        };
+        assert!(stop_matches("mon-1", "daily", &module, "daily"));
+        assert!(!stop_matches("mon-1", "daily", &module, "mon-1"));
+        assert!(stop_matches("mon-2", "tests", &Origin::Agent, "mon-2"));
+        assert!(stop_matches("mon-2", "tests", &Origin::Agent, "tests"));
+    }
+
+    #[test]
+    fn event_text_is_not_interpreted_as_template_syntax() {
+        let effect = Effect {
+            monitor: "mon-1".to_owned(),
+            label: "tests".to_owned(),
+            action: Action::Notify {
+                title: None,
+                body: None,
+            },
+            event: "literal {{label}} {{monitor}}".to_owned(),
+            failure: false,
+        };
+        assert_eq!(
+            effect.render("{{event}} for {{label}}"),
+            "literal {{label}} {{monitor}} for tests"
+        );
+    }
 }

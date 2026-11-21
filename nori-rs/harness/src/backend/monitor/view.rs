@@ -114,6 +114,8 @@ impl Monitors {
             )
             .unwrap_or(i64::MAX),
             labels,
+            // The jobs are counted by the backend, which owns them.
+            jobs: 0,
         }
     }
 }

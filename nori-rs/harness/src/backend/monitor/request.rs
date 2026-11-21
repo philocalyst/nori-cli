@@ -9,13 +9,16 @@ use std::path::Path;
 use rmcp::schemars;
 use serde::Deserialize;
 
+use super::source::Schedule;
 use super::source::resolve_path;
+use super::spec::Action;
 use super::spec::ChangeKind;
 use super::spec::Extract;
 use super::spec::Limits;
 use super::spec::MAX_EVENTS_CEILING;
 use super::spec::MAX_TIMEOUT_SECONDS;
 use super::spec::Rules;
+use super::spec::SessionTrigger;
 use super::spec::Source;
 use super::spec::Spec;
 use super::spec::Track;
@@ -49,6 +52,8 @@ pub(crate) enum SourceKind {
     Actor,
     Ci,
     HttpPoll,
+    Timer,
+    Session,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -58,7 +63,7 @@ pub(crate) struct MonitorStartRequest {
     /// Required. A short name, such as `tests` or `ci`: it heads the events and addresses the
     /// monitor in `monitor_stop` and `monitor_rearm`. Unique among your running monitors.
     label: String,
-    /// Required. What to watch: `command`, `file`, `watch`, `actor`, `ci` or `http_poll`.
+    /// Required. What to watch. Set only the fields of that source (marked below).
     source: SourceKind,
     /// `command`: the shell command. Each stdout line is an event; when it exits, the exit code
     /// is the last event and non-zero is a failure.
@@ -110,6 +115,30 @@ pub(crate) struct MonitorStartRequest {
     /// match) is the value.
     #[serde(default)]
     regex: Option<String>,
+    /// `timer`: fire every this many seconds (the first time that long from now).
+    #[serde(default)]
+    every_seconds: Option<i64>,
+    /// `timer`: fire once at this time: RFC 3339 (`2026-11-20T09:00:00Z`) or a local `HH:MM`
+    /// (the next one).
+    #[serde(default)]
+    at: Option<String>,
+    /// `timer`: fire on this cron schedule, local time: five fields (`0 9 * * 1-5` is 09:00 on
+    /// weekdays), six with seconds first, or `@hourly`/`@daily`/`@weekly`.
+    #[serde(default)]
+    cron: Option<String>,
+    /// `session`: which moments are events: `turn_ended` (not the turns your own wakes start),
+    /// `turn_failed`, `route_changed`, `subagent_ended`, `permission_requested`, `quota_low`.
+    #[serde(default)]
+    events: Option<Vec<SessionTrigger>>,
+    /// `session`: an event when the session has been idle this many seconds (once per idle
+    /// stretch).
+    #[serde(default)]
+    idle_seconds: Option<i64>,
+    /// What an event does, each by `kind`. Default: `wake` you with it. `notify` tells the person
+    /// instead and does not wake you. Templates `{{event}}`, `{{label}}` and `{{monitor}}` are
+    /// filled in.
+    #[serde(default)]
+    actions: Option<Vec<Action>>,
     /// Only lines that match this regular expression are events.
     #[serde(default)]
     filter: Option<String>,
@@ -152,6 +181,8 @@ impl MonitorStartRequest {
             SourceKind::Actor => "actor",
             SourceKind::Ci => "ci",
             SourceKind::HttpPoll => "http_poll",
+            SourceKind::Timer => "timer",
+            SourceKind::Session => "session",
         };
         // Fields of other sources would be silently ignored: say so instead.
         let strays: Vec<&str> = [
@@ -174,6 +205,19 @@ impl MonitorStartRequest {
             ),
             ("json_path", self.json_path.is_some(), SourceKind::HttpPoll),
             ("regex", self.regex.is_some(), SourceKind::HttpPoll),
+            (
+                "every_seconds",
+                self.every_seconds.is_some(),
+                SourceKind::Timer,
+            ),
+            ("at", self.at.is_some(), SourceKind::Timer),
+            ("cron", self.cron.is_some(), SourceKind::Timer),
+            ("events", self.events.is_some(), SourceKind::Session),
+            (
+                "idle_seconds",
+                self.idle_seconds.is_some(),
+                SourceKind::Session,
+            ),
         ]
         .into_iter()
         .filter(|(_, present, owner)| *present && *owner != kind)
@@ -254,6 +298,23 @@ impl MonitorStartRequest {
                     extract,
                 }
             }
+            SourceKind::Timer => Source::Timer {
+                schedule: match (self.every_seconds, self.at, self.cron) {
+                    (Some(seconds), None, None) => Schedule::Every { seconds },
+                    (None, Some(at), None) => Schedule::At { at },
+                    (None, None, Some(expression)) => Schedule::Cron { expression },
+                    _ => {
+                        return Err(
+                            "`source: timer` needs exactly one of `every_seconds`, `at` and `cron`"
+                                .to_owned(),
+                        );
+                    }
+                },
+            },
+            SourceKind::Session => Source::Session {
+                events: self.events.unwrap_or_default(),
+                idle_seconds: self.idle_seconds,
+            },
         };
         let positive = |value: Option<i64>, field: &str, default: i64, ceiling: i64| match value {
             Some(value) if value < 1 => Err(format!("`{field}` must be at least 1")),
@@ -284,6 +345,8 @@ impl MonitorStartRequest {
             },
             wake: self.wake.unwrap_or_default(),
             limits,
+            actions: self.actions.unwrap_or_default(),
+            origin: super::spec::Origin::Agent,
         })
     }
 }

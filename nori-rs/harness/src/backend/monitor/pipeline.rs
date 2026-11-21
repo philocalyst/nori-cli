@@ -175,6 +175,10 @@ pub(super) async fn run(
         emitted += 1;
     }
     let ending = match ending {
+        Ending::Expired { .. } if spec.source.expires_quietly() => Ending::Finished {
+            ok: true,
+            note: format!("The watch ran its course after {emitted} event(s)."),
+        },
         Ending::Expired { .. } => Ending::Expired { events: emitted },
         other => other,
     };

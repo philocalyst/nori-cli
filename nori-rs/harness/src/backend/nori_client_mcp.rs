@@ -23,6 +23,8 @@ mod bash_tool;
 mod caller;
 mod conversation_tools;
 mod goal_tools;
+mod job_tools;
+mod lsp_tools;
 mod monitor_tools;
 mod server;
 mod session_capabilities;

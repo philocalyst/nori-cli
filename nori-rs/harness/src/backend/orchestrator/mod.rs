@@ -228,6 +228,11 @@ pub(super) struct Inner {
     polls: std::sync::Mutex<polling::PollTracker>,
     /// The background watchers this actor armed.
     monitors: super::monitor::Monitors,
+    /// The background jobs this actor started; their wakes are monitors.
+    jobs: super::jobs::Jobs,
+    /// The Pkl runtime's modules for this session (jobs, monitors, skills, plugins), as last
+    /// loaded; `None` until the first load ends. A child's are empty.
+    modules: Arc<tokio::sync::watch::Sender<Option<Arc<nori_pkl::catalog::Catalog>>>>,
 }
 
 impl Orchestrator {
@@ -237,6 +242,8 @@ impl Orchestrator {
         events: mpsc::Sender<BackendEvent>,
     ) -> (Self, mpsc::UnboundedReceiver<Signal>) {
         let (signals_tx, signals_rx) = mpsc::unbounded_channel();
+        let monitors = super::monitor::Monitors::new();
+        let home = seed.config.nori_home.clone();
         let inner = Inner {
             seed,
             program_backend: std::sync::OnceLock::new(),
@@ -249,7 +256,9 @@ impl Orchestrator {
             caller_view: None,
             native_scopes: Mutex::new(HashMap::new()),
             polls: std::sync::Mutex::new(polling::PollTracker::default()),
-            monitors: super::monitor::Monitors::new(),
+            jobs: super::jobs::Jobs::new(monitors.clone(), home),
+            monitors,
+            modules: Arc::new(tokio::sync::watch::Sender::new(None)),
         };
         (
             Self {
@@ -276,9 +285,37 @@ impl Orchestrator {
         &self.inner.monitors
     }
 
+    /// The background jobs this actor started.
+    pub(crate) fn jobs(&self) -> &super::jobs::Jobs {
+        &self.inner.jobs
+    }
+
     /// Whether this is a delegated child's session, which works to its parent's task.
     pub(crate) fn is_child(&self) -> bool {
         self.inner.seed.is_child()
+    }
+
+    /// The session's Pkl modules as last loaded. A caller right after the session started waits
+    /// for the first load (they are read off the event loop at start), at most a few seconds.
+    pub(crate) async fn modules(&self) -> Arc<nori_pkl::catalog::Catalog> {
+        const FIRST_LOAD: std::time::Duration = std::time::Duration::from_secs(10);
+        let mut loaded = self.inner.modules.subscribe();
+        let first = tokio::time::timeout(FIRST_LOAD, loaded.wait_for(Option::is_some)).await;
+        match first {
+            Ok(Ok(catalog)) => catalog.clone().unwrap_or_default(),
+            Ok(Err(_)) | Err(_) => Arc::default(),
+        }
+    }
+
+    /// The modules as they load: `None` until the first load, then each catalog published.
+    pub(crate) fn module_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<Arc<nori_pkl::catalog::Catalog>>> {
+        self.inner.modules.subscribe()
+    }
+
+    pub(crate) fn publish_modules(&self, catalog: Arc<nori_pkl::catalog::Catalog>) {
+        self.inner.modules.send_replace(Some(catalog));
     }
 
     /// The configuration this session runs with.

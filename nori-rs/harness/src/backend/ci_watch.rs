@@ -110,6 +110,8 @@ impl AcpBackend {
             },
             rules: Rules::default(),
             source,
+            actions: Vec::new(),
+            origin: crate::backend::monitor::spec::Origin::Agent,
         };
         let armed = async {
             let env = SourceEnv::prepare(&spec.source, &self.orchestrator, None, &self.cwd).await?;
